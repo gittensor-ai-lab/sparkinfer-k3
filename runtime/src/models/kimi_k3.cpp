@@ -291,10 +291,13 @@ int kimi_k3_mla_ordinal(const KimiK3Config& cfg, int layer) {
     return ord;
 }
 
-bool kimi_k3_alloc_state(const KimiK3Config& cfg, int max_ctx, KimiK3RuntimeState& out) {
+bool kimi_k3_alloc_state(const KimiK3Config& cfg, int max_ctx, KimiK3RuntimeState& out,
+                        int first_layer, int last_layer) {
     const int qkv = cfg.n_q_heads * cfg.kda_head_dim;
     const int n_kda = cfg.n_kda_layers();
     const int n_mla = cfg.n_mla_layers();
+    const int lo = first_layer < 0 ? 0 : first_layer;
+    const int hi = last_layer < 0 ? cfg.n_layers - 1 : last_layer;
     out.max_ctx = max_ctx;
     out.max_ckpt = cfg.attn_res_block_size > 0
         ? (cfg.n_layers + cfg.attn_res_block_size - 1) / cfg.attn_res_block_size
@@ -307,24 +310,34 @@ bool kimi_k3_alloc_state(const KimiK3Config& cfg, int max_ctx, KimiK3RuntimeStat
         return (float*)p;
     };
 
-    out.conv_state_q.resize(n_kda);
-    out.conv_state_k.resize(n_kda);
-    out.conv_state_v.resize(n_kda);
-    out.delta_state.resize(n_kda);
-    for (int k = 0; k < n_kda; ++k) {
-        out.conv_state_q[k] = alloc((size_t)(cfg.kda_conv_kernel - 1) * qkv);
-        out.conv_state_k[k] = alloc((size_t)(cfg.kda_conv_kernel - 1) * qkv);
-        out.conv_state_v[k] = alloc((size_t)(cfg.kda_conv_kernel - 1) * qkv);
-        out.delta_state[k]  = alloc((size_t)cfg.kda_head_dim * cfg.kda_head_dim * cfg.n_q_heads);
-        if (!out.conv_state_q[k] || !out.conv_state_k[k] || !out.conv_state_v[k] ||
-            !out.delta_state[k])
-            return false;
-    }
+    // The state vectors stay indexed by GLOBAL ordinal (kimi_k3_kda_ordinal /
+    // kimi_k3_mla_ordinal), so they keep their full length — but only the slots for
+    // layers this stage actually owns are allocated; the rest stay null and are never
+    // indexed. This is what makes the pipeline fit: without it, EVERY stage would
+    // allocate all 24 MLA layers' KV cache, and at 1M context that is ~58 GB per
+    // stage of KV that mostly belongs to other GPUs' layers. Sized to what a stage
+    // owns, it is ~58 GB / 8 instead.
+    out.conv_state_q.assign(n_kda, nullptr);
+    out.conv_state_k.assign(n_kda, nullptr);
+    out.conv_state_v.assign(n_kda, nullptr);
+    out.delta_state.assign(n_kda, nullptr);
+    out.mla_kv_cache.assign(n_mla, nullptr);
 
-    out.mla_kv_cache.resize(n_mla);
-    for (int k = 0; k < n_mla; ++k) {
-        out.mla_kv_cache[k] = alloc((size_t)cfg.key_length * max_ctx);
-        if (!out.mla_kv_cache[k]) return false;
+    for (int layer = lo; layer <= hi && layer < cfg.n_layers; ++layer) {
+        if (cfg.is_kda_layer(layer)) {
+            const int k = kimi_k3_kda_ordinal(cfg, layer);
+            out.conv_state_q[k] = alloc((size_t)(cfg.kda_conv_kernel - 1) * qkv);
+            out.conv_state_k[k] = alloc((size_t)(cfg.kda_conv_kernel - 1) * qkv);
+            out.conv_state_v[k] = alloc((size_t)(cfg.kda_conv_kernel - 1) * qkv);
+            out.delta_state[k]  = alloc((size_t)cfg.kda_head_dim * cfg.kda_head_dim * cfg.n_q_heads);
+            if (!out.conv_state_q[k] || !out.conv_state_k[k] || !out.conv_state_v[k] ||
+                !out.delta_state[k])
+                return false;
+        } else {
+            const int k = kimi_k3_mla_ordinal(cfg, layer);
+            out.mla_kv_cache[k] = alloc((size_t)cfg.key_length * max_ctx);
+            if (!out.mla_kv_cache[k]) return false;
+        }
     }
 
     if (out.max_ckpt > 0) {
@@ -937,7 +950,8 @@ bool kimi_k3_pipeline_init(const GGUF& g, const KimiK3Config& cfg,
                                         st.first_layer, st.last_layer,
                                         /*load_embed=*/first, /*load_head=*/last))
             return false;
-        if (!kimi_k3_alloc_state(cfg, max_ctx, st.state)) return false;
+        if (!kimi_k3_alloc_state(cfg, max_ctx, st.state, st.first_layer, st.last_layer))
+            return false;
         st.fwd.cfg = &out.cfg;
         st.fwd.w = &st.weights;
         st.fwd.state = &st.state;

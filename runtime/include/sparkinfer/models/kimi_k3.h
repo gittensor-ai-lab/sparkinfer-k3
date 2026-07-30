@@ -184,7 +184,15 @@ struct KimiK3RuntimeState {
     std::vector<void*> owned;
 };
 
-bool kimi_k3_alloc_state(const KimiK3Config& cfg, int max_ctx, KimiK3RuntimeState& out);
+// Allocate recurrent state. By default (first_layer/last_layer defaulted) sizes for
+// the WHOLE model. A pipeline stage passes its own [first_layer, last_layer] so it
+// allocates state ONLY for the layers it owns — the state vectors keep their
+// full-model length and global-ordinal indexing, but out-of-range slots stay null
+// and are never touched. This is what lets the layer-split pipeline fit: the MLA KV
+// cache is per-MLA-layer and grows with context (~58 GB total at 1M), so an
+// every-stage-allocates-everything sizing would need that PER STAGE.
+bool kimi_k3_alloc_state(const KimiK3Config& cfg, int max_ctx, KimiK3RuntimeState& out,
+                        int first_layer = -1, int last_layer = -1);
 void kimi_k3_reset_state(KimiK3RuntimeState& s);   // zero everything, position=0, n_ckpt=0
 void kimi_k3_free_state(KimiK3RuntimeState& s);
 
