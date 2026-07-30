@@ -247,7 +247,28 @@ bool GGUF::parse_mapped(MappedFile& mf, bool capture_meta, int shard_idx) {
         } else if (vt == VT_ARR) {
             uint32_t et = c.rd<uint32_t>(); uint64_t n = c.rd<uint64_t>();
             if (et == VT_STR) {
-                for (uint64_t k = 0; k < n && c.ok; k++) c.rd_str();
+                // CAPTURE, don't skip. tokenizer.ggml.tokens is a string array and it
+                // is the vocab — without it a generated token id cannot be turned back
+                // into text, so the runtime can produce logits and still not show
+                // anyone what the model said. Only captured for keys that are worth
+                // the memory (K3's vocab is 163840 entries); everything else is still
+                // skipped, since most string arrays in a GGUF are not needed at
+                // runtime and some are large.
+                const bool want = capture_meta &&
+                    (key == "tokenizer.ggml.tokens" || key == "tokenizer.ggml.merges" ||
+                     key == "tokenizer.ggml.token_type");
+                if (want) {
+                    std::vector<std::string> vals;
+                    vals.reserve((size_t)n);
+                    for (uint64_t k = 0; k < n && c.ok; k++) vals.push_back(c.rd_str());
+                    if (!c.ok) {
+                        fprintf(stderr, "[gguf] truncated string array for %s\n", key.c_str());
+                        return false;
+                    }
+                    str_arrays_[key] = std::move(vals);
+                } else {
+                    for (uint64_t k = 0; k < n && c.ok; k++) c.rd_str();
+                }
             } else if (et == VT_U8 || et == VT_I8 || et == VT_BOOL ||
                        et == VT_U16 || et == VT_I16 ||
                        et == VT_U32 || et == VT_I32 ||
@@ -482,6 +503,10 @@ std::string GGUF::meta_str(const std::string& k, const std::string& d) const {
 const std::vector<long>* GGUF::meta_int_array(const std::string& k) const {
     auto it = int_arrays_.find(k);
     return it == int_arrays_.end() ? nullptr : &it->second;
+}
+const std::vector<std::string>* GGUF::meta_str_array(const std::string& k) const {
+    auto it = str_arrays_.find(k);
+    return it == str_arrays_.end() ? nullptr : &it->second;
 }
 const GGUFTensor* GGUF::tensor(const std::string& n) const {
     auto it = tensors_.find(n); return it == tensors_.end() ? nullptr : &it->second;

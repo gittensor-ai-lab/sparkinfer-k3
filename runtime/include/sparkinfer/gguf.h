@@ -77,6 +77,9 @@ public:
     std::string meta_str(const std::string& key, const std::string& def = "") const;
     // Returns nullptr when the key is absent or was not an integer array.
     const std::vector<long>* meta_int_array(const std::string& key) const;
+    // Returns nullptr when the key is absent or was not a captured string array.
+    // Only tokenizer.ggml.{tokens,merges,token_type} are captured — see gguf.cpp.
+    const std::vector<std::string>* meta_str_array(const std::string& key) const;
     const GGUFTensor* tensor(const std::string& name) const;
 
     size_t n_tensors() const { return tensors_.size(); }
@@ -121,6 +124,7 @@ private:
     std::unordered_map<std::string, double>             floats_;
     std::unordered_map<std::string, std::string>        strs_;
     std::unordered_map<std::string, std::vector<long>>  int_arrays_;
+    std::unordered_map<std::string, std::vector<std::string>> str_arrays_;
     std::unordered_map<std::string, GGUFTensor>         tensors_;
 };
 
