@@ -75,21 +75,28 @@ static void test_nccl_is_the_default_on_a_real_node() {
     CHECK(why.empty(), "no downgrade, so no reason expected: %s", why.c_str());
 }
 
-static void test_unvendored_backends_fall_back_and_say_so() {
-    std::printf("unvendored_backends_fall_back_and_say_so\n");
-    // peer-oneshot and multimem are declared but not in this tree. They must
-    // never appear to have run — a benchmark naming them would be measuring NCCL.
-    CHECK(!backend_vendored(Backend::PeerOneShot), "peer-oneshot must not claim to be vendored");
-    CHECK(!backend_vendored(Backend::Multimem), "multimem must not claim to be vendored");
+static void test_vendored_backends_are_selectable_on_capable_hardware() {
+    std::printf("vendored_backends_are_selectable_on_capable_hardware\n");
+    // All three are now in the tree (runtime/csrc/tp/). On a node that can
+    // actually run them, an explicit request is honoured rather than silently
+    // downgraded — an operator who asks for multimem and gets NCCL would be
+    // benchmarking the wrong mechanism.
     CHECK(backend_vendored(Backend::Nccl), "nccl is vendored");
+    CHECK(backend_vendored(Backend::PeerOneShot), "peer-oneshot is vendored");
+    CHECK(backend_vendored(Backend::Multimem), "multimem is vendored");
 
-    for (Backend b : {Backend::PeerOneShot, Backend::Multimem}) {
-        std::string why;
-        CHECK_BACKEND(select_backend(b, 8, h200x8(), &why), Backend::Nccl);
-        CHECK(why.find("not implemented") != std::string::npos,
-              "%s downgrade should say it is not implemented, got: %s",
-              backend_name(b), why.c_str());
-    }
+    std::string why;
+    CHECK_BACKEND(select_backend(Backend::PeerOneShot, 8, h200x8(), &why), Backend::PeerOneShot);
+    CHECK(why.empty(), "no downgrade expected on capable hardware: %s", why.c_str());
+    why.clear();
+    CHECK_BACKEND(select_backend(Backend::Multimem, 8, h200x8(), &why), Backend::Multimem);
+    CHECK(why.empty(), "no downgrade expected on capable hardware: %s", why.c_str());
+
+    // They are still NOT VALIDATED on hardware — their own headers say so. That
+    // is not selection's job to enforce: make_collective() falls back to NCCL if
+    // construction fails, and tp_allreduce_check is what actually proves them.
+    // Selection's job is only to never claim a backend the box cannot run, which
+    // test_hardware_gates_are_reported_before_vendoring covers.
 }
 
 static void test_hardware_gates_are_reported_before_vendoring() {
@@ -181,7 +188,7 @@ static void test_backend_names_are_stable() {
 int main() {
     test_tp1_never_issues_a_collective();
     test_nccl_is_the_default_on_a_real_node();
-    test_unvendored_backends_fall_back_and_say_so();
+    test_vendored_backends_are_selectable_on_capable_hardware();
     test_hardware_gates_are_reported_before_vendoring();
     test_too_few_devices_is_a_hard_downgrade();
     test_backend_none_at_tp8_is_rejected_loudly();

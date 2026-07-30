@@ -21,12 +21,15 @@ bool backend_vendored(Backend b) {
     switch (b) {
         case Backend::None: return true;
         case Backend::Nccl: return true;
-        // Not in this tree. The implementations exist in the cacheon comm engine
-        // but are vLLM-derived (Apache-2.0) and self-declared UNTESTED on
-        // hardware; vendoring them is a separate, deliberate decision.
+        // Vendored: runtime/csrc/tp/{peer_oneshot,multimem}_allreduce.cu.
+        // Present in this tree, but still NOT VALIDATED ON HARDWARE — their own
+        // headers say so. select_backend() therefore lets them through (the
+        // operator asked for them explicitly) while make_collective() falls back
+        // to NCCL if construction fails, and tp_allreduce_check is what proves
+        // any of it. Attribution for the vLLM-derived barrier: see NOTICE.
         case Backend::PeerOneShot:
         case Backend::Multimem:
-            return false;
+            return true;
     }
     return false;
 }

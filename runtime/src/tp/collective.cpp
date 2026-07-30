@@ -10,7 +10,9 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
 #include <sstream>
+#include <utility>
 
 #if defined(SPARKINFER_TP_NCCL)
 #include <nccl.h>
@@ -18,6 +20,11 @@
 
 #if defined(SPARKINFER_TP_CUDA_DRIVER)
 #include <cuda.h>
+#endif
+
+#if defined(SPARKINFER_TP_FAST_COLLECTIVES)
+#include "sparkinfer/tp/multimem_allreduce.h"
+#include "sparkinfer/tp/peer_oneshot_allreduce.h"
 #endif
 
 namespace sparkinfer {
@@ -129,6 +136,78 @@ private:
 
 #endif  // SPARKINFER_TP_NCCL
 
+// ---------------------------------------------------------------------------
+// Mode B: owned-buffer, group-launched backends
+// ---------------------------------------------------------------------------
+
+#if defined(SPARKINFER_TP_FAST_COLLECTIVES)
+
+// Both wrappers are thin on purpose. The vendored classes already own the right
+// memory (multicast-bound / peer-registered) and already do the group launch with
+// an in-kernel barrier; adapting them means exposing that shape through
+// Collective, not reshaping them into an in-place per-rank call they cannot
+// support without a copy that would erase the win.
+template <class Impl>
+class OwnedBufferCollective final : public Collective {
+public:
+    OwnedBufferCollective(std::unique_ptr<Impl> impl, Backend b, int n, std::size_t max_count)
+        : impl_(std::move(impl)), backend_(b), n_(n), max_count_(max_count) {}
+
+    Backend backend() const override { return backend_; }
+    int size() const override { return n_; }
+    bool owns_buffers() const override { return true; }
+    std::size_t max_count() const override { return max_count_; }
+
+    void* reduce_in(int rank) const override {
+        return (rank >= 0 && rank < n_) ? impl_->rank_buffer(rank) : nullptr;
+    }
+    void* reduce_out(int rank) const override {
+        return (rank >= 0 && rank < n_) ? impl_->rank_result(rank) : nullptr;
+    }
+
+    // Mode A is not available: reducing a caller-owned pointer would require
+    // staging it through the owned buffer, i.e. two extra 14 KiB copies per
+    // collective. Returning false makes a mis-wired forward fail immediately
+    // instead of quietly paying that on every one of 186 collectives per token.
+    bool allreduce_bf16(void*, std::size_t, int, cudaStream_t) override { return false; }
+
+    bool allreduce_group(std::size_t count,
+                         const std::vector<cudaStream_t>& streams) override {
+        if (static_cast<int>(streams.size()) != n_) return false;
+        if (count == 0) return true;
+        if (count > max_count_) {
+            std::fprintf(stderr, "[tp] allreduce_group count %zu exceeds max_count %zu\n",
+                         count, max_count_);
+            return false;
+        }
+        // The vendored API takes void* streams.
+        std::vector<void*> raw(streams.size());
+        for (std::size_t i = 0; i < streams.size(); ++i) raw[i] = (void*)streams[i];
+        impl_->allreduce_bf16(count, raw);
+        return true;
+    }
+
+    bool barrier() override {
+        int prev = -1;
+        cudaGetDevice(&prev);
+        bool ok = true;
+        for (int r = 0; r < n_; ++r) {
+            if (cudaSetDevice(r) != cudaSuccess) { ok = false; continue; }
+            if (cudaDeviceSynchronize() != cudaSuccess) ok = false;
+        }
+        if (prev >= 0) cudaSetDevice(prev);
+        return ok;
+    }
+
+private:
+    std::unique_ptr<Impl> impl_;
+    Backend backend_;
+    int n_;
+    std::size_t max_count_;
+};
+
+#endif  // SPARKINFER_TP_FAST_COLLECTIVES
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -152,6 +231,57 @@ std::unique_ptr<Collective> make_nccl_collective(const std::vector<int>& devices
     if (error) {
         *error = "NCCL support not compiled in — configure with -DSPARKINFER_TP=ON";
     }
+    return nullptr;
+#endif
+}
+
+std::unique_ptr<Collective> make_peer_oneshot_collective(const std::vector<int>& devices,
+                                                        std::size_t max_count,
+                                                        std::string* error) {
+#if defined(SPARKINFER_TP_FAST_COLLECTIVES)
+    if (devices.size() < 2) { if (error) *error = "peer-oneshot needs >= 2 devices"; return nullptr; }
+    // The packed reduce is 128-bit vectorized: 8 bf16 per uint4.
+    if (max_count == 0 || (max_count % 8) != 0) {
+        if (error) *error = "peer-oneshot max_count must be a non-zero multiple of 8";
+        return nullptr;
+    }
+    auto impl = std::make_unique<PeerOneShotAllreduce>(devices, max_count);
+    if (!impl->ok()) {
+        if (error) *error = "PeerOneShotAllreduce setup failed (peer access or allocation)";
+        return nullptr;
+    }
+    return std::unique_ptr<Collective>(new OwnedBufferCollective<PeerOneShotAllreduce>(
+        std::move(impl), Backend::PeerOneShot, static_cast<int>(devices.size()), max_count));
+#else
+    (void)devices; (void)max_count;
+    if (error) *error = "fast collectives not compiled in — configure with -DSPARKINFER_TP=ON";
+    return nullptr;
+#endif
+}
+
+std::unique_ptr<Collective> make_multimem_collective(const std::vector<int>& devices,
+                                                     std::size_t max_count,
+                                                     std::string* error) {
+#if defined(SPARKINFER_TP_FAST_COLLECTIVES)
+    if (devices.size() < 2) { if (error) *error = "multimem needs >= 2 devices"; return nullptr; }
+    if (max_count == 0 || (max_count % 8) != 0) {
+        if (error) *error = "multimem max_count must be a non-zero multiple of 8";
+        return nullptr;
+    }
+    if (!multimem_allreduce_supported(devices)) {
+        if (error) *error = "CUDA multicast (NVLS) unsupported on these devices";
+        return nullptr;
+    }
+    auto impl = std::make_unique<MultimemAllreduce>(devices, max_count);
+    if (!impl->ok()) {
+        if (error) *error = "MultimemAllreduce setup failed (multicast bind or mapping)";
+        return nullptr;
+    }
+    return std::unique_ptr<Collective>(new OwnedBufferCollective<MultimemAllreduce>(
+        std::move(impl), Backend::Multimem, static_cast<int>(devices.size()), max_count));
+#else
+    (void)devices; (void)max_count;
+    if (error) *error = "fast collectives not compiled in — configure with -DSPARKINFER_TP=ON";
     return nullptr;
 #endif
 }
@@ -214,7 +344,8 @@ Capabilities probe_capabilities() {
 
 std::unique_ptr<Collective> make_collective(const std::vector<int>& devices,
                                             Backend requested,
-                                            std::string* error) {
+                                            std::string* error,
+                                            std::size_t max_count) {
     const int tp_size = static_cast<int>(devices.size());
     Capabilities caps = probe_capabilities();
 
@@ -225,29 +356,51 @@ std::unique_ptr<Collective> make_collective(const std::vector<int>& devices,
         if (error) *error = reason;
     }
 
+    // NCCL, used both as the requested backend and as the fallback for a fast
+    // backend whose runtime setup failed. Correctness path, always available
+    // when TP is compiled in.
+    auto try_nccl = [&](const char* why) -> std::unique_ptr<Collective> {
+        std::string nccl_err;
+        auto c = make_nccl_collective(devices, &nccl_err);
+        if (c) {
+            if (why) std::fprintf(stderr, "[tp] %s — using nccl\n", why);
+            std::fprintf(stderr, "[tp] all-reduce backend: nccl, %d rank(s)\n", tp_size);
+            return c;
+        }
+        // A no-op collective at tp>1 leaks partial sums as if they were results,
+        // so keep the error set: a caller that checks it must refuse to run.
+        if (error) *error = nccl_err;
+        std::fprintf(stderr, "[tp] FATAL for sharded execution: %s\n", nccl_err.c_str());
+        return make_single_device_collective();
+    };
+
     switch (chosen) {
-        case Backend::Nccl: {
-            std::string nccl_err;
-            auto c = make_nccl_collective(devices, &nccl_err);
+        case Backend::Nccl:
+            return try_nccl(nullptr);
+
+        case Backend::PeerOneShot: {
+            std::string e;
+            auto c = make_peer_oneshot_collective(devices, max_count, &e);
             if (c) {
-                std::fprintf(stderr, "[tp] all-reduce backend: nccl, %d rank(s)\n", tp_size);
+                std::fprintf(stderr, "[tp] all-reduce backend: peer-oneshot, %d rank(s), "
+                                     "max_count %zu (owned buffers)\n", tp_size, max_count);
                 return c;
             }
-            // Selection said NCCL was available but init failed. Fall back to the
-            // no-op so the process does not crash, but keep the error set: a
-            // caller that checks it must refuse to run a sharded model, because a
-            // no-op collective at tp>1 leaks partial sums as if they were results.
-            if (error) *error = nccl_err;
-            std::fprintf(stderr, "[tp] FATAL for sharded execution: %s\n", nccl_err.c_str());
-            return make_single_device_collective();
+            return try_nccl(e.c_str());
         }
-        case Backend::PeerOneShot:
-        case Backend::Multimem:
-            // Unreachable: select_backend() downgrades unvendored backends to
-            // Nccl. Handled explicitly so adding a backend cannot silently fall
-            // through to the no-op.
-            if (error) *error = std::string(backend_name(chosen)) + " has no implementation";
-            return make_single_device_collective();
+
+        case Backend::Multimem: {
+            std::string e;
+            auto c = make_multimem_collective(devices, max_count, &e);
+            if (c) {
+                std::fprintf(stderr, "[tp] all-reduce backend: multimem, %d rank(s), "
+                                     "max_count %zu (owned buffers, NVSwitch reduce)\n",
+                             tp_size, max_count);
+                return c;
+            }
+            return try_nccl(e.c_str());
+        }
+
         case Backend::None:
         default:
             return make_single_device_collective();

@@ -69,13 +69,38 @@ if(SPARKINFER_TP)
         target_compile_definitions(sparkinfer_runtime PUBLIC SPARKINFER_TP_NCCL)
         message(STATUS "sparkinfer: TP enabled — NCCL ${NCCL_LIBRARY}")
 
-        # The CUDA driver API is needed only to probe multicast/NVLS support for
-        # the (not-yet-vendored) multimem backend. Optional: without it the probe
-        # reports multicast unsupported, which is the safe answer.
+        # ---- fast collectives: peer-oneshot + multimem -----------------------
+        # Added to the target only under SPARKINFER_TP, because they need the CUDA
+        # driver API (multicast VMM) and multimem.* PTX. Both are internally
+        # arch-guarded (__CUDA_ARCH__ >= 900 around the PTX, CUDA_VERSION >= 12010
+        # around the driver calls), so they still COMPILE for the sm_89 entry in
+        # the default arch list — the multimem path just compiles out there and
+        # multimem_allreduce_supported() reports false at run time.
+        #
+        # NOT VALIDATED ON HARDWARE. Their own headers say so. make_collective()
+        # falls back to NCCL when construction fails, and tp_allreduce_check is
+        # what proves them. Attribution for the vLLM-derived barrier: see NOTICE.
+        file(GLOB TP_FAST_SRC "${CMAKE_CURRENT_SOURCE_DIR}/csrc/tp/*.cu")
+        if(TP_FAST_SRC)
+            target_sources(sparkinfer_runtime PRIVATE ${TP_FAST_SRC})
+            target_compile_definitions(sparkinfer_runtime PUBLIC SPARKINFER_TP_FAST_COLLECTIVES)
+            # csrc/tp/*.cu include tp_allreduce.cuh / tp_error.hpp as siblings.
+            target_include_directories(sparkinfer_runtime PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/csrc/tp)
+            message(STATUS "sparkinfer: TP fast collectives compiled (peer-oneshot, multimem)")
+        endif()
+
+        # The CUDA driver API is required by the multimem backend (cuMulticast*)
+        # and used to probe NVLS support. Without it the probe reports multicast
+        # unsupported, which is the safe answer, and multimem construction fails
+        # into the NCCL fallback.
         if(TARGET CUDA::cuda_driver)
             target_link_libraries(sparkinfer_runtime PUBLIC CUDA::cuda_driver)
             target_compile_definitions(sparkinfer_runtime PUBLIC SPARKINFER_TP_CUDA_DRIVER)
             message(STATUS "sparkinfer: TP multicast probe enabled (CUDA driver API)")
+        else()
+            message(WARNING "sparkinfer: CUDA driver API not found — the multimem "
+                            "backend will be unavailable at run time (NCCL fallback)")
         endif()
     else()
         # Hard error, not a silent downgrade: -DSPARKINFER_TP=ON is an explicit

@@ -102,8 +102,13 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // Owned-buffer backends size their buffers at construction, so the largest
+    // payload we intend to test has to be declared up front.
+    const std::vector<std::size_t> payloads = {7168, 7168 * 8, 7168 * 64, 7168 * 512};
+    const std::size_t max_count = payloads.back();
+
     std::string err;
-    auto coll = tp::make_collective(devices, requested, &err);
+    auto coll = tp::make_collective(devices, requested, &err, max_count);
     if (!coll) {
         std::printf("\nFAIL: could not build a collective: %s\n", err.c_str());
         return 1;
@@ -114,10 +119,9 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Per-rank streams + buffers, sized for the largest payload we test.
-    // K3 decode is 7168 elems (14 KiB); prefill at ubatch 512 is 512x that.
-    const std::vector<std::size_t> payloads = {7168, 7168 * 8, 7168 * 64, 7168 * 512};
-    const std::size_t max_count = payloads.back();
+    const bool owned = coll->owns_buffers();
+    std::printf("  buffers  : %s\n", owned ? "collective-owned (group launch)"
+                                            : "caller-owned (in-place, per rank)");
 
     std::vector<cudaStream_t> streams(tp_size);
     std::vector<void*> bufs(tp_size, nullptr);
@@ -140,14 +144,24 @@ int main(int argc, char** argv) {
             const uint16_t v = f32_to_bf16(static_cast<float>(r + 1));
             for (std::size_t i = 0; i < count; ++i) host[i] = v;
             if (!check(cudaSetDevice(devices[r]), "set")) return 1;
-            if (!check(cudaMemcpyAsync(bufs[r], host.data(), count * sizeof(uint16_t),
+            void* dst = owned ? coll->reduce_in(r) : bufs[r];
+            if (!dst) { std::printf("  FAIL: no input buffer for rank %d\n", r); return 1; }
+            if (!check(cudaMemcpyAsync(dst, host.data(), count * sizeof(uint16_t),
                                        cudaMemcpyHostToDevice, streams[r]), "H2D")) return 1;
         }
-        for (int r = 0; r < tp_size; ++r) {
-            if (!check(cudaSetDevice(devices[r]), "set")) return 1;
-            if (!coll->allreduce_bf16(bufs[r], count, r, streams[r])) {
-                std::printf("  FAIL: allreduce returned false (rank %d, count %zu)\n", r, count);
+        if (owned) {
+            // ONE group launch across every stream; the barrier is in the kernel.
+            if (!coll->allreduce_group(count, streams)) {
+                std::printf("  FAIL: allreduce_group returned false (count %zu)\n", count);
                 return 1;
+            }
+        } else {
+            for (int r = 0; r < tp_size; ++r) {
+                if (!check(cudaSetDevice(devices[r]), "set")) return 1;
+                if (!coll->allreduce_bf16(bufs[r], count, r, streams[r])) {
+                    std::printf("  FAIL: allreduce returned false (rank %d, count %zu)\n", r, count);
+                    return 1;
+                }
             }
         }
         for (int r = 0; r < tp_size; ++r) {
@@ -163,7 +177,9 @@ int main(int argc, char** argv) {
         float bad_val = 0;
         for (int r = 0; r < tp_size && ok; ++r) {
             if (!check(cudaSetDevice(devices[r]), "set")) return 1;
-            if (!check(cudaMemcpy(host.data(), bufs[r], count * sizeof(uint16_t),
+            const void* src = owned ? coll->reduce_out(r) : bufs[r];
+            if (!src) { std::printf("  FAIL: no output buffer for rank %d\n", r); return 1; }
+            if (!check(cudaMemcpy(host.data(), src, count * sizeof(uint16_t),
                                   cudaMemcpyDeviceToHost), "D2H")) return 1;
             for (std::size_t i = 0; i < count; ++i) {
                 const float got = bf16_to_f32(host[i]);
@@ -194,24 +210,21 @@ int main(int argc, char** argv) {
     std::printf("\n=== latency (%d iters, median-free mean of the steady state) ===\n", iters);
     std::printf("  %10s  %10s  %12s  %14s\n", "elems", "KiB", "us/call", "us/token(186)");
     for (std::size_t count : payloads) {
-        for (int warm = 0; warm < 20; ++warm) {
+        auto issue = [&]() {
+            if (owned) { coll->allreduce_group(count, streams); return; }
             for (int r = 0; r < tp_size; ++r) {
                 cudaSetDevice(devices[r]);
                 coll->allreduce_bf16(bufs[r], count, r, streams[r]);
             }
-        }
+        };
+        for (int warm = 0; warm < 20; ++warm) issue();
         for (int r = 0; r < tp_size; ++r) {
             cudaSetDevice(devices[r]);
             cudaStreamSynchronize(streams[r]);
         }
 
         const auto t0 = std::chrono::steady_clock::now();
-        for (int it = 0; it < iters; ++it) {
-            for (int r = 0; r < tp_size; ++r) {
-                cudaSetDevice(devices[r]);
-                coll->allreduce_bf16(bufs[r], count, r, streams[r]);
-            }
-        }
+        for (int it = 0; it < iters; ++it) issue();
         for (int r = 0; r < tp_size; ++r) {
             cudaSetDevice(devices[r]);
             cudaStreamSynchronize(streams[r]);

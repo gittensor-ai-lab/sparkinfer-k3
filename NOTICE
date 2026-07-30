@@ -1,0 +1,55 @@
+SparkInfer-K3
+Copyright (c) Gittensor AI Lab
+Licensed under the MIT License (see LICENSE).
+
+================================================================================
+Third-party code
+================================================================================
+
+runtime/csrc/tp/tp_allreduce.cuh
+--------------------------------------------------------------------------------
+Portions adapted from the vLLM project (https://github.com/vllm-project/vllm),
+file `csrc/custom_all_reduce.cuh`.
+
+    Copyright the vLLM project
+    Licensed under the Apache License, Version 2.0
+
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+        http://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+
+What was adapted: the `Signal` layout, the dual-counter cross-rank device-flag
+barrier, the acquire/release flag operations, and the packed FP32-accumulate
+reduce. Kept faithful to the original so it inherits vLLM's correctness; only
+namespacing and type names differ.
+
+Apache-2.0 and MIT are compatible. The requirement this NOTICE satisfies is
+attribution: Apache-2.0 §4 requires retaining the copyright notice and stating
+that the file was changed. The original attribution header is preserved in
+tp_allreduce.cuh itself, and the modification is stated above and there.
+
+runtime/csrc/tp/peer_oneshot_allreduce.cu
+runtime/include/sparkinfer/tp/peer_oneshot_allreduce.h
+--------------------------------------------------------------------------------
+Implements the same one-shot all-reduce algorithm as vLLM's
+`cross_device_reduce_1stage` / `cross_device_reduce_2stage`, and uses the barrier
+above. Original code, but the algorithm and the barrier are vLLM-derived, so the
+same attribution applies.
+
+runtime/csrc/tp/multimem_allreduce.cu
+runtime/include/sparkinfer/tp/multimem_allreduce.h
+--------------------------------------------------------------------------------
+Original code. Uses the CUDA driver multicast VMM API (cuMulticast*) and
+`multimem.*` PTX directly; it shares only the barrier from tp_allreduce.cuh.
+
+================================================================================
+
+Everything else in this repository is MIT-licensed as stated in LICENSE.

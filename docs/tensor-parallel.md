@@ -14,6 +14,7 @@ abstraction, the NCCL backend, the hardware validation tool) and **what has not*
 | ✅ **Shard math** | `runtime/src/tp/shard.cpp` — CUDA-free, **4972 checks passing** |
 | ✅ **Backend selection** | `runtime/src/tp/backend_select.cpp` — CUDA-free, **44 checks passing** |
 | ✅ **NCCL collective** | `runtime/src/tp/collective.cpp` — compiles, **not run on hardware** |
+| ✅ **Fast collectives** | `runtime/csrc/tp/` — peer-oneshot + multimem vendored, **not run on hardware** |
 | ✅ **Validation tool** | `tp_allreduce_check` — correctness + latency, **never executed** |
 | ❌ **Forward integration** | `qwen35.cpp` is untouched. Nothing shards a real model yet |
 | ❌ **Sharded weight loading** | `load_gguf()` still loads everything onto one device |
@@ -34,28 +35,46 @@ has two collectives that should beat NCCL on this workload:
 | `peer-oneshot` | every rank reads all peers, sums in FP32, **in-kernel flag barrier** | one kernel per rank, no host events, no cross-stream graph edges |
 | `multimem` | `multimem.ld_reduce` — the **NVSwitch** does the reduction | one reduced load per rank instead of N peer loads; needs sm_90+ and NVLS |
 
-Neither is vendored, for two reasons that are both worth stating plainly:
+**Both are now vendored** under `runtime/csrc/tp/`, and `select_backend()` honours
+an explicit request for either on hardware that can run it. Two things remain true
+and matter:
 
-1. **Both are self-declared untested.** `peer_oneshot_allreduce.hpp` says
-   *"UNTESTED on the 8x H200 target as committed"*; `multimem_allreduce.hpp` says
-   *"UNTESTED on hardware as committed — validate with `multimem_allreduce_bench`
-   before integrating"*. The engine's own guidance is to validate before wiring in.
-2. **Licensing.** `tp_allreduce.cuh` states it is *"Adapted from vLLM
-   `csrc/custom_all_reduce.cuh` (Apache-2.0, Copyright the vLLM project)"*, and
-   `peer_oneshot_allreduce` follows vLLM's algorithm. The cacheon repo has **no
-   LICENSE file**. This repo is MIT. Vendoring needs Apache-2.0 attribution plus a
-   NOTICE, and confirmation that the cacheon code is yours to relicense.
+1. **Neither is validated on hardware.** `peer_oneshot_allreduce.h` says *"UNTESTED
+   on the 8x H200 target as committed"*; `multimem_allreduce.h` says *"UNTESTED on
+   hardware as committed"*. That is not selection's problem to solve — the
+   protection is that `make_collective()` falls back to NCCL when construction
+   fails, and that `tp_allreduce_check` must pass before a forward trusts either.
+   **NCCL remains the default**, so nothing gets a fast collective by accident.
+2. **Attribution.** `tp_allreduce.cuh` is *"Adapted from vLLM
+   `csrc/custom_all_reduce.cuh` (Apache-2.0, Copyright the vLLM project)"* — the
+   `Signal` layout, the dual-counter barrier, the acquire/release flag ops and the
+   packed FP32 reduce. Apache-2.0 and MIT are compatible; §4 requires retaining the
+   copyright notice and stating the file was modified. Both are done: the header
+   keeps its attribution, and [`NOTICE`](../NOTICE) records it. The rest of the
+   comm engine is first-party code.
 
-`backend_vendored()` returns `false` for both, and `select_backend()` downgrades
-them to NCCL with an explicit reason. That is not a placeholder — it is the
-guarantee that **no benchmark can ever attribute a number to a backend that did
-not run.** A comm "optimization" credited to `multimem` while NCCL did the work
-would corrupt the frontier, which is the same failure the `lock` CI job exists to
-prevent on the baseline side.
+### Two calling modes, because the fast backends need it
 
-Enabling one later is a one-line change to `backend_vendored()` plus the
-implementation. The interface, the selection logic, the fallback chain and the
-benchmark tool already name them.
+NCCL reduces the caller's own buffer in place, per rank. The fast backends
+**cannot** — only multicast-bound (multimem) or peer-registered (one-shot)
+allocations can back their loads, so the buffer has to belong to the collective:
+
+```
+Mode A  NCCL, TP=1 no-op        allreduce_bf16(buf, count, rank, stream)
+Mode B  peer-oneshot, multimem  write reduce_in(rank) -> allreduce_group(count, streams)
+                                -> read reduce_out(rank)
+```
+
+`Collective::owns_buffers()` says which. Mode B also launches **one kernel per
+rank across every stream at once**, with the cross-rank barrier inside the kernel —
+no host events, no cross-stream graph edges. That barrier mechanism, not the
+reduce arithmetic, is what these backends exist to change.
+
+Hiding Mode B behind a copy into/out of a caller buffer would add two 14 KiB
+device-to-device copies per collective — **372 extra copies per K3 token** — and
+erase the entire reason for using them. So `allreduce_bf16()` returns `false` on a
+Mode B backend rather than silently staging, which makes a mis-wired forward fail
+immediately instead of paying that cost 186 times per token.
 
 ## The shard plan
 
