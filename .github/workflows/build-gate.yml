@@ -24,7 +24,6 @@ on:
       - "kernels/**"
       - "moe/**"
       - "runtime/**"
-      - "server/**"
       - ".github/workflows/build-gate.yml"
   push:
     branches: [main]
@@ -33,7 +32,6 @@ on:
       - "kernels/**"
       - "moe/**"
       - "runtime/**"
-      - "server/**"
       - ".github/workflows/build-gate.yml"
   workflow_dispatch:
 
@@ -42,7 +40,12 @@ permissions:
 
 concurrency:
   group: build-gate-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  # NOT cancel-in-progress. A CUDA install plus a -j2 compile is ~8 minutes per
+  # arch, and cancelling on every push meant this job never once reached a verdict
+  # across three consecutive commits — it was cancelled twice and its first real
+  # result came only after a merge. A stale-but-finished result is more useful than
+  # a perpetually-cancelled fresh one.
+  cancel-in-progress: false
 
 jobs:
   compile:

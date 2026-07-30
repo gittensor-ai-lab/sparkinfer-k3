@@ -325,10 +325,25 @@ Capabilities probe_capabilities() {
         }
     }
 
-#if defined(SPARKINFER_TP_CUDA_DRIVER)
-    // Multicast (NVLS) is a driver-API attribute; needed only by the multimem
-    // backend, which is not vendored here. Probed anyway so the capability
-    // report is honest about what the node could support.
+#if defined(SPARKINFER_TP_FAST_COLLECTIVES)
+    // Ask the multimem backend itself, which now attempts a real minimal bind
+    // rather than reading CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED.
+    //
+    // MEASURED ON HARDWARE: on an 8x H200 container without Fabric Manager access,
+    // all eight devices report MULTICAST_SUPPORTED = 1 and cuMulticastBindMem then
+    // fails with CUDA error 401. The attribute describes the silicon; it does not
+    // describe what this process may do. Trusting it made this probe report
+    // multicast as available on a node where multimem cannot run, so
+    // select_backend() would choose multimem and the failure would only surface at
+    // construction. A capability report that a benchmark relies on has to be right.
+    {
+        std::vector<int> devs(static_cast<std::size_t>(n));
+        for (int d = 0; d < n; ++d) devs[static_cast<std::size_t>(d)] = d;
+        caps.multicast_supported = (n > 1) && multimem_allreduce_supported(devs);
+    }
+#elif defined(SPARKINFER_TP_CUDA_DRIVER)
+    // No multimem implementation compiled in, so the attribute is all we can read.
+    // Report it, but it is the weaker claim — see the comment above.
     caps.multicast_supported = (n > 1);
     for (int d = 0; d < n && caps.multicast_supported; ++d) {
         int v = 0;

@@ -114,6 +114,9 @@ bool multimem_allreduce_supported(const std::vector<int>& devices) noexcept {
 #else
     if (devices.size() < 2) return false;
     if (cuInit(0) != CUDA_SUCCESS) return false;
+
+    // Step 1: the device attribute. NECESSARY BUT NOT SUFFICIENT — it reports what
+    // the silicon can do, not what this process is permitted to do.
     for (int dev : devices) {
         int v = 0;
         if (cuDeviceGetAttribute(&v, CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED, dev)
@@ -121,7 +124,79 @@ bool multimem_allreduce_supported(const std::vector<int>& devices) noexcept {
             return false;
         }
     }
-    return true;
+
+    // Step 2: actually bind a minimal multicast allocation, and tear it down.
+    //
+    // WHY THIS IS HERE. On an 8x H200 container without Fabric Manager access,
+    // every device reports MULTICAST_SUPPORTED = 1 and then cuMulticastBindMem
+    // fails with CUDA error 401 (CUDA_ERROR_ILLEGAL_STATE, "the operation cannot be
+    // performed in the present state"). NCCL hits the same wall and says so:
+    // "Failed to bind NVLink SHARP (NVLS) Multicast memory ... usually caused by a
+    // system or configuration error in the Fabric Manager or NVSwitches."
+    //
+    // The attribute-only check therefore reported multimem as available on a node
+    // where it cannot run, which made select_backend() choose it and left the real
+    // failure to surface at construction time. Honest capability reporting matters
+    // more than usual here: a benchmark that names its backend has to be right.
+    //
+    // Cost is one granularity-sized allocation, once, at startup.
+    const int lead = devices[0];
+
+    CUmulticastObjectProp mc_prop = {};
+    mc_prop.numDevices = static_cast<unsigned>(devices.size());
+    mc_prop.size = 0;
+    mc_prop.handleTypes = CU_MEM_HANDLE_TYPE_NONE;
+
+    std::size_t mc_gran = 0;
+    if (cuMulticastGetGranularity(&mc_gran, &mc_prop,
+                                  CU_MULTICAST_GRANULARITY_RECOMMENDED) != CUDA_SUCCESS
+        || mc_gran == 0) {
+        return false;
+    }
+
+    CUmemAllocationProp ap = {};
+    ap.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    ap.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    ap.location.id = lead;
+
+    std::size_t mem_gran = 0;
+    if (cuMemGetAllocationGranularity(&mem_gran, &ap,
+                                      CU_MEM_ALLOC_GRANULARITY_RECOMMENDED) != CUDA_SUCCESS) {
+        return false;
+    }
+
+    std::size_t bytes = mc_gran > mem_gran ? mc_gran : mem_gran;
+    // Round up to a multiple of both.
+    if (bytes % mc_gran) bytes += mc_gran - (bytes % mc_gran);
+
+    mc_prop.size = bytes;
+    CUmemGenericAllocationHandle mc = 0;
+    if (cuMulticastCreate(&mc, &mc_prop) != CUDA_SUCCESS) return false;
+
+    bool ok = true;
+    for (int dev : devices) {
+        if (cuMulticastAddDevice(mc, dev) != CUDA_SUCCESS) { ok = false; break; }
+    }
+
+    CUmemGenericAllocationHandle phys = 0;
+    if (ok && cuMemCreate(&phys, bytes, &ap, 0) != CUDA_SUCCESS) {
+        ok = false;
+        phys = 0;
+    }
+
+    // THE step that fails with 401 when Fabric Manager is not reachable.
+    bool bound = false;
+    if (ok && cuMulticastBindMem(mc, /*mcOffset=*/0, phys, /*memOffset=*/0, bytes, 0)
+                  == CUDA_SUCCESS) {
+        bound = true;
+    } else if (ok) {
+        ok = false;
+    }
+
+    if (bound) cuMulticastUnbind(mc, lead, 0, bytes);
+    if (phys) cuMemRelease(phys);
+    cuMemRelease(mc);
+    return ok;
 #endif
 }
 

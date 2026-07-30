@@ -23,9 +23,19 @@
 
 namespace sparkinfer::tp {
 
-// True iff every device supports CUDA multicast (CU_DEVICE_ATTRIBUTE_
-// MULTICAST_SUPPORTED) and a multicast object spanning them can be created.
-// Cheap; call once at construction to decide peer-N vs multimem.
+// True iff multimem can ACTUALLY run here: every device reports
+// CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED *and* a minimal multicast object
+// spanning them can be created, have every device added, and be BOUND to physical
+// memory. The bind is the part that matters.
+//
+// MEASURED: on an 8x H200 container without Fabric Manager access, all eight
+// devices report MULTICAST_SUPPORTED = 1 and cuMulticastBindMem then fails with
+// CUDA error 401 (CUDA_ERROR_ILLEGAL_STATE). NCCL hits the same wall. The
+// attribute describes the silicon, not this process's permissions, so an
+// attribute-only check reports multimem as available on nodes where it cannot run.
+//
+// Costs one granularity-sized allocation, once. Call at construction to decide
+// peer-N vs multimem.
 bool multimem_allreduce_supported(const std::vector<int>& devices) noexcept;
 
 // Owns a multicast object bound across `devices`, plus per-device unicast +
