@@ -63,14 +63,40 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The CUDA 12.8 toolkit does not fit a stock ubuntu-latest runner: the first run of
+      # this job died with "Free space left: 0 MB" and sudo exit 15 during install. The
+      # inherited workflow had the same shape, so it was equally unable to install — it
+      # just was not exercised here before.
+      #
+      # Reclaim the preinstalled toolchains this build never touches (~25 GB) rather than
+      # trimming the toolkit: the build links only CUDA::cudart (+ optional CUDA::nvml,
+      # which degrades cleanly), so a sub-package install would also work — but getting the
+      # package names wrong fails at link time, whereas freeing disk cannot.
+      - name: Reclaim runner disk
+        run: |
+          set -uo pipefail
+          echo "before:"; df -h / | tail -1
+          sudo rm -rf /usr/local/lib/android          # ~9 GB, largest single win
+          sudo rm -rf /usr/local/.ghcup              # ~2.7 GB
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/share/dotnet              # ~1.6 GB
+          sudo rm -rf /usr/share/swift               # ~1.7 GB
+          sudo rm -rf /opt/hostedtoolcache/CodeQL    # ~5 GB
+          docker image prune --all --force >/dev/null 2>&1 || true
+          echo "after:"; df -h / | tail -1
+
       - name: Install CUDA toolkit
         uses: Jimver/cuda-toolkit@v0.2.35
         with:
           cuda: "12.8.1"
           use-github-cache: false
+          # Do not spend the disk we just freed on caching the installer tarball.
+          use-local-cache: false
 
       - name: Configure
         run: |
+          echo "disk after CUDA install:"; df -h / | tail -1
+          nvcc --version | tail -2
           cmake -S . -B build \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_CUDA_ARCHITECTURES="${{ matrix.arch }}" \
