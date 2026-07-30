@@ -1,72 +1,116 @@
 ![sparkinfer banner](docs/sparkinfer.png)
 
-# SP⚡RKINFER · Powered by SN74
+# SP⚡RKINFER-K3 · Powered by SN74
 
-**Agentic AI inference. Optimized for every Blackwell GPU.**
+**Kimi K3 inference. 2.8T parameters, one node.**
 
-**+86% faster** than llama.cpp with Blackwell-native **Custom CUDA kernels** (Qwen3.6-35B-A3B SOTA, RTX 5090, v0.4.3). SparkInfer is the runtime layer for **Private AI** agents — optimized MoE/LLM decoding from desk-side RTX to workstation PRO 6000. Continuously optimized by competition at **[SN74 on Gittensor](https://gittensor.io/miners/repository?name=gittensor-ai-lab%2Fsparkinfer)** and **Kernel Design Agents**.
-
-**Why fastest?** Faster inference means more intelligence, more responsive agents, and more efficient compute.
+Kimi K3 is the largest open-weight model anyone can actually run: **2.8T total parameters**, hybrid KDA + MLA attention, **896 routed experts**, 1M context, native vision. SparkInfer-K3 is the runtime track for that model class — where the bottleneck stops being one card's bandwidth and becomes expert residency across eight. Continuously optimized by competition at **[SN74 on Gittensor](https://gittensor.io/miners/repository?name=gittensor-ai-lab%2Fsparkinfer)** and **Kernel Design Agents**.
 
 > **Fewer models. Deeper optimization. Faster evolution.**
 
-## Frontier models
+## Status — read this first
 
-SparkInfer focuses on the models driving the future of AI — not thousands of legacy architectures.
+This repo currently contains **the measuring stick, not the runtime.**
 
-| Model | Role |
+| | |
 |---|---|
-| [**Qwen3.6-35B-A3B**](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) | Primary SOTA — hybrid Gated-DeltaNet + full-attention MoE |
-| [**Qwythos 9B**](https://huggingface.co/empero-ai/Qwythos-9B-Claude-Mythos-5-1M-GGUF) | Mythos-level reasoning · long-context guard |
-| [**SparkDistill**](https://github.com/gittensor-model-hub/SparkDistill/) | Fable 5 / OpenAI 5.6-level CoT *(coming soon)* |
-| [**MiniMax M3**](https://huggingface.co/MiniMaxAI/MiniMax-M3) | Open MoE frontier *(next)* |
+| ✅ **Evaluation baseline** | Pinned llama.cpp reference, sharded-weight verification, accuracy reference server, 35 tests |
+| ✅ **Architecture spec** | Every hparam traced to `config.json` or the reference implementation's source |
+| ❌ **Native K3 runtime** | No `kimi-k3` GGUF loader. `runtime/` loaders are Qwen-shaped |
+| ❌ **sm_90 kernel path** | `kernels/` targets Blackwell `sm_120`/`sm_121`; H200 is Hopper |
+| ❌ **Measured numbers** | The sweep has not been run on hardware. Every reference slot ships `0`/`null` |
 
-## Blackwell native
+Nothing here claims a speedup, because nothing here has been measured yet. That is deliberate: a baseline you can't reproduce is worse than no baseline. Full detail in [`docs/kimi-k3-baseline.md`](docs/kimi-k3-baseline.md).
 
-**Consumer → Workstation → Datacenter** — built for NVIDIA Blackwell from the beginning (`sm_120` + `sm_121`, not datacenter `sm_100`).
+## The model
 
-| GPU | Arch | Target |
-|---|---|---|
-| [RTX Spark GB10](https://nvidianews.nvidia.com/news/nvidia-microsoft-windows-pcs-agents-rtx-spark) | `sm_121` | Personal AI PC · desk-side agents |
-| [DGX Spark](https://www.nvidia.com/en-us/products/workstations/dgx-spark/) | `sm_121` | AI workstation |
-| [RTX 5090](https://www.nvidia.com/en-us/geforce/graphics-cards/50-series/rtx-5090/) | `sm_120` | Consumer Blackwell · current dev platform |
-| [RTX PRO 6000](https://www.nvidia.com/en-us/products/workstations/) | `sm_120` | 96 GB workstation · 32k/4k API profile |
+| | |
+|---|---|
+| Params | 2.8T total · typed `2.8T.A50B` by the reference implementation |
+| Layers | 93 — **24 MLA** (full attention) + **69 KDA** (linear, recurrent) |
+| Hidden / vocab | 7168 / 163840 |
+| Context | 1,048,576 |
+| MoE | **896 routed experts**, top-16, 2 shared · latent MoE at **3584**, expert FFN 3072 |
+| Attention (full) | MLA — `q_lora 1536`, `kv_lora 512`, **NoPE-only**, sigmoid output gate |
+| Attention (linear) | KDA — 96 heads × 128, conv kernel 4, full-rank gate, `gate_lower_bound −5.0` |
+| Activation | `situ` replaces SwiGLU everywhere (`β 4.0`, `linear β 25.0`) |
+| Extras | Cross-layer residual attention, `block_size 12` |
+| Vision | MoonViT-3d — 27 layers, 1024 wide, **non-square fused QKV** (1536 ≠ n_embd), patch 14 |
 
-## Benchmark · Qwen3.6-35B-A3B SOTA
+Three traps that produce silently wrong output rather than an error — all encoded in [`bench/configs/models/kimi_k3.yaml`](bench/configs/models/kimi_k3.yaml):
 
-RTX 5090 · same `UD-Q4_K_M` GGUF · greedy bs=1 · warm interleaved · **v0.4.4** frontier (same-box main guards).
+- **`full_attn_layers` is 1-indexed.** The converter tests `(il + 1) in full_attn_layers`. Off by one and you get garbage, not a crash.
+- **MLA is stored as MQA.** `head_count_kv = 1`, `key_length = kv_lora + qk_rope = 576`; per-layer `head_count_kv == 0` is what marks a KDA layer.
+- **Routed experts live in a down-projected space.** `expert_latent_length 3584`, not `hidden_size 7168`. Size expert GEMMs off `hidden_size` and you're wrong by 2×.
 
-### Decode
+## Why the baseline is a fork
 
-| context | SparkInfer | llama.cpp | Δ |
-|---:|---:|---:|---:|
-| 128 | **512** tok/s | 276 tok/s | **+86%** |
-| 512 | **506** tok/s | 276 tok/s | +83% |
-| 4k | **486** tok/s | 276 tok/s | +76% |
-| 16k | **467** tok/s | 281 tok/s | +66% |
-| 32k | **437** tok/s | 280 tok/s | +56% |
+Every other model in the SparkInfer family is benchmarked against `ggml-org/llama.cpp` at a pinned commit. Kimi K3 cannot be.
 
-### Prefill
+**Upstream llama.cpp cannot load this model at all.** It asserts `n_expert <= LLAMA_MAX_EXPERTS`, and upstream's cap is 512. K3 has 896. There is no upstream number to compare against, so the reference is [`unslothai/llama.cpp`](https://github.com/unslothai/llama.cpp) PR #48, pinned in [`bench/scripts/reference.lock`](bench/scripts/reference.lock).
 
-| context | SparkInfer | llama.cpp | Δ |
-|---:|---:|---:|---:|
-| 4k | **13,800** tok/s | 8,726 tok/s | **+58%** |
-| 16k | **17,700** tok/s | 8,390 tok/s | **+111%** |
-| 32k | **18,150** tok/s | 7,984 tok/s | **+127%** |
+Four things in that fork are load-bearing, not cosmetic:
 
-Quality parity vs llama.cpp: top-1 **0.953** · KL **0.031** · IFEval **83%** · BFCL **75%**.
+1. `LLAMA_MAX_EXPERTS 1024` — without it, the model asserts at load.
+2. The `LLM_ARCH_KIMI_K3` graph — hybrid KDA + MLA, latent MoE, `situ`, cross-layer attention residual, MLA output gate, full-rank KDA gate.
+3. `graph_max_nodes = max(n_tokens × 160, 64 × n_tensors)` — the generic `×40` budget shared by other hybrid archs is exhausted at ubatch 3840.
+4. Four **required-not-defaulted** KV keys (`expert_latent_length`, `attn_res.block_size`, both `situ` betas). Silently defaulting them loads cleanly and emits garbage — exactly what a baseline must refuse to do.
 
-Full competitor matrix (vLLM, SGLang, TensorRT-LLM) and quality tables:
-[`bench/competitors/latest-results.md`](bench/competitors/latest-results.md) ·
-[`bench/quality/README.md`](bench/quality/README.md).
+Because the pin is a PR head on a fork, GitHub refuses fetch-by-sha. The harness fetches the ref and then **asserts** it resolves to the pinned commit, so a force-push **fails the run** instead of quietly moving the baseline.
 
-Runtime footprint (excluding model weights):
+## Hardware · 8× H200 SXM
 
-| runtime | size | vs sparkinfer |
-|---|---:|---:|
-| sparkinfer native binary | **2.5 MB** | 1× |
-| llama.cpp CUDA | 80 MB | 33× larger |
-| vLLM | 605 MB | 243× larger |
+The smallest useful K3 quant is **553 GiB**. That fits no Blackwell edge card, and no eight of them. 8× H200 SXM (141 GB each, 1051 GiB total) is the smallest node that holds the weights entirely in HBM — a hard requirement, since a partially-offloaded baseline isn't reproducible.
+
+| quant | GiB | fits 8× H200 | top-1 vs lossless |
+|---|---:|---|---:|
+| **UD-IQ1_S** | **553** | ✅ default | 78.9% |
+| UD-IQ1_M | 604 | ✅ | 81.2% |
+| UD-IQ2_XXS | 662 | ✅ | 84.1% |
+| **UD-Q2_K_XL** | **802** | ✅ accuracy knee | 90.4% |
+| UD-Q8_K_XL | 1453 | ❌ | lossless |
+
+Two caveats stated plainly, because they cap the ceiling:
+
+- **H200 is Hopper (`sm_90`), not Blackwell.** The CMake arch list includes 90, so a source build compiles — but no sm_90 kernel path is tuned. Treat any future SparkInfer number on this node as untuned until that work lands.
+- **Hopper has no FP4 tensor core.** K3's routed experts ship as MXFP4 and the useful GGUFs are 1–2 bit, so every low-bit expert GEMM dequantizes before the MMA. llama.cpp takes the same path, so the comparison is *fair* — the ceiling is simply lower than on Blackwell.
+
+### Memory budget · UD-IQ1_S
+
+Derived from the reference implementation's own sizing functions, not estimated:
+
+| item | size |
+|---|---:|
+| weights | 553 GiB |
+| MLA KV @ 32k | 0.84 GiB |
+| MLA KV @ 128k | 3.38 GiB |
+| MLA KV @ **1M** | **27.0 GiB** |
+| KDA recurrent state | 0.43 GiB / sequence |
+| headroom @ 1M | ~470 GiB |
+
+**KV is not the constraint.** 24 MLA layers × 576 × 2 B = 27,648 B/token, K-only (MLA allocates no V cache), so the entire 1M-token budget is 27 GiB. The pressure on this model is expert residency and compute buffers — which is where a native runtime has to win.
+
+## Quickstart
+
+On the 8× H200 node — the scripts detect arch, build the pinned reference for `sm_90`, fetch the 14 shards, and refuse to run if the weights won't fit in HBM:
+
+```bash
+export KIMI_K3_MODELS_DIR=/workspace/models_k3     # needs ~600 GiB free
+export PRIMARY_QUANT=UD-IQ1_S                      # or UD-Q2_K_XL for the accuracy knee
+
+# plan the whole run — no network, no GPU, no weights
+bench/scripts/kimi_k3_baseline.sh --dry-run
+
+# fetch + build + sweep decode/prefill at 128 / 512 / 4k / 32k
+bench/scripts/kimi_k3_baseline.sh --download
+
+# accuracy reference for accuracy_compare.py
+bench/scripts/kimi_k3_reference_server.sh --ctx 8704
+```
+
+Results land in `bench/results/`. Tests need no GPU: `python3 bench/scripts/test_kimi_k3_baseline.py`.
+
+K3 ships a **tiktoken vocab, not `tokenizer.json`**, so eval prompt ids come from the GGUF itself via `gen_eval_prompt.py --gguf` — strictly more correct than a side-loaded tokenizer, and cheap (`vocab_only`, metadata not weights).
 
 ## Powered by SN74 — moving at the speed of ⚡
 
@@ -83,79 +127,65 @@ Miner workflow: [`docs/miner-guide.md`](docs/miner-guide.md).
 
 ## Roadmap
 
-### Milestone 1 · Now — Fast on every Blackwell edge GPU
+### Milestone 1 · Now — a reference nobody can dispute
 
-*Fastest = cost-effective inference* — more tokens per dollar on Blackwell edge first.
+- Pinned fork baseline, sharded-weight verification, fits-in-HBM refusal — **landed**
+- Run the sweep on 8× H200 and pin the measured decode/prefill numbers — **pending hardware**
+- Vision baseline via `llama-mtmd-cli` + `mmproj` (wired up, no image benchmark yet)
 
-- Qwen3.6 SOTA: **+86%** decode / **+127%** prefill @ 32k vs llama.cpp on RTX 5090 (512 tok/s decode @ 128 ctx)
-- RTX PRO 6000 — **32k input + 4k output**, full MoE resident
-- RTX Spark + DGX Spark `sm_121` bring-up for desk-side agents
-- Fastest AI runtime at the edge · desktop app, RAG, memory
+### Milestone 2 · Next — load it natively
 
-### Milestone 2 · Next — Trustable AI on confidential compute
+- `kimi-k3` GGUF loader: 93 layers, per-layer KDA/MLA layout, 896 experts
+- KDA linear-attention decode — full-rank gate, conv state, f32 recurrent state
+- MLA NoPE decode with output gate · latent MoE expert dispatch · `situ` · attn residual
+- Multi-GPU weight sharding — 553 GiB fits no single card at any quant
 
-Attested builds and sealed execution on PRO 6000 server and B200.
+### Milestone 3 · Then — beat the reference
 
-- TDX + NVIDIA CC attestation for `sparkinfer-server` workloads
-- Source-verified binaries — same eval loop, inside the enclave
-- Privacy guardrails and end-to-end encryption
-- Domain-specific models via [SparkDistill](https://github.com/gittensor-model-hub/SparkDistill/)
-- Licensed on-prem runtime for regulated enterprise
-
-## Quickstart
-
-On NVIDIA Blackwell (CUDA 12.8+) — scripts auto-detect GPU arch, fetch prebuilt binaries (or build from source), and download the model:
-
-```bash
-# decode throughput (fetches Qwen3-30B-A3B Q4_K_M on first run)
-bench/scripts/bench.sh --download
-
-# head-to-head vs llama.cpp on the same GGUF + GPU
-bench/scripts/bench.sh --download --compare
-
-# accuracy gate — token-match / KL vs llama.cpp
-bench/scripts/accuracy.sh --download
-```
-
-Your own model: `bench/scripts/bench.sh /path/to/model.gguf --tokens 256`. Options: [`bench/scripts/README.md`](bench/scripts/README.md).
+- `sm_90` kernel path, then the same correctness-first eval loop the Qwen frontier uses
+- Expert residency and compute-buffer pressure, not KV, is the target
 
 ## Layout & scoring
 
 | Path | What |
 |---|---|
+| [`bench/`](bench) | **the baseline** — K3 harness, arch/target configs, eval + accuracy scripts |
+| [`docs/`](docs) | [`kimi-k3-baseline.md`](docs/kimi-k3-baseline.md) — how to run it, and every trap in the arch |
 | [`kernels/`](kernels) | CUDA kernels — flash-decode, decode GEMV, fused MoE FFN, GEMM, RMSNorm, RoPE, GGUF dequant |
 | [`runtime/`](runtime) | scheduler, paged KV cache, CUDA-graph decode, native GGUF loading, model forward |
 | [`moe/`](moe) | sync-free MoE router + expert dispatch |
-| [`bench/`](bench) | reproducible benchmarks + eval harness |
-| [`dashboard/`](dashboard) | static frontier dashboard (GitHub Pages) |
 | [`server/`](server) | OpenAI-compatible HTTP API (`BUILD_SERVER=ON`) |
+
+`kernels/`, `runtime/`, `moe/` and `server/` are inherited from SparkInfer and are **Qwen-shaped today** — they are the surface Milestone 2 lands on, not K3 support.
 
 **Scoring is speedup-only.** SN74 pays verified marginal speedups labeled **XL / L / M / S / XS**. Sub-2% gains are never aggregated across contexts. See [`.gittensor/weights.json`](.gittensor/weights.json).
 
 ## Build
 
-Requires **CUDA Toolkit 12.8+** (`sm_120` / `sm_121` codegen).
+Requires **CUDA Toolkit 12.8+**. H200 is `sm_90`:
 
 ```bash
-cmake -B build -DCMAKE_CUDA_ARCHITECTURES=120   # or 121 for RTX Spark / Jetson Thor
+cmake -B build -DCMAKE_CUDA_ARCHITECTURES=90
 cmake --build build -j
 ctest --test-dir build
 ```
 
+The baseline scripts build the pinned llama.cpp reference themselves into `.llamacpp-k3/` — a separate checkout from the upstream pin, so the two references never fight over one tree.
+
 ## Automated evaluation
 
-Open a PR — a bot evaluates every ~30 min: source build on RTX 5090, correctness gate vs llama.cpp, no-regression guards, **`eval:<label>`** verdict. The bot **never auto-merges**. Details: [`eval/`](eval) · **[EVAL-TRUST.md](EVAL-TRUST.md)** (Polaris TDX receipts, reproducible from source today).
+Correctness for K3 is **agreement with the reference on identical weights** — nothing else. There is no second independent K3 implementation, and UD-IQ1_S's own top-1 against full precision is 78.9%, so absolute quality numbers are meaningless.
 
-| label | meaning |
-|---|---|
-| `XL · L · M · S · XS` | verified speedup over frontier, by % gain |
-| `none` | correct, no verified improvement |
-| `REJECT` | failed correctness or regression |
-| `BASELINE` | first verified frontier entry |
+Two reference-server flags are mandatory, not tuning:
+
+- `--no-context-shift` — K3 is a hybrid recurrent arch; llama.cpp cannot context-shift or restore slots for it, and a long eval dies mid-run without it.
+- `--no-jinja` — the gate posts raw token ids; a chat template would prepend tokens the candidate never saw.
+
+Details: [`eval/`](eval) · **[EVAL-TRUST.md](EVAL-TRUST.md)** (Polaris TDX receipts, reproducible from source today).
 
 ## Contributing
 
-Source-required and reproducible. Before a PR: `bench/scripts/bench.sh` + `bench/scripts/accuracy.sh`. See [CONTRIBUTING.md](CONTRIBUTING.md).
+Source-required and reproducible. Before a PR: `bench/scripts/kimi_k3_baseline.sh --dry-run` and `python3 bench/scripts/test_kimi_k3_baseline.py`. Never hand-fill a `reference.lock` baseline — downstream, a hand-filled number is indistinguishable from a measured one. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
