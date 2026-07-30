@@ -70,20 +70,31 @@ int main(int argc, char** argv) {
         opt.has_routed_norm    = g.tensor((p + "ffn_routed_norm.weight").c_str()) != nullptr;
     }
 
-    auto run = [&](const std::vector<int>& devices, std::vector<float>& logits) -> bool {
+    // Run a SEQUENCE of tokens, returning the last token's logits. Multi-token is
+    // the point: each stage maintains its OWN recurrent state (conv/delta/KV) across
+    // tokens, so a bug where the pipeline shares or drops per-stage state between
+    // tokens is invisible at one token and only appears from token 2 on a stage
+    // boundary. token, token+1, token+2, ... as a deterministic sequence.
+    const int NTOK = 4;
+    auto run = [&](const std::vector<int>& devices, std::vector<float>& last_logits) -> bool {
         KimiK3Pipeline p;
         if (!kimi_k3_pipeline_init(g, cfg, opt, devices, /*max_ctx=*/16, p)) {
             std::printf("pipeline init failed for %zu stage(s)\n", devices.size());
             return false;
         }
-        logits.assign(cfg.vocab, 0.0f);
-        const bool ok = kimi_k3_pipeline_forward_token(p, token, logits.data());
+        last_logits.assign(cfg.vocab, 0.0f);
+        bool ok = true;
+        for (int t = 0; t < NTOK && ok; ++t)
+            ok = kimi_k3_pipeline_forward_token(p, token + t, last_logits.data());
         kimi_k3_pipeline_free(p);
         return ok;
     };
 
     std::vector<float> ref;
     if (!run({0}, ref)) { std::printf("1-stage run failed\n"); return 1; }
+    std::printf("(each run decodes %d tokens; comparison is on the LAST token's logits,\n"
+                " so per-stage recurrent state must have evolved identically across all "
+                "of them)\n", NTOK);
     double ss = 0; for (float v : ref) ss += (double)v * v;
     std::printf("\n1-stage (reference): logits rms=%.6g  first4=%.6g,%.6g,%.6g,%.6g\n",
                 std::sqrt(ss / cfg.vocab), ref[0], ref[1], ref[2], ref[3]);
