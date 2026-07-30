@@ -9,9 +9,12 @@
 // model stays fluent and the error looks like a quality regression.
 
 #include "sparkinfer/kernels/kimi_k3.h"
+#include "sparkinfer/kernels/iq2xs_tables.h"
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <math.h>
+#include <cstdio>
 
 namespace sparkinfer {
 namespace kernels {
@@ -254,6 +257,51 @@ __global__ void kda_conv_step_kernel(float* __restrict__ out, float* __restrict_
 }
 
 // ---------------------------------------------------------------------------
+// 11. IQ2_XS dequantisation
+// ---------------------------------------------------------------------------
+// One thread per 8-value group (one qs entry). 32 groups per 256-value block.
+
+__constant__ uint64_t c_iq2xs_grid[512];
+__constant__ uint8_t  c_ksigns_iq2xs[128];
+__constant__ uint8_t  c_kmask_iq2xs[8];
+
+struct BlockIQ2XS {          // 74 bytes, matches ggml block_iq2_xs exactly
+    uint16_t d;              // fp16 bits
+    uint16_t qs[32];
+    uint8_t  scales[8];
+};
+
+__global__ void dequant_iq2_xs_kernel(float* __restrict__ out,
+                                      const BlockIQ2XS* __restrict__ blocks,
+                                      int64_t n_groups) {
+    const int64_t g = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;  // 8-value group
+    if (g >= n_groups) return;
+
+    const int64_t ib = g >> 5;          // 32 groups per block
+    const int      l = (int)(g & 31);   // group within the block
+    const int   ib32 = l >> 2;          // which 32-value sub-group
+    const int   sub  = l & 3;           // 0..3 within it
+
+    const BlockIQ2XS& b = blocks[ib];
+    const float d = __half2float(__ushort_as_half(b.d));
+
+    // db[l/2], NOT db[l&1]: sub 0,1 take the low nibble and 2,3 the high one.
+    const uint8_t sc = b.scales[ib32];
+    const float db = (sub < 2) ? d * (0.5f + (float)(sc & 0xf)) * 0.25f
+                               : d * (0.5f + (float)(sc >> 4))  * 0.25f;
+
+    const uint16_t q = b.qs[l];
+    const uint8_t* grid = (const uint8_t*)&c_iq2xs_grid[q & 511];
+    const uint8_t signs = c_ksigns_iq2xs[q >> 9];
+
+    float* dst = out + g * 8;
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        dst[j] = db * (float)grid[j] * ((signs & c_kmask_iq2xs[j]) ? -1.0f : 1.0f);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 5. MLA output gate
 // ---------------------------------------------------------------------------
 
@@ -489,6 +537,30 @@ void kda_conv_step_f32(float* out, float* state, const float* x, const float* w,
     const int T = 256;
     const int blocks = (d_inner + T - 1) / T;
     kda_conv_step_kernel<<<(unsigned)blocks, T, 0, stream>>>(out, state, x, w, d_conv, d_inner);
+}
+
+void dequant_iq2_xs_f32(float* out, const void* src, int64_t n, cudaStream_t stream) {
+    if (n <= 0) return;
+    if (n % 256) {
+        fprintf(stderr, "[k3] dequant_iq2_xs: n=%lld not a multiple of 256\n",
+                     (long long)n);
+        return;
+    }
+    // Upload the lattice/sign tables once. __constant__ is the right home: every
+    // thread in a warp reads the same grid entry for a given codepoint, so the
+    // broadcast path is what we want rather than L1 thrash.
+    static bool tables_ready = false;
+    if (!tables_ready) {
+        cudaMemcpyToSymbol(c_iq2xs_grid,   h_iq2xs_grid,   sizeof(h_iq2xs_grid));
+        cudaMemcpyToSymbol(c_ksigns_iq2xs, h_ksigns_iq2xs, sizeof(h_ksigns_iq2xs));
+        cudaMemcpyToSymbol(c_kmask_iq2xs,  h_kmask_iq2xs,  sizeof(h_kmask_iq2xs));
+        tables_ready = true;
+    }
+    const int64_t n_groups = n / 8;
+    const int T = 256;
+    const int64_t blocks = (n_groups + T - 1) / T;
+    dequant_iq2_xs_kernel<<<(unsigned)blocks, T, 0, stream>>>(
+        out, (const BlockIQ2XS*)src, n_groups);
 }
 
 void mla_gate_out_f32(float* out, const float* attn_out, const float* gate_proj,

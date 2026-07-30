@@ -50,6 +50,18 @@ runtime/include/sparkinfer/tp/multimem_allreduce.h
 Original code. Uses the CUDA driver multicast VMM API (cuMulticast*) and
 `multimem.*` PTX directly; it shares only the barrier from tp_allreduce.cuh.
 
+kernels/include/sparkinfer/kernels/iq2xs_tables.h
+--------------------------------------------------------------------------------
+The IQ2_XS lattice and sign tables (iq2xs_grid[512], ksigns_iq2xs[128],
+kmask_iq2xs[8]) are extracted verbatim from ggml/src/ggml-common.h.
+
+    Copyright (c) 2023-2024 The ggml authors
+    Licensed under the MIT License
+
+Extracted mechanically rather than transcribed: a single wrong constant in the
+512-entry lattice corrupts only the codepoints that use it, which no shape or size
+check can detect. MIT-to-MIT, so no additional obligation beyond this attribution.
+
 ================================================================================
 
 Everything else in this repository is MIT-licensed as stated in LICENSE.

@@ -139,6 +139,37 @@ void kda_conv_step_f32(float* out, float* state, const float* x, const float* w,
                        int d_conv, int d_inner, cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
+// 11. IQ2_XS dequantisation
+// ---------------------------------------------------------------------------
+// Reference: ggml dequantize_row_iq2_xs() + block_iq2_xs in ggml-common.h.
+//
+// THIS IS THE ONE THAT UNBLOCKS EVERYTHING. Kimi K3's UD-Q2_K_XL keeps all 896
+// routed experts in IQ2_XS (ggml type 17) — 744.5 GiB of the model's 802.1 GiB.
+// The rest of sparkinfer's quant kernels cover Q4_K/Q5_K/Q6_K/Q8_0/Q8_1 only, so
+// until this exists the runtime can read the attention and norms and none of the
+// weights that do the work.
+//
+// Block layout (74 bytes / 256 values, 2.3125 bpw):
+//     ggml_half d;                 // fp16 super-scale
+//     uint16_t  qs[32];            // per 8 values: low 9 bits = grid index,
+//                                  //               high 7 bits = sign index
+//     uint8_t   scales[8];         // two 4-bit sub-scales per 32-value group
+//
+// Per 32-value group ib32, the two sub-scales are
+//     db[0] = d * (0.5 + (scales[ib32] & 0xf)) * 0.25
+//     db[1] = d * (0.5 + (scales[ib32] >> 4)) * 0.25
+// and l = 0,1 use db[0] while l = 2,3 use db[1]  (db[l/2] — NOT db[l&1]).
+//
+// Each qs entry expands to 8 values: an 8-byte lattice point from iq2xs_grid,
+// scaled, with per-element sign flips from ksigns_iq2xs/kmask_iq2xs.
+//
+// The lattice and sign tables are EXTRACTED, not retyped — see iq2xs_tables.h.
+//
+// n must be a multiple of 256. `src` is the packed block stream, `out` the
+// dequantised f32 values.
+void dequant_iq2_xs_f32(float* out, const void* src, int64_t n, cudaStream_t stream);
+
+// ---------------------------------------------------------------------------
 // 5. MLA output gate
 // ---------------------------------------------------------------------------
 // Reference: src/models/kimi-k3.cpp — "K3: sigmoid output gate applied to the
