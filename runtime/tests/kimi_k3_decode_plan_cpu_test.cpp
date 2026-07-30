@@ -415,6 +415,26 @@ int main() {
                   vb->second->expect_ne2 == cfg.n_q_heads,
               "attn_v_b.weight pins [kv_lora_rank, n_embd_head_v, n_head]");
 
+        // MlaAbsorbQ's OUTPUT (and so MlaDecodeAttn's INPUT) is qh*key_length
+        // (kv_lora + rope_dim concatenated per head = 576-wide), not qh*kv_lora_rank
+        // (512-wide) — per mla_absorb_q_f32's own doc: "Q[h] = concat(q_nope_absorbed
+        // [h], q_pe[h]) // length key_length". Only caught while sizing the actual
+        // executor buffers, not by any earlier schedule-level check — worth pinning
+        // down explicitly so it can't regress silently.
+        int idx_absorb = -1, idx_decode = -1;
+        for (size_t k = 0; k < plan.steps.size(); ++k) {
+            if (plan.steps[k].layer != 0) continue;
+            if (plan.steps[k].op == K3Op::MlaAbsorbQ) idx_absorb = (int)k;
+            if (plan.steps[k].op == K3Op::MlaDecodeAttn) idx_decode = (int)k;
+        }
+        check(idx_absorb >= 0 &&
+                  plan.steps[idx_absorb].out_dim == cfg.n_q_heads * cfg.key_length,
+              "MlaAbsorbQ out_dim is qh*key_length (kv_lora+rope_dim), not "
+              "qh*kv_lora_rank alone");
+        check(idx_decode >= 0 &&
+                  plan.steps[idx_decode].in_dim == cfg.n_q_heads * cfg.key_length,
+              "MlaDecodeAttn in_dim matches MlaAbsorbQ's real output width");
+
         // dt_bias must precede decay_gate in the STEP ORDER, not just in the tensor
         // set: kda_decay_gate_f32's contract is that g_raw already includes +dt_bias.
         // An earlier version of this plan had the order backwards.

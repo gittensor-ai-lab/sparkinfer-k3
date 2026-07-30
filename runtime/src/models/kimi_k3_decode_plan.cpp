@@ -305,17 +305,30 @@ struct Builder {
             // UD-IQ1_S file is expected to ship the split k_b/v_b form (has_fused_kv_b
             // defaults false); resolve this properly if a file is ever seen without
             // attn_k_b/attn_v_b.
+            // out_dim is qh*key_length (kv_lora + rope_dim CONCATENATED per head,
+            // 576-wide), not qh*kv_lora_rank — see the non-fused branch's comment,
+            // which applies identically here.
             op(K3Op::MlaAbsorbQ, i, false, "absorb_q", qh * cfg.key_length_mla,
-               qh * cfg.kv_lora_rank, blk(i, "attn_kv_b.weight"),
+               qh * cfg.key_length, blk(i, "attn_kv_b.weight"),
                "fold k_b (fused kv_b, split not modeled) into q");
-            op(K3Op::MlaDecodeAttn, i, false, "decode_attn", qh * cfg.kv_lora_rank,
+            op(K3Op::MlaDecodeAttn, i, false, "decode_attn", qh * cfg.key_length,
                qh * cfg.value_length_mla, "", "NoPE-only");
         } else {
+            // out_dim is qh*key_length, NOT qh*kv_lora_rank. Per mla_absorb_q_f32's
+            // own doc: "Q[h] = concat(q_nope_absorbed[h], q_pe[h]) // length
+            // key_length" — the kernel concatenates the absorbed kv_lora-wide result
+            // with the untouched rope-dim-wide q_pe, so its OUTPUT is key_length
+            // (kv_lora + rope_dim = 576) wide per head, not kv_lora_rank (512) alone.
+            // An earlier version of this plan used kv_lora_rank for both this step's
+            // output AND decode_attn's input — a mismatch only caught by working out
+            // the exact buffer sizes while wiring the executor, which is exactly the
+            // class of bug a schedule-only review does not force you to catch.
             op(K3Op::MlaAbsorbQ, i, false, "absorb_q", qh * cfg.key_length_mla,
-               qh * cfg.kv_lora_rank, blk(i, "attn_k_b.weight"),
-               "fold k_b into q so attention runs in latent space");
+               qh * cfg.key_length, blk(i, "attn_k_b.weight"),
+               "fold k_b into q so attention runs in latent space; output is "
+               "key_length (kv_lora+rope_dim) wide per head, not kv_lora_rank alone");
             pin3(qk_nope, cfg.kv_lora_rank, qh);
-            op(K3Op::MlaDecodeAttn, i, false, "decode_attn", qh * cfg.kv_lora_rank,
+            op(K3Op::MlaDecodeAttn, i, false, "decode_attn", qh * cfg.key_length,
                qh * cfg.value_length_mla, blk(i, "attn_v_b.weight"), "NoPE-only");
             pin3(cfg.kv_lora_rank, cfg.value_length_mla, qh);
         }
