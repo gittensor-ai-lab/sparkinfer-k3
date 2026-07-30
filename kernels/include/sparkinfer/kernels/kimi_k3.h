@@ -242,6 +242,47 @@ void moe_expert_ffn_iq2xs_f32(float* out, float* scratch,
                               cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
+// 4b. IQ1_S — the UD-IQ1_S target's expert type
+// ---------------------------------------------------------------------------
+// Same contract as the IQ2_XS pair above; the reconstruction differs in three ways
+// that each silently bias the result if dropped:
+//   - the grid index is 11 bits (qs low 8 + 3 bits out of qh), so the lattice has
+//     2048 entries, not 256
+//   - the sub-block scale is ODD-valued: dl = d * (2*s + 1)
+//   - there is a DELTA: value = dl * (grid + delta), delta = +/-0.125 per sub-block.
+//     The lattice itself is only {-1, 0, +1}; the delta is what represents an
+//     asymmetric distribution. Omit it and every tensor stays well-formed and biased.
+//
+// Tables in iq1s_tables.h are extracted mechanically from ggml-common.h, never typed.
+void dequant_iq1_s_f32(float* out, const void* src, int64_t n, cudaStream_t stream);
+
+void moe_expert_ffn_iq1s_f32(float* out, float* scratch,
+                             const float* x, const int* ids, const float* w,
+                             const void* gate_exps, const void* up_exps,
+                             const void* down_exps,
+                             int latent, int ffn, int top_k,
+                             float situ_beta, float situ_linear_beta,
+                             cudaStream_t stream);
+
+// Type-dispatched front doors. PREFER THESE over the per-type entry points.
+//
+// An unsloth dynamic quant mixes types per tensor, so the expert type is a property
+// of the FILE, not of the build. Dispatching at the call site is what lets one binary
+// load UD-IQ1_S and UD-Q2_K_XL alike. Both return false for a type with no kernel —
+// the caller must fail loudly rather than run a wrong decoder over right-sized bytes,
+// which produces fluent noise rather than an error.
+bool dequant_f32_by_type(float* out, const void* src, int64_t n, int ggml_type,
+                         cudaStream_t stream);
+
+bool moe_expert_ffn_f32_by_type(float* out, float* scratch,
+                                const float* x, const int* ids, const float* w,
+                                const void* gate_exps, const void* up_exps,
+                                const void* down_exps,
+                                int latent, int ffn, int top_k,
+                                float situ_beta, float situ_linear_beta,
+                                int ggml_type, cudaStream_t stream);
+
+// ---------------------------------------------------------------------------
 // 5. MLA output gate
 // ---------------------------------------------------------------------------
 // Reference: src/models/kimi-k3.cpp — "K3: sigmoid output gate applied to the
