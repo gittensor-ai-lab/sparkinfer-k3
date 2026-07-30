@@ -8,6 +8,9 @@
 #include <cstring>
 #include <algorithm>
 #include <cstdlib>
+#include <string>
+#include <unordered_map>
+#include <utility>
 
 namespace sparkinfer {
 
@@ -97,7 +100,56 @@ bool upload_force_f32(const GGUF& g, const std::string& name, KimiK3Weights& w,
     return true;
 }
 
+
+// Opt-in phase timing, SPARKINFER_K3_PROFILE=1. Records cudaEvent pairs around the
+// attention and FFN branches and accumulates GPU time per tag, reading the elapsed
+// time back only when the tag is next reused (by which point the events are long
+// since complete), so the hot loop takes no extra sync. Off by default and behind a
+// single env check, so the production path is untouched — this exists to find the
+// bottleneck for the H200 optimization pass, not to run in it.
+struct K3Profiler {
+    struct Slot { cudaEvent_t a = nullptr, b = nullptr; bool pending = false; double ms = 0; long n = 0; };
+    std::unordered_map<std::string, Slot> slots;
+    bool on = false;
+    K3Profiler() { const char* e = std::getenv("SPARKINFER_K3_PROFILE"); on = e && e[0] == '1'; }
+    void start(const std::string& tag, cudaStream_t st) {
+        if (!on) return;
+        auto& sl = slots[tag];
+        if (!sl.a) { cudaEventCreate(&sl.a); cudaEventCreate(&sl.b); }
+        if (sl.pending) {   // drain the previous pair for this tag first
+            cudaEventSynchronize(sl.b);
+            float ms = 0; cudaEventElapsedTime(&ms, sl.a, sl.b); sl.ms += ms; ++sl.n;
+        }
+        cudaEventRecord(sl.a, st);
+        sl.pending = true;
+    }
+    void stop(const std::string& tag, cudaStream_t st) {
+        if (!on) return;
+        cudaEventRecord(slots[tag].b, st);
+    }
+    void report() {
+        if (!on) return;
+        double total = 0;
+        std::vector<std::pair<std::string, double>> rows;
+        for (auto& kv : slots) {
+            auto& sl = kv.second;
+            if (sl.pending) { cudaEventSynchronize(sl.b); float ms = 0;
+                cudaEventElapsedTime(&ms, sl.a, sl.b); sl.ms += ms; ++sl.n; sl.pending = false; }
+            rows.emplace_back(kv.first, sl.ms);
+            total += sl.ms;
+        }
+        std::sort(rows.begin(), rows.end(), [](auto& a, auto& b){ return a.second > b.second; });
+        std::fprintf(stderr, "\n[k3 profile] %.1f ms total across timed phases:\n", total);
+        for (auto& r : rows)
+            std::fprintf(stderr, "  %-18s %8.2f ms  (%5.1f%%)\n",
+                         r.first.c_str(), r.second, total > 0 ? 100.0 * r.second / total : 0.0);
+    }
+};
+K3Profiler& k3_profiler() { static K3Profiler p; return p; }
+
 }  // namespace
+
+void kimi_k3_profile_report() { k3_profiler().report(); }
 
 bool kimi_k3_load_weights(const GGUF& g, const KimiK3Config& cfg,
                          const K3PlanOptions& opt, KimiK3Weights& out,
@@ -484,6 +536,7 @@ bool kimi_k3_forward_layer(KimiK3Forward& fwd, int layer, const float* hidden_in
     k3k::rms_norm_f32(s.normed, s.mixed, (const float*)L.attn_norm.data, H, eps, stream);
     if (fwd.debug) fwd.debug("attn_norm", layer, s.normed, H);
 
+    k3_profiler().start(L.is_kda ? "attn_kda" : "attn_mla", stream);
     if (L.is_kda) {
         const int kda_ord = kimi_k3_kda_ordinal(cfg, layer);
         if (kda_ord < 0) return false;
@@ -609,6 +662,8 @@ bool kimi_k3_forward_layer(KimiK3Forward& fwd, int layer, const float* hidden_in
         if (fwd.debug) fwd.debug("mla_out", layer, s.attn_out, H);
     }
 
+    k3_profiler().stop(L.is_kda ? "attn_kda" : "attn_mla", stream);
+
     // --- combine: replace on a checkpoint layer, add otherwise. Uses hidden_in
     // (the RAW pre-mix value), not s.mixed — the reference's residual add is
     // against the unmixed prefix_sum, only the norm/attention input was mixed. ---
@@ -633,6 +688,7 @@ bool kimi_k3_forward_layer(KimiK3Forward& fwd, int layer, const float* hidden_in
     k3k::rms_norm_f32(s.normed2, s.mixed2, (const float*)L.ffn_norm.data, H, eps, stream);
     if (fwd.debug) fwd.debug("ffn_norm", layer, s.normed2, H);
 
+    k3_profiler().start(layer < cfg.leading_dense ? "ffn_dense" : "ffn_moe", stream);
     if (layer < cfg.leading_dense) {
         if (!proj(s.dense_gate, s.normed2, L.ffn_gate, cfg.dense_ffn, H)) return false;
         if (!proj(s.dense_up, s.normed2, L.ffn_up, cfg.dense_ffn, H)) return false;
@@ -700,6 +756,7 @@ bool kimi_k3_forward_layer(KimiK3Forward& fwd, int layer, const float* hidden_in
             k3k::k3_add_f32(s.ffn_out, s.ffn_out, s.shexp_out, H, stream);
         }
     }
+    k3_profiler().stop(layer < cfg.leading_dense ? "ffn_dense" : "ffn_moe", stream);
     if (fwd.debug) fwd.debug("ffn_out", layer, s.ffn_out, H);
 
     // FFN residual is ALWAYS an add, never a replace.

@@ -249,6 +249,9 @@ bool kimi_k3_forward_token(KimiK3Forward& fwd, int token_id, float* out_logits);
 bool kimi_k3_forward_layer(KimiK3Forward& fwd, int layer, const float* hidden_in,
                           float* hidden_out);
 
+// Print the SPARKINFER_K3_PROFILE=1 phase breakdown to stderr (no-op when unset).
+void kimi_k3_profile_report();
+
 // ---------------------------------------------------------------------------
 // Layer-split pipeline across multiple GPUs.
 //

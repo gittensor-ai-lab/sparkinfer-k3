@@ -23,6 +23,7 @@
 #include "sparkinfer/models/kimi_k3_gguf_manifest.h"
 #include "sparkinfer/models/kimi_k3_vocab.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -133,7 +134,10 @@ int main(int argc, char** argv) {
         }
     }
 
-    // ---- greedy decode ----
+    // ---- greedy decode (timed) ----
+    using clk = std::chrono::steady_clock;
+    auto t_dec0 = clk::now();
+    int decoded = 0;
     for (int step = 0; step < n_predict; ++step) {
         int best = 0;
         for (int i = 1; i < cfg.vocab; ++i) if (logits[i] > logits[best]) best = i;
@@ -147,7 +151,14 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "forward failed at step %d\n", step);
             kimi_k3_pipeline_free(pipe); return 1;
         }
+        ++decoded;
     }
+    const double dec_s = std::chrono::duration<double>(clk::now() - t_dec0).count();
+    if (decoded > 0)
+        std::printf("decode: %d forward passes in %.3f s = %.2f tok/s "
+                    "(%.1f ms/token over %d layers => ~%.0f ms/token extrapolated to %d)\n",
+                    decoded, dec_s, decoded / dec_s, 1000.0 * dec_s / decoded, cfg.n_layers,
+                    1000.0 * dec_s / decoded * (double)n_full / cfg.n_layers, n_full);
 
     if (logits_path) {
         if (!write_spkl(logits_path, logits, cfg.vocab))
@@ -166,6 +177,7 @@ int main(int argc, char** argv) {
         std::printf("\ngenerated text: %s\n",
                     kimi_k3_detokenize(vocab, generated).c_str());
 
+    kimi_k3_profile_report();
     kimi_k3_pipeline_free(pipe);
     return 0;
 }
