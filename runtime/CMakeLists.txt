@@ -176,6 +176,15 @@ if(BUILD_EXAMPLES)
     target_link_libraries(kimi_k3_mla_ref_check PRIVATE sparkinfer_runtime CUDA::cudart)
     set_target_properties(kimi_k3_mla_ref_check PROPERTIES CXX_STANDARD 17)
 
+    # MULTI-TOKEN state evolution. The two checks above run a single token at
+    # position 0, where all recurrent state is zero — so the conv window shift, the
+    # delta-rule accumulation, and MLA attention with a non-trivial softmax are all
+    # structurally unreachable there. This runs T tokens against an independent
+    # float64 reference of the same state.
+    add_executable(kimi_k3_state_check examples/kimi_k3_state_check.cpp)
+    target_link_libraries(kimi_k3_state_check PRIVATE sparkinfer_runtime CUDA::cudart)
+    set_target_properties(kimi_k3_state_check PROPERTIES CXX_STANDARD 17)
+
     add_executable(thermal_sweep examples/thermal_sweep.cpp)   # force each thermal mode, measure W/°C/tok/s
     target_include_directories(thermal_sweep PRIVATE include)
     target_link_libraries(thermal_sweep PRIVATE sparkinfer_runtime CUDA::cudart Threads::Threads)

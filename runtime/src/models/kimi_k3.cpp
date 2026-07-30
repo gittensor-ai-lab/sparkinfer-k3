@@ -705,6 +705,25 @@ bool kimi_k3_forward_token(KimiK3Forward& fwd, int token_id, float* out_logits) 
     cudaStream_t stream = fwd.stream;
     const int H = cfg.hidden;
 
+    // THE CROSS-LAYER RESIDUAL BANK IS PER-TOKEN, NOT PERSISTENT. In the reference
+    // it is `ckpts`, a member of the per-forward-pass `graph` object, so it is
+    // constructed empty on every forward pass and discarded at the end of it — the
+    // checkpoints a token banks are visible only to LATER LAYERS OF THAT SAME TOKEN,
+    // never to the next token.
+    //
+    // This is the opposite lifetime from the KDA recurrent state and the MLA KV
+    // cache in the same struct, which DO persist across tokens (that is the entire
+    // point of them). Three kinds of state, two different lifetimes, one struct —
+    // so resetting it is easy to forget, and forgetting it is not subtle: with
+    // max_ckpt = ceil(93/12) = 8 exactly filled by one token's eight checkpoint
+    // layers, token 2's first push hits the `n_ckpt >= max_ckpt` guard in
+    // forward_layer and the whole call fails. Caught by reasoning through a
+    // multi-token decode before ever running one.
+    //
+    // Deliberately NOT reset inside forward_layer: that entry point is also used
+    // standalone for per-layer validation, where the caller owns bank lifetime.
+    fwd.state->n_ckpt = 0;
+
     float* x = nullptr;
     float* x_next = nullptr;
     if (cudaMalloc(&x, (size_t)H * sizeof(float)) != cudaSuccess) return false;
