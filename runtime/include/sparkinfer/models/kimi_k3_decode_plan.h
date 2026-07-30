@@ -26,6 +26,27 @@
 //     multiplies an already-complete tensor by tp_size. Neither is a crash, and at
 //     186 reduces per token there is no chance of spotting either by eye.
 //
+//  4. THE CROSS-LAYER RESIDUAL MIX RUNS BEFORE EACH NORM, NOT AFTER — and a
+//     checkpointed layer REPLACES the residual stream rather than adding to it.
+//     Read directly off unslothai/llama.cpp's graph builder
+//     (llama_model_kimi_k3::graph, src/models/kimi-k3.cpp), the per-layer order is:
+//
+//       cur = res_mix(prefix_sum, attn_res_score)      <- BEFORE attn_norm
+//       if il % block_size == 0: bank(prefix_sum)      <- RAW pre-mix value, attn side only
+//       cur = attn_norm(cur); cur = attention(cur)
+//       prefix_sum = banked ? cur : prefix_sum + cur    <- REPLACE on a banked layer
+//       cur = res_mix(prefix_sum, ffn_res_score)        <- BEFORE ffn_norm, no bank push
+//       cur = ffn_norm(cur); cur = ffn_or_moe(cur)
+//       prefix_sum = prefix_sum + cur                   <- FFN side ALWAYS adds
+//
+//     An earlier version of this plan had res_mix running AFTER attention/FFN and
+//     the residual combine as an unconditional add on both sides — plausible, and
+//     wrong on both counts. The mix must precede the norm because it is choosing
+//     what to attend/FFN over, not what to fold in after; and the attention-side
+//     replace exists specifically so a banked checkpoint is not double-counted
+//     (once in the bank, again in the running sum this layer would otherwise have
+//     kept adding it into).
+//
 // So the schedule is emitted as a list, and the tests assert the properties that
 // would otherwise only show up as degraded output quality: widths chain, layer types
 // use their own ops, the reduce count is exactly 2*n_layers, and — the strongest
@@ -74,6 +95,8 @@ enum class K3Op {
 
     // cross-layer residual attention
     AttnResMix,       // attn_res_mix_f32
+    ResBankPush,      // bank the raw pre-mix residual into the checkpoint ring buffer;
+                      // bookkeeping only (a device-side copy), no dedicated kernel
 
     // MoE
     MoeRouter,        // moe_router_noaux_tc_f32
@@ -117,6 +140,13 @@ struct K3Step {
     // producing step as well as an explicit AllReduce step so the two can be checked
     // against each other.
     bool needs_reduce = false;
+
+    // Set on the ATTENTION-side residual-combine step (label "add_attn" /
+    // "replace_attn") when this layer is a checkpoint layer (i % block_size == 0).
+    // true means REPLACE the residual stream with the attention output; false means
+    // the ordinary add. Never set on the FFN-side combine, which always adds — see
+    // the header comment on why the two sides differ.
+    bool residual_replace = false;
 
     std::string note;
 };

@@ -351,17 +351,112 @@ int main() {
               first["blk.5.ffn_down_exps.weight"]->expect_ne1 == cfg.expert_latent,
               "down_exps pinned to [moe_ffn, expert_latent, n_experts]");
 
-        // Inferred, NOT verified: must stay unasserted so the validator reports them
-        // instead of a guess being enforced as truth.
-        for (const char* n : {"blk.5.ssm_f_a.weight", "blk.5.ssm_f_b.weight",
-                              "blk.5.ssm_beta.weight", "blk.5.ssm_dt.bias",
-                              "blk.5.ssm_a", "blk.5.ssm_conv1d_q.weight"}) {
-            auto it = first.find(n);
-            check(it != first.end(), std::string(n) + " is in the plan");
-            if (it == first.end()) continue;
-            check(it->second->expect_ne0 == 0 && it->second->expect_ne1 == 0,
-                  std::string(n) + " is UNPINNED (its layout was inferred, not read)");
+        // PINNED from the reference loader's create_tensor() calls (kimi-k3.cpp) —
+        // ssm_f_a/f_b were WRONG in an earlier version of this plan (see the
+        // comment at the build site) until this reading corrected them.
+        auto fa = first.find("blk.5.ssm_f_a.weight");
+        check(fa != first.end() && fa->second->expect_ne0 == cfg.hidden &&
+                  fa->second->expect_ne1 == cfg.kda_head_dim,
+              "ssm_f_a pins [hidden, kda_head_dim] — NOT [hidden, qkv]");
+        auto fb = first.find("blk.5.ssm_f_b.weight");
+        check(fb != first.end() && fb->second->expect_ne0 == cfg.kda_head_dim &&
+                  fb->second->expect_ne1 == cfg.n_q_heads * cfg.kda_head_dim,
+              "ssm_f_b pins [kda_head_dim, qkv] — the low-rank bottleneck is "
+              "kda_head_dim wide, not qkv wide");
+        auto beta_t = first.find("blk.5.ssm_beta.weight");
+        check(beta_t != first.end() && beta_t->second->expect_ne0 == cfg.hidden &&
+                  beta_t->second->expect_ne1 == cfg.n_q_heads,
+              "ssm_beta pins [hidden, n_q_heads]");
+        auto dtb = first.find("blk.5.ssm_dt.bias");
+        check(dtb != first.end() && dtb->second->expect_ne0 == cfg.n_q_heads * cfg.kda_head_dim &&
+                  dtb->second->expect_ne1 == 0,
+              "ssm_dt.bias pins ne0=d_inner (qkv) as a 1-D bias");
+        auto ssma = first.find("blk.5.ssm_a");
+        check(ssma != first.end() && ssma->second->expect_ne0 == cfg.n_q_heads &&
+                  ssma->second->expect_ne1 == 0,
+              "ssm_a pins ne0=n_head — CONFIRMED against the real UD-IQ1_S file (96x1x1)");
+
+        // ssm_norm.weight is [head_dim] (128), NOT [d_inner]/qkv (12288) — an earlier
+        // version of this plan pinned it at qkv width AND scheduled a separate
+        // RmsNorm step for it, when kda_gate_out_f32 already does rms_norm internally
+        // and consumes ssm_norm.weight itself. There is no standalone "ssm_norm" step.
+        int idx_ssmnorm_step = -1;
+        for (size_t k = 0; k < plan.steps.size(); ++k)
+            if (plan.steps[k].layer == 5 && plan.steps[k].op == K3Op::RmsNorm &&
+                plan.steps[k].tensor == "blk.5.ssm_norm.weight")
+                idx_ssmnorm_step = (int)k;
+        check(idx_ssmnorm_step < 0,
+              "no standalone RmsNorm step consumes ssm_norm.weight — it is folded "
+              "into kda_gate_out");
+        auto ssmnorm = first.find("blk.5.ssm_norm.weight");
+        check(ssmnorm != first.end() && ssmnorm->second->op == K3Op::KdaGateOut,
+              "ssm_norm.weight is consumed by the KdaGateOut step");
+        check(ssmnorm != first.end() && ssmnorm->second->expect_ne0 == cfg.kda_head_dim &&
+                  ssmnorm->second->expect_ne1 == 0,
+              "ssm_norm.weight pins ne0=kda_head_dim (128), not qkv (12288)");
+
+        // wk_b/wv_b: 3-D, head-major, consumed directly by MlaAbsorbQ/MlaDecodeAttn —
+        // an earlier version of this plan modeled them as 2-D GEMV projections
+        // (mm() calls) that don't correspond to anything in the reference. Layer 0
+        // is MLA in this test's synthetic layer map.
+        auto kb = first.find("blk.0.attn_k_b.weight");
+        const int qk_nope = cfg.key_length_mla - cfg.rope_dim;
+        check(kb != first.end() && kb->second->op == K3Op::MlaAbsorbQ,
+              "attn_k_b.weight is consumed by MlaAbsorbQ, not a separate MatMul");
+        check(kb != first.end() && kb->second->expect_ne0 == qk_nope &&
+                  kb->second->expect_ne1 == cfg.kv_lora_rank &&
+                  kb->second->expect_ne2 == cfg.n_q_heads,
+              "attn_k_b.weight pins [qk_nope_head_dim, kv_lora_rank, n_head]");
+        auto vb = first.find("blk.0.attn_v_b.weight");
+        check(vb != first.end() && vb->second->op == K3Op::MlaDecodeAttn,
+              "attn_v_b.weight is consumed by MlaDecodeAttn, not a separate MatMul");
+        check(vb != first.end() && vb->second->expect_ne0 == cfg.kv_lora_rank &&
+                  vb->second->expect_ne1 == cfg.value_length_mla &&
+                  vb->second->expect_ne2 == cfg.n_q_heads,
+              "attn_v_b.weight pins [kv_lora_rank, n_embd_head_v, n_head]");
+
+        // MlaAbsorbQ's OUTPUT (and so MlaDecodeAttn's INPUT) is qh*key_length
+        // (kv_lora + rope_dim concatenated per head = 576-wide), not qh*kv_lora_rank
+        // (512-wide) — per mla_absorb_q_f32's own doc: "Q[h] = concat(q_nope_absorbed
+        // [h], q_pe[h]) // length key_length". Only caught while sizing the actual
+        // executor buffers, not by any earlier schedule-level check — worth pinning
+        // down explicitly so it can't regress silently.
+        int idx_absorb = -1, idx_decode = -1;
+        for (size_t k = 0; k < plan.steps.size(); ++k) {
+            if (plan.steps[k].layer != 0) continue;
+            if (plan.steps[k].op == K3Op::MlaAbsorbQ) idx_absorb = (int)k;
+            if (plan.steps[k].op == K3Op::MlaDecodeAttn) idx_decode = (int)k;
         }
+        check(idx_absorb >= 0 &&
+                  plan.steps[idx_absorb].out_dim == cfg.n_q_heads * cfg.key_length,
+              "MlaAbsorbQ out_dim is qh*key_length (kv_lora+rope_dim), not "
+              "qh*kv_lora_rank alone");
+        check(idx_decode >= 0 &&
+                  plan.steps[idx_decode].in_dim == cfg.n_q_heads * cfg.key_length,
+              "MlaDecodeAttn in_dim matches MlaAbsorbQ's real output width");
+
+        // dt_bias must precede decay_gate in the STEP ORDER, not just in the tensor
+        // set: kda_decay_gate_f32's contract is that g_raw already includes +dt_bias.
+        // An earlier version of this plan had the order backwards.
+        int idx_dt = -1, idx_gate = -1, idx_fb = -1;
+        for (size_t k = 0; k < plan.steps.size(); ++k) {
+            if (plan.steps[k].layer != 5) continue;
+            if (plan.steps[k].label == std::string("dt_bias")) idx_dt = (int)k;
+            if (plan.steps[k].op == K3Op::KdaDecayGate) idx_gate = (int)k;
+            if (plan.steps[k].label == std::string("f_b")) idx_fb = (int)k;
+        }
+        check(idx_fb >= 0 && idx_dt >= 0 && idx_gate >= 0 &&
+                  idx_fb < idx_dt && idx_dt < idx_gate,
+              "order is f_b -> dt_bias -> decay_gate, matching the reference dataflow");
+
+        // PINNED: GGUFTensor defaults unlisted dims to 1, so the reference's 3-D vs
+        // 4-D conv1d storage (trailing 1 squeezed or not) is identical on ne0..ne2 —
+        // there was no real ambiguity here, just an earlier overcautious guess.
+        auto conv = first.find("blk.5.ssm_conv1d_q.weight");
+        check(conv != first.end() && conv->second->expect_ne0 == cfg.kda_conv_kernel &&
+                  conv->second->expect_ne1 == 1 &&
+                  conv->second->expect_ne2 == cfg.n_q_heads * cfg.kda_head_dim,
+              "ssm_conv1d_q pins [kda_conv_kernel, 1, qkv]");
 
         // A 1-D norm asserts its width and nothing else — pinning ne1 on a 1-D tensor
         // would fail against every real file, where ne1 is 1.
@@ -382,6 +477,143 @@ int main() {
         std::printf("  %d distinct tensors pinned, %d awaiting a read from real weights\n",
                     pinned, unpinned);
         check(pinned > unpinned, "most tensors are pinned");
+    }
+
+    // -------------------------------------- cross-layer residual: order + banking
+    // Read directly off unslothai/llama.cpp's graph builder (src/models/kimi-k3.cpp):
+    // res_mix runs BEFORE each norm, not after; a checkpointed layer REPLACES the
+    // residual stream on the attention side instead of adding; the bank push happens
+    // only on the attention side, using the RAW pre-mix value. An earlier version of
+    // this plan had all of this backwards (mix after, unconditional add) — plausible
+    // and wrong, exactly the class of bug this project is built to catch before it
+    // reaches a kernel.
+    std::printf("\n[cross-layer residual: pre-norm mix, attention-side replace]\n");
+    {
+        auto idx_of = [&](int layer, K3Op op, const char* label) -> int {
+            for (size_t k = 0; k < plan.steps.size(); ++k) {
+                const auto& s = plan.steps[k];
+                if (s.layer == layer && s.op == op &&
+                    (label == nullptr || s.label == std::string(label)))
+                    return (int)k;
+            }
+            return -1;
+        };
+
+        // Layer 0 is a checkpoint layer (0 % 12 == 0) in every configuration —
+        // block_size divides 0 regardless of its value.
+        //
+        // attn_res_score.weight is NOT a separate MatMul step — it is a 1-D scoring
+        // vector consumed directly by AttnResMix (see the build-site comment), so the
+        // check here is on AttnResMix's own tensor field, not a preceding step.
+        const int L = 0;
+        const int i_mix    = idx_of(L, K3Op::AttnResMix, "attn_res_mix");
+        const int i_push   = idx_of(L, K3Op::ResBankPush, "res_bank_push");
+        const int i_norm   = idx_of(L, K3Op::RmsNorm, "attn_norm");
+        const int i_replace = idx_of(L, K3Op::AddResidual, "replace_attn");
+        const int i_add_attn = idx_of(L, K3Op::AddResidual, "add_attn");
+
+        check(i_mix >= 0 && i_push >= 0 && i_norm >= 0,
+              "layer 0 has attn_res_mix, res_bank_push, attn_norm");
+        check(i_mix >= 0 && plan.steps[i_mix].tensor == "blk.0.attn_res_score.weight",
+              "attn_res_mix's own tensor is attn_res_score.weight, not a preceding "
+              "MatMul's output");
+        check(i_mix >= 0 && plan.steps[i_mix].expect_ne0 == cfg.hidden &&
+                  plan.steps[i_mix].expect_ne1 == 0,
+              "attn_res_score.weight pins ne0=hidden only — it is 1-D, not a "
+              "[hidden, block_size] matrix");
+        check(i_mix < i_push && i_push < i_norm,
+              "order is attn_res_mix -> res_bank_push -> attn_norm "
+              "(mix and bank BEFORE the norm, not after)");
+        check(i_replace >= 0, "layer 0's attention residual combine is labelled "
+                              "'replace_attn' (it is a checkpoint layer)");
+        check(i_add_attn < 0, "layer 0 has NO 'add_attn' step — checkpoint layers "
+                              "replace, they do not also add");
+        if (i_replace >= 0)
+            check(plan.steps[i_replace].residual_replace,
+                  "layer 0's residual-combine step has residual_replace = true");
+
+        // Layer 5 is NOT a checkpoint layer (5 % 12 != 0): ordinary add, no bank push.
+        const int L2 = 5;
+        check(idx_of(L2, K3Op::ResBankPush, nullptr) < 0,
+              "layer 5 (not a checkpoint layer) has no res_bank_push");
+        const int i_add5 = idx_of(L2, K3Op::AddResidual, "add_attn");
+        check(i_add5 >= 0, "layer 5's attention residual combine is labelled 'add_attn'");
+        if (i_add5 >= 0)
+            check(!plan.steps[i_add5].residual_replace,
+                  "layer 5's residual-combine step has residual_replace = false");
+
+        // The FFN side NEVER replaces, checkpoint layer or not — and never gets a
+        // bank push either.
+        for (int layer : {0, 5}) {
+            const int i_ffn_mix = idx_of(layer, K3Op::AttnResMix, "ffn_res_mix");
+            const int i_ffn_norm = idx_of(layer, K3Op::RmsNorm, "ffn_norm");
+            const int i_ffn_add = idx_of(layer, K3Op::AddResidual, "add_ffn");
+            check(i_ffn_mix >= 0 && i_ffn_norm >= 0 && i_ffn_mix < i_ffn_norm,
+                  "layer " + std::to_string(layer) +
+                      ": ffn_res_mix runs before ffn_norm");
+            check(i_ffn_add >= 0 && !plan.steps[i_ffn_add].residual_replace,
+                  "layer " + std::to_string(layer) +
+                      ": FFN-side residual combine is always 'add_ffn', never replace");
+        }
+
+        // Exactly one bank push per res_bs-layer cycle, i.e. ceil(n_layers/res_bs).
+        int n_pushes = 0;
+        for (const auto& s : plan.steps) if (s.op == K3Op::ResBankPush) ++n_pushes;
+        const int want_pushes = (cfg.attn_res_block_size > 0)
+            ? (cfg.n_layers + cfg.attn_res_block_size - 1) / cfg.attn_res_block_size
+            : 0;
+        check_eq(n_pushes, want_pushes,
+                 "one bank push per res_block_size-layer cycle");
+    }
+
+    // ---------------------------------------------------- routed_norm + shexp order
+    // Read directly off the reference's build_latent_moe: routed_norm runs on the
+    // DISPATCH OUTPUT (right before routed_up), not on routed_down's output (the
+    // dispatch's input). An earlier version of this plan had it backwards — the
+    // same class of bug as the ssm_norm fix, caught the same way, by reading the
+    // actual control flow rather than assuming a norm sits next to its same-named
+    // projection. Also checks n_ff_shexp = moe_ffn * n_shared, confirmed against
+    // the real UD-IQ1_S file (blk.3.ffn_gate_shexp.weight is 7168x6144).
+    std::printf("\n[routed_norm normalises the dispatch OUTPUT, not its input]\n");
+    {
+        K3PlanOptions opt2;
+        opt2.has_q_lora = true;
+        opt2.has_routed_norm = true;
+        opt2.has_shared_experts = true;
+        const K3DecodePlan p2 = build_k3_decode_plan(cfg, d, opt2);
+
+        const int L = 5;   // a KDA MoE layer
+        int idx_down = -1, idx_dispatch_last = -1, idx_norm = -1, idx_up = -1;
+        int idx_shexp_gate = -1, idx_shexp_down = -1;
+        for (size_t k = 0; k < p2.steps.size(); ++k) {
+            const auto& s = p2.steps[k];
+            if (s.layer != L) continue;
+            if (s.label == std::string("routed_down")) idx_down = (int)k;
+            if (s.op == K3Op::MoeDispatch) idx_dispatch_last = (int)k;   // last wins
+            if (s.op == K3Op::RmsNorm && s.label == std::string("routed_norm"))
+                idx_norm = (int)k;
+            if (s.label == std::string("routed_up")) idx_up = (int)k;
+            if (s.label == std::string("shexp_gate")) idx_shexp_gate = (int)k;
+            if (s.label == std::string("shexp_down")) idx_shexp_down = (int)k;
+        }
+        check(idx_down >= 0 && idx_dispatch_last >= 0 && idx_norm >= 0 && idx_up >= 0,
+              "layer 5 has routed_down, a MoeDispatch step, routed_norm, routed_up");
+        check(idx_down < idx_dispatch_last && idx_dispatch_last < idx_norm &&
+                  idx_norm < idx_up,
+              "order is routed_down -> dispatch -> routed_norm -> routed_up "
+              "(norm AFTER the dispatch, not between routed_down and it)");
+        check(idx_norm >= 0 && p2.steps[idx_norm].expect_ne0 == cfg.expert_latent,
+              "routed_norm pins ne0=expert_latent (it normalises a latent-width "
+              "tensor either way)");
+
+        const int want_shexp = cfg.moe_ffn * cfg.n_shared;
+        check(idx_shexp_gate >= 0 &&
+                  p2.steps[idx_shexp_gate].out_dim == want_shexp &&
+                  p2.steps[idx_shexp_gate].expect_ne1 == want_shexp,
+              "shexp_gate out_dim/pin is moe_ffn*n_shared (6144 for K3), not moe_ffn "
+              "(3072) alone");
+        check(idx_shexp_down >= 0 && p2.steps[idx_shexp_down].in_dim == want_shexp,
+              "shexp_down in_dim matches the same derived width");
     }
 
     // ------------------------------------------------------------ TP invariance

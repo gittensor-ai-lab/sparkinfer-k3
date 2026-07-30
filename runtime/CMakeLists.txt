@@ -151,6 +151,67 @@ if(BUILD_EXAMPLES)
     target_link_libraries(kimi_k3_plan_check PRIVATE sparkinfer_runtime)
     set_target_properties(kimi_k3_plan_check PROPERTIES CXX_STANDARD 17)
 
+    # Loads real weights for one layer (from a possibly-partial shard set) and runs
+    # kimi_k3_forward_layer on a synthetic hidden vector: does it load, execute
+    # without a CUDA error, and produce finite, non-degenerate output? First real
+    # exercise of the executor — numerical comparison against llama.cpp is separate.
+    add_executable(kimi_k3_smoke_test examples/kimi_k3_smoke_test.cpp)
+    target_link_libraries(kimi_k3_smoke_test PRIVATE sparkinfer_runtime CUDA::cudart)
+    set_target_properties(kimi_k3_smoke_test PROPERTIES CXX_STANDARD 17)
+
+    # Full-layer numerical validation: layer 0 computed twice on the same real
+    # weights — once by kimi_k3_forward_layer, once by an independent float64 CPU
+    # reference that dequantizes the same GGUF bytes by hand. Proves the EXECUTOR's
+    # wiring (not just each kernel in isolation, already covered by
+    # kimi_k3_numeric_test) against ground truth built from the real file.
+    add_executable(kimi_k3_layer0_ref_check examples/kimi_k3_layer0_ref_check.cpp)
+    target_link_libraries(kimi_k3_layer0_ref_check PRIVATE sparkinfer_runtime CUDA::cudart)
+    set_target_properties(kimi_k3_layer0_ref_check PROPERTIES CXX_STANDARD 17)
+
+    # Same idea, for the MLA attention branch (q_lora, the q_nope/q_pe deinterleave,
+    # the KV-cache write, absorbed attention, attn_gate) — none of which the KDA
+    # layer above touches. Stops before FFN/MoE/shexp, which have their own
+    # dedicated real-weight validation (kimi_k3_moe_real_test.cu).
+    add_executable(kimi_k3_mla_ref_check examples/kimi_k3_mla_ref_check.cpp)
+    target_link_libraries(kimi_k3_mla_ref_check PRIVATE sparkinfer_runtime CUDA::cudart)
+    set_target_properties(kimi_k3_mla_ref_check PROPERTIES CXX_STANDARD 17)
+
+    # MULTI-TOKEN state evolution. The two checks above run a single token at
+    # position 0, where all recurrent state is zero — so the conv window shift, the
+    # delta-rule accumulation, and MLA attention with a non-trivial softmax are all
+    # structurally unreachable there. This runs T tokens against an independent
+    # float64 reference of the same state.
+    add_executable(kimi_k3_state_check examples/kimi_k3_state_check.cpp)
+    target_link_libraries(kimi_k3_state_check PRIVATE sparkinfer_runtime CUDA::cudart)
+    set_target_properties(kimi_k3_state_check PROPERTIES CXX_STANDARD 17)
+
+    # Layer-split pipeline equivalence: an N-stage pipeline must produce
+    # BIT-IDENTICAL logits to a 1-stage one (a stage boundary only adds an exact f32
+    # round-trip). Really a test of the residual-bank handoff — the bank spans all
+    # layers, so a boundary after any checkpoint layer needs it carried across.
+    add_executable(kimi_k3_pipeline_check examples/kimi_k3_pipeline_check.cpp)
+    target_link_libraries(kimi_k3_pipeline_check PRIVATE sparkinfer_runtime CUDA::cudart)
+    set_target_properties(kimi_k3_pipeline_check PROPERTIES CXX_STANDARD 17)
+
+    # Generation driver: pre-tokenized prompt ids in, greedy-decoded text out.
+    # Takes ids rather than a string because encoding needs a tiktoken BPE pass that
+    # llama.cpp already provides (llama-tokenize), and the acceptance test must feed
+    # both implementations identical ids anyway. --logits dumps the final step in the
+    # .spkl format bench/scripts/compare_logits.py reads.
+    add_executable(kimi_k3_generate examples/kimi_k3_generate.cpp)
+    target_link_libraries(kimi_k3_generate PRIVATE sparkinfer_runtime CUDA::cudart)
+    set_target_properties(kimi_k3_generate PROPERTIES CXX_STANDARD 17)
+
+    # MoE FFN-branch validation inside the executor vs an independent float64
+    # reference: router -> routed_down -> expert dispatch -> routed_norm -> routed_up
+    # -> shared experts, with real IQ1_S weights. Closes the one executor path that
+    # had no end-to-end numerical check (layer0 covered dense FFN, mla stopped at
+    # attention). Needs the kernels headers for the GPU expert dequant.
+    add_executable(kimi_k3_moe_ref_check examples/kimi_k3_moe_ref_check.cpp)
+    target_link_libraries(kimi_k3_moe_ref_check PRIVATE sparkinfer_runtime sparkinfer_kernels CUDA::cudart)
+    target_include_directories(kimi_k3_moe_ref_check PRIVATE ${PROJECT_SOURCE_DIR}/../kernels/include)
+    set_target_properties(kimi_k3_moe_ref_check PROPERTIES CXX_STANDARD 17)
+
     add_executable(thermal_sweep examples/thermal_sweep.cpp)   # force each thermal mode, measure W/°C/tok/s
     target_include_directories(thermal_sweep PRIVATE include)
     target_link_libraries(thermal_sweep PRIVATE sparkinfer_runtime CUDA::cudart Threads::Threads)

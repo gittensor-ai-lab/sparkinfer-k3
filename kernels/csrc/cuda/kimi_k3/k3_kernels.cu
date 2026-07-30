@@ -10,6 +10,7 @@
 
 #include "sparkinfer/kernels/kimi_k3.h"
 #include "sparkinfer/kernels/iq2xs_tables.h"
+#include "sparkinfer/kernels/iq1s_tables.h"
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -44,6 +45,7 @@ __device__ __forceinline__ float block_sum(float v, float* shm) {
     __syncthreads();
     return shm[NWARP];
 }
+
 
 // ---------------------------------------------------------------------------
 // 1. situ
@@ -271,6 +273,21 @@ struct BlockIQ2XS {          // 74 bytes, matches ggml block_iq2_xs exactly
     uint8_t  scales[8];
 };
 
+// 50 bytes, matches ggml block_iq1_s exactly (ggml-common.h asserts
+// sizeof(ggml_half) + QK_K/8 + QK_K/16). IQ1_S is the UD-IQ1_S target's expert type.
+//
+// Reconstruction differs from IQ2_XS in three ways that all matter:
+//   - the grid index is 11 BITS: qs[l] low 8, plus 3 bits pulled out of qh
+//   - the scale is per 32-value sub-block and ODD-VALUED: dl = d * (2*s + 1)
+//   - there is a DELTA: value = dl * (grid + delta), delta = +/-0.125 per sub-block
+// The delta is what lets a {-1,0,+1} lattice represent an asymmetric distribution;
+// dropping it produces a well-formed tensor with a systematic bias.
+struct BlockIQ1S {           // 50 bytes
+    uint16_t d;              // fp16 bits
+    uint8_t  qs[32];         // grid index, low 8 bits
+    uint16_t qh[8];          // 3 bits x4 of grid index, 3-bit scale, 1 sign bit
+};
+
 __global__ void dequant_iq2_xs_kernel(float* __restrict__ out,
                                       const BlockIQ2XS* __restrict__ blocks,
                                       int64_t n_groups) {
@@ -299,6 +316,37 @@ __global__ void dequant_iq2_xs_kernel(float* __restrict__ out,
     for (int j = 0; j < 8; ++j) {
         dst[j] = db * (float)grid[j] * ((signs & c_kmask_iq2xs[j]) ? -1.0f : 1.0f);
     }
+}
+
+// One thread per 8-value group, matching dequantize_row_iq1_s's inner loop exactly:
+//   dl    = d * (2*((qh[ib] >> 12) & 7) + 1)
+//   delta = (qh[ib] & 0x8000) ? -IQ1S_DELTA : +IQ1S_DELTA
+//   grid  = iq1s_grid[ qs[4*ib + l] | (((qh[ib] >> 3*l) & 7) << 8) ]
+//   y[j]  = dl * (grid[j] + delta)
+__global__ void dequant_iq1_s_kernel(float* __restrict__ out,
+                                     const BlockIQ1S* __restrict__ blocks,
+                                     int64_t n_groups) {
+    const int64_t g = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
+    if (g >= n_groups) return;
+
+    const int64_t ib  = g >> 5;          // 32 groups of 8 per 256-value block
+    const int     l32 = (int)(g & 31);
+    const int     ib32 = l32 >> 2;       // which 32-value sub-block (0..7)
+    const int     l    = l32 & 3;        // which group of 8 inside it (0..3)
+
+    const BlockIQ1S& b = blocks[ib];
+    const float    d   = __half2float(__ushort_as_half(b.d));
+    const uint16_t h   = b.qh[ib32];
+
+    const float dl    = d * (float)(2 * ((h >> 12) & 7) + 1);
+    const float delta = (h & 0x8000) ? -SPARKINFER_IQ1S_DELTA : SPARKINFER_IQ1S_DELTA;
+
+    const uint32_t idx = (uint32_t)b.qs[4 * ib32 + l] | (((uint32_t)(h >> (3 * l)) & 7u) << 8);
+    const int8_t* grid = (const int8_t*)&iq1s_grid_c[idx];
+
+    float* dst = out + g * 8;
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) dst[j] = dl * ((float)grid[j] + delta);
 }
 
 // ---------------------------------------------------------------------------
@@ -382,7 +430,7 @@ __global__ void moe_router_noaux_tc_kernel(float* __restrict__ out_w,
 // Decode one IQ2_XS block (256 values) into the caller's dot accumulator against
 // `x`. Same arithmetic as dequant_iq2_xs_kernel — kept in one place so the two
 // cannot drift, since that kernel is the one validated bit-exact against ggml.
-__device__ __forceinline__ float iq2xs_block_dot(const BlockIQ2XS& b,
+__device__ __forceinline__ float block_dot(const BlockIQ2XS& b,
                                                  const float* __restrict__ x,
                                                  int lane, int nlanes) {
     const float d = __half2float(__ushort_as_half(b.d));
@@ -406,13 +454,37 @@ __device__ __forceinline__ float iq2xs_block_dot(const BlockIQ2XS& b,
     return acc;
 }
 
+// IQ1_S counterpart. Same contract: decode inside the dot product and never stage
+// dequantised weights. Overloaded on the block type so the MoE kernels below are
+// written once and instantiated per quant type — the combine logic must not exist
+// twice, or the two copies will drift.
+__device__ __forceinline__ float block_dot(const BlockIQ1S& b,
+                                           const float* __restrict__ x,
+                                           int lane, int nlanes) {
+    const float d = __half2float(__ushort_as_half(b.d));
+    float acc = 0.0f;
+    for (int l32 = lane; l32 < 32; l32 += nlanes) {
+        const int ib32 = l32 >> 2, l = l32 & 3;
+        const uint16_t h = b.qh[ib32];
+        const float dl    = d * (float)(2 * ((h >> 12) & 7) + 1);
+        const float delta = (h & 0x8000) ? -SPARKINFER_IQ1S_DELTA : SPARKINFER_IQ1S_DELTA;
+        const uint32_t idx =
+            (uint32_t)b.qs[4 * ib32 + l] | (((uint32_t)(h >> (3 * l)) & 7u) << 8);
+        const int8_t* grid = (const int8_t*)&iq1s_grid_c[idx];
+        const float* xv = x + l32 * 8;
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) acc += dl * ((float)grid[j] + delta) * xv[j];
+    }
+    return acc;
+}
+
 // gate/up GEMV + situ. One block per (selected expert k, output chunk).
-template <int BLOCK>
+template <int BLOCK, typename Blk>
 __global__ void moe_gate_up_situ_kernel(float* __restrict__ scratch,
                                         const float* __restrict__ x,
                                         const int* __restrict__ ids,
-                                        const BlockIQ2XS* __restrict__ gate_exps,
-                                        const BlockIQ2XS* __restrict__ up_exps,
+                                        const Blk* __restrict__ gate_exps,
+                                        const Blk* __restrict__ up_exps,
                                         int latent, int ffn,
                                         float beta, float inv_beta,
                                         float lb, float inv_lb, int lb_active) {
@@ -422,14 +494,14 @@ __global__ void moe_gate_up_situ_kernel(float* __restrict__ scratch,
     const int e = ids[k];
     const int blocks_per_row = latent / 256;
 
-    const BlockIQ2XS* g_row = gate_exps + (size_t)(e * ffn + j) * blocks_per_row;
-    const BlockIQ2XS* u_row = up_exps   + (size_t)(e * ffn + j) * blocks_per_row;
+    const Blk* g_row = gate_exps + (size_t)(e * ffn + j) * blocks_per_row;
+    const Blk* u_row = up_exps   + (size_t)(e * ffn + j) * blocks_per_row;
 
     float gacc = 0.0f, uacc = 0.0f;
     for (int b = 0; b < blocks_per_row; ++b) {
         const float* xb = x + b * 256;
-        gacc += iq2xs_block_dot(g_row[b], xb, threadIdx.x, BLOCK);
-        uacc += iq2xs_block_dot(u_row[b], xb, threadIdx.x, BLOCK);
+        gacc += block_dot(g_row[b], xb, threadIdx.x, BLOCK);
+        uacc += block_dot(u_row[b], xb, threadIdx.x, BLOCK);
     }
     __shared__ float shm[BLOCK / 32 + 1];
     gacc = block_sum<BLOCK>(gacc, shm);
@@ -446,12 +518,12 @@ __global__ void moe_gate_up_situ_kernel(float* __restrict__ scratch,
 
 // down GEMV + weighted combine. One block per output element; accumulates the
 // top_k experts so the combine needs no second pass and no atomics.
-template <int BLOCK>
+template <int BLOCK, typename Blk>
 __global__ void moe_down_combine_kernel(float* __restrict__ out,
                                         const float* __restrict__ scratch,
                                         const int* __restrict__ ids,
                                         const float* __restrict__ w,
-                                        const BlockIQ2XS* __restrict__ down_exps,
+                                        const Blk* __restrict__ down_exps,
                                         int latent, int ffn, int top_k) {
     const int o = blockIdx.x;                 // output element in [0, latent)
     if (o >= latent) return;
@@ -461,11 +533,11 @@ __global__ void moe_down_combine_kernel(float* __restrict__ out,
     float total = 0.0f;
     for (int k = 0; k < top_k; ++k) {
         const int e = ids[k];
-        const BlockIQ2XS* d_row = down_exps + (size_t)(e * latent + o) * blocks_per_row;
+        const Blk* d_row = down_exps + (size_t)(e * latent + o) * blocks_per_row;
         const float* act = scratch + (size_t)k * ffn;
         float acc = 0.0f;
         for (int b = 0; b < blocks_per_row; ++b)
-            acc += iq2xs_block_dot(d_row[b], act + b * 256, threadIdx.x, BLOCK);
+            acc += block_dot(d_row[b], act + b * 256, threadIdx.x, BLOCK);
         acc = block_sum<BLOCK>(acc, shm);
         __syncthreads();
         if (threadIdx.x == 0) total += w[k] * acc;
@@ -652,6 +724,86 @@ __global__ void mla_decode_attn_kernel(float* __restrict__ out,
     }
 }
 
+// --- generic f32-activation GEMV --------------------------------------------
+// One CUDA thread block per output row n; threads stride over K.
+
+struct BlockQ8_0 {   // 34 bytes, matches ggml block_q8_0 exactly
+    uint16_t d;       // fp16 scale
+    int8_t   qs[32];
+};
+
+template <int BLOCK>
+__global__ void proj_q8_0_kernel(float* __restrict__ y, const float* __restrict__ x,
+                                 const BlockQ8_0* __restrict__ W, int blocks_per_row) {
+    const int n = blockIdx.x;
+    const BlockQ8_0* row = W + (size_t)n * blocks_per_row;
+    __shared__ float shm[BLOCK / 32 + 1];
+
+    float acc = 0.0f;
+    for (int b = threadIdx.x; b < blocks_per_row; b += BLOCK) {
+        const float d = __half2float(__ushort_as_half(row[b].d));
+        const float* xb = x + (size_t)b * 32;
+        float s = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 32; ++j) s += (float)row[b].qs[j] * xb[j];
+        acc += d * s;
+    }
+    acc = block_sum<BLOCK>(acc, shm);
+    if (threadIdx.x == 0) y[n] = acc;
+}
+
+// Plain per-block dequant of N CONTIGUOUS values (no reduction) — what a row gather
+// needs (token_embd's row for one token), as opposed to k3_proj_f32's per-ROW dot
+// product. Shares the same block layouts.
+__global__ void dequant_q8_0_kernel(float* __restrict__ out,
+                                    const BlockQ8_0* __restrict__ blocks,
+                                    int64_t n_blocks) {
+    const int64_t b = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
+    if (b >= n_blocks) return;
+    const float d = __half2float(__ushort_as_half(blocks[b].d));
+    float* dst = out + b * 32;
+#pragma unroll
+    for (int j = 0; j < 32; ++j) dst[j] = (float)blocks[b].qs[j] * d;
+}
+
+__global__ void dequant_f32_passthrough_kernel(float* __restrict__ out,
+                                               const float* __restrict__ src,
+                                               int64_t n) {
+    const int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
+    if (i < n) out[i] = src[i];
+}
+
+template <int BLOCK>
+__global__ void proj_f32_kernel(float* __restrict__ y, const float* __restrict__ x,
+                                const float* __restrict__ W, int K) {
+    const int n = blockIdx.x;
+    const float* row = W + (size_t)n * K;
+    __shared__ float shm[BLOCK / 32 + 1];
+
+    float acc = 0.0f;
+    for (int k = threadIdx.x; k < K; k += BLOCK) acc += row[k] * x[k];
+    acc = block_sum<BLOCK>(acc, shm);
+    if (threadIdx.x == 0) y[n] = acc;
+}
+
+
+__global__ void add_f32_kernel(float* __restrict__ out, const float* __restrict__ a,
+                               const float* __restrict__ b, int64_t n) {
+    const int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
+    if (i < n) out[i] = a[i] + b[i];
+}
+
+template <int BLOCK>
+__global__ void rms_norm_kernel(float* __restrict__ out, const float* __restrict__ x,
+                                const float* __restrict__ w, int n, float eps) {
+    __shared__ float shm[BLOCK / 32 + 1];
+    float acc = 0.0f;
+    for (int d = threadIdx.x; d < n; d += BLOCK) acc += x[d] * x[d];
+    const float ss = block_sum<BLOCK>(acc, shm);
+    const float inv = rsqrtf(ss / (float)n + eps);
+    for (int d = threadIdx.x; d < n; d += BLOCK) out[d] = x[d] * inv * w[d];
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -724,6 +876,13 @@ static void ensure_iq2xs_tables() {
     ready = true;
 }
 
+static void ensure_iq1s_tables() {
+    static bool ready = false;
+    if (ready) return;
+    cudaMemcpyToSymbol(iq1s_grid_c, iq1s_grid_host, sizeof(iq1s_grid_host));
+    ready = true;
+}
+
 void dequant_iq2_xs_f32(float* out, const void* src, int64_t n, cudaStream_t stream) {
     if (n <= 0) return;
     if (n % 256) {
@@ -767,12 +926,93 @@ void moe_expert_ffn_iq2xs_f32(float* out, float* scratch,
     ensure_iq2xs_tables();
     const int lb_active = situ_linear_beta > 0.0f ? 1 : 0;
     dim3 g1((unsigned)ffn, (unsigned)top_k);
-    moe_gate_up_situ_kernel<128><<<g1, 128, 0, stream>>>(
+    moe_gate_up_situ_kernel<128, BlockIQ2XS><<<g1, 128, 0, stream>>>(
         scratch, x, ids, (const BlockIQ2XS*)gate_exps, (const BlockIQ2XS*)up_exps,
         latent, ffn, situ_beta, 1.0f / situ_beta, situ_linear_beta,
         lb_active ? 1.0f / situ_linear_beta : 1.0f, lb_active);
-    moe_down_combine_kernel<128><<<(unsigned)latent, 128, 0, stream>>>(
+    moe_down_combine_kernel<128, BlockIQ2XS><<<(unsigned)latent, 128, 0, stream>>>(
         out, scratch, ids, w, (const BlockIQ2XS*)down_exps, latent, ffn, top_k);
+}
+
+void dequant_iq1_s_f32(float* out, const void* src, int64_t n, cudaStream_t stream) {
+    ensure_iq1s_tables();
+    const int64_t n_groups = n / 8;
+    const int T = 256;
+    const int64_t blocks = (n_groups + T - 1) / T;
+    dequant_iq1_s_kernel<<<(unsigned)blocks, T, 0, stream>>>(
+        out, (const BlockIQ1S*)src, n_groups);
+}
+
+void moe_expert_ffn_iq1s_f32(float* out, float* scratch,
+                             const float* x, const int* ids, const float* w,
+                             const void* gate_exps, const void* up_exps,
+                             const void* down_exps,
+                             int latent, int ffn, int top_k,
+                             float situ_beta, float situ_linear_beta,
+                             cudaStream_t stream) {
+    ensure_iq1s_tables();
+    const int lb_active = situ_linear_beta > 0.0f ? 1 : 0;
+    dim3 g1((unsigned)ffn, (unsigned)top_k);
+    moe_gate_up_situ_kernel<128, BlockIQ1S><<<g1, 128, 0, stream>>>(
+        scratch, x, ids, (const BlockIQ1S*)gate_exps, (const BlockIQ1S*)up_exps,
+        latent, ffn, situ_beta, 1.0f / situ_beta, situ_linear_beta,
+        lb_active ? 1.0f / situ_linear_beta : 1.0f, lb_active);
+    moe_down_combine_kernel<128, BlockIQ1S><<<(unsigned)latent, 128, 0, stream>>>(
+        out, scratch, ids, w, (const BlockIQ1S*)down_exps, latent, ffn, top_k);
+}
+
+// Type-dispatched front doors. An unsloth dynamic quant MIXES types per tensor, so
+// the expert type is a property of the FILE, not of the build — dispatching at the
+// call site rather than at compile time is what keeps one binary able to load both
+// UD-IQ1_S and UD-Q2_K_XL. Returns false for a type with no kernel, so the caller
+// fails loudly instead of running a wrong decoder over right-sized bytes.
+bool dequant_f32_by_type(float* out, const void* src, int64_t n, int ggml_type,
+                         cudaStream_t stream) {
+    switch (ggml_type) {
+        case 0: {  // F32 passthrough — used for a single row of token_embd.weight
+            if (n <= 0) return false;
+            const int T = 256;
+            const int64_t blocks = (n + T - 1) / T;
+            dequant_f32_passthrough_kernel<<<(unsigned)blocks, T, 0, stream>>>(
+                out, (const float*)src, n);
+            return true;
+        }
+        case 8: {  // Q8_0 — the other type token_embd.weight / output.weight may use
+            if (n <= 0 || n % 32 != 0) return false;
+            const int64_t n_blocks = n / 32;
+            const int T = 256;
+            const int64_t blocks = (n_blocks + T - 1) / T;
+            dequant_q8_0_kernel<<<(unsigned)blocks, T, 0, stream>>>(
+                out, (const BlockQ8_0*)src, n_blocks);
+            return true;
+        }
+        case 17: dequant_iq2_xs_f32(out, src, n, stream); return true;   // IQ2_XS
+        case 19: dequant_iq1_s_f32(out, src, n, stream);  return true;   // IQ1_S
+        default: return false;
+    }
+}
+
+bool moe_expert_ffn_f32_by_type(float* out, float* scratch,
+                                const float* x, const int* ids, const float* w,
+                                const void* gate_exps, const void* up_exps,
+                                const void* down_exps,
+                                int latent, int ffn, int top_k,
+                                float situ_beta, float situ_linear_beta,
+                                int ggml_type, cudaStream_t stream) {
+    switch (ggml_type) {
+        case 17:
+            moe_expert_ffn_iq2xs_f32(out, scratch, x, ids, w, gate_exps, up_exps,
+                                     down_exps, latent, ffn, top_k, situ_beta,
+                                     situ_linear_beta, stream);
+            return true;
+        case 19:
+            moe_expert_ffn_iq1s_f32(out, scratch, x, ids, w, gate_exps, up_exps,
+                                    down_exps, latent, ffn, top_k, situ_beta,
+                                    situ_linear_beta, stream);
+            return true;
+        default:
+            return false;
+    }
 }
 
 void mla_gate_out_f32(float* out, const float* attn_out, const float* gate_proj,
@@ -816,6 +1056,41 @@ void mla_decode_attn_f32(float* out, const float* q, const float* k_cache,
     const size_t shm = ((size_t)n_ctx + (size_t)kv_lora + BLOCK / 32 + 1) * sizeof(float);
     mla_decode_attn_kernel<BLOCK><<<(unsigned)n_head, BLOCK, shm, stream>>>(
         out, q, k_cache, wv_b, key_length, kv_lora, v_dim, n_ctx, scale);
+}
+
+bool k3_proj_f32(float* y, const float* x, const void* W, int wtype,
+                 int N, int K, cudaStream_t stream) {
+    if (N <= 0 || K <= 0) return false;
+    constexpr int BLOCK = 128;
+    switch (wtype) {
+        case 0:   // F32, dense
+            proj_f32_kernel<BLOCK><<<(unsigned)N, BLOCK, 0, stream>>>(
+                y, x, (const float*)W, K);
+            return true;
+        case 8: {  // Q8_0
+            if (K % 32 != 0) return false;
+            proj_q8_0_kernel<BLOCK><<<(unsigned)N, BLOCK, 0, stream>>>(
+                y, x, (const BlockQ8_0*)W, K / 32);
+            return true;
+        }
+        default:
+            return false;
+    }
+}
+
+void rms_norm_f32(float* out, const float* x, const float* w, int n, float eps,
+                  cudaStream_t stream) {
+    if (n <= 0) return;
+    constexpr int BLOCK = 128;
+    rms_norm_kernel<BLOCK><<<1, BLOCK, 0, stream>>>(out, x, w, n, eps);
+}
+
+void k3_add_f32(float* out, const float* a, const float* b, int64_t n,
+               cudaStream_t stream) {
+    if (n <= 0) return;
+    const int T = 256;
+    const int64_t blocks = (n + T - 1) / T;
+    add_f32_kernel<<<(unsigned)blocks, T, 0, stream>>>(out, a, b, n);
 }
 
 }  // namespace k3

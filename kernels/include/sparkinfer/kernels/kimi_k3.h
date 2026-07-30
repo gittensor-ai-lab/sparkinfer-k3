@@ -242,6 +242,47 @@ void moe_expert_ffn_iq2xs_f32(float* out, float* scratch,
                               cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
+// 4b. IQ1_S — the UD-IQ1_S target's expert type
+// ---------------------------------------------------------------------------
+// Same contract as the IQ2_XS pair above; the reconstruction differs in three ways
+// that each silently bias the result if dropped:
+//   - the grid index is 11 bits (qs low 8 + 3 bits out of qh), so the lattice has
+//     2048 entries, not 256
+//   - the sub-block scale is ODD-valued: dl = d * (2*s + 1)
+//   - there is a DELTA: value = dl * (grid + delta), delta = +/-0.125 per sub-block.
+//     The lattice itself is only {-1, 0, +1}; the delta is what represents an
+//     asymmetric distribution. Omit it and every tensor stays well-formed and biased.
+//
+// Tables in iq1s_tables.h are extracted mechanically from ggml-common.h, never typed.
+void dequant_iq1_s_f32(float* out, const void* src, int64_t n, cudaStream_t stream);
+
+void moe_expert_ffn_iq1s_f32(float* out, float* scratch,
+                             const float* x, const int* ids, const float* w,
+                             const void* gate_exps, const void* up_exps,
+                             const void* down_exps,
+                             int latent, int ffn, int top_k,
+                             float situ_beta, float situ_linear_beta,
+                             cudaStream_t stream);
+
+// Type-dispatched front doors. PREFER THESE over the per-type entry points.
+//
+// An unsloth dynamic quant mixes types per tensor, so the expert type is a property
+// of the FILE, not of the build. Dispatching at the call site is what lets one binary
+// load UD-IQ1_S and UD-Q2_K_XL alike. Both return false for a type with no kernel —
+// the caller must fail loudly rather than run a wrong decoder over right-sized bytes,
+// which produces fluent noise rather than an error.
+bool dequant_f32_by_type(float* out, const void* src, int64_t n, int ggml_type,
+                         cudaStream_t stream);
+
+bool moe_expert_ffn_f32_by_type(float* out, float* scratch,
+                                const float* x, const int* ids, const float* w,
+                                const void* gate_exps, const void* up_exps,
+                                const void* down_exps,
+                                int latent, int ffn, int top_k,
+                                float situ_beta, float situ_linear_beta,
+                                int ggml_type, cudaStream_t stream);
+
+// ---------------------------------------------------------------------------
 // 5. MLA output gate
 // ---------------------------------------------------------------------------
 // Reference: src/models/kimi-k3.cpp — "K3: sigmoid output gate applied to the
@@ -333,6 +374,53 @@ void mla_decode_attn_f32(float* out, const float* q, const float* k_cache,
                          const float* wv_b, int key_length, int kv_lora,
                          int v_dim, int n_head, int n_ctx, float scale,
                          cudaStream_t stream);
+
+// ---------------------------------------------------------------------------
+// 14. Generic projection (GEMV), f32 activation in, f32 out
+// ---------------------------------------------------------------------------
+// Every other GEMV in this codebase (kernels/include/sparkinfer/kernels/gemm.h,
+// launch_gemv / launch_gemv_q) takes a BF16 activation, because the Qwen models run
+// their residual stream in bf16. K3's kernels above are all f32 in/out, transcribed
+// directly from a float64 reference and validated bit-for-bit against ggml — running
+// the hidden state in bf16 would truncate to ~8 bits of mantissa at every one of
+// K3's ~2 projections per layer times 93 layers, and the whole point of this
+// project's per-kernel float64 validation is to keep error near machine epsilon, not
+// to reintroduce it at the one place a "GEMV" would otherwise seem interchangeable.
+// So this is a SEPARATE, f32-native GEMV rather than a cast to bf16 and a reuse of
+// launch_gemv_q.
+//
+//   y[n] = sum_k x[k] * W[k + n*K]     W is GGUF-native [N,K] (ne0=K fastest)
+//
+// wtype is the ggml type id. Only types actually present in K3's non-expert tensors
+// are implemented — F32 (0, dense passthrough: norms are already stored this way,
+// though norms go through rms_norm, not this) and Q8_0 (8, dequant_row_q8_0's
+// y=qs*d, the block layout the attention/FFN projections and the LM head use in the
+// UD-IQ1_S/UD-Q2_K_XL dumps this project has read off the real file). Anything else
+// returns false — a caller that decoded an unsupported type by falling through to a
+// wrong reader would produce a right-shaped, wrong-valued tensor, the same trap
+// dequant_f32_by_type exists to refuse elsewhere.
+bool k3_proj_f32(float* y, const float* x, const void* W, int wtype,
+                 int N, int K, cudaStream_t stream);
+
+// ---------------------------------------------------------------------------
+// 15. Plain RMS norm (full width, elementwise)
+// ---------------------------------------------------------------------------
+// The ordinary case: attn_norm, ffn_norm, q_a_norm, kv_a_norm, ffn_routed_norm.
+// Every OTHER norm in this file is a variant fused with something else
+// (kda_gate_out_f32 norms per-head then gates; attn_res_mix_f32 norms internally
+// while scoring) — this is the one for a learned weight applied over the WHOLE
+// vector at once, out[d] = x[d]/sqrt(mean(x^2)+eps) * w[d]. In-place is fine.
+void rms_norm_f32(float* out, const float* x, const float* w, int n, float eps,
+                  cudaStream_t stream);
+
+// ---------------------------------------------------------------------------
+// 16. Elementwise add (residual combine)
+// ---------------------------------------------------------------------------
+// out[i] = a[i] + b[i]. Safe in-place with out==a (the residual-add case: prefix_sum
+// += layer_output). The "replace" case (a checkpointed layer's residual combine)
+// needs no kernel at all — it is a plain device-to-device copy of the layer output.
+void k3_add_f32(float* out, const float* a, const float* b, int64_t n,
+                cudaStream_t stream);
 
 }  // namespace k3
 }  // namespace kernels
