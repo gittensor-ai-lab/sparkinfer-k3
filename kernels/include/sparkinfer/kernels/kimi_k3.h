@@ -105,6 +105,34 @@ void attn_res_mix_f32(float* out, const float* ckpts, const float* cur,
                       float eps, cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
+// 6. KDA causal short conv, decode step
+// ---------------------------------------------------------------------------
+// Reference: src/models/kimi-k3.cpp kimi_k3_conv1d() + ggml_ssm_conv.
+//
+// K3 runs a depthwise causal conv (short_conv_kernel_size = 4) over EACH of Q, K and
+// V before the delta-net scan. For one decoded token, per channel c:
+//
+//   window[t] = state[t][c]  for t in [0, d_conv-1),  window[d_conv-1] = x[c]
+//   out[c]    = silu( sum_t window[t] * w[t][c] )
+//   state[t][c] <- window[t+1]        for t in [0, d_conv-1)     (shift left by one)
+//
+// Two things to get right:
+//   - The new sample is appended at the END of the window (ggml_concat puts the
+//     transposed x after the state), so w[d_conv-1] multiplies the CURRENT token.
+//     Reversing the window silently gives a different, still-plausible filter.
+//   - The conv weight is PER CHANNEL: [d_conv, d_inner], not shared across channels.
+//   - silu is applied AFTER the convolution, not before.
+//
+// Q, K and V each own a distinct third of the recurrent conv state
+// (n_embd_r = 3 * (d_conv-1) * d_inner), so this is called three times per layer with
+// different state/weight pointers. state is updated in place.
+//
+// x, out are [d_inner]; state is [d_conv-1, d_inner] with the time index fastest;
+// w is [d_conv, d_inner] with the time index fastest.
+void kda_conv_step_f32(float* out, float* state, const float* x, const float* w,
+                       int d_conv, int d_inner, cudaStream_t stream);
+
+// ---------------------------------------------------------------------------
 // 5. MLA output gate
 // ---------------------------------------------------------------------------
 // Reference: src/models/kimi-k3.cpp — "K3: sigmoid output gate applied to the

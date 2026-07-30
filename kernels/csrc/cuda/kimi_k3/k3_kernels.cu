@@ -220,6 +220,40 @@ __global__ void attn_res_mix_kernel(float* __restrict__ out,
 }
 
 // ---------------------------------------------------------------------------
+// 6. KDA causal short conv, decode step
+// ---------------------------------------------------------------------------
+// One thread per channel. d_conv is 4 for K3, so the window is read into registers
+// and the shift is a register rotate rather than a memory move.
+
+__global__ void kda_conv_step_kernel(float* __restrict__ out, float* __restrict__ state,
+                                     const float* __restrict__ x,
+                                     const float* __restrict__ w,
+                                     int d_conv, int d_inner) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= d_inner) return;
+
+    // state is [d_conv-1, d_inner], time fastest -> channel c's history is contiguous.
+    float* st = state + (size_t)c * (d_conv - 1);
+    const float* wc = w + (size_t)c * d_conv;
+
+    // Build the window: history first, CURRENT token last. The order matters — the
+    // reference appends x after the state, so wc[d_conv-1] weights the new sample.
+    float acc = 0.0f;
+    #pragma unroll 4
+    for (int t = 0; t < d_conv - 1; ++t) acc += st[t] * wc[t];
+    const float xc = x[c];
+    acc += xc * wc[d_conv - 1];
+
+    // silu AFTER the convolution.
+    out[c] = acc * sigmoidf_(acc);
+
+    // Shift the history left by one and drop in the current token.
+    #pragma unroll 4
+    for (int t = 0; t < d_conv - 2; ++t) st[t] = st[t + 1];
+    st[d_conv - 2] = xc;
+}
+
+// ---------------------------------------------------------------------------
 // 5. MLA output gate
 // ---------------------------------------------------------------------------
 
@@ -281,6 +315,14 @@ void attn_res_mix_f32(float* out, const float* ckpts, const float* cur,
     attn_res_mix_kernel<256><<<1, 256, 0, stream>>>(
         out, ckpts, cur, score_w, n_embd, n_ckpt, eps, scratch);
     cudaFreeAsync(scratch, stream);
+}
+
+void kda_conv_step_f32(float* out, float* state, const float* x, const float* w,
+                       int d_conv, int d_inner, cudaStream_t stream) {
+    if (d_conv < 2 || d_inner <= 0) return;
+    const int T = 256;
+    const int blocks = (d_inner + T - 1) / T;
+    kda_conv_step_kernel<<<(unsigned)blocks, T, 0, stream>>>(out, state, x, w, d_conv, d_inner);
 }
 
 void mla_gate_out_f32(float* out, const float* attn_out, const float* gate_proj,

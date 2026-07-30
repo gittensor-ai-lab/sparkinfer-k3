@@ -195,11 +195,11 @@ runtime:
     - kda_output_gating                # rms_norm then full-rank sigmoid gate
     - cross_layer_attn_residual        # block_size 12; scores normalised, sum over RAW
     - mla_output_gate                  # sigmoid before o_proj
+    - kda_conv_step                    # depthwise causal conv, d_conv 4, silu AFTER
 
   required_work:
     - kimi_k3_gguf_loader              # 93 layers, per-layer KDA/MLA layout, 896 experts
     - latent_moe_expert_dispatch       # routed experts at 3584, not 7168
-    - kda_conv_state                   # short_conv_kernel_size 4, not yet implemented
     - mla_nope_attention               # the attention itself; only its output gate exists
     - coalesced_kda_state_access       # current state walk is stride-head_dim
     - multi_gpu_weight_sharding        # 802 GiB does not fit one card at any quant

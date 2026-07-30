@@ -394,6 +394,73 @@ static void test_mla_gate_out() {
 }
 
 // ---------------------------------------------------------------------------
+// 6. KDA causal short conv, decode step
+// ---------------------------------------------------------------------------
+
+static void test_kda_conv_step() {
+    std::printf("KDA causal short conv, decode step (d_conv=4, depthwise, silu after)\n");
+    std::mt19937 rng(31337);
+    const int d_conv = 4;                  // K3's short_conv_kernel_size
+    const int d_inner = 96 * 128;          // n_head_kda * head_dim
+    auto x = rnd((size_t)d_inner, rng, -2.f, 2.f);
+    auto w = rnd((size_t)d_conv * d_inner, rng, -1.f, 1.f);
+    auto st0 = rnd((size_t)(d_conv - 1) * d_inner, rng, -2.f, 2.f);
+
+    // --- float64 reference ---
+    std::vector<double> ref_out(d_inner), ref_state((size_t)(d_conv - 1) * d_inner);
+    for (int c = 0; c < d_inner; ++c) {
+        const float* stc = &st0[(size_t)c * (d_conv - 1)];
+        const float* wc = &w[(size_t)c * d_conv];
+        double acc = 0.0;
+        for (int tt = 0; tt < d_conv - 1; ++tt) acc += (double)stc[tt] * (double)wc[tt];
+        acc += (double)x[c] * (double)wc[d_conv - 1];       // current token is LAST
+        ref_out[c] = acc * (1.0 / (1.0 + std::exp(-acc)));  // silu AFTER the conv
+        for (int tt = 0; tt < d_conv - 2; ++tt)
+            ref_state[(size_t)c * (d_conv - 1) + tt] = (double)stc[tt + 1];
+        ref_state[(size_t)c * (d_conv - 1) + (d_conv - 2)] = (double)x[c];
+    }
+
+    // The plausible wrong version: reversed window, i.e. w[0] weights the current
+    // token. Still a valid depthwise conv, still fluent output, different filter.
+    {
+        std::vector<double> wrong(d_inner);
+        for (int c = 0; c < d_inner; ++c) {
+            const float* stc = &st0[(size_t)c * (d_conv - 1)];
+            const float* wc = &w[(size_t)c * d_conv];
+            double acc = (double)x[c] * (double)wc[0];
+            for (int tt = 0; tt < d_conv - 1; ++tt) acc += (double)stc[tt] * (double)wc[tt + 1];
+            wrong[c] = acc * (1.0 / (1.0 + std::exp(-acc)));
+        }
+        assert_variant_differs(ref_out, wrong, "vs reversed conv window");
+    }
+    // And: silu BEFORE the conv instead of after.
+    {
+        std::vector<double> wrong(d_inner);
+        for (int c = 0; c < d_inner; ++c) {
+            const float* stc = &st0[(size_t)c * (d_conv - 1)];
+            const float* wc = &w[(size_t)c * d_conv];
+            auto silu = [](double z) { return z * (1.0 / (1.0 + std::exp(-z))); };
+            double acc = 0.0;
+            for (int tt = 0; tt < d_conv - 1; ++tt) acc += silu((double)stc[tt]) * (double)wc[tt];
+            acc += silu((double)x[c]) * (double)wc[d_conv - 1];
+            wrong[c] = acc;
+        }
+        assert_variant_differs(ref_out, wrong, "vs silu before the conv");
+    }
+
+    float *dx = to_dev(x), *dw = to_dev(w), *dst = to_dev(st0), *dout = nullptr;
+    CU(cudaMalloc(&dout, (size_t)d_inner * sizeof(float)));
+    kda_conv_step_f32(dout, dst, dx, dw, d_conv, d_inner, 0);
+    CU(cudaDeviceSynchronize());
+    CU(cudaGetLastError());
+    close_enough(from_dev(dout, d_inner), ref_out, "kda conv out vs float64 ref");
+    close_enough(from_dev(dst, (size_t)(d_conv - 1) * d_inner), ref_state,
+                 "kda conv state shift vs float64 ref");
+
+    CU(cudaFree(dx)); CU(cudaFree(dw)); CU(cudaFree(dst)); CU(cudaFree(dout));
+}
+
+// ---------------------------------------------------------------------------
 
 int main() {
     int n = 0;
@@ -409,6 +476,7 @@ int main() {
     test_kda_decode_step();    std::printf("\n");
     test_kda_gate_out();       std::printf("\n");
     test_attn_res_mix();       std::printf("\n");
+    test_kda_conv_step();      std::printf("\n");
     test_mla_gate_out();       std::printf("\n");
 
     std::printf("%d cases, %d failure(s)\n", g_case, g_fail);
