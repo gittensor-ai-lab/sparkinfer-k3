@@ -2,6 +2,7 @@
 
 #include "sparkinfer/kernels/kimi_k3.h"
 #include "sparkinfer/models/kimi_k3_gguf_manifest.h"
+#include "sparkinfer/tp/weight_residency.h"   // plan_tensor_residency for the sharded loader
 
 #include <cmath>
 #include <cstdio>
@@ -28,30 +29,141 @@ std::string blk(int i, const char* suffix) {
 // This is the WHOLE loader primitive — every K3 weight is read natively at forward
 // time (k3_proj_f32 / the MoE dispatch kernels decode Q8_0 / IQ1_S / IQ2_XS / F32
 // directly), so there is no equivalent of a load-time dequantize-to-bf16 pass.
-bool upload_raw(const GGUF& g, const std::string& name, KimiK3Weights& w,
-                KimiK3Tensor& out, bool required) {
+// Upload this rank's SLICE of a tensor, honouring w.shard. At tp_size 1 the plan
+// degenerates to Replicate and this is byte-for-byte the old whole-tensor upload.
+//
+// The slicing decisions are NOT made here — plan_tensor_residency() owns them, and
+// is unit-tested without a GPU (tp_weight_residency_cpu_test). This function is the
+// copy plumbing for the StridedCopy that planner returns, and nothing more. That
+// split matters: ColShard cuts WITHIN each memory row, and a cut that lands
+// mid-quantisation-block is unrecoverable and undetectable — right shape, right byte
+// count, noise for values. The planner bands over BLOCKS so every cut is legal by
+// construction; re-deriving offsets here would put that guarantee back at risk.
+bool upload_sliced(const GGUF& g, const std::string& name, KimiK3Weights& w,
+                   KimiK3Tensor& out, bool required) {
     const GGUFTensor* t = g.tensor(name);
     if (!t) {
         if (required)
             std::fprintf(stderr, "[k3] missing required tensor: %s\n", name.c_str());
         return !required;   // absent-and-optional is not an error
     }
-    void* d = nullptr;
-    if (cudaMalloc(&d, (size_t)t->n_bytes) != cudaSuccess) {
-        std::fprintf(stderr, "[k3] cudaMalloc failed for %s (%ld bytes)\n",
-                     name.c_str(), t->n_bytes);
+
+    // --- tp_size 1: the original path, unchanged ---
+    if (w.shard.tp_size <= 1) {
+        void* d = nullptr;
+        if (cudaMalloc(&d, (size_t)t->n_bytes) != cudaSuccess) {
+            std::fprintf(stderr, "[k3] cudaMalloc failed for %s (%ld bytes)\n",
+                         name.c_str(), t->n_bytes);
+            return false;
+        }
+        if (cudaMemcpy(d, t->data, (size_t)t->n_bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+            std::fprintf(stderr, "[k3] cudaMemcpy failed for %s\n", name.c_str());
+            cudaFree(d);
+            return false;
+        }
+        w.owned.push_back(d);
+        out.data = d;
+        out.type = t->ggml_type;
+        out.n_bytes = t->n_bytes;
+        for (int k = 0; k < 4; ++k) out.rank_ne[k] = t->dims[k];
+        return true;
+    }
+
+    // --- tp_size > 1 ---
+    // Under ExpertsOnly, only the three routed-expert stacks are banded. Everything
+    // else takes the replicate path above, at full width, so the forward's cfg-derived
+    // shapes stay correct on every rank. Matching on the tensor SUFFIX rather than on
+    // the rule is deliberate: attn_k_b/attn_v_b also carry Rule::ExpertShard (they
+    // band the head axis), and banding those without teaching the MLA kernels their
+    // per-rank head count would silently drop 7/8 of the attention heads.
+    if (w.policy == KimiK3Weights::ShardPolicy::ExpertsOnly) {
+        auto ends_with = [&](const char* suf) {
+            const std::size_t n = std::strlen(suf);
+            return name.size() >= n && name.compare(name.size() - n, n, suf) == 0;
+        };
+        const bool routed_expert_stack = ends_with("ffn_gate_exps.weight") ||
+                                         ends_with("ffn_up_exps.weight")   ||
+                                         ends_with("ffn_down_exps.weight");
+        if (!routed_expert_stack) {
+            void* d = nullptr;
+            if (cudaMalloc(&d, (size_t)t->n_bytes) != cudaSuccess) {
+                std::fprintf(stderr, "[k3] cudaMalloc failed for %s (%ld bytes)\n",
+                             name.c_str(), t->n_bytes);
+                return false;
+            }
+            if (cudaMemcpy(d, t->data, (size_t)t->n_bytes, cudaMemcpyHostToDevice)
+                    != cudaSuccess) {
+                std::fprintf(stderr, "[k3] cudaMemcpy failed for %s\n", name.c_str());
+                cudaFree(d);
+                return false;
+            }
+            w.owned.push_back(d);
+            out.data = d;
+            out.type = t->ggml_type;
+            out.n_bytes = t->n_bytes;
+            for (int k = 0; k < 4; ++k) out.rank_ne[k] = t->dims[k];
+            return true;
+        }
+    }
+
+    const tp::TensorResidency r =
+        tp::plan_tensor_residency(name, t->dims, t->n_dims, t->ggml_type, w.shard);
+
+    // A tensor with no rule, an unknown quant type, or a mid-block cut STOPS THE
+    // LOAD. The alternative — fall back to replicating it — silently changes the
+    // model: a weight that should have been sharded but was replicated makes every
+    // rank compute the full contraction, and the following all-reduce then sums
+    // tp_size copies of the same complete answer.
+    if (!r.ok()) {
+        std::fprintf(stderr, "[k3] TP: %s — %s (%s)%s%s\n", name.c_str(),
+                     tp::residency_error_name(r.error), tp::rule_name(r.rule),
+                     r.note.empty() ? "" : ": ", r.note.c_str());
         return false;
     }
-    if (cudaMemcpy(d, t->data, (size_t)t->n_bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
-        std::fprintf(stderr, "[k3] cudaMemcpy failed for %s\n", name.c_str());
+
+    void* d = nullptr;
+    if (cudaMalloc(&d, r.rank_bytes) != cudaSuccess) {
+        std::fprintf(stderr, "[k3] cudaMalloc failed for %s rank slice (%zu bytes)\n",
+                     name.c_str(), r.rank_bytes);
+        return false;
+    }
+
+    const char* src = static_cast<const char*>(t->data);
+    char* dst = static_cast<char*>(d);
+    const tp::StridedCopy& c = r.copy;
+    cudaError_t e;
+    if (c.contiguous()) {
+        // RowShard / ExpertShard / Replicate: one band of whole memory rows.
+        e = cudaMemcpy(dst + c.dst_offset, src + c.src_offset, c.total_bytes(),
+                       cudaMemcpyHostToDevice);
+    } else {
+        // ColShard: a sub-range within EVERY row, so ne1 separate runs. cudaMemcpy2D
+        // rather than a loop — for a 3-D expert tensor the loop would be millions of
+        // tiny transfers.
+        e = cudaMemcpy2D(dst + c.dst_offset, c.dst_stride,
+                         src + c.src_offset, c.src_stride,
+                         c.row_bytes, (size_t)c.n_rows,
+                         cudaMemcpyHostToDevice);
+    }
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "[k3] upload failed for %s rank slice: %s\n",
+                     name.c_str(), cudaGetErrorString(e));
         cudaFree(d);
         return false;
     }
+
     w.owned.push_back(d);
     out.data = d;
     out.type = t->ggml_type;
-    out.n_bytes = t->n_bytes;
+    out.n_bytes = (long)r.rank_bytes;
+    for (int k = 0; k < 4; ++k) out.rank_ne[k] = r.rank_ne[k];
     return true;
+}
+
+// Kept as the name the 49 load sites use.
+bool upload_raw(const GGUF& g, const std::string& name, KimiK3Weights& w,
+                KimiK3Tensor& out, bool required) {
+    return upload_sliced(g, name, w, out, required);
 }
 
 // wk_b / wv_b feed mla_absorb_q_f32 / mla_decode_attn_f32, which take them as plain
@@ -73,30 +185,48 @@ bool upload_force_f32(const GGUF& g, const std::string& name, KimiK3Weights& w,
     if (t->ggml_type == 0) {
         return upload_raw(g, name, w, out, required);
     }
-    void* raw = nullptr;
-    if (cudaMalloc(&raw, (size_t)t->n_bytes) != cudaSuccess) return false;
-    if (cudaMemcpy(raw, t->data, (size_t)t->n_bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
-        cudaFree(raw);
+
+    // Stage the rank's QUANTISED slice through upload_sliced (so the ColShard /
+    // ExpertShard band arithmetic has exactly one implementation), then dequantise
+    // that slice. wk_b/wv_b are ExpertShard on the HEAD axis — ne2 = 96 heads, banded
+    // 12-per-rank at tp 8 — so the rank's element count is NOT the caller's
+    // full-tensor n_values, and dequantising n_values elements out of a buffer
+    // holding an eighth of them reads past the end.
+    KimiK3Tensor staged;
+    const std::size_t owned_before = w.owned.size();
+    if (!upload_sliced(g, name, w, staged, required)) return false;
+    if (!staged.ok()) return !required;
+
+    long rank_values = 1;
+    for (int k = 0; k < 4; ++k) rank_values *= (staged.rank_ne[k] > 0 ? staged.rank_ne[k] : 1);
+    if (w.shard.tp_size <= 1 && rank_values != n_values) {
+        std::fprintf(stderr, "[k3] %s: shape gives %ld values, caller expected %ld\n",
+                     name.c_str(), rank_values, n_values);
         return false;
     }
+
     void* f32 = nullptr;
-    if (cudaMalloc(&f32, (size_t)n_values * sizeof(float)) != cudaSuccess) {
-        cudaFree(raw);
-        return false;
-    }
-    const bool ok = k3k::dequant_f32_by_type((float*)f32, raw, n_values, t->ggml_type, 0);
+    if (cudaMalloc(&f32, (size_t)rank_values * sizeof(float)) != cudaSuccess) return false;
+    const bool ok = k3k::dequant_f32_by_type((float*)f32, staged.data, rank_values,
+                                             staged.type, 0);
     cudaDeviceSynchronize();
-    cudaFree(raw);
+
+    // Drop the staged quantised buffer: only the f32 expansion is kept live.
+    if (w.owned.size() > owned_before) {
+        cudaFree(w.owned[owned_before]);
+        w.owned.erase(w.owned.begin() + (long)owned_before);
+    }
     if (!ok) {
         std::fprintf(stderr, "[k3] %s: ggml type %d has no dequant path (needed as f32 "
-                             "for the absorbed-MLA kernels)\n", name.c_str(), t->ggml_type);
+                             "for the absorbed-MLA kernels)\n", name.c_str(), staged.type);
         cudaFree(f32);
         return false;
     }
     w.owned.push_back(f32);
     out.data = f32;
     out.type = 0;   // now F32, regardless of the file's original type
-    out.n_bytes = n_values * (long)sizeof(float);
+    out.n_bytes = rank_values * (long)sizeof(float);
+    for (int k = 0; k < 4; ++k) out.rank_ne[k] = staged.rank_ne[k];
     return true;
 }
 
@@ -107,42 +237,75 @@ bool upload_force_f32(const GGUF& g, const std::string& name, KimiK3Weights& w,
 // since complete), so the hot loop takes no extra sync. Off by default and behind a
 // single env check, so the production path is untouched — this exists to find the
 // bottleneck for the H200 optimization pass, not to run in it.
+// SLOTS ARE KEYED BY (TAG, DEVICE), NOT BY TAG ALONE.
+//
+// cudaEventElapsedTime is defined only for two events recorded on the SAME device.
+// This profiler is a process-global singleton, so under tensor parallelism every rank
+// reaches the same tag ("ffn_moe") from a different device, and rank 1's start would be
+// paired against rank 0's stop — across devices, where the driver returns garbage.
+//
+// MEASURED before this fix, at tp=8: ffn_dense -9557 ms, ffn_moe -1265 ms, total
+// -8564 ms. Negative elapsed times are obvious once printed, but the same defect with a
+// smaller cross-device skew would have produced plausible-looking SHARES instead — and
+// deciding where the optimisation effort goes is the only thing this profiler is for.
 struct K3Profiler {
     struct Slot { cudaEvent_t a = nullptr, b = nullptr; bool pending = false; double ms = 0; long n = 0; };
-    std::unordered_map<std::string, Slot> slots;
+    std::unordered_map<std::string, Slot> slots;   // key: "tag@device"
     bool on = false;
     K3Profiler() { const char* e = std::getenv("SPARKINFER_K3_PROFILE"); on = e && e[0] == '1'; }
+
+    static std::string key_for(const std::string& tag) {
+        int dev = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess) dev = -1;
+        return tag + "@" + std::to_string(dev);
+    }
     void start(const std::string& tag, cudaStream_t st) {
         if (!on) return;
-        auto& sl = slots[tag];
+        auto& sl = slots[key_for(tag)];
         if (!sl.a) { cudaEventCreate(&sl.a); cudaEventCreate(&sl.b); }
-        if (sl.pending) {   // drain the previous pair for this tag first
+        if (sl.pending) {   // drain the previous pair for this tag+device first
             cudaEventSynchronize(sl.b);
-            float ms = 0; cudaEventElapsedTime(&ms, sl.a, sl.b); sl.ms += ms; ++sl.n;
+            float ms = 0;
+            if (cudaEventElapsedTime(&ms, sl.a, sl.b) == cudaSuccess) { sl.ms += ms; ++sl.n; }
         }
         cudaEventRecord(sl.a, st);
         sl.pending = true;
     }
     void stop(const std::string& tag, cudaStream_t st) {
         if (!on) return;
-        cudaEventRecord(slots[tag].b, st);
+        auto it = slots.find(key_for(tag));
+        if (it != slots.end() && it->second.b) cudaEventRecord(it->second.b, st);
     }
     void report() {
         if (!on) return;
-        double total = 0;
-        std::vector<std::pair<std::string, double>> rows;
+        // Aggregate per TAG across devices. Every rank runs the same phases, so the
+        // per-tag sum is total GPU time in that phase across the node, and the shares
+        // are what the optimisation decision needs.
+        std::unordered_map<std::string, double> by_tag;
+        std::unordered_map<std::string, int> devs_seen;
         for (auto& kv : slots) {
             auto& sl = kv.second;
-            if (sl.pending) { cudaEventSynchronize(sl.b); float ms = 0;
-                cudaEventElapsedTime(&ms, sl.a, sl.b); sl.ms += ms; ++sl.n; sl.pending = false; }
-            rows.emplace_back(kv.first, sl.ms);
-            total += sl.ms;
+            if (sl.pending) {
+                cudaEventSynchronize(sl.b);
+                float ms = 0;
+                if (cudaEventElapsedTime(&ms, sl.a, sl.b) == cudaSuccess) { sl.ms += ms; ++sl.n; }
+                sl.pending = false;
+            }
+            const std::size_t at = kv.first.rfind('@');
+            const std::string tag = at == std::string::npos ? kv.first : kv.first.substr(0, at);
+            by_tag[tag] += sl.ms;
+            devs_seen[tag] += 1;
         }
+        double total = 0;
+        std::vector<std::pair<std::string, double>> rows;
+        for (auto& kv : by_tag) { rows.emplace_back(kv.first, kv.second); total += kv.second; }
         std::sort(rows.begin(), rows.end(), [](auto& a, auto& b){ return a.second > b.second; });
-        std::fprintf(stderr, "\n[k3 profile] %.1f ms total across timed phases:\n", total);
+        std::fprintf(stderr, "\n[k3 profile] %.1f ms of GPU time across timed phases "
+                             "(summed over ranks):\n", total);
         for (auto& r : rows)
-            std::fprintf(stderr, "  %-18s %8.2f ms  (%5.1f%%)\n",
-                         r.first.c_str(), r.second, total > 0 ? 100.0 * r.second / total : 0.0);
+            std::fprintf(stderr, "  %-18s %9.2f ms  (%5.1f%%)  over %d device(s)\n",
+                         r.first.c_str(), r.second,
+                         total > 0 ? 100.0 * r.second / total : 0.0, devs_seen[r.first]);
     }
 };
 K3Profiler& k3_profiler() { static K3Profiler p; return p; }
@@ -508,12 +671,46 @@ void kimi_k3_forward_free_scratch(KimiK3Forward& fwd) {
 
 bool kimi_k3_forward_layer(KimiK3Forward& fwd, int layer, const float* hidden_in,
                           float* hidden_out) {
+    return kimi_k3_forward_layer_phase(fwd, layer, K3LayerPhase::All,
+                                      hidden_in, hidden_out);
+}
+
+float* kimi_k3_partial_buffer(KimiK3Forward& fwd, int layer, K3LayerPhase phase,
+                             int* count) {
+    const KimiK3Config& cfg = *fwd.cfg;
+    auto& s = *fwd.s;
+    if (phase == K3LayerPhase::Attn) {
+        if (count) *count = cfg.hidden;
+        return s.attn_out;
+    }
+    if (phase == K3LayerPhase::FfnPartial) {
+        // The leading dense layer reduces ffn_down's full-width partial; every MoE
+        // layer reduces the expert accumulator, which is LATENT wide. Two different
+        // buffers and two different widths, decided by the same branch the forward
+        // took — not by the caller guessing.
+        if (layer < cfg.leading_dense) {
+            if (count) *count = cfg.hidden;
+            return s.ffn_out;
+        }
+        if (count) *count = cfg.expert_latent;
+        return s.moe_out;
+    }
+    if (count) *count = 0;
+    return nullptr;
+}
+
+bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase phase,
+                                const float* hidden_in, float* hidden_out) {
     const KimiK3Config& cfg = *fwd.cfg;
     const KimiK3LayerWeights& L = fwd.w->layers[layer];
     KimiK3RuntimeState& st = *fwd.state;
     auto& s = *fwd.s;
     cudaStream_t stream = fwd.stream;
     const float eps = cfg.rms_eps;
+
+    const bool do_attn   = (phase == K3LayerPhase::All || phase == K3LayerPhase::Attn);
+    const bool do_ffn_p  = (phase == K3LayerPhase::All || phase == K3LayerPhase::FfnPartial);
+    const bool do_ffn_f  = (phase == K3LayerPhase::All || phase == K3LayerPhase::FfnFinish);
 
     const int H = cfg.hidden;
     const int qkv = cfg.n_q_heads * cfg.kda_head_dim;
@@ -527,258 +724,292 @@ bool kimi_k3_forward_layer(KimiK3Forward& fwd, int layer, const float* hidden_in
         return k3k::k3_proj_f32(y, x, W.data, W.type, N, K, stream);
     };
 
-    // --- pre-attention mix, then bank push (raw pre-mix value) ---
-    if (res_bs > 0) {
-        if (!L.attn_res_score.ok()) return false;
-        k3k::attn_res_mix_f32(s.mixed, st.res_bank, hidden_in,
-                              (const float*)L.attn_res_score.data, H, st.n_ckpt,
-                              eps, stream);
-        if (banked) {
-            if (st.n_ckpt >= st.max_ckpt) return false;
-            cudaMemcpyAsync(st.res_bank + (size_t)st.n_ckpt * H, hidden_in,
-                            (size_t)H * sizeof(float), cudaMemcpyDeviceToDevice, stream);
-            ++st.n_ckpt;
-        }
-    } else {
-        cudaMemcpyAsync(s.mixed, hidden_in, (size_t)H * sizeof(float),
-                        cudaMemcpyDeviceToDevice, stream);
-    }
-    if (fwd.debug) fwd.debug("attn_res_mix", layer, s.mixed, H);
-
-    if (!L.attn_norm.ok()) return false;
-    k3k::rms_norm_f32(s.normed, s.mixed, (const float*)L.attn_norm.data, H, eps, stream);
-    if (fwd.debug) fwd.debug("attn_norm", layer, s.normed, H);
-
-    k3_profiler().start(L.is_kda ? "attn_kda" : "attn_mla", stream);
-    if (L.is_kda) {
-        const int kda_ord = kimi_k3_kda_ordinal(cfg, layer);
-        if (kda_ord < 0) return false;
-        const int head_dim = cfg.kda_head_dim, n_head = cfg.n_q_heads;
-
-        if (!proj(s.qkv_q, s.normed, L.attn_q, qkv, H)) return false;
-        if (!proj(s.qkv_k, s.normed, L.attn_k, qkv, H)) return false;
-        if (!proj(s.qkv_v, s.normed, L.attn_v, qkv, H)) return false;
-
-        if (!L.ssm_conv1d_q.ok() || !L.ssm_conv1d_k.ok() || !L.ssm_conv1d_v.ok())
-            return false;
-        k3k::kda_conv_step_f32(s.conv_q, st.conv_state_q[kda_ord], s.qkv_q,
-                               (const float*)L.ssm_conv1d_q.data, cfg.kda_conv_kernel,
-                               qkv, stream);
-        k3k::kda_conv_step_f32(s.conv_k, st.conv_state_k[kda_ord], s.qkv_k,
-                               (const float*)L.ssm_conv1d_k.data, cfg.kda_conv_kernel,
-                               qkv, stream);
-        k3k::kda_conv_step_f32(s.conv_v, st.conv_state_v[kda_ord], s.qkv_v,
-                               (const float*)L.ssm_conv1d_v.data, cfg.kda_conv_kernel,
-                               qkv, stream);
-        if (fwd.debug) fwd.debug("dbg_conv_q", layer, s.conv_q, qkv);
-        if (fwd.debug) fwd.debug("dbg_conv_v", layer, s.conv_v, qkv);
-
-        // q gets the extra 1/sqrt(head_dim) scale the reference applies before the
-        // scan; k does not (see kda_decode_step_f32's contract on pre-scaled q).
-        k3k::l2_norm_heads_f32(s.conv_q, s.conv_q, head_dim, n_head,
-                               1.0f / std::sqrt((float)head_dim), eps, stream);
-        k3k::l2_norm_heads_f32(s.conv_k, s.conv_k, head_dim, n_head, 1.0f, eps, stream);
-        if (fwd.debug) fwd.debug("dbg_l2_q", layer, s.conv_q, qkv);
-
-        if (!proj(s.f_a_out, s.normed, L.ssm_f_a, head_dim, H)) return false;
-        if (!proj(s.g_raw, s.f_a_out, L.ssm_f_b, qkv, head_dim)) return false;
-        if (!L.ssm_dt_bias.ok()) return false;
-        k3k::k3_add_f32(s.g_raw, s.g_raw, (const float*)L.ssm_dt_bias.data, qkv, stream);
-
-        if (!L.ssm_a.ok()) return false;
-        k3k::kda_decay_gate_f32(s.decay_g, s.g_raw, (const float*)L.ssm_a.data,
-                                head_dim, n_head, cfg.kda_gate_lower_bound, stream);
-
-        if (!proj(s.beta_out, s.normed, L.ssm_beta, n_head, H)) return false;
-
-        if (fwd.debug) fwd.debug("dbg_decay_g", layer, s.decay_g, qkv);
-        if (fwd.debug) fwd.debug("dbg_beta", layer, s.beta_out, n_head);
-        k3k::kda_decode_step_f32(s.delta_out, st.delta_state[kda_ord],
-                                 s.conv_q, s.conv_k, s.conv_v, s.decay_g, s.beta_out,
-                                 head_dim, n_head, stream);
-        if (fwd.debug) fwd.debug("dbg_delta_out", layer, s.delta_out, qkv);
-
-        if (!proj(s.g_proj_out, s.normed, L.ssm_g, qkv, H)) return false;
-        if (!L.ssm_norm.ok()) return false;
-        k3k::kda_gate_out_f32(s.gate_out, s.delta_out, (const float*)L.ssm_norm.data,
-                              s.g_proj_out, head_dim, n_head, eps, stream);
-        if (fwd.debug) fwd.debug("dbg_gate_out", layer, s.gate_out, qkv);
-
-        if (!proj(s.attn_out, s.gate_out, L.attn_output, H, qkv)) return false;
-        if (fwd.debug) fwd.debug("kda_out", layer, s.attn_out, H);
-    } else {
-        const int mla_ord = kimi_k3_mla_ordinal(cfg, layer);
-        if (mla_ord < 0) return false;
-
-        if (L.has_q_lora) {
-            if (!proj(s.q_lora_out, s.normed, L.attn_q_a, cfg.q_lora_rank, H)) return false;
-            if (!L.attn_q_a_norm.ok()) return false;
-            k3k::rms_norm_f32(s.q_lora_out, s.q_lora_out,
-                              (const float*)L.attn_q_a_norm.data, cfg.q_lora_rank, eps,
-                              stream);
-            if (!proj(s.q_proj_out, s.q_lora_out, L.attn_q_b, qh * cfg.key_length_mla,
-                     cfg.q_lora_rank))
-                return false;
+    // ---- phase 1: attention. Ends holding a FULL-WIDTH PARTIAL SUM,
+    // because attn_output is ColShard. The driver reduces it before phase 2. ----
+    if (do_attn) {
+        // --- pre-attention mix, then bank push (raw pre-mix value) ---
+        if (res_bs > 0) {
+            if (!L.attn_res_score.ok()) return false;
+            k3k::attn_res_mix_f32(s.mixed, st.res_bank, hidden_in,
+                                  (const float*)L.attn_res_score.data, H, st.n_ckpt,
+                                  eps, stream);
+            if (banked) {
+                if (st.n_ckpt >= st.max_ckpt) return false;
+                cudaMemcpyAsync(st.res_bank + (size_t)st.n_ckpt * H, hidden_in,
+                                (size_t)H * sizeof(float), cudaMemcpyDeviceToDevice, stream);
+                ++st.n_ckpt;
+            }
         } else {
-            if (!proj(s.q_proj_out, s.normed, L.attn_q_dense, qh * cfg.key_length_mla, H))
-                return false;
+            cudaMemcpyAsync(s.mixed, hidden_in, (size_t)H * sizeof(float),
+                            cudaMemcpyDeviceToDevice, stream);
         }
+        if (fwd.debug) fwd.debug("attn_res_mix", layer, s.mixed, H);
 
-        // De-interleave [qh, key_length_mla] into q_nope [qh, qk_nope] and
-        // q_pe [qh, rope_dim] — each head's 192 values are qk_nope(128) then
-        // rope_dim(64) concatenated, so this is a strided 2-D copy, not a plain split.
-        cudaMemcpy2DAsync(s.q_nope, (size_t)qk_nope * sizeof(float),
-                          s.q_proj_out, (size_t)cfg.key_length_mla * sizeof(float),
-                          (size_t)qk_nope * sizeof(float), qh,
-                          cudaMemcpyDeviceToDevice, stream);
-        cudaMemcpy2DAsync(s.q_pe, (size_t)cfg.rope_dim * sizeof(float),
-                          (const char*)s.q_proj_out + (size_t)qk_nope * sizeof(float),
-                          (size_t)cfg.key_length_mla * sizeof(float),
-                          (size_t)cfg.rope_dim * sizeof(float), qh,
-                          cudaMemcpyDeviceToDevice, stream);
+        if (!L.attn_norm.ok()) return false;
+        k3k::rms_norm_f32(s.normed, s.mixed, (const float*)L.attn_norm.data, H, eps, stream);
+        if (fwd.debug) fwd.debug("attn_norm", layer, s.normed, H);
 
-        if (!proj(s.kv_a_out, s.normed, L.attn_kv_a_mqa, cfg.key_length, H)) return false;
-        if (!L.attn_kv_a_norm.ok()) return false;
-        k3k::rms_norm_f32(s.kv_cmpr_normed, s.kv_a_out,
-                          (const float*)L.attn_kv_a_norm.data, cfg.kv_lora_rank, eps,
-                          stream);
-        if (fwd.debug) fwd.debug("dbg_kvcmpr", layer, s.kv_cmpr_normed, cfg.kv_lora_rank);
+        k3_profiler().start(L.is_kda ? "attn_kda" : "attn_mla", stream);
+        if (L.is_kda) {
+            const int kda_ord = kimi_k3_kda_ordinal(cfg, layer);
+            if (kda_ord < 0) return false;
+            const int head_dim = cfg.kda_head_dim, n_head = cfg.n_q_heads;
 
-        // K-cache row for this position: concat(normed kv_cmpr, RAW k_pe).
-        float* row = st.mla_kv_cache[mla_ord] + (size_t)st.position * cfg.key_length;
-        cudaMemcpyAsync(row, s.kv_cmpr_normed, (size_t)cfg.kv_lora_rank * sizeof(float),
-                        cudaMemcpyDeviceToDevice, stream);
-        cudaMemcpyAsync(row + cfg.kv_lora_rank, s.kv_a_out + cfg.kv_lora_rank,
-                        (size_t)cfg.rope_dim * sizeof(float),
-                        cudaMemcpyDeviceToDevice, stream);
+            if (!proj(s.qkv_q, s.normed, L.attn_q, qkv, H)) return false;
+            if (!proj(s.qkv_k, s.normed, L.attn_k, qkv, H)) return false;
+            if (!proj(s.qkv_v, s.normed, L.attn_v, qkv, H)) return false;
 
-        if (!L.attn_k_b.ok() || !L.attn_v_b.ok()) return false;
-        k3k::mla_absorb_q_f32(s.absorbed_q, s.q_nope, s.q_pe,
-                              (const float*)L.attn_k_b.data, qk_nope, cfg.kv_lora_rank,
-                              cfg.rope_dim, qh, stream);
-        if (fwd.debug) fwd.debug("mla_absorb_q", layer, s.absorbed_q, qh * cfg.key_length);
-
-        const float mla_scale = 1.0f / std::sqrt((float)cfg.key_length_mla);
-        k3k::mla_decode_attn_f32(s.mla_attn_out, s.absorbed_q, st.mla_kv_cache[mla_ord],
-                                 (const float*)L.attn_v_b.data, cfg.key_length,
-                                 cfg.kv_lora_rank, cfg.value_length_mla, qh,
-                                 st.position + 1, mla_scale, stream);
-        if (fwd.debug) fwd.debug("dbg_preattn", layer, s.mla_attn_out, qh * cfg.value_length_mla);
-
-        if (L.has_attn_gate) {
-            if (!proj(s.gate_proj_out, s.normed, L.attn_gate, qh * cfg.value_length_mla, H))
+            if (!L.ssm_conv1d_q.ok() || !L.ssm_conv1d_k.ok() || !L.ssm_conv1d_v.ok())
                 return false;
-            if (fwd.debug) fwd.debug("dbg_gateproj", layer, s.gate_proj_out, qh * cfg.value_length_mla);
-            k3k::mla_gate_out_f32(s.mla_attn_out, s.mla_attn_out, s.gate_proj_out,
-                                  (int64_t)qh * cfg.value_length_mla, stream);
-            if (fwd.debug) fwd.debug("dbg_postgate", layer, s.mla_attn_out, qh * cfg.value_length_mla);
-        }
+            k3k::kda_conv_step_f32(s.conv_q, st.conv_state_q[kda_ord], s.qkv_q,
+                                   (const float*)L.ssm_conv1d_q.data, cfg.kda_conv_kernel,
+                                   qkv, stream);
+            k3k::kda_conv_step_f32(s.conv_k, st.conv_state_k[kda_ord], s.qkv_k,
+                                   (const float*)L.ssm_conv1d_k.data, cfg.kda_conv_kernel,
+                                   qkv, stream);
+            k3k::kda_conv_step_f32(s.conv_v, st.conv_state_v[kda_ord], s.qkv_v,
+                                   (const float*)L.ssm_conv1d_v.data, cfg.kda_conv_kernel,
+                                   qkv, stream);
+            if (fwd.debug) fwd.debug("dbg_conv_q", layer, s.conv_q, qkv);
+            if (fwd.debug) fwd.debug("dbg_conv_v", layer, s.conv_v, qkv);
 
-        if (!proj(s.attn_out, s.mla_attn_out, L.attn_output, H, qh * cfg.value_length_mla))
-            return false;
-        if (fwd.debug) fwd.debug("mla_out", layer, s.attn_out, H);
-    }
+            // q gets the extra 1/sqrt(head_dim) scale the reference applies before the
+            // scan; k does not (see kda_decode_step_f32's contract on pre-scaled q).
+            k3k::l2_norm_heads_f32(s.conv_q, s.conv_q, head_dim, n_head,
+                                   1.0f / std::sqrt((float)head_dim), eps, stream);
+            k3k::l2_norm_heads_f32(s.conv_k, s.conv_k, head_dim, n_head, 1.0f, eps, stream);
+            if (fwd.debug) fwd.debug("dbg_l2_q", layer, s.conv_q, qkv);
 
-    k3_profiler().stop(L.is_kda ? "attn_kda" : "attn_mla", stream);
+            if (!proj(s.f_a_out, s.normed, L.ssm_f_a, head_dim, H)) return false;
+            if (!proj(s.g_raw, s.f_a_out, L.ssm_f_b, qkv, head_dim)) return false;
+            if (!L.ssm_dt_bias.ok()) return false;
+            k3k::k3_add_f32(s.g_raw, s.g_raw, (const float*)L.ssm_dt_bias.data, qkv, stream);
 
-    // --- combine: replace on a checkpoint layer, add otherwise. Uses hidden_in
-    // (the RAW pre-mix value), not s.mixed — the reference's residual add is
-    // against the unmixed prefix_sum, only the norm/attention input was mixed. ---
-    if (banked) {
-        cudaMemcpyAsync(hidden_out, s.attn_out, (size_t)H * sizeof(float),
-                        cudaMemcpyDeviceToDevice, stream);
-    } else {
-        k3k::k3_add_f32(hidden_out, hidden_in, s.attn_out, H, stream);
-    }
+            if (!L.ssm_a.ok()) return false;
+            k3k::kda_decay_gate_f32(s.decay_g, s.g_raw, (const float*)L.ssm_a.data,
+                                    head_dim, n_head, cfg.kda_gate_lower_bound, stream);
 
-    // --- pre-FFN mix, no bank push ---
-    if (res_bs > 0) {
-        if (!L.ffn_res_score.ok()) return false;
-        k3k::attn_res_mix_f32(s.mixed2, st.res_bank, hidden_out,
-                              (const float*)L.ffn_res_score.data, H, st.n_ckpt, eps,
+            if (!proj(s.beta_out, s.normed, L.ssm_beta, n_head, H)) return false;
+
+            if (fwd.debug) fwd.debug("dbg_decay_g", layer, s.decay_g, qkv);
+            if (fwd.debug) fwd.debug("dbg_beta", layer, s.beta_out, n_head);
+            k3k::kda_decode_step_f32(s.delta_out, st.delta_state[kda_ord],
+                                     s.conv_q, s.conv_k, s.conv_v, s.decay_g, s.beta_out,
+                                     head_dim, n_head, stream);
+            if (fwd.debug) fwd.debug("dbg_delta_out", layer, s.delta_out, qkv);
+
+            if (!proj(s.g_proj_out, s.normed, L.ssm_g, qkv, H)) return false;
+            if (!L.ssm_norm.ok()) return false;
+            k3k::kda_gate_out_f32(s.gate_out, s.delta_out, (const float*)L.ssm_norm.data,
+                                  s.g_proj_out, head_dim, n_head, eps, stream);
+            if (fwd.debug) fwd.debug("dbg_gate_out", layer, s.gate_out, qkv);
+
+            if (!proj(s.attn_out, s.gate_out, L.attn_output, H, qkv)) return false;
+            if (fwd.debug) fwd.debug("kda_out", layer, s.attn_out, H);
+        } else {
+            const int mla_ord = kimi_k3_mla_ordinal(cfg, layer);
+            if (mla_ord < 0) return false;
+
+            if (L.has_q_lora) {
+                if (!proj(s.q_lora_out, s.normed, L.attn_q_a, cfg.q_lora_rank, H)) return false;
+                if (!L.attn_q_a_norm.ok()) return false;
+                k3k::rms_norm_f32(s.q_lora_out, s.q_lora_out,
+                                  (const float*)L.attn_q_a_norm.data, cfg.q_lora_rank, eps,
+                                  stream);
+                if (!proj(s.q_proj_out, s.q_lora_out, L.attn_q_b, qh * cfg.key_length_mla,
+                         cfg.q_lora_rank))
+                    return false;
+            } else {
+                if (!proj(s.q_proj_out, s.normed, L.attn_q_dense, qh * cfg.key_length_mla, H))
+                    return false;
+            }
+
+            // De-interleave [qh, key_length_mla] into q_nope [qh, qk_nope] and
+            // q_pe [qh, rope_dim] — each head's 192 values are qk_nope(128) then
+            // rope_dim(64) concatenated, so this is a strided 2-D copy, not a plain split.
+            cudaMemcpy2DAsync(s.q_nope, (size_t)qk_nope * sizeof(float),
+                              s.q_proj_out, (size_t)cfg.key_length_mla * sizeof(float),
+                              (size_t)qk_nope * sizeof(float), qh,
+                              cudaMemcpyDeviceToDevice, stream);
+            cudaMemcpy2DAsync(s.q_pe, (size_t)cfg.rope_dim * sizeof(float),
+                              (const char*)s.q_proj_out + (size_t)qk_nope * sizeof(float),
+                              (size_t)cfg.key_length_mla * sizeof(float),
+                              (size_t)cfg.rope_dim * sizeof(float), qh,
+                              cudaMemcpyDeviceToDevice, stream);
+
+            if (!proj(s.kv_a_out, s.normed, L.attn_kv_a_mqa, cfg.key_length, H)) return false;
+            if (!L.attn_kv_a_norm.ok()) return false;
+            k3k::rms_norm_f32(s.kv_cmpr_normed, s.kv_a_out,
+                              (const float*)L.attn_kv_a_norm.data, cfg.kv_lora_rank, eps,
                               stream);
-    } else {
-        cudaMemcpyAsync(s.mixed2, hidden_out, (size_t)H * sizeof(float),
-                        cudaMemcpyDeviceToDevice, stream);
-    }
-    if (!L.ffn_norm.ok()) return false;
-    k3k::rms_norm_f32(s.normed2, s.mixed2, (const float*)L.ffn_norm.data, H, eps, stream);
-    if (fwd.debug) fwd.debug("ffn_norm", layer, s.normed2, H);
+            if (fwd.debug) fwd.debug("dbg_kvcmpr", layer, s.kv_cmpr_normed, cfg.kv_lora_rank);
 
-    k3_profiler().start(layer < cfg.leading_dense ? "ffn_dense" : "ffn_moe", stream);
-    if (layer < cfg.leading_dense) {
-        if (!proj(s.dense_gate, s.normed2, L.ffn_gate, cfg.dense_ffn, H)) return false;
-        if (!proj(s.dense_up, s.normed2, L.ffn_up, cfg.dense_ffn, H)) return false;
-        if (fwd.debug) fwd.debug("dbg_dense_gate", layer, s.dense_gate, cfg.dense_ffn);
-        if (fwd.debug) fwd.debug("dbg_dense_up", layer, s.dense_up, cfg.dense_ffn);
-        k3k::situ_f32(s.dense_situ, s.dense_gate, s.dense_up, cfg.dense_ffn,
-                     cfg.situ_beta, cfg.situ_linear_beta, stream);
-        if (fwd.debug) fwd.debug("dbg_dense_situ", layer, s.dense_situ, cfg.dense_ffn);
-        if (!proj(s.ffn_out, s.dense_situ, L.ffn_down, H, cfg.dense_ffn)) return false;
-    } else {
-        if (!proj(s.router_logits, s.normed2, L.ffn_gate_inp, cfg.n_experts, H))
-            return false;
-        if (!L.exp_probs_b.ok()) return false;
-        k3k::moe_router_noaux_tc_f32(s.router_w, s.router_ids, s.router_logits,
-                                     (const float*)L.exp_probs_b.data, cfg.n_experts,
-                                     cfg.top_k, /*n_tokens=*/1, /*norm_w=*/true,
-                                     /*w_scale=*/1.0f, stream);
+            // K-cache row for this position: concat(normed kv_cmpr, RAW k_pe).
+            float* row = st.mla_kv_cache[mla_ord] + (size_t)st.position * cfg.key_length;
+            cudaMemcpyAsync(row, s.kv_cmpr_normed, (size_t)cfg.kv_lora_rank * sizeof(float),
+                            cudaMemcpyDeviceToDevice, stream);
+            cudaMemcpyAsync(row + cfg.kv_lora_rank, s.kv_a_out + cfg.kv_lora_rank,
+                            (size_t)cfg.rope_dim * sizeof(float),
+                            cudaMemcpyDeviceToDevice, stream);
 
-        // routed_down feeds the dispatch UNNORMALISED — routed_norm (if present)
-        // normalises the dispatch's OUTPUT, not this. See build_latent_moe in the
-        // reference: build_moe_ffn runs first, then "if (layer.ffn_routed_norm)
-        // moe_out = build_norm(moe_out, ...)", and only after that does
-        // ffn_routed_up run. Getting this backwards (norm between routed_down and
-        // the dispatch) was an earlier version's bug, same class as the ssm_norm fix.
-        if (!proj(s.routed_down_out, s.normed2, L.ffn_routed_down, cfg.expert_latent, H))
-            return false;
+            if (!L.attn_k_b.ok() || !L.attn_v_b.ok()) return false;
+            k3k::mla_absorb_q_f32(s.absorbed_q, s.q_nope, s.q_pe,
+                                  (const float*)L.attn_k_b.data, qk_nope, cfg.kv_lora_rank,
+                                  cfg.rope_dim, qh, stream);
+            if (fwd.debug) fwd.debug("mla_absorb_q", layer, s.absorbed_q, qh * cfg.key_length);
 
-        if (!L.ffn_gate_exps.ok() || !L.ffn_up_exps.ok() || !L.ffn_down_exps.ok())
-            return false;
-        const bool moe_ok = k3k::moe_expert_ffn_f32_by_type(
-            s.moe_out, s.moe_scratch, s.routed_down_out, s.router_ids, s.router_w,
-            L.ffn_gate_exps.data, L.ffn_up_exps.data, L.ffn_down_exps.data,
-            cfg.expert_latent, cfg.moe_ffn, cfg.top_k, cfg.situ_beta,
-            cfg.situ_linear_beta, L.ffn_gate_exps.type, stream);
-        if (!moe_ok) return false;
+            const float mla_scale = 1.0f / std::sqrt((float)cfg.key_length_mla);
+            k3k::mla_decode_attn_f32(s.mla_attn_out, s.absorbed_q, st.mla_kv_cache[mla_ord],
+                                     (const float*)L.attn_v_b.data, cfg.key_length,
+                                     cfg.kv_lora_rank, cfg.value_length_mla, qh,
+                                     st.position + 1, mla_scale, stream);
+            if (fwd.debug) fwd.debug("dbg_preattn", layer, s.mla_attn_out, qh * cfg.value_length_mla);
 
-        if (L.has_routed_norm) {
-            if (!L.ffn_routed_norm.ok()) return false;
-            k3k::rms_norm_f32(s.moe_out, s.moe_out,
-                              (const float*)L.ffn_routed_norm.data, cfg.expert_latent,
-                              eps, stream);
+            if (L.has_attn_gate) {
+                if (!proj(s.gate_proj_out, s.normed, L.attn_gate, qh * cfg.value_length_mla, H))
+                    return false;
+                if (fwd.debug) fwd.debug("dbg_gateproj", layer, s.gate_proj_out, qh * cfg.value_length_mla);
+                k3k::mla_gate_out_f32(s.mla_attn_out, s.mla_attn_out, s.gate_proj_out,
+                                      (int64_t)qh * cfg.value_length_mla, stream);
+                if (fwd.debug) fwd.debug("dbg_postgate", layer, s.mla_attn_out, qh * cfg.value_length_mla);
+            }
+
+            if (!proj(s.attn_out, s.mla_attn_out, L.attn_output, H, qh * cfg.value_length_mla))
+                return false;
+            if (fwd.debug) fwd.debug("mla_out", layer, s.attn_out, H);
         }
 
-        if (!proj(s.ffn_out, s.moe_out, L.ffn_routed_up, H, cfg.expert_latent))
-            return false;
+        k3_profiler().stop(L.is_kda ? "attn_kda" : "attn_mla", stream);
+    }
 
-        // Shared experts run on `normed2` directly (hidden width throughout, no
-        // latent detour) and add into the routed output AFTER ffn_routed_up — both
-        // contributions are at hidden width when combined. Reuses the dense-FFN
-        // scratch buffers: a layer is either the leading-dense branch or this MoE
-        // branch, never both, and dense_ffn (33792) comfortably covers n_ff_shexp
-        // (6144), so a dedicated buffer would be pure duplication.
-        if (L.has_shared_experts) {
-            if (!L.ffn_gate_shexp.ok() || !L.ffn_up_shexp.ok() || !L.ffn_down_shexp.ok())
-                return false;
-            const int n_ff_shexp = cfg.moe_ffn * cfg.n_shared;
-            if (!proj(s.dense_gate, s.normed2, L.ffn_gate_shexp, n_ff_shexp, H))
-                return false;
-            if (!proj(s.dense_up, s.normed2, L.ffn_up_shexp, n_ff_shexp, H))
-                return false;
-            k3k::situ_f32(s.dense_situ, s.dense_gate, s.dense_up, n_ff_shexp,
+    // ---- phase 2: attention residual, FFN norm, and the FFN's PARTIAL. ----
+    if (do_ffn_p) {
+        // --- combine: replace on a checkpoint layer, add otherwise. Uses hidden_in
+        // (the RAW pre-mix value), not s.mixed — the reference's residual add is
+        // against the unmixed prefix_sum, only the norm/attention input was mixed. ---
+        if (banked) {
+            cudaMemcpyAsync(hidden_out, s.attn_out, (size_t)H * sizeof(float),
+                            cudaMemcpyDeviceToDevice, stream);
+        } else {
+            k3k::k3_add_f32(hidden_out, hidden_in, s.attn_out, H, stream);
+        }
+
+        // --- pre-FFN mix, no bank push ---
+        if (res_bs > 0) {
+            if (!L.ffn_res_score.ok()) return false;
+            k3k::attn_res_mix_f32(s.mixed2, st.res_bank, hidden_out,
+                                  (const float*)L.ffn_res_score.data, H, st.n_ckpt, eps,
+                                  stream);
+        } else {
+            cudaMemcpyAsync(s.mixed2, hidden_out, (size_t)H * sizeof(float),
+                            cudaMemcpyDeviceToDevice, stream);
+        }
+        if (!L.ffn_norm.ok()) return false;
+        k3k::rms_norm_f32(s.normed2, s.mixed2, (const float*)L.ffn_norm.data, H, eps, stream);
+        if (fwd.debug) fwd.debug("ffn_norm", layer, s.normed2, H);
+
+        k3_profiler().start(layer < cfg.leading_dense ? "ffn_dense" : "ffn_moe", stream);
+        if (layer < cfg.leading_dense) {
+            if (!proj(s.dense_gate, s.normed2, L.ffn_gate, cfg.dense_ffn, H)) return false;
+            if (!proj(s.dense_up, s.normed2, L.ffn_up, cfg.dense_ffn, H)) return false;
+            if (fwd.debug) fwd.debug("dbg_dense_gate", layer, s.dense_gate, cfg.dense_ffn);
+            if (fwd.debug) fwd.debug("dbg_dense_up", layer, s.dense_up, cfg.dense_ffn);
+            k3k::situ_f32(s.dense_situ, s.dense_gate, s.dense_up, cfg.dense_ffn,
                          cfg.situ_beta, cfg.situ_linear_beta, stream);
-            if (!proj(s.shexp_out, s.dense_situ, L.ffn_down_shexp, H, n_ff_shexp))
+            if (fwd.debug) fwd.debug("dbg_dense_situ", layer, s.dense_situ, cfg.dense_ffn);
+            if (!proj(s.ffn_out, s.dense_situ, L.ffn_down, H, cfg.dense_ffn)) return false;
+        } else {
+            if (!proj(s.router_logits, s.normed2, L.ffn_gate_inp, cfg.n_experts, H))
                 return false;
-            k3k::k3_add_f32(s.ffn_out, s.ffn_out, s.shexp_out, H, stream);
+            if (!L.exp_probs_b.ok()) return false;
+            k3k::moe_router_noaux_tc_f32(s.router_w, s.router_ids, s.router_logits,
+                                         (const float*)L.exp_probs_b.data, cfg.n_experts,
+                                         cfg.top_k, /*n_tokens=*/1, /*norm_w=*/true,
+                                         /*w_scale=*/1.0f, stream);
+
+            // routed_down feeds the dispatch UNNORMALISED — routed_norm (if present)
+            // normalises the dispatch's OUTPUT, not this. See build_latent_moe in the
+            // reference: build_moe_ffn runs first, then "if (layer.ffn_routed_norm)
+            // moe_out = build_norm(moe_out, ...)", and only after that does
+            // ffn_routed_up run. Getting this backwards (norm between routed_down and
+            // the dispatch) was an earlier version's bug, same class as the ssm_norm fix.
+            if (!proj(s.routed_down_out, s.normed2, L.ffn_routed_down, cfg.expert_latent, H))
+                return false;
+
+            if (!L.ffn_gate_exps.ok() || !L.ffn_up_exps.ok() || !L.ffn_down_exps.ok())
+                return false;
+            // THE EXPERT BAND. The router above ran on the replicated ffn_gate_inp,
+            // so every rank picked the SAME top_k global ids; this rank evaluates only
+            // the ones whose weights it holds, leaving a partial sum in s.moe_out that
+            // the driver reduces at expert_latent before phase 3. At tp_size 1 the
+            // band covers every expert and the call is unchanged.
+            const int expert_begin  = fwd.w->shard.expert_band.offset;
+            const int n_local_exp   = fwd.w->shard.tp_size > 1
+                                        ? fwd.w->shard.expert_band.extent : 0;
+            const bool moe_ok = k3k::moe_expert_ffn_f32_by_type(
+                s.moe_out, s.moe_scratch, s.routed_down_out, s.router_ids, s.router_w,
+                L.ffn_gate_exps.data, L.ffn_up_exps.data, L.ffn_down_exps.data,
+                cfg.expert_latent, cfg.moe_ffn, cfg.top_k, cfg.situ_beta,
+                cfg.situ_linear_beta, L.ffn_gate_exps.type, stream,
+                expert_begin, n_local_exp);
+            if (!moe_ok) return false;
+            // This rank's PARTIAL expert sum: it legitimately differs per rank and
+            // from the tp=1 value. dbg_moe_reduced below is the one that must match.
+            if (fwd.debug) fwd.debug("dbg_moe_partial", layer, s.moe_out, cfg.expert_latent);
         }
     }
-    k3_profiler().stop(layer < cfg.leading_dense ? "ffn_dense" : "ffn_moe", stream);
-    if (fwd.debug) fwd.debug("ffn_out", layer, s.ffn_out, H);
 
-    // FFN residual is ALWAYS an add, never a replace.
-    k3k::k3_add_f32(hidden_out, hidden_out, s.ffn_out, H, stream);
-    if (fwd.debug) fwd.debug("l_out", layer, hidden_out, H);
+    // ---- phase 3: everything downstream of the FFN collective. Every weight
+    // here is Replicate and reads the ALREADY-REDUCED value — routed_norm is an
+    // rms_norm, so the sum cannot be deferred past it. ----
+    if (do_ffn_f) {
+        if (layer >= cfg.leading_dense) {
+            // Post-collective: every rank must now hold the SAME complete expert sum,
+            // equal to what tp=1 computed. If this tag differs, the dispatch or the
+            // reduce is wrong; if it matches and ffn_out still differs, the fault is
+            // downstream in routed_norm / routed_up / shexp.
+            if (fwd.debug) fwd.debug("dbg_moe_reduced", layer, s.moe_out, cfg.expert_latent);
+            if (L.has_routed_norm) {
+                if (!L.ffn_routed_norm.ok()) return false;
+                k3k::rms_norm_f32(s.moe_out, s.moe_out,
+                                  (const float*)L.ffn_routed_norm.data, cfg.expert_latent,
+                                  eps, stream);
+            }
+
+            if (fwd.debug) fwd.debug("dbg_moe_normed", layer, s.moe_out, cfg.expert_latent);
+            if (!proj(s.ffn_out, s.moe_out, L.ffn_routed_up, H, cfg.expert_latent))
+                return false;
+            if (fwd.debug) fwd.debug("dbg_routed_up", layer, s.ffn_out, H);
+
+            // Shared experts run on `normed2` directly (hidden width throughout, no
+            // latent detour) and add into the routed output AFTER ffn_routed_up — both
+            // contributions are at hidden width when combined. Reuses the dense-FFN
+            // scratch buffers: a layer is either the leading-dense branch or this MoE
+            // branch, never both, and dense_ffn (33792) comfortably covers n_ff_shexp
+            // (6144), so a dedicated buffer would be pure duplication.
+            if (L.has_shared_experts) {
+                if (!L.ffn_gate_shexp.ok() || !L.ffn_up_shexp.ok() || !L.ffn_down_shexp.ok())
+                    return false;
+                const int n_ff_shexp = cfg.moe_ffn * cfg.n_shared;
+                if (!proj(s.dense_gate, s.normed2, L.ffn_gate_shexp, n_ff_shexp, H))
+                    return false;
+                if (!proj(s.dense_up, s.normed2, L.ffn_up_shexp, n_ff_shexp, H))
+                    return false;
+                k3k::situ_f32(s.dense_situ, s.dense_gate, s.dense_up, n_ff_shexp,
+                             cfg.situ_beta, cfg.situ_linear_beta, stream);
+                if (!proj(s.shexp_out, s.dense_situ, L.ffn_down_shexp, H, n_ff_shexp))
+                    return false;
+                if (fwd.debug) fwd.debug("dbg_shexp", layer, s.shexp_out, H);
+                k3k::k3_add_f32(s.ffn_out, s.ffn_out, s.shexp_out, H, stream);
+            }
+        }
+        k3_profiler().stop(layer < cfg.leading_dense ? "ffn_dense" : "ffn_moe", stream);
+        if (fwd.debug) fwd.debug("ffn_out", layer, s.ffn_out, H);
+
+        // FFN residual is ALWAYS an add, never a replace.
+        k3k::k3_add_f32(hidden_out, hidden_out, s.ffn_out, H, stream);
+        if (fwd.debug) fwd.debug("l_out", layer, hidden_out, H);
+    }
     return true;
 }
 
