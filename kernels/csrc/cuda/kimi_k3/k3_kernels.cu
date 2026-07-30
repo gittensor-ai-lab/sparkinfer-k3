@@ -265,6 +265,172 @@ __global__ void mla_gate_out_kernel(float* __restrict__ out,
     out[i] = attn_out[i] * sigmoidf_(gate_proj[i]);
 }
 
+// ---------------------------------------------------------------------------
+// 7. KDA decay gate (lower_bound form)
+// ---------------------------------------------------------------------------
+// One block per head; head_dim threads. A[h] broadcasts across the head_dim channels.
+
+__global__ void kda_decay_gate_kernel(float* __restrict__ out,
+                                      const float* __restrict__ g_raw,
+                                      const float* __restrict__ A,
+                                      int head_dim, float lower_bound) {
+    const int h = blockIdx.x;
+    const int d = threadIdx.x;
+    if (d >= head_dim) return;
+    const float Ah = A[h];
+    const float gr = g_raw[(size_t)h * head_dim + d];
+    // g = lb * sigmoid(-(A * g_raw))
+    out[(size_t)h * head_dim + d] = lower_bound * sigmoidf_(-(Ah * gr));
+}
+
+// ---------------------------------------------------------------------------
+// 8. L2-norm over heads (+ optional scale)
+// ---------------------------------------------------------------------------
+
+template <int BLOCK>
+__global__ void l2_norm_heads_kernel(float* __restrict__ out,
+                                     const float* __restrict__ x,
+                                     int head_dim, float scale, float eps) {
+    const int h = blockIdx.x;
+    const float* xh = x + (size_t)h * head_dim;
+    float* oh = out + (size_t)h * head_dim;
+
+    float ss = 0.0f;
+    for (int d = threadIdx.x; d < head_dim; d += BLOCK)
+        ss += xh[d] * xh[d];
+    __shared__ float shm[BLOCK / 32 + 1];
+    ss = block_sum<BLOCK>(ss, shm);
+    const float inv = scale * rsqrtf(ss + eps);
+
+    for (int d = threadIdx.x; d < head_dim; d += BLOCK)
+        oh[d] = xh[d] * inv;
+}
+
+// ---------------------------------------------------------------------------
+// 9. MLA absorb Q
+// ---------------------------------------------------------------------------
+// One block per (head, kv_lora-row). Thread-reduce over qk_nope, then thread 0
+// writes the absorbed slot and (once per head) copies q_pe into the tail.
+
+template <int BLOCK>
+__global__ void mla_absorb_q_kernel(float* __restrict__ out,
+                                    const float* __restrict__ q_nope,
+                                    const float* __restrict__ q_pe,
+                                    const float* __restrict__ wk_b,
+                                    int qk_nope, int kv_lora, int rope_dim) {
+    const int h = blockIdx.y;
+    const int r = blockIdx.x;   // kv_lora index
+    if (r >= kv_lora) return;
+
+    const float* qh = q_nope + (size_t)h * qk_nope;
+    const float* wh = wk_b + (size_t)h * (size_t)qk_nope * kv_lora;
+    // wk_b layout: [qk_nope, kv_lora, n_head] with qk_nope fastest →
+    // column r starts at offset r * qk_nope.
+    const float* wr = wh + (size_t)r * qk_nope;
+
+    float acc = 0.0f;
+    for (int d = threadIdx.x; d < qk_nope; d += BLOCK)
+        acc += wr[d] * qh[d];
+    __shared__ float shm[BLOCK / 32 + 1];
+    acc = block_sum<BLOCK>(acc, shm);
+
+    float* oh = out + (size_t)h * (kv_lora + rope_dim);
+    if (threadIdx.x == 0) oh[r] = acc;
+
+    // Copy q_pe once per head (blockIdx.x == 0 owns it).
+    if (r == 0) {
+        const float* pe = q_pe + (size_t)h * rope_dim;
+        for (int d = threadIdx.x; d < rope_dim; d += BLOCK)
+            oh[kv_lora + d] = pe[d];
+    }
+}
+
+// Block-wide max into lane 0 of warp 0, then broadcast via shared memory.
+template <int BLOCK>
+__device__ __forceinline__ float block_max(float v, float* shm) {
+    for (int off = 16; off > 0; off >>= 1) v = fmaxf(v, __shfl_down_sync(0xffffffff, v, off));
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    if (lane == 0) shm[warp] = v;
+    __syncthreads();
+    constexpr int NWARP = BLOCK / 32;
+    if (threadIdx.x == 0) {
+        float m = shm[0];
+        for (int w = 1; w < NWARP; ++w) m = fmaxf(m, shm[w]);
+        shm[NWARP] = m;
+    }
+    __syncthreads();
+    return shm[NWARP];
+}
+
+// ---------------------------------------------------------------------------
+// 10. MLA NoPE decode attention
+// ---------------------------------------------------------------------------
+// One block per head. Scores vs shared K-cache (MQA), softmax, attend over the
+// leading kv_lora of K as V, then decompress with wv_b.
+
+template <int BLOCK>
+__global__ void mla_decode_attn_kernel(float* __restrict__ out,
+                                       const float* __restrict__ q,
+                                       const float* __restrict__ k_cache,
+                                       const float* __restrict__ wv_b,
+                                       int key_length, int kv_lora, int v_dim,
+                                       int n_ctx, float scale) {
+    const int h = blockIdx.x;
+    const float* qh = q + (size_t)h * key_length;
+    const float* wh = wv_b + (size_t)h * (size_t)kv_lora * v_dim;
+
+    extern __shared__ float smem[];
+    float* scores = smem;                     // n_ctx
+    float* latent = scores + n_ctx;           // kv_lora
+    float* red    = latent + kv_lora;         // BLOCK/32 + 1
+
+    for (int t = threadIdx.x; t < n_ctx; t += BLOCK) {
+        const float* kt = k_cache + (size_t)t * key_length;
+        float s = 0.0f;
+#pragma unroll 4
+        for (int d = 0; d < key_length; ++d) s += qh[d] * kt[d];
+        scores[t] = s * scale;
+    }
+    __syncthreads();
+
+    float mx = -1e30f;
+    for (int t = threadIdx.x; t < n_ctx; t += BLOCK)
+        mx = fmaxf(mx, scores[t]);
+    mx = block_max<BLOCK>(mx, red);
+
+    float sum = 0.0f;
+    for (int t = threadIdx.x; t < n_ctx; t += BLOCK) {
+        const float e = __expf(scores[t] - mx);
+        scores[t] = e;
+        sum += e;
+    }
+    sum = block_sum<BLOCK>(sum, red);
+    const float inv = 1.0f / sum;
+    for (int t = threadIdx.x; t < n_ctx; t += BLOCK)
+        scores[t] *= inv;
+    __syncthreads();
+
+    // latent[r] = sum_t p[t] * k_cache[t, r]   (V = leading kv_lora of K)
+    for (int r = threadIdx.x; r < kv_lora; r += BLOCK) {
+        float acc = 0.0f;
+        for (int t = 0; t < n_ctx; ++t)
+            acc += scores[t] * k_cache[(size_t)t * key_length + r];
+        latent[r] = acc;
+    }
+    __syncthreads();
+
+    // out[v] = sum_r wv_b[r, v, h] * latent[r]
+    float* oh = out + (size_t)h * v_dim;
+    for (int v = threadIdx.x; v < v_dim; v += BLOCK) {
+        const float* wr = wh + (size_t)v * kv_lora;
+        float acc = 0.0f;
+#pragma unroll 4
+        for (int r = 0; r < kv_lora; ++r) acc += wr[r] * latent[r];
+        oh[v] = acc;
+    }
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -331,6 +497,41 @@ void mla_gate_out_f32(float* out, const float* attn_out, const float* gate_proj,
     const int T = 256;
     const int64_t blocks = (n + T - 1) / T;
     mla_gate_out_kernel<<<(unsigned)blocks, T, 0, stream>>>(out, attn_out, gate_proj, n);
+}
+
+void kda_decay_gate_f32(float* out, const float* g_raw, const float* A,
+                        int head_dim, int n_head, float lower_bound,
+                        cudaStream_t stream) {
+    if (head_dim <= 0 || n_head <= 0) return;
+    kda_decay_gate_kernel<<<(unsigned)n_head, head_dim, 0, stream>>>(
+        out, g_raw, A, head_dim, lower_bound);
+}
+
+void l2_norm_heads_f32(float* out, const float* x, int head_dim, int n_head,
+                       float scale, float eps, cudaStream_t stream) {
+    if (head_dim <= 0 || n_head <= 0) return;
+    l2_norm_heads_kernel<128><<<(unsigned)n_head, 128, 0, stream>>>(
+        out, x, head_dim, scale, eps);
+}
+
+void mla_absorb_q_f32(float* out, const float* q_nope, const float* q_pe,
+                      const float* wk_b, int qk_nope, int kv_lora, int rope_dim,
+                      int n_head, cudaStream_t stream) {
+    if (n_head <= 0 || kv_lora <= 0 || qk_nope <= 0) return;
+    dim3 grid((unsigned)kv_lora, (unsigned)n_head);
+    mla_absorb_q_kernel<128><<<grid, 128, 0, stream>>>(
+        out, q_nope, q_pe, wk_b, qk_nope, kv_lora, rope_dim);
+}
+
+void mla_decode_attn_f32(float* out, const float* q, const float* k_cache,
+                         const float* wv_b, int key_length, int kv_lora,
+                         int v_dim, int n_head, int n_ctx, float scale,
+                         cudaStream_t stream) {
+    if (n_head <= 0 || n_ctx <= 0 || key_length <= 0 || kv_lora <= 0 || v_dim <= 0) return;
+    constexpr int BLOCK = 256;
+    const size_t shm = ((size_t)n_ctx + (size_t)kv_lora + BLOCK / 32 + 1) * sizeof(float);
+    mla_decode_attn_kernel<BLOCK><<<(unsigned)n_head, BLOCK, shm, stream>>>(
+        out, q, k_cache, wv_b, key_length, kv_lora, v_dim, n_ctx, scale);
 }
 
 }  // namespace k3

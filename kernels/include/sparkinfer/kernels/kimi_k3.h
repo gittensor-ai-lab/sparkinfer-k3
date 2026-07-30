@@ -1,16 +1,22 @@
 #pragma once
 // Kimi K3 specific kernels.
 //
-// K3 is not "another MoE transformer with different numbers". Five things in it have
-// no equivalent in the Qwen stack sparkinfer was built for, and each is implemented
-// here with the reference semantics stated exactly, because every one of them is a
-// silent-wrong-output risk rather than a crash risk:
+// K3 is not "another MoE transformer with different numbers". The ops below have
+// no equivalent in the Qwen stack sparkinfer was built for (or a subtly different
+// form of one), and each is implemented with the reference semantics stated
+// exactly, because every one of them is a silent-wrong-output risk rather than a
+// crash risk:
 //
 //   1. situ activation           replaces SwiGLU everywhere
 //   2. KDA decode step           gated delta rule, PER-CHANNEL decay
 //   3. KDA output gating         rms_norm then a full-rank sigmoid gate
 //   4. cross-layer attn residual softmax over banked checkpoints
 //   5. MLA output gate           sigmoid before o_proj
+//   6. KDA causal short conv     depthwise, silu AFTER, current token at END
+//   7. KDA decay gate            lower_bound*sigmoid form (NOT softplus)
+//   8. L2-norm heads             per-head; optional 1/sqrt scale for Q
+//   9. MLA absorb Q              wk_b @ q_nope, concat q_pe → key_length
+//  10. MLA NoPE decode attn      MQA over K-cache + wv_b decompress
 //
 // SEMANTICS ARE TRANSCRIBED, NOT INFERRED. Each function below cites the reference
 // implementation it must match (unslothai/llama.cpp @ kimi-k3-fullsize-vision,
@@ -142,6 +148,88 @@ void kda_conv_step_f32(float* out, float* state, const float* x, const float* w,
 // gating above because it has no rms_norm and applies to the MLA branch.
 void mla_gate_out_f32(float* out, const float* attn_out, const float* gate_proj,
                       int64_t n, cudaStream_t stream);
+
+// ---------------------------------------------------------------------------
+// 7. KDA decay gate (K3 lower_bound form)
+// ---------------------------------------------------------------------------
+// Reference: src/models/kimi-k3.cpp build_kda_layer(), gated by
+// linear_attn_config.gate_lower_bound. K3 ships lower_bound = -5.0, which
+// SWAPS the activation entirely vs kimi-linear:
+//
+//   kimi-linear (unset):  g = A * softplus(g_raw)          A = -exp(A_log)
+//   K3 (lower_bound set): g = lb * sigmoid(-(A * g_raw))
+//                       = lb * sigmoid( exp(A_log) * g_raw )
+//
+// g_raw is already f_b(f_a(x)) + dt_bias — the GEMMs stay outside this kernel.
+// A is per-head (shape [n_head]); it broadcasts across head_dim. ssm_a in the
+// GGUF already holds -exp(A_log) (folded at conversion).
+//
+// THE TRAP: using softplus here is the kimi-linear path. It still produces a
+// plausible negative decay and the model stays fluent.
+//
+// g_raw, out: [head_dim, n_head]; A: [n_head].
+void kda_decay_gate_f32(float* out, const float* g_raw, const float* A,
+                        int head_dim, int n_head, float lower_bound,
+                        cudaStream_t stream);
+
+// ---------------------------------------------------------------------------
+// 8. L2-norm over heads (+ optional scale)
+// ---------------------------------------------------------------------------
+// Reference: ggml_l2_norm on Q/K before build_delta_net, then
+// build_delta_net_autoregressive scales q by 1/sqrt(head_dim). Combined here so
+// the KDA micro-path is one launch: pass scale=1/sqrt(D) for Q, scale=1 for K.
+//
+//   out[h,d] = x[h,d] * scale / sqrt(sum_d x[h,d]^2 + eps)
+//
+// In-place is fine (out may alias x). Layout [head_dim, n_head].
+void l2_norm_heads_f32(float* out, const float* x, int head_dim, int n_head,
+                       float scale, float eps, cudaStream_t stream);
+
+// ---------------------------------------------------------------------------
+// 9. MLA absorb Q (wk_b @ q_nope, concat q_pe)
+// ---------------------------------------------------------------------------
+// Reference: src/models/kimi-k3.cpp build_mla_layer() absorbed path
+// (layer.wk_b && layer.wv_b):
+//
+//   q_nope_absorbed[h] = wk_b[h] @ q_nope[h]     // [kv_lora] <- [qk_nope]
+//   Q[h]               = concat(q_nope_absorbed[h], q_pe[h])  // length key_length
+//
+// GGUF layout of wk_b is [qk_nope, kv_lora, n_head] with qk_nope fastest —
+// per head: absorbed[r] = sum_d wk_b[d + r*qk_nope + h*qk_nope*kv_lora] * q_nope[d].
+//
+// q_nope: [qk_nope, n_head]; q_pe: [rope_dim, n_head];
+// wk_b:   [qk_nope, kv_lora, n_head];
+// out:    [key_length, n_head] where key_length = kv_lora + rope_dim (= 576).
+void mla_absorb_q_f32(float* out, const float* q_nope, const float* q_pe,
+                      const float* wk_b, int qk_nope, int kv_lora, int rope_dim,
+                      int n_head, cudaStream_t stream);
+
+// ---------------------------------------------------------------------------
+// 10. MLA NoPE decode attention (MQA over K-cache + wv_b decompress)
+// ---------------------------------------------------------------------------
+// Reference: build_mla_layer absorbed path + build_attn(inp_attn_k, ..., wv_b).
+// K3 is NoPE-only; the K cache stores concat(kv_cmpr, k_pe) of length
+// key_length = kv_lora + rope_dim, V is the leading kv_lora of that same cache,
+// and wv_b decompresses the attended latent back to v_dim per head.
+//
+// Per head h:
+//   score[t]  = scale * sum_d q[h,d] * k_cache[t,d]     d in [0, key_length)
+//   p         = softmax(score[0..n_ctx))
+//   latent[r] = sum_t p[t] * k_cache[t,r]               r in [0, kv_lora)
+//   out[h,v]  = sum_r wv_b[r,v,h] * latent[r]           v in [0, v_dim)
+//
+// THE TRAP: kq_scale is 1/sqrt(n_embd_head_k_mla) = 1/sqrt(qk_nope+rope) =
+// 1/sqrt(192), NOT 1/sqrt(key_length=576). Scaling by the cached key width is
+// the natural wrong guess and shifts every attention distribution.
+//
+// q:       [key_length, n_head]     (output of mla_absorb_q_f32)
+// k_cache: [key_length, n_ctx]      token-major rows; MQA (one K shared by heads)
+// wv_b:    [kv_lora, v_dim, n_head]  kv_lora fastest
+// out:     [v_dim, n_head]
+void mla_decode_attn_f32(float* out, const float* q, const float* k_cache,
+                         const float* wv_b, int key_length, int kv_lora,
+                         int v_dim, int n_head, int n_ctx, float scale,
+                         cudaStream_t stream);
 
 }  // namespace k3
 }  // namespace kernels

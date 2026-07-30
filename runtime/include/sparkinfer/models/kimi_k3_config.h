@@ -1,0 +1,67 @@
+#pragma once
+
+#include <vector>
+
+namespace sparkinfer {
+
+// Kimi K3 (Moonshot) decode configuration.
+//
+// Defaults match moonshotai/Kimi-K3 / unsloth UD-Q2_K_XL as typed by
+// unslothai/llama.cpp @ efc8bc38 (LLM_TYPE_2_8T_A50B). Required GGUF keys
+// (expert_latent_length, attn_res.block_size, both situ betas) must be present
+// in the file — kimi_k3_config_from_gguf refuses silent defaults for those,
+// because a defaulted load emits fluent garbage rather than failing.
+struct KimiK3Config {
+    int   vocab       = 163840;
+    int   hidden      = 7168;
+    int   n_layers    = 93;
+    int   n_q_heads   = 96;
+    int   head_dim    = 128;     // KDA head_dim; MLA uses separate dims below
+    int   n_experts   = 896;
+    int   top_k       = 16;
+    int   n_shared    = 2;
+    int   moe_ffn     = 3072;
+    int   expert_latent = 3584;  // REQUIRED — routed experts live here, not at hidden
+    int   dense_ffn   = 33792;   // leading dense block only
+    int   leading_dense = 1;
+    float rms_eps     = 1e-5f;
+    int   eos_id      = 163839;  // placeholder until tokenizer metadata is read
+    int   max_seq     = 1048576;
+
+    // situ — both REQUIRED in GGUF
+    float situ_beta         = 4.0f;
+    float situ_linear_beta  = 25.0f;
+
+    // cross-layer residual attention — REQUIRED
+    int   attn_res_block_size = 12;
+
+    // KDA (linear / recurrent)
+    int   kda_head_dim      = 128;
+    int   kda_conv_kernel   = 4;
+    float kda_gate_lower_bound = -5.0f;
+
+    // MLA (full attention). GGUF encodes MLA as MQA with key_length = 576.
+    int   q_lora_rank       = 1536;
+    int   kv_lora_rank      = 512;
+    int   key_length        = 576;   // kv_lora + qk_rope
+    int   key_length_mla    = 192;   // qk_nope + qk_rope
+    int   value_length_mla  = 128;
+    int   rope_dim          = 64;    // present in GGUF; arch is NoPE-only at runtime
+
+    // Per-layer type map. layer_is_kda[i] == true when head_count_kv[i] == 0.
+    // Length must equal n_layers. Derived from the GGUF int array — never baked.
+    std::vector<char> layer_is_kda;
+
+    int n_kda_layers() const {
+        int n = 0;
+        for (char v : layer_is_kda) n += (v != 0);
+        return n;
+    }
+    int n_mla_layers() const { return n_layers - n_kda_layers(); }
+
+    bool is_kda_layer(int layer) const {
+        return layer >= 0 && layer < (int)layer_is_kda.size() && layer_is_kda[layer] != 0;
+    }
+};
+
+} // namespace sparkinfer

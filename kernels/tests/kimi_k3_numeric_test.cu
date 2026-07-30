@@ -461,6 +461,191 @@ static void test_kda_conv_step() {
 }
 
 // ---------------------------------------------------------------------------
+// 7. KDA decay gate (lower_bound form)
+// ---------------------------------------------------------------------------
+
+static void test_kda_decay_gate() {
+    std::printf("KDA decay gate (lower_bound*sigmoid — K3 form, NOT softplus)\n");
+    std::mt19937 rng(2026);
+    const int D = 128, H = 16;
+    const float lb = -5.0f;   // K3's kda.gate_lower_bound
+    auto g_raw = rnd((size_t)D * H, rng, -4.f, 4.f);
+    // A = -exp(A_log); typically negative and small-magnitude after folding.
+    auto A = rnd((size_t)H, rng, -2.0f, -0.05f);
+
+    std::vector<double> ref((size_t)D * H), wrong_softplus((size_t)D * H);
+    for (int h = 0; h < H; ++h) {
+        const double Ah = A[h];
+        for (int d = 0; d < D; ++d) {
+            const double gr = g_raw[(size_t)h * D + d];
+            // K3: lb * sigmoid(-(A * g_raw))
+            ref[(size_t)h * D + d] =
+                (double)lb * (1.0 / (1.0 + std::exp(Ah * gr)));
+            // kimi-linear (unset lower_bound): A * softplus(g_raw)
+            const double sp = std::log1p(std::exp(gr));
+            wrong_softplus[(size_t)h * D + d] = Ah * sp;
+        }
+    }
+    assert_variant_differs(ref, wrong_softplus, "vs softplus (kimi-linear form)");
+
+    float *dg = to_dev(g_raw), *dA = to_dev(A), *dout = nullptr;
+    CU(cudaMalloc(&dout, (size_t)D * H * sizeof(float)));
+    kda_decay_gate_f32(dout, dg, dA, D, H, lb, 0);
+    CU(cudaDeviceSynchronize());
+    CU(cudaGetLastError());
+    close_enough(from_dev(dout, (size_t)D * H), ref, "kda decay gate vs float64 ref");
+    CU(cudaFree(dg)); CU(cudaFree(dA)); CU(cudaFree(dout));
+}
+
+// ---------------------------------------------------------------------------
+// 8. L2-norm heads (+ optional scale)
+// ---------------------------------------------------------------------------
+
+static void test_l2_norm_heads() {
+    std::printf("L2-norm heads (scale=1 and scale=1/sqrt(D) for KDA Q)\n");
+    std::mt19937 rng(11);
+    const int D = 128, H = 24;
+    const float eps = 1e-6f;
+    auto x = rnd((size_t)D * H, rng, -3.f, 3.f);
+
+    auto make_ref = [&](double scale) {
+        std::vector<double> ref((size_t)D * H);
+        for (int h = 0; h < H; ++h) {
+            double ss = 0.0;
+            for (int d = 0; d < D; ++d) ss += (double)x[h * D + d] * x[h * D + d];
+            const double inv = scale / std::sqrt(ss + eps);
+            for (int d = 0; d < D; ++d) ref[(size_t)h * D + d] = (double)x[h * D + d] * inv;
+        }
+        return ref;
+    };
+
+    float *dx = to_dev(x), *dout = nullptr;
+    CU(cudaMalloc(&dout, (size_t)D * H * sizeof(float)));
+
+    l2_norm_heads_f32(dout, dx, D, H, 1.0f, eps, 0);
+    CU(cudaDeviceSynchronize());
+    CU(cudaGetLastError());
+    close_enough(from_dev(dout, (size_t)D * H), make_ref(1.0), "l2_norm scale=1");
+
+    const float qscale = 1.0f / std::sqrt((float)D);
+    l2_norm_heads_f32(dout, dx, D, H, qscale, eps, 0);
+    CU(cudaDeviceSynchronize());
+    close_enough(from_dev(dout, (size_t)D * H), make_ref(qscale), "l2_norm scale=1/sqrt(D)");
+
+    CU(cudaFree(dx)); CU(cudaFree(dout));
+}
+
+// ---------------------------------------------------------------------------
+// 9. MLA absorb Q
+// ---------------------------------------------------------------------------
+
+static void test_mla_absorb_q() {
+    std::printf("MLA absorb Q (wk_b @ q_nope, concat q_pe)\n");
+    std::mt19937 rng(42);
+    // K3 dims, fewer heads for the micro-test.
+    const int qk_nope = 128, kv_lora = 512, rope = 64, H = 8;
+    const int key_length = kv_lora + rope;   // 576
+    auto q_nope = rnd((size_t)qk_nope * H, rng);
+    auto q_pe = rnd((size_t)rope * H, rng);
+    auto wk_b = rnd((size_t)qk_nope * kv_lora * H, rng, -0.1f, 0.1f);
+
+    std::vector<double> ref((size_t)key_length * H, 0.0);
+    for (int h = 0; h < H; ++h) {
+        for (int r = 0; r < kv_lora; ++r) {
+            double acc = 0.0;
+            for (int d = 0; d < qk_nope; ++d) {
+                const size_t wi = (size_t)h * qk_nope * kv_lora + (size_t)r * qk_nope + d;
+                acc += (double)wk_b[wi] * (double)q_nope[(size_t)h * qk_nope + d];
+            }
+            ref[(size_t)h * key_length + r] = acc;
+        }
+        for (int d = 0; d < rope; ++d)
+            ref[(size_t)h * key_length + kv_lora + d] = q_pe[(size_t)h * rope + d];
+    }
+
+    float *dn = to_dev(q_nope), *dp = to_dev(q_pe), *dw = to_dev(wk_b), *dout = nullptr;
+    CU(cudaMalloc(&dout, (size_t)key_length * H * sizeof(float)));
+    mla_absorb_q_f32(dout, dn, dp, dw, qk_nope, kv_lora, rope, H, 0);
+    CU(cudaDeviceSynchronize());
+    CU(cudaGetLastError());
+    close_enough(from_dev(dout, (size_t)key_length * H), ref, "mla absorb Q vs float64 ref");
+    CU(cudaFree(dn)); CU(cudaFree(dp)); CU(cudaFree(dw)); CU(cudaFree(dout));
+}
+
+// ---------------------------------------------------------------------------
+// 10. MLA NoPE decode attention
+// ---------------------------------------------------------------------------
+
+static void test_mla_decode_attn() {
+    std::printf("MLA NoPE decode attn (MQA K-cache + wv_b; scale=1/sqrt(192))\n");
+    std::mt19937 rng(77);
+    const int kv_lora = 64;     // shrunk from 512 so the float64 ref stays cheap
+    const int rope = 16;        // shrunk from 64; ratio preserved
+    const int v_dim = 32;       // shrunk from 128
+    const int key_length = kv_lora + rope;
+    const int H = 4;
+    const int n_ctx = 48;
+    // Correct K3 scale uses n_embd_head_k_mla = qk_nope+rope, NOT key_length.
+    const int qk_nope = 32;     // stand-in for 128
+    const float scale = 1.0f / std::sqrt((float)(qk_nope + rope));
+    const float wrong_scale = 1.0f / std::sqrt((float)key_length);
+
+    auto q = rnd((size_t)key_length * H, rng);
+    auto k_cache = rnd((size_t)key_length * n_ctx, rng);
+    auto wv_b = rnd((size_t)kv_lora * v_dim * H, rng, -0.2f, 0.2f);
+
+    auto run_ref = [&](double sc) {
+        std::vector<double> out((size_t)v_dim * H, 0.0);
+        for (int h = 0; h < H; ++h) {
+            std::vector<double> scores(n_ctx);
+            double mx = -1e300;
+            for (int t = 0; t < n_ctx; ++t) {
+                double s = 0.0;
+                for (int d = 0; d < key_length; ++d)
+                    s += (double)q[(size_t)h * key_length + d] *
+                         (double)k_cache[(size_t)t * key_length + d];
+                scores[t] = s * sc;
+                mx = std::max(mx, scores[t]);
+            }
+            double sum = 0.0;
+            for (int t = 0; t < n_ctx; ++t) {
+                scores[t] = std::exp(scores[t] - mx);
+                sum += scores[t];
+            }
+            for (int t = 0; t < n_ctx; ++t) scores[t] /= sum;
+
+            std::vector<double> latent(kv_lora, 0.0);
+            for (int r = 0; r < kv_lora; ++r)
+                for (int t = 0; t < n_ctx; ++t)
+                    latent[r] += scores[t] * (double)k_cache[(size_t)t * key_length + r];
+
+            for (int v = 0; v < v_dim; ++v) {
+                double acc = 0.0;
+                for (int r = 0; r < kv_lora; ++r) {
+                    const size_t wi = (size_t)h * kv_lora * v_dim + (size_t)v * kv_lora + r;
+                    acc += (double)wv_b[wi] * latent[r];
+                }
+                out[(size_t)h * v_dim + v] = acc;
+            }
+        }
+        return out;
+    };
+
+    auto ref = run_ref(scale);
+    auto wrong = run_ref(wrong_scale);
+    assert_variant_differs(ref, wrong, "vs scale=1/sqrt(key_length=80)");
+
+    float *dq = to_dev(q), *dk = to_dev(k_cache), *dw = to_dev(wv_b), *dout = nullptr;
+    CU(cudaMalloc(&dout, (size_t)v_dim * H * sizeof(float)));
+    mla_decode_attn_f32(dout, dq, dk, dw, key_length, kv_lora, v_dim, H, n_ctx, scale, 0);
+    CU(cudaDeviceSynchronize());
+    CU(cudaGetLastError());
+    close_enough(from_dev(dout, (size_t)v_dim * H), ref, "mla decode attn vs float64 ref");
+
+    CU(cudaFree(dq)); CU(cudaFree(dk)); CU(cudaFree(dw)); CU(cudaFree(dout));
+}
+
+// ---------------------------------------------------------------------------
 
 int main() {
     int n = 0;
@@ -478,6 +663,10 @@ int main() {
     test_attn_res_mix();       std::printf("\n");
     test_kda_conv_step();      std::printf("\n");
     test_mla_gate_out();       std::printf("\n");
+    test_kda_decay_gate();     std::printf("\n");
+    test_l2_norm_heads();      std::printf("\n");
+    test_mla_absorb_q();       std::printf("\n");
+    test_mla_decode_attn();    std::printf("\n");
 
     std::printf("%d cases, %d failure(s)\n", g_case, g_fail);
     return g_fail == 0 ? 0 : 1;

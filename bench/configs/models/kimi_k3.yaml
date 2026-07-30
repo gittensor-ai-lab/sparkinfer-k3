@@ -181,7 +181,7 @@ baseline_requirements:
 
 runtime:
   sparkinfer_native_decode: false
-  # Nothing in runtime/ loads a kimi-k3 GGUF yet: the loaders are Qwen-shaped
+  # Nothing in runtime/ loads a kimi-k3 GGUF yet for decode: the loaders are Qwen-shaped
   # (runtime/src/models/qwen35.cpp, runtime/include/sparkinfer/models/qwen_config.h).
   # This branch lands the measurable llama.cpp reference FIRST so any native work has
   # a same-box number to beat.
@@ -189,6 +189,10 @@ runtime:
   # on an H200 (kernels/tests/kimi_k3_numeric_test.cu, rel-L2 < 3e-7). Semantics
   # transcribed from unslothai/llama.cpp @ efc8bc38, not inferred. These are
   # correctness-first f32 reference kernels; quantised/bf16/fused variants come after.
+  # DONE — GGUF metadata parse: runtime/include/sparkinfer/models/kimi_k3_gguf_config.h
+  # reads required keys (situ betas, attn_res.block_size, expert_latent_length) and the
+  # per-layer head_count_kv int array (GGUF now captures integer arrays). Validated on
+  # the real UD-Q2_K_XL shard-00001 (93 / 69 KDA / 24 MLA). Weight upload + decode next.
   implemented_kernels:
     - situ_activation                  # beta*tanh(g/beta)*sigmoid(g) * lb*tanh(u/lb)
     - kda_decode_step                  # gated delta rule, PER-CHANNEL decay
@@ -197,9 +201,13 @@ runtime:
     - mla_output_gate                  # sigmoid before o_proj
     - kda_conv_step                    # depthwise causal conv, d_conv 4, silu AFTER
 
+  implemented_runtime:
+    - kimi_k3_gguf_config              # arch gate + required keys + layer_is_kda map
+
   required_work:
-    - kimi_k3_gguf_loader              # 93 layers, per-layer KDA/MLA layout, 896 experts
+    - kimi_k3_gguf_loader              # multi-shard tensor open, 93-layer weight upload
     - latent_moe_expert_dispatch       # routed experts at 3584, not 7168
     - mla_nope_attention               # the attention itself; only its output gate exists
     - coalesced_kda_state_access       # current state walk is stride-head_dim
     - multi_gpu_weight_sharding        # 802 GiB does not fit one card at any quant
+    - kda_layer_micro_path             # wire one KDA layer through si_k3 kernels

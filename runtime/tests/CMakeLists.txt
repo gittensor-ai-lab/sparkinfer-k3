@@ -35,6 +35,20 @@ add_executable(qwen36_config_cpu_test qwen36_config_cpu_test.cpp ../src/gguf.cpp
 set_target_properties(qwen36_config_cpu_test PROPERTIES CXX_STANDARD 17)
 add_test(NAME qwen36_config_cpu_test COMMAND qwen36_config_cpu_test)
 
+# Kimi K3 GGUF metadata parse — same shape as qwen36_config_cpu_test, but also
+# exercises GGUF integer-array capture (per-layer head_count_kv) and the
+# required-key refusal that stops silent situ/attn_res/latent defaults.
+add_executable(kimi_k3_config_cpu_test kimi_k3_config_cpu_test.cpp ../src/gguf.cpp)
+set_target_properties(kimi_k3_config_cpu_test PROPERTIES CXX_STANDARD 17)
+target_include_directories(kimi_k3_config_cpu_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
+add_test(NAME kimi_k3_config_cpu_test COMMAND kimi_k3_config_cpu_test)
+
+# Multi-shard GGUF merge + K3 tensor-manifest validation (no GPU / no real weights).
+add_executable(kimi_k3_manifest_cpu_test kimi_k3_manifest_cpu_test.cpp ../src/gguf.cpp)
+set_target_properties(kimi_k3_manifest_cpu_test PROPERTIES CXX_STANDARD 17)
+target_include_directories(kimi_k3_manifest_cpu_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
+add_test(NAME kimi_k3_manifest_cpu_test COMMAND kimi_k3_manifest_cpu_test)
+
 # Thermal governor — pure tiering policy (no GPU); links the runtime for classify()/pace() symbols.
 add_executable(thermal_governor_cpu_test thermal_governor_cpu_test.cpp)
 target_link_libraries(thermal_governor_cpu_test PRIVATE sparkinfer_runtime)
