@@ -51,7 +51,6 @@ int main(int argc, char** argv) {
 
     llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = 0;         // CPU + mmap: page the 594 GB from disk, no VRAM need
-    mp.use_mmap = true;
     llama_model* model = llama_model_load_from_file(model_path.c_str(), mp);
     if (!model) { std::fprintf(stderr, "failed to load model\n"); return 1; }
 
@@ -73,7 +72,6 @@ int main(int argc, char** argv) {
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx = (uint32_t)(n + n_predict + 16);
     cp.n_batch = (uint32_t)(n + 16);
-    cp.logits_all = false;      // we want the LAST token's logits per decode
     llama_context* ctx = llama_init_from_model(model, cp);
     if (!ctx) { std::fprintf(stderr, "failed to create context\n"); return 1; }
 

@@ -14,6 +14,14 @@ WITHOUT re-running the (slow, disk-mmap) full-model llama.cpp pass each time:
     <name>.txt         prompt text + argmax next token, human-readable
     <name>.stepK.spkl  per-step logits when captured with n_predict > 0
 
+## Captured references
+
+    hello.*   prompt "Hello, world!" -> 4 tokens (ids 19180 11 2695 0), full 93-layer
+              UD-IQ1_S via llama.cpp (kimi-k3-fullsize-vision @ efc8bc38). llama.cpp's
+              argmax next token is 1379 (' This'), logit 13.8495. hello.step0/1.spkl
+              are the next two greedy steps. This is the ground truth sparkinfer must
+              reproduce on the same ids when a multi-GPU node can run the full model.
+
 ## Regenerating
 
 Needs the K3-supporting llama.cpp (branch kimi-k3-fullsize-vision @ efc8bc38) built,

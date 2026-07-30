@@ -1,0 +1,4 @@
+model: /workspace/models_k3/UD-IQ1_S/Kimi-K3-UD-IQ1_S-00001-of-00014.gguf
+prompt: Hello, world!
+tokens: 4  vocab: 163840
+argmax next-token id: 1379  logit: 13.849484  piece: ' This'
