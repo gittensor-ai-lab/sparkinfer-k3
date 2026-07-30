@@ -84,6 +84,57 @@ const std::unordered_map<std::string, Rule>& table() {
         {"ssm_alpha.weight",        Rule::Replicate},
         {"ssm_out.weight",          Rule::Replicate},
 
+        // --- Kimi K3 additions -------------------------------------------------
+        // Enumerated from the REAL UD-Q2_K_XL tensor table (2573 tensors), not from
+        // the reference source, so nothing here is a guess about what ships.
+
+        // MLA (24 layers). q_a/q_b is the LoRA-factored query: q_a is a down-proj
+        // to q_lora_rank 1536 and must stay whole (its output is not a head axis),
+        // while q_b produces n_head*key_length_mla and row-shards by head.
+        {"attn_q_a.weight",         Rule::Replicate},
+        {"attn_q_a_norm.weight",    Rule::Replicate},
+        {"attn_q_b.weight",         Rule::RowShard},
+        // kv_a_mqa produces the SHARED compressed kv (kv_lora + rope) that every
+        // head reads — it is the MQA latent, so sharding it would split the one
+        // thing all heads need. Replicated, like the kv side generally.
+        {"attn_kv_a_mqa.weight",    Rule::Replicate},
+        {"attn_kv_a_norm.weight",   Rule::Replicate},
+        // k_b/v_b decompress the latent per head: [.., .., n_head] with the head
+        // axis LAST, so they shard on the head axis, not on a matrix dim.
+        {"attn_k_b.weight",         Rule::ExpertShard},   // head-axis band
+        {"attn_v_b.weight",         Rule::ExpertShard},   // head-axis band
+        // K3's sigmoid output gate: same shape as the attn output, so same rule.
+        {"attn_gate.weight",        Rule::RowShard},
+
+        // Cross-layer residual scoring vectors: [hidden], elementwise against the
+        // residual stream, and every rank scores the same stream. Replicated.
+        {"attn_res_score.weight",   Rule::Replicate},
+        {"ffn_res_score.weight",    Rule::Replicate},
+        {"output_res_score.weight", Rule::Replicate},
+
+        // Latent MoE. routed_down/up bracket the expert block (7168<->3584). The
+        // router scores the FULL-WIDTH input while the experts consume the latent
+        // one, so routed_down consumes hidden (col-shard would need a reduce we do
+        // not have there) and routed_up produces hidden from the latent.
+        {"ffn_routed_down.weight",  Rule::Replicate},
+        {"ffn_routed_norm.weight",  Rule::Replicate},
+        {"ffn_routed_up.weight",    Rule::Replicate},
+        // noaux_tc router bias, one scalar per expert.
+        {"exp_probs_b.bias",        Rule::Replicate},
+
+        // KDA (69 layers). q/k/v projections produce head-major activations and
+        // row-shard; the recurrent-state machinery is per-head and small, and the
+        // conv/state partitioning is not designed yet, so it replicates.
+        {"ssm_a",                   Rule::Replicate},
+        {"ssm_dt.bias",             Rule::Replicate},
+        {"ssm_beta.weight",         Rule::Replicate},
+        {"ssm_f_a.weight",          Rule::Replicate},
+        {"ssm_f_b.weight",          Rule::Replicate},
+        {"ssm_g.weight",            Rule::RowShard},
+        {"ssm_conv1d_q.weight",     Rule::Replicate},
+        {"ssm_conv1d_k.weight",     Rule::Replicate},
+        {"ssm_conv1d_v.weight",     Rule::Replicate},
+
         // --- model level ---
         // token_embd is a gather, not a matmul: every rank needs any row.
         {"token_embd.weight",       Rule::Replicate},

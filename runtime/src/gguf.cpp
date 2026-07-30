@@ -44,21 +44,62 @@ struct Cursor {
 };
 
 // block (bytes, elements) per ggml type for n_bytes computation.
-// Unknown types return elems=0 so the caller can skip a strict end-bound check
-// while still recording the tensor name (needed for split manifests).
+//
+// COMPLETENESS MATTERS MORE THAN IT LOOKS. A missing entry does not fail — it
+// silently yields n_bytes = 0, which reads as "an empty tensor" rather than "a
+// tensor I cannot size". On the real Kimi K3 UD-Q2_K_XL that cost 745 GiB: the
+// three ffn_*_exps tensors are IQ2_XS (type 17), which was absent, so the whole
+// 802 GiB model measured as 57.9 GiB and every expert appeared to be zero bytes.
+// Nothing can shard, offset, or upload a tensor whose size is zero, so this
+// blocked the multi-GPU path outright while looking like a successful parse.
+//
+// An unsloth "dynamic" quant deliberately MIXES types per tensor — attention in
+// Q8_0, experts in an IQ2 variant, norms in F32 — so a table covering only the
+// common K-quants is not enough. The IQ family below is what UD quants actually
+// reach for. Sizes are ggml's block layouts (ggml/src/ggml.c type_traits).
 void block_info(int t, long& bytes, long& elems) {
     switch (t) {
         case 0:  bytes=4;   elems=1;   break;   // F32
         case 1:  bytes=2;   elems=1;   break;   // F16
+        case 2:  bytes=18;  elems=32;  break;   // Q4_0
+        case 3:  bytes=20;  elems=32;  break;   // Q4_1
+        case 6:  bytes=22;  elems=32;  break;   // Q5_0
+        case 7:  bytes=24;  elems=32;  break;   // Q5_1
         case 8:  bytes=34;  elems=32;  break;   // Q8_0
+        case 9:  bytes=36;  elems=32;  break;   // Q8_1
         case 10: bytes=84;  elems=256; break;   // Q2_K
+        case 11: bytes=110; elems=256; break;   // Q3_K
         case 12: bytes=144; elems=256; break;   // Q4_K
         case 13: bytes=176; elems=256; break;   // Q5_K
         case 14: bytes=210; elems=256; break;   // Q6_K
+        case 15: bytes=292; elems=256; break;   // Q8_K
+        case 16: bytes=66;  elems=256; break;   // IQ2_XXS
+        case 17: bytes=74;  elems=256; break;   // IQ2_XS   <- K3 experts
+        case 18: bytes=98;  elems=256; break;   // IQ3_XXS
+        case 19: bytes=50;  elems=256; break;   // IQ1_S
+        case 20: bytes=18;  elems=32;  break;   // IQ4_NL
+        case 21: bytes=110; elems=256; break;   // IQ3_S
+        case 22: bytes=82;  elems=256; break;   // IQ2_S
+        case 23: bytes=136; elems=256; break;   // IQ4_XS
+        case 24: bytes=1;   elems=1;   break;   // I8
+        case 25: bytes=2;   elems=1;   break;   // I16
+        case 26: bytes=4;   elems=1;   break;   // I32
+        case 27: bytes=8;   elems=1;   break;   // I64
+        case 28: bytes=8;   elems=1;   break;   // F64
+        case 29: bytes=56;  elems=256; break;   // IQ1_M
         case 30: bytes=2;   elems=1;   break;   // BF16
         case 39: bytes=17;  elems=32;  break;   // MXFP4
         default: bytes=0;   elems=0;   break;
     }
+}
+
+// True when block_info() knows the type. Callers that need a real size (upload,
+// sharding, offset arithmetic) must check this and refuse rather than treat an
+// unknown type as a zero-byte tensor — see the comment above.
+bool block_known(int t) {
+    long b = 0, e = 0;
+    block_info(t, b, e);
+    return e != 0;
 }
 } // namespace
 
@@ -282,6 +323,19 @@ bool GGUF::parse_mapped(MappedFile& mf, bool capture_meta, int shard_idx) {
         in.t.shard = shard_idx;
         long bb, be; block_info(in.t.ggml_type, bb, be);
         in.t.n_bytes = be ? (nv / be) * bb : 0;
+        // An unknown type silently sizes to 0, which downstream reads as "empty
+        // tensor" rather than "cannot size this". That is how 745 GiB of IQ2_XS
+        // experts once measured as zero. Say it loudly, once per type.
+        if (!be) {
+            static std::vector<int> warned;
+            if (std::find(warned.begin(), warned.end(), in.t.ggml_type) == warned.end()) {
+                warned.push_back(in.t.ggml_type);
+                fprintf(stderr, "[gguf] WARNING: unknown ggml_type %d (first seen on '%s') — "
+                                "n_bytes=0 for every tensor of this type. Add it to block_info() "
+                                "before sharding or uploading.\n",
+                        in.t.ggml_type, in.name.c_str());
+            }
+        }
         infos.push_back(std::move(in));
     }
     if (!c.ok) { fprintf(stderr, "[gguf] tensor table parse error (shard %d)\n", shard_idx); return false; }
