@@ -302,6 +302,80 @@ __global__ void dequant_iq2_xs_kernel(float* __restrict__ out,
 }
 
 // ---------------------------------------------------------------------------
+// 12. noaux_tc MoE router
+// ---------------------------------------------------------------------------
+// One block per token. K3 picks 16 of 896, so 16 passes of a block-wide argmax is
+// ~14k comparisons — trivial next to the expert FFNs that follow, and it matches
+// argsort's tie-breaking exactly (lowest index wins) without needing a sort.
+
+template <int BLOCK>
+__global__ void moe_router_noaux_tc_kernel(float* __restrict__ out_w,
+                                           int* __restrict__ out_ids,
+                                           const float* __restrict__ logits,
+                                           const float* __restrict__ bias,
+                                           int n_expert, int top_k,
+                                           bool norm_w, float w_scale) {
+    const int tok = blockIdx.x;
+    const float* lg = logits + (size_t)tok * n_expert;
+    float* w   = out_w   + (size_t)tok * top_k;
+    int*   ids = out_ids + (size_t)tok * top_k;
+
+    extern __shared__ float smem_r[];
+    float* s_sel = smem_r;                 // biased scores, mutated during selection
+    float* s_p   = s_sel + n_expert;       // UNBIASED probs, never mutated
+    __shared__ float s_bestv[BLOCK / 32];
+    __shared__ int   s_besti[BLOCK / 32];
+
+    for (int e = threadIdx.x; e < n_expert; e += BLOCK) {
+        const float p = 1.0f / (1.0f + __expf(-lg[e]));   // sigmoid
+        s_p[e]   = p;
+        s_sel[e] = bias ? (p + bias[e]) : p;              // bias: selection only
+    }
+    __syncthreads();
+
+    for (int k = 0; k < top_k; ++k) {
+        // block-wide argmax over the remaining biased scores
+        float bv = -INFINITY; int bi = -1;
+        for (int e = threadIdx.x; e < n_expert; e += BLOCK) {
+            const float v = s_sel[e];
+            if (v > bv || (v == bv && e < bi)) { bv = v; bi = e; }
+        }
+        for (int off = 16; off > 0; off >>= 1) {
+            const float ov = __shfl_down_sync(0xffffffff, bv, off);
+            const int   oi = __shfl_down_sync(0xffffffff, bi, off);
+            if (ov > bv || (ov == bv && oi >= 0 && oi < bi)) { bv = ov; bi = oi; }
+        }
+        const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+        if (lane == 0) { s_bestv[warp] = bv; s_besti[warp] = bi; }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float mv = s_bestv[0]; int mi = s_besti[0];
+            for (int wv = 1; wv < BLOCK / 32; ++wv) {
+                if (s_bestv[wv] > mv || (s_bestv[wv] == mv && s_besti[wv] < mi)) {
+                    mv = s_bestv[wv]; mi = s_besti[wv];
+                }
+            }
+            ids[k] = mi;
+            w[k]   = s_p[mi];        // UNBIASED prob — the whole point
+            s_sel[mi] = -INFINITY;   // remove from further rounds
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        if (norm_w) {
+            float sum = 0.0f;
+            for (int k = 0; k < top_k; ++k) sum += w[k];
+            // smallest normal F16, per the reference — not an arbitrary epsilon
+            sum = fmaxf(sum, 6.103515625e-5f);
+            for (int k = 0; k < top_k; ++k) w[k] /= sum;
+        }
+        if (w_scale != 0.0f && w_scale != 1.0f)
+            for (int k = 0; k < top_k; ++k) w[k] *= w_scale;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 5. MLA output gate
 // ---------------------------------------------------------------------------
 
@@ -561,6 +635,18 @@ void dequant_iq2_xs_f32(float* out, const void* src, int64_t n, cudaStream_t str
     const int64_t blocks = (n_groups + T - 1) / T;
     dequant_iq2_xs_kernel<<<(unsigned)blocks, T, 0, stream>>>(
         out, (const BlockIQ2XS*)src, n_groups);
+}
+
+void moe_router_noaux_tc_f32(float* out_w, int* out_ids, const float* logits,
+                             const float* bias, int n_expert, int top_k,
+                             int n_tokens, bool norm_w, float w_scale,
+                             cudaStream_t stream) {
+    if (n_expert <= 0 || top_k <= 0 || n_tokens <= 0) return;
+    if (top_k > n_expert) return;
+    const int T = 256;
+    const size_t shm = (size_t)2 * n_expert * sizeof(float);
+    moe_router_noaux_tc_kernel<256><<<(unsigned)n_tokens, T, shm, stream>>>(
+        out_w, out_ids, logits, bias, n_expert, top_k, norm_w, w_scale);
 }
 
 void mla_gate_out_f32(float* out, const float* attn_out, const float* gate_proj,

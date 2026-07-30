@@ -646,6 +646,106 @@ static void test_mla_decode_attn() {
 }
 
 // ---------------------------------------------------------------------------
+// 12. noaux_tc MoE router
+// ---------------------------------------------------------------------------
+
+static void test_moe_router_noaux_tc() {
+    std::printf("noaux_tc router (sigmoid + bias for SELECTION only, then renormalise)\n");
+    std::mt19937 rng(20260730);
+    const int E = 896, K = 16, TOK = 8;          // K3's real routing shape
+    auto logits = rnd((size_t)E * TOK, rng, -6.f, 6.f);
+    auto bias = rnd((size_t)E, rng, -0.35f, 0.35f);
+
+    // --- float64 reference, straight from build_moe_ffn's semantics ---
+    std::vector<double> ref_w((size_t)K * TOK);
+    std::vector<int> ref_id((size_t)K * TOK);
+    std::vector<double> wrong_biased_w((size_t)K * TOK);   // weights from BIASED probs
+    std::vector<int> wrong_unbiased_sel((size_t)K * TOK);  // select on UNBIASED probs
+
+    for (int t0 = 0; t0 < TOK; ++t0) {
+        std::vector<double> p(E), sel(E);
+        for (int e = 0; e < E; ++e) {
+            p[e] = 1.0 / (1.0 + std::exp(-(double)logits[(size_t)t0 * E + e]));
+            sel[e] = p[e] + (double)bias[e];
+        }
+        auto topk = [&](const std::vector<double>& score) {
+            std::vector<double> s = score;
+            std::vector<int> out;
+            for (int k = 0; k < K; ++k) {
+                int bi = -1; double bv = -1e300;
+                for (int e = 0; e < E; ++e)
+                    if (s[e] > bv) { bv = s[e]; bi = e; }   // lower index wins ties
+                out.push_back(bi);
+                s[bi] = -1e300;
+            }
+            return out;
+        };
+        // reference: select on biased, weight from UNBIASED, then renormalise
+        std::vector<int> sel_ids = topk(sel);
+        double sum = 0.0;
+        for (int k = 0; k < K; ++k) { ref_id[(size_t)t0*K+k] = sel_ids[k];
+                                      ref_w[(size_t)t0*K+k] = p[sel_ids[k]]; sum += p[sel_ids[k]]; }
+        sum = std::max(sum, 6.103515625e-5);
+        for (int k = 0; k < K; ++k) ref_w[(size_t)t0*K+k] /= sum;
+
+        // wrong variant A: weights taken from the BIASED probs (the natural bug)
+        double s2 = 0.0;
+        for (int k = 0; k < K; ++k) { wrong_biased_w[(size_t)t0*K+k] = sel[sel_ids[k]]; s2 += sel[sel_ids[k]]; }
+        s2 = std::max(s2, 6.103515625e-5);
+        for (int k = 0; k < K; ++k) wrong_biased_w[(size_t)t0*K+k] /= s2;
+
+        // wrong variant B: select on unbiased probs (bias ignored entirely)
+        std::vector<int> u = topk(p);
+        for (int k = 0; k < K; ++k) wrong_unbiased_sel[(size_t)t0*K+k] = u[k];
+    }
+    assert_variant_differs(ref_w, wrong_biased_w, "vs weights from BIASED probs");
+    {   // selection must actually differ when the bias is applied, or the test is vacuous
+        ++g_case;
+        int diff = 0;
+        for (size_t i = 0; i < ref_id.size(); ++i) if (ref_id[i] != wrong_unbiased_sel[i]) ++diff;
+        const bool ok = diff > 0;
+        std::printf("  %-34s %d/%zu ids differ  %s\n", "bias changes the SELECTION",
+                    diff, ref_id.size(), ok ? "OK" : "FAIL (bias had no effect)");
+        if (!ok) ++g_fail;
+    }
+
+    float *dl = to_dev(logits), *db = to_dev(bias), *dw = nullptr; int* di = nullptr;
+    CU(cudaMalloc(&dw, (size_t)K * TOK * sizeof(float)));
+    CU(cudaMalloc(&di, (size_t)K * TOK * sizeof(int)));
+    moe_router_noaux_tc_f32(dw, di, dl, db, E, K, TOK, /*norm_w=*/true, /*w_scale=*/1.0f, 0);
+    CU(cudaDeviceSynchronize());
+    CU(cudaGetLastError());
+
+    close_enough(from_dev(dw, (size_t)K * TOK), ref_w, "router weights vs float64 ref");
+
+    std::vector<int> got_id((size_t)K * TOK);
+    CU(cudaMemcpy(got_id.data(), di, got_id.size() * sizeof(int), cudaMemcpyDeviceToHost));
+    ++g_case;
+    int bad = 0;
+    for (size_t i = 0; i < got_id.size(); ++i) if (got_id[i] != ref_id[i]) ++bad;
+    std::printf("  %-34s %d/%zu wrong  %s\n", "selected expert ids", bad, got_id.size(),
+                bad ? "FAIL" : "OK");
+    if (bad) { ++g_fail;
+        for (size_t i = 0; i < got_id.size() && i < 6; ++i)
+            std::printf("        [%zu] got %d want %d\n", i, got_id[i], ref_id[i]);
+    }
+
+    // weights must sum to 1 per token after renormalisation
+    auto gw = from_dev(dw, (size_t)K * TOK);
+    ++g_case;
+    double worst = 0;
+    for (int t0 = 0; t0 < TOK; ++t0) {
+        double s = 0; for (int k = 0; k < K; ++k) s += gw[(size_t)t0*K+k];
+        worst = std::fmax(worst, std::fabs(s - 1.0));
+    }
+    std::printf("  %-34s max |sum-1| = %.3e  %s\n", "renormalised to 1 per token", worst,
+                worst < 1e-5 ? "OK" : "FAIL");
+    if (worst >= 1e-5) ++g_fail;
+
+    CU(cudaFree(dl)); CU(cudaFree(db)); CU(cudaFree(dw)); CU(cudaFree(di));
+}
+
+// ---------------------------------------------------------------------------
 
 int main() {
     int n = 0;
@@ -667,6 +767,7 @@ int main() {
     test_l2_norm_heads();      std::printf("\n");
     test_mla_absorb_q();       std::printf("\n");
     test_mla_decode_attn();    std::printf("\n");
+    test_moe_router_noaux_tc(); std::printf("\n");
 
     std::printf("%d cases, %d failure(s)\n", g_case, g_fail);
     return g_fail == 0 ? 0 : 1;

@@ -170,6 +170,40 @@ void kda_conv_step_f32(float* out, float* state, const float* x, const float* w,
 void dequant_iq2_xs_f32(float* out, const void* src, int64_t n, cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
+// 12. noaux_tc MoE router (sigmoid + expert bias + top-k + renormalise)
+// ---------------------------------------------------------------------------
+// Reference: llm_graph_context::build_moe_ffn() in src/llama-graph.cpp, with
+// K3's settings: gating_op = SIGMOID, exp_probs_b present, norm_w = true,
+// w_scale = routed_scaling_factor = 1.0, n_expert_groups = 1 (so the DeepSeek
+// group-masking path is skipped entirely).
+//
+//   probs           = sigmoid(logits)                 [n_expert]
+//   selection_probs = probs + exp_probs_b             bias, for SELECTION ONLY
+//   selected        = top_k(selection_probs)          [top_k] expert ids
+//   weights         = probs[selected]                 <- UNBIASED probs
+//   weights        /= clamp(sum(weights), 6.103515625e-5, INF)
+//   weights        *= w_scale   (skipped when 1.0)
+//
+// THE TRAP, and the reference calls it out in a comment: the bias steers WHICH
+// experts are chosen but must NOT appear in the weights they are combined with.
+// Using selection_probs for both is the obvious implementation and it is wrong —
+// every expert's contribution is then scaled by its routing bias, which shifts the
+// output smoothly rather than breaking it. Fluent, plausible, wrong.
+//
+// The clamp constant is the smallest normal F16 (6.103515625e-5), not an epsilon
+// someone picked; it is there so a token that routes to 16 near-zero experts does
+// not divide by ~0.
+//
+// Ties break toward the lower expert index, matching a stable descending sort.
+//
+// logits/probs are [n_expert] per token; out_w and out_ids are [top_k] per token.
+// bias may be null. n_tokens tokens are processed independently.
+void moe_router_noaux_tc_f32(float* out_w, int* out_ids, const float* logits,
+                             const float* bias, int n_expert, int top_k,
+                             int n_tokens, bool norm_w, float w_scale,
+                             cudaStream_t stream);
+
+// ---------------------------------------------------------------------------
 // 5. MLA output gate
 // ---------------------------------------------------------------------------
 // Reference: src/models/kimi-k3.cpp — "K3: sigmoid output gate applied to the
