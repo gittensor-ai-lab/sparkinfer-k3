@@ -385,6 +385,32 @@ struct Builder {
            blk(i, "ffn_down_exps.weight"));
         pin3(cfg.moe_ffn, cfg.expert_latent, cfg.n_experts);
 
+        // THE FFN COLLECTIVE LANDS HERE, AT LATENT WIDTH — NOT AFTER routed_up.
+        //
+        // The experts are ExpertShard (weight_plan.cpp): rank r runs only the
+        // n_experts/tp_size experts it owns, so what the dispatch leaves in the
+        // accumulator is a PARTIAL sum over the top_k — the other ranks hold the rest.
+        //
+        // routed_norm is an RMS NORM, and rms_norm is NOT LINEAR:
+        //     rms_norm(sum_r partial_r) != sum_r rms_norm(partial_r)
+        // so the cross-rank sum MUST complete before it runs. Deferring the reduce
+        // past the norm normalises a fraction of the activation on every rank and
+        // then sums eight differently-scaled vectors. Fluent, plausible, wrong —
+        // and invisible without a reference.
+        //
+        // An earlier version of this plan put the single FFN reduce after routed_up
+        // at hidden width. That was wrong TWICE over: it skipped the reduce the
+        // experts actually need, and by that point routed_norm/routed_up/shexp are
+        // all Replicate, so every rank already holds the identical full-width result
+        // — reducing it MULTIPLIES THE FFN OUTPUT BY tp_size. Exactly the failure this
+        // header warns about, and the reason the reduce count is asserted rather than
+        // eyeballed.
+        //
+        // After this reduce the accumulator is complete and identical on every rank,
+        // so routed_norm, routed_up and the shared experts run replicated and need no
+        // further collective. One reduce per FFN block, at expert_latent.
+        reduce(i, kda, "reduce_moe_latent", cfg.expert_latent);
+
         // routed_norm normalises the DISPATCH OUTPUT, not its input. Read directly
         // off the reference (src/models/kimi-k3.cpp build_latent_moe): build_moe_ffn
         // runs first on the UNNORMALISED routed_in, THEN
@@ -415,8 +441,9 @@ struct Builder {
             mm(i, kda, "shexp_down", blk(i, "ffn_down_shexp.weight"), n_ff_shexp, H);
         }
 
+        // Replicated (weight_plan.cpp): every rank computes the identical result from
+        // the already-reduced latent accumulator. No collective — see reduce_moe_latent.
         mm(i, kda, "routed_up", blk(i, "ffn_routed_up.weight"), cfg.expert_latent, H);
-        reduce(i, kda, "reduce_ffn", H);
     }
 
     void build(const K3PlanOptions& opt) {

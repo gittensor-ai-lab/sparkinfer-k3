@@ -10,6 +10,7 @@
 
 #include "sparkinfer/kernels/kimi_k3.h"
 #include "sparkinfer/kernels/iq2xs_tables.h"
+#include <climits>   // INT_MAX — the "no expert band" sentinel
 #include "sparkinfer/kernels/iq1s_tables.h"
 
 #include <cuda_runtime.h>
@@ -487,11 +488,26 @@ __global__ void moe_gate_up_situ_kernel(float* __restrict__ scratch,
                                         const Blk* __restrict__ up_exps,
                                         int latent, int ffn,
                                         float beta, float inv_beta,
-                                        float lb, float inv_lb, int lb_active) {
+                                        float lb, float inv_lb, int lb_active,
+                                        int expert_begin, int n_local_experts) {
     const int k = blockIdx.y;                 // which selected expert
     const int j = blockIdx.x;                 // which ffn output row
     if (j >= ffn) return;
-    const int e = ids[k];
+
+    // EXPERT PARALLELISM. `ids` holds GLOBAL expert indices — every rank's router
+    // sees the same replicated ffn_gate_inp and therefore selects the same top_k —
+    // but this rank stores only experts [expert_begin, expert_begin+n_local).
+    // Selections outside that band belong to another rank and contribute ZERO here;
+    // the all-reduce that follows sums the bands back into the full top_k combine.
+    //
+    // The zero-fill is not optional. scratch is reused across layers, so leaving a
+    // foreign expert's slot untouched would feed the PREVIOUS layer's activations
+    // into this layer's down-projection — for a slot whose weight is nonzero.
+    const int e = ids[k] - expert_begin;
+    if (e < 0 || e >= n_local_experts) {
+        if (threadIdx.x == 0) scratch[(size_t)k * ffn + j] = 0.0f;
+        return;
+    }
     const int blocks_per_row = latent / 256;
 
     const Blk* g_row = gate_exps + (size_t)(e * ffn + j) * blocks_per_row;
@@ -524,7 +540,8 @@ __global__ void moe_down_combine_kernel(float* __restrict__ out,
                                         const int* __restrict__ ids,
                                         const float* __restrict__ w,
                                         const Blk* __restrict__ down_exps,
-                                        int latent, int ffn, int top_k) {
+                                        int latent, int ffn, int top_k,
+                                        int expert_begin, int n_local_experts) {
     const int o = blockIdx.x;                 // output element in [0, latent)
     if (o >= latent) return;
     const int blocks_per_row = ffn / 256;
@@ -532,7 +549,12 @@ __global__ void moe_down_combine_kernel(float* __restrict__ out,
 
     float total = 0.0f;
     for (int k = 0; k < top_k; ++k) {
-        const int e = ids[k];
+        // Same band test as the gate/up pass. Skipping here is what keeps the read
+        // in bounds: down_exps holds n_local experts, so indexing it by a GLOBAL id
+        // would run off the end of the allocation for every rank but rank 0 — and
+        // read whatever the allocator put there rather than faulting.
+        const int e = ids[k] - expert_begin;
+        if (e < 0 || e >= n_local_experts) continue;
         const Blk* d_row = down_exps + (size_t)(e * latent + o) * blocks_per_row;
         const float* act = scratch + (size_t)k * ffn;
         float acc = 0.0f;
@@ -867,20 +889,48 @@ void kda_conv_step_f32(float* out, float* state, const float* x, const float* w,
 // Upload the lattice/sign tables once. __constant__ is the right home: every
 // thread in a warp reads the same grid entry for a given codepoint, so the
 // broadcast path is what we want rather than L1 thrash.
+// THE LATTICE TABLES ARE PER-DEVICE STATE, SO THE GUARD MUST BE TOO.
+//
+// c_iq2xs_grid / iq1s_grid_c live in __constant__ / __device__ memory, and
+// cudaMemcpyToSymbol writes THE CURRENT DEVICE'S copy. A single process-global
+// `static bool ready` therefore uploads the tables to whichever device happened to be
+// current on the first call and silently skips every other one.
+//
+// On one GPU that is invisible. On a multi-GPU run it is catastrophic and quiet:
+// ranks 1..N-1 decode IQ1_S / IQ2_XS against a table of ZEROS, so every routed expert
+// on those ranks returns ~0. The model still runs, the all-reduce still sums, and the
+// output is a mixture missing (N-1)/N of its experts — fluent, plausible, wrong.
+//
+// MEASURED, not theorised: at tp=2 this made rank 1's expert partial ~0 while rank 0's
+// was correct, so sum(bands) came to 14.32 against the single-GPU 35.97. It was
+// invisible to the band test, which simulates every rank on device 0.
+//
+// Indexed by device ordinal. 64 covers any single node; a device beyond that falls
+// through to uploading every call, which is slow but correct.
+constexpr int kMaxTableDevices = 64;
+
+static int current_device_index() {
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return -1;
+    return (dev >= 0 && dev < kMaxTableDevices) ? dev : -1;
+}
+
 static void ensure_iq2xs_tables() {
-    static bool ready = false;
-    if (ready) return;
+    static bool ready[kMaxTableDevices] = {false};
+    const int dev = current_device_index();
+    if (dev >= 0 && ready[dev]) return;
     cudaMemcpyToSymbol(c_iq2xs_grid,   h_iq2xs_grid,   sizeof(h_iq2xs_grid));
     cudaMemcpyToSymbol(c_ksigns_iq2xs, h_ksigns_iq2xs, sizeof(h_ksigns_iq2xs));
     cudaMemcpyToSymbol(c_kmask_iq2xs,  h_kmask_iq2xs,  sizeof(h_kmask_iq2xs));
-    ready = true;
+    if (dev >= 0) ready[dev] = true;
 }
 
 static void ensure_iq1s_tables() {
-    static bool ready = false;
-    if (ready) return;
+    static bool ready[kMaxTableDevices] = {false};
+    const int dev = current_device_index();
+    if (dev >= 0 && ready[dev]) return;
     cudaMemcpyToSymbol(iq1s_grid_c, iq1s_grid_host, sizeof(iq1s_grid_host));
-    ready = true;
+    if (dev >= 0) ready[dev] = true;
 }
 
 void dequant_iq2_xs_f32(float* out, const void* src, int64_t n, cudaStream_t stream) {
@@ -916,7 +966,8 @@ void moe_expert_ffn_iq2xs_f32(float* out, float* scratch,
                               const void* down_exps,
                               int latent, int ffn, int top_k,
                               float situ_beta, float situ_linear_beta,
-                              cudaStream_t stream) {
+                              cudaStream_t stream,
+                              int expert_begin, int n_local_experts) {
     if (latent <= 0 || ffn <= 0 || top_k <= 0) return;
     if (latent % 256 || ffn % 256) {
         fprintf(stderr, "[k3] moe_expert_ffn: latent=%d ffn=%d must be multiples of 256\n",
@@ -925,13 +976,18 @@ void moe_expert_ffn_iq2xs_f32(float* out, float* scratch,
     }
     ensure_iq2xs_tables();
     const int lb_active = situ_linear_beta > 0.0f ? 1 : 0;
+    // n_local <= 0 means "this rank holds every expert" — the tp_size 1 case, where
+    // the band test must never reject. INT_MAX makes it a no-op rather than a branch.
+    const int n_local = n_local_experts > 0 ? n_local_experts : INT_MAX;
     dim3 g1((unsigned)ffn, (unsigned)top_k);
     moe_gate_up_situ_kernel<128, BlockIQ2XS><<<g1, 128, 0, stream>>>(
         scratch, x, ids, (const BlockIQ2XS*)gate_exps, (const BlockIQ2XS*)up_exps,
         latent, ffn, situ_beta, 1.0f / situ_beta, situ_linear_beta,
-        lb_active ? 1.0f / situ_linear_beta : 1.0f, lb_active);
+        lb_active ? 1.0f / situ_linear_beta : 1.0f, lb_active,
+        expert_begin, n_local);
     moe_down_combine_kernel<128, BlockIQ2XS><<<(unsigned)latent, 128, 0, stream>>>(
-        out, scratch, ids, w, (const BlockIQ2XS*)down_exps, latent, ffn, top_k);
+        out, scratch, ids, w, (const BlockIQ2XS*)down_exps, latent, ffn, top_k,
+        expert_begin, n_local);
 }
 
 void dequant_iq1_s_f32(float* out, const void* src, int64_t n, cudaStream_t stream) {
@@ -949,16 +1005,20 @@ void moe_expert_ffn_iq1s_f32(float* out, float* scratch,
                              const void* down_exps,
                              int latent, int ffn, int top_k,
                              float situ_beta, float situ_linear_beta,
-                             cudaStream_t stream) {
+                             cudaStream_t stream,
+                             int expert_begin, int n_local_experts) {
     ensure_iq1s_tables();
     const int lb_active = situ_linear_beta > 0.0f ? 1 : 0;
+    const int n_local = n_local_experts > 0 ? n_local_experts : INT_MAX;
     dim3 g1((unsigned)ffn, (unsigned)top_k);
     moe_gate_up_situ_kernel<128, BlockIQ1S><<<g1, 128, 0, stream>>>(
         scratch, x, ids, (const BlockIQ1S*)gate_exps, (const BlockIQ1S*)up_exps,
         latent, ffn, situ_beta, 1.0f / situ_beta, situ_linear_beta,
-        lb_active ? 1.0f / situ_linear_beta : 1.0f, lb_active);
+        lb_active ? 1.0f / situ_linear_beta : 1.0f, lb_active,
+        expert_begin, n_local);
     moe_down_combine_kernel<128, BlockIQ1S><<<(unsigned)latent, 128, 0, stream>>>(
-        out, scratch, ids, w, (const BlockIQ1S*)down_exps, latent, ffn, top_k);
+        out, scratch, ids, w, (const BlockIQ1S*)down_exps, latent, ffn, top_k,
+        expert_begin, n_local);
 }
 
 // Type-dispatched front doors. An unsloth dynamic quant MIXES types per tensor, so
@@ -998,17 +1058,20 @@ bool moe_expert_ffn_f32_by_type(float* out, float* scratch,
                                 const void* down_exps,
                                 int latent, int ffn, int top_k,
                                 float situ_beta, float situ_linear_beta,
-                                int ggml_type, cudaStream_t stream) {
+                                int ggml_type, cudaStream_t stream,
+                                int expert_begin, int n_local_experts) {
     switch (ggml_type) {
         case 17:
             moe_expert_ffn_iq2xs_f32(out, scratch, x, ids, w, gate_exps, up_exps,
                                      down_exps, latent, ffn, top_k, situ_beta,
-                                     situ_linear_beta, stream);
+                                     situ_linear_beta, stream,
+                                     expert_begin, n_local_experts);
             return true;
         case 19:
             moe_expert_ffn_iq1s_f32(out, scratch, x, ids, w, gate_exps, up_exps,
                                     down_exps, latent, ffn, top_k, situ_beta,
-                                    situ_linear_beta, stream);
+                                    situ_linear_beta, stream,
+                                    expert_begin, n_local_experts);
             return true;
         default:
             return false;

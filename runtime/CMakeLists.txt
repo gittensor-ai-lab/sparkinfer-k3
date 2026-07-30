@@ -151,6 +151,32 @@ if(BUILD_EXAMPLES)
     target_link_libraries(kimi_k3_plan_check PRIVATE sparkinfer_runtime)
     set_target_properties(kimi_k3_plan_check PROPERTIES CXX_STANDARD 17)
 
+    # Sharded-loader validation against the real GGUF: does every byte land on
+    # exactly one rank, and does the copy reproduce it. Needs a device for part B.
+    add_executable(kimi_k3_tp_load_check examples/kimi_k3_tp_load_check.cpp)
+    target_link_libraries(kimi_k3_tp_load_check PRIVATE sparkinfer_runtime CUDA::cudart)
+    set_target_properties(kimi_k3_tp_load_check PROPERTIES CXX_STANDARD 17)
+
+    # One-call vs three-phase equivalence for the layer split TP decode needs.
+    # What TP buys: ms/token and ms/layer at a given tp_size.
+    add_executable(kimi_k3_tp_bench examples/kimi_k3_tp_bench.cpp)
+    target_link_libraries(kimi_k3_tp_bench PRIVATE sparkinfer_runtime CUDA::cudart)
+    set_target_properties(kimi_k3_tp_bench PROPERTIES CXX_STANDARD 17)
+
+    # End-to-end TP decode vs single-GPU decode.
+    add_executable(kimi_k3_tp_check examples/kimi_k3_tp_check.cpp)
+    target_link_libraries(kimi_k3_tp_check PRIVATE sparkinfer_runtime CUDA::cudart)
+    set_target_properties(kimi_k3_tp_check PROPERTIES CXX_STANDARD 17)
+
+    # Expert-parallel correctness: disjoint bands must sum to the unsharded result.
+    add_executable(kimi_k3_tp_moe_check examples/kimi_k3_tp_moe_check.cpp)
+    target_link_libraries(kimi_k3_tp_moe_check PRIVATE sparkinfer_runtime CUDA::cudart)
+    set_target_properties(kimi_k3_tp_moe_check PROPERTIES CXX_STANDARD 17)
+
+    add_executable(kimi_k3_tp_phase_check examples/kimi_k3_tp_phase_check.cpp)
+    target_link_libraries(kimi_k3_tp_phase_check PRIVATE sparkinfer_runtime CUDA::cudart)
+    set_target_properties(kimi_k3_tp_phase_check PROPERTIES CXX_STANDARD 17)
+
     # Loads real weights for one layer (from a possibly-partial shard set) and runs
     # kimi_k3_forward_layer on a synthetic hidden vector: does it load, execute
     # without a CUDA error, and produce finite, non-degenerate output? First real

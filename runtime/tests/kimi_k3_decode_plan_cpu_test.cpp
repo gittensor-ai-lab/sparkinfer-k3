@@ -188,6 +188,69 @@ int main() {
         check(colshard_steps >= cfg.n_layers,
               "at least one ColShard per layer (attn_output)");
         std::printf("  %d ColShard consumers, each reduce-adjacent\n", colshard_steps);
+
+        // THE EXPERT-PARALLEL PARTIAL SUM. ColShard is not the only rule that leaves a
+        // rank holding a fraction of the answer: the routed experts are ExpertShard, so
+        // rank r's dispatch accumulator covers only the selected experts r owns.
+        //
+        // rule_needs_reduce() cannot express this — ExpertShard is also used for
+        // attn_k_b/attn_v_b, which band the HEAD axis, and heads are concatenated
+        // rather than summed, so those genuinely need no collective. The distinction is
+        // the OP, not the rule, which is why it is asserted here on MoeDispatch.
+        //
+        // This is the check that would have caught the plan reducing after routed_up
+        // instead of after the dispatch: routed_norm is an rms_norm and rms_norm is not
+        // linear, so normalising a partial sum and reducing afterwards is wrong, and
+        // wrong in a way that stays fluent.
+        int dispatch_layers = 0;
+        for (size_t k = 0; k < plan.steps.size(); ++k) {
+            const auto& s = plan.steps[k];
+            if (s.op != K3Op::MoeDispatch) continue;
+            // Only assert once per layer, on the LAST dispatch step of that layer.
+            if (k + 1 < plan.steps.size() && plan.steps[k + 1].op == K3Op::MoeDispatch &&
+                plan.steps[k + 1].layer == s.layer)
+                continue;
+            ++dispatch_layers;
+            bool followed = false;
+            int reduce_width = -1;
+            for (size_t j = k + 1; j < plan.steps.size(); ++j) {
+                if (plan.steps[j].layer != s.layer) break;
+                if (plan.steps[j].op == K3Op::AllReduce) {
+                    followed = true;
+                    reduce_width = plan.steps[j].in_dim;
+                    break;
+                }
+                // A norm or a projection consuming the PARTIAL expert sum is the bug.
+                if (plan.steps[j].op == K3Op::MatMul || plan.steps[j].op == K3Op::RmsNorm)
+                    break;
+            }
+            check(followed,
+                  "MoE dispatch is followed by an all-reduce before routed_norm/routed_up "
+                  "consume the partial expert sum");
+            // And it must reduce the LATENT vector, not the hidden one — reducing at
+            // hidden width means it was placed after routed_up, where every rank
+            // already holds the complete tensor and summing multiplies it by tp_size.
+            check_eq(reduce_width, cfg.expert_latent,
+                     "the MoE collective is at expert_latent width, not hidden");
+        }
+        check_eq(dispatch_layers, cfg.n_layers - cfg.leading_dense,
+                 "every MoE layer's dispatch is reduce-covered");
+
+        // Nothing may reduce AFTER routed_up: by then routed_norm/routed_up/shexp are
+        // all Replicate, so the tensor is already complete and identical on every rank.
+        for (size_t k = 0; k < plan.steps.size(); ++k) {
+            if (plan.steps[k].op != K3Op::MatMul) continue;
+            if (std::string(plan.steps[k].label) != "routed_up") continue;
+            bool spurious = false;
+            for (size_t j = k + 1; j < plan.steps.size(); ++j) {
+                if (plan.steps[j].layer != plan.steps[k].layer) break;
+                if (plan.steps[j].op == K3Op::AllReduce) { spurious = true; break; }
+            }
+            check(!spurious,
+                  "no all-reduce after routed_up (it would multiply the FFN output by tp_size)");
+        }
+        std::printf("  %d MoE dispatches, each reduced at latent width %d\n",
+                    dispatch_layers, cfg.expert_latent);
     }
 
     // ------------------------------------------------------------ width flow

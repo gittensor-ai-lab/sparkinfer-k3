@@ -54,6 +54,14 @@ struct KimiK3Tensor {
     int         type = -1;       // ggml type id; -1 = tensor absent
     long        n_bytes = 0;
 
+    // THIS RANK'S logical shape, ggml ne order. Identical to the file's shape at
+    // tp_size 1, and a band of it otherwise. Carried on the tensor rather than
+    // recomputed by the forward from cfg + rule, because the two would be free to
+    // disagree: block_aligned_band() hands a remainder to the low ranks, so per-rank
+    // extents legitimately differ by one block and a forward that derives
+    // "cfg.hidden / tp_size" would be wrong on exactly the ranks that differ.
+    long rank_ne[4] = {1, 1, 1, 1};
+
     bool ok() const { return data != nullptr; }
 };
 
@@ -113,6 +121,39 @@ struct KimiK3Weights {
     bool has_output_res_score = false;
     KimiK3Tensor output_res_score;
     std::vector<KimiK3LayerWeights> layers;
+
+    // HOW MUCH OF THE MODEL TO SHARD.
+    //
+    //   ExpertsOnly  Band the 896 routed experts across ranks; replicate everything
+    //                else. The routed experts are ~531 of UD-IQ1_S's 553 GiB, so this
+    //                captures essentially the whole memory win, and it needs exactly
+    //                ONE collective per MoE layer (the expert partial sum at
+    //                expert_latent) instead of two. Critically, no activation changes
+    //                width, so the forward runs at full cfg dims on every rank and
+    //                needs no per-rank shape threading.
+    //
+    //   Full         Also row/col-shard the attention and dense-FFN projections, per
+    //                weight_plan. Saves the remaining ~22 GiB and splits the attention
+    //                FLOPs, but every kernel then has to be handed per-rank widths and
+    //                the KDA/MLA state has to be sized per rank. NOT YET SUPPORTED by
+    //                the forward — the loader would shard weights the executor still
+    //                indexes at full width, which reads past the end of the slice.
+    //
+    // Kept explicit rather than inferred from tp_size so that turning on Full is a
+    // deliberate act with a matching forward, not a silent consequence of tp>1.
+    enum class ShardPolicy { ExpertsOnly, Full };
+    ShardPolicy policy = ShardPolicy::ExpertsOnly;
+
+    // WHICH SLICE OF EACH TENSOR THIS RANK HOLDS. Set BEFORE calling the loader;
+    // the default (tp_size 1) makes every rule degenerate to Replicate, so the
+    // loader takes byte-for-byte the same path it always did and the single-GPU
+    // build is unchanged.
+    //
+    // It lives on the weights rather than being threaded through the loader's ~49
+    // upload call sites because it is a property of the loaded model, and the
+    // forward needs it too: an all-reduce whose tp_size disagrees with the tp_size
+    // the weights were sharded under is a partial sum presented as an answer.
+    tp::ShardDims shard;
 
     // Every device buffer this struct owns, for bulk free in the destructor.
     std::vector<void*> owned;
@@ -256,6 +297,52 @@ bool kimi_k3_forward_token(KimiK3Forward& fwd, int token_id, float* out_logits);
 // other, not just against llama.cpp.
 bool kimi_k3_forward_layer(KimiK3Forward& fwd, int layer, const float* hidden_in,
                           float* hidden_out);
+
+// ---------------------------------------------------------------------------
+// The same layer, split at the two points where TP has to insert a collective.
+//
+// WHY A PHASE SPLIT RATHER THAN A REDUCE CALLBACK. The obvious design — hand the
+// forward a `reduce(buf, n)` callback it invokes in place — CANNOT WORK here. The
+// collective is a GROUP operation: NCCL requires every rank's ncclAllReduce to be
+// enqueued inside one ncclGroupStart/End before any of them launches, and
+// sparkinfer drives all ranks from a SINGLE host thread. A callback fired from
+// inside rank r's forward would block waiting for ranks that thread has not reached
+// yet. That is not hypothetical — it is the deadlock recorded in collective.h,
+// measured on an 8x H200 node, which hung at the first collective with no output.
+//
+// So the driver must own the interleaving: run phase N on EVERY rank, issue ONE
+// group collective, then run phase N+1 on every rank.
+//
+//   Attn        res_mix, bank push, attn_norm, the attention branch, attn_output.
+//               attn_output is ColShard, so this leaves a FULL-WIDTH PARTIAL SUM.
+//                 -> reduce at hidden
+//   FfnPartial  attention residual combine, ffn_res_mix, ffn_norm, then either the
+//               dense FFN (down is ColShard -> partial at hidden) or the MoE path
+//               (router, routed_down, expert dispatch -> partial at expert_latent,
+//               because the experts are ExpertShard and this rank ran only its own).
+//                 -> reduce at expert_latent (MoE) or hidden (leading dense)
+//   FfnFinish   routed_norm, routed_up, shared experts, the FFN residual add.
+//               Everything here is Replicate and reads the ALREADY-REDUCED value,
+//               which is exactly why the collective cannot be deferred past it:
+//               routed_norm is an rms_norm and rms_norm is not linear.
+//
+// `All` runs all three back to back and is what kimi_k3_forward_layer calls, so the
+// tp_size 1 path is unchanged. Running All must be bit-identical to running the
+// three phases in sequence — asserted by kimi_k3_tp_phase_check.
+enum class K3LayerPhase { All = 0, Attn = 1, FfnPartial = 2, FfnFinish = 3 };
+
+bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase phase,
+                                const float* hidden_in, float* hidden_out);
+
+// The buffer holding THIS RANK'S partial sum after `phase`, and its element count.
+// Returns nullptr with *count = 0 for a phase that produces no partial (FfnFinish).
+//
+// Exists because Scratch is opaque to callers: the TP driver has to hand the exact
+// device pointer and width to the collective, and guessing either — reducing
+// hidden width after the MoE dispatch, say, when the partial is expert_latent wide —
+// reduces the wrong bytes and still returns success.
+float* kimi_k3_partial_buffer(KimiK3Forward& fwd, int layer, K3LayerPhase phase,
+                             int* count);
 
 // Print the SPARKINFER_K3_PROFILE=1 phase breakdown to stderr (no-op when unset).
 void kimi_k3_profile_report();

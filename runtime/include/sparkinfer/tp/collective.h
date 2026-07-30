@@ -101,6 +101,38 @@ public:
     virtual bool allreduce_bf16(void* buf, std::size_t count, int rank,
                                 cudaStream_t stream) = 0;
 
+    // ---- f32 ---------------------------------------------------------------
+    //
+    // WHY A SECOND DTYPE RATHER THAN CASTING. Kimi K3's executor runs its hidden
+    // state in f32 end to end, and that is a decision with a stated reason
+    // (kernels/include/sparkinfer/kernels/kimi_k3.h): every K3 kernel is
+    // transcribed from a float64 reference and validated to near machine epsilon,
+    // and bf16 would truncate to ~8 mantissa bits. TP adds 2 collectives per layer
+    // x 93 layers, so routing K3's activations through allreduce_bf16 would
+    // reintroduce that truncation 186 TIMES PER TOKEN — at the layer boundary,
+    // which is precisely where the residual stream accumulates. The f32 path exists
+    // so TP does not silently undo the executor's numerics.
+    //
+    // Qwen keeps using the bf16 entry points: its residual stream IS bf16, so a
+    // bf16 collective is lossless there and moves half the bytes.
+    //
+    // Same group-call contract as allreduce_bf16_group (see the deadlock note above):
+    // one host thread, every rank enqueued inside one NCCL group.
+    virtual bool allreduce_f32_group(const std::vector<void*>& bufs,
+                                     std::size_t count,
+                                     const std::vector<cudaStream_t>& streams) {
+        (void)bufs; (void)count; (void)streams;
+        return false;
+    }
+
+    // False when this backend has no f32 reduce. Checked at SETUP, not per call:
+    // a forward that needs f32 must refuse a backend that cannot do it rather than
+    // discover it 186 collectives into a token. The owned-buffer backends currently
+    // report false — their kernels are templated on __nv_bfloat16 (8 per 128-bit
+    // transaction); an f32 variant is 4 per transaction and is a straight mirror,
+    // but it is not written yet and claiming support would be worse than refusing.
+    virtual bool supports_f32() const { return false; }
+
     // Mode B. False for NCCL and the no-op; true for the peer/multimem backends.
     virtual bool owns_buffers() const { return false; }
 
@@ -157,10 +189,16 @@ Capabilities probe_capabilities();
 // back per select_backend(). Never returns nullptr: on total failure it returns
 // the single-device no-op and sets `error`, so a caller that ignores the error
 // gets a correct TP=1 run rather than a crash.
+//
+// `need_f32` (Kimi K3) narrows the choice to backends that implement the f32
+// reduce. A fast backend that cannot is skipped with a logged reason rather than
+// selected and failed later — the alternative is a run that loads 553 GiB and then
+// dies at the first collective.
 std::unique_ptr<Collective> make_collective(const std::vector<int>& devices,
                                             Backend requested,
                                             std::string* error,
-                                            std::size_t max_count = 0);
+                                            std::size_t max_count = 0,
+                                            bool need_f32 = false);
 
 }  // namespace tp
 }  // namespace sparkinfer
