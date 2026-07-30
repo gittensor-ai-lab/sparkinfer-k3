@@ -491,12 +491,15 @@ bool kimi_k3_forward_layer(KimiK3Forward& fwd, int layer, const float* hidden_in
         k3k::kda_conv_step_f32(s.conv_v, st.conv_state_v[kda_ord], s.qkv_v,
                                (const float*)L.ssm_conv1d_v.data, cfg.kda_conv_kernel,
                                qkv, stream);
+        if (fwd.debug) fwd.debug("dbg_conv_q", layer, s.conv_q, qkv);
+        if (fwd.debug) fwd.debug("dbg_conv_v", layer, s.conv_v, qkv);
 
         // q gets the extra 1/sqrt(head_dim) scale the reference applies before the
         // scan; k does not (see kda_decode_step_f32's contract on pre-scaled q).
         k3k::l2_norm_heads_f32(s.conv_q, s.conv_q, head_dim, n_head,
                                1.0f / std::sqrt((float)head_dim), eps, stream);
         k3k::l2_norm_heads_f32(s.conv_k, s.conv_k, head_dim, n_head, 1.0f, eps, stream);
+        if (fwd.debug) fwd.debug("dbg_l2_q", layer, s.conv_q, qkv);
 
         if (!proj(s.f_a_out, s.normed, L.ssm_f_a, head_dim, H)) return false;
         if (!proj(s.g_raw, s.f_a_out, L.ssm_f_b, qkv, head_dim)) return false;
@@ -509,14 +512,18 @@ bool kimi_k3_forward_layer(KimiK3Forward& fwd, int layer, const float* hidden_in
 
         if (!proj(s.beta_out, s.normed, L.ssm_beta, n_head, H)) return false;
 
+        if (fwd.debug) fwd.debug("dbg_decay_g", layer, s.decay_g, qkv);
+        if (fwd.debug) fwd.debug("dbg_beta", layer, s.beta_out, n_head);
         k3k::kda_decode_step_f32(s.delta_out, st.delta_state[kda_ord],
                                  s.conv_q, s.conv_k, s.conv_v, s.decay_g, s.beta_out,
                                  head_dim, n_head, stream);
+        if (fwd.debug) fwd.debug("dbg_delta_out", layer, s.delta_out, qkv);
 
         if (!proj(s.g_proj_out, s.normed, L.ssm_g, qkv, H)) return false;
         if (!L.ssm_norm.ok()) return false;
         k3k::kda_gate_out_f32(s.gate_out, s.delta_out, (const float*)L.ssm_norm.data,
                               s.g_proj_out, head_dim, n_head, eps, stream);
+        if (fwd.debug) fwd.debug("dbg_gate_out", layer, s.gate_out, qkv);
 
         if (!proj(s.attn_out, s.gate_out, L.attn_output, H, qkv)) return false;
         if (fwd.debug) fwd.debug("kda_out", layer, s.attn_out, H);
@@ -616,8 +623,11 @@ bool kimi_k3_forward_layer(KimiK3Forward& fwd, int layer, const float* hidden_in
     if (layer < cfg.leading_dense) {
         if (!proj(s.dense_gate, s.normed2, L.ffn_gate, cfg.dense_ffn, H)) return false;
         if (!proj(s.dense_up, s.normed2, L.ffn_up, cfg.dense_ffn, H)) return false;
+        if (fwd.debug) fwd.debug("dbg_dense_gate", layer, s.dense_gate, cfg.dense_ffn);
+        if (fwd.debug) fwd.debug("dbg_dense_up", layer, s.dense_up, cfg.dense_ffn);
         k3k::situ_f32(s.dense_situ, s.dense_gate, s.dense_up, cfg.dense_ffn,
                      cfg.situ_beta, cfg.situ_linear_beta, stream);
+        if (fwd.debug) fwd.debug("dbg_dense_situ", layer, s.dense_situ, cfg.dense_ffn);
         if (!proj(s.ffn_out, s.dense_situ, L.ffn_down, H, cfg.dense_ffn)) return false;
     } else {
         if (!proj(s.router_logits, s.normed2, L.ffn_gate_inp, cfg.n_experts, H))

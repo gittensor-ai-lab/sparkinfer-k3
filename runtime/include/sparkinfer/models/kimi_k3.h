@@ -192,6 +192,18 @@ int kimi_k3_mla_ordinal(const KimiK3Config& cfg, int layer);   // -1 if layer is
 // enough that a tag/layer pair here should name-match what a debug build of
 // llama.cpp would report for the same graph node, which is what makes per-layer
 // comparison possible before the whole model is validated end to end.
+//
+// Two tiers of tags. The coarse ones ("attn_res_mix", "attn_norm", "kda_out"/
+// "mla_out", "ffn_norm", "ffn_out", "l_out") are the ones a real cross-check
+// against llama.cpp's own graph would target. The "dbg_*" tags inside the KDA
+// branch (dbg_conv_q, dbg_conv_v, dbg_l2_q, dbg_decay_g, dbg_beta, dbg_delta_out,
+// dbg_gate_out) and the dense-FFN branch (dbg_dense_gate/up/situ) exist because
+// bisecting kimi_k3_layer0_ref_check.cpp's first real divergence against an
+// independent float64 reference needed them — the coarse tags alone narrowed the
+// bug to "somewhere in the KDA branch", not to the specific step. Kept rather than
+// stripped back out: the next layer this executor gets extended to validate (an
+// MLA layer, or a MoE one) will need the same kind of bisection, and these cost
+// nothing when fwd.debug is unset.
 using KimiK3DebugFn = std::function<void(const char* tag, int layer, const float* dev_ptr, int64_t n)>;
 
 struct KimiK3Forward {

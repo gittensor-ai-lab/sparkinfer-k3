@@ -159,6 +159,15 @@ if(BUILD_EXAMPLES)
     target_link_libraries(kimi_k3_smoke_test PRIVATE sparkinfer_runtime CUDA::cudart)
     set_target_properties(kimi_k3_smoke_test PROPERTIES CXX_STANDARD 17)
 
+    # Full-layer numerical validation: layer 0 computed twice on the same real
+    # weights — once by kimi_k3_forward_layer, once by an independent float64 CPU
+    # reference that dequantizes the same GGUF bytes by hand. Proves the EXECUTOR's
+    # wiring (not just each kernel in isolation, already covered by
+    # kimi_k3_numeric_test) against ground truth built from the real file.
+    add_executable(kimi_k3_layer0_ref_check examples/kimi_k3_layer0_ref_check.cpp)
+    target_link_libraries(kimi_k3_layer0_ref_check PRIVATE sparkinfer_runtime CUDA::cudart)
+    set_target_properties(kimi_k3_layer0_ref_check PROPERTIES CXX_STANDARD 17)
+
     add_executable(thermal_sweep examples/thermal_sweep.cpp)   # force each thermal mode, measure W/°C/tok/s
     target_include_directories(thermal_sweep PRIVATE include)
     target_link_libraries(thermal_sweep PRIVATE sparkinfer_runtime CUDA::cudart Threads::Threads)
