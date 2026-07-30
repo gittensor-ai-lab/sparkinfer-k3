@@ -202,6 +202,16 @@ if(BUILD_EXAMPLES)
     target_link_libraries(kimi_k3_generate PRIVATE sparkinfer_runtime CUDA::cudart)
     set_target_properties(kimi_k3_generate PROPERTIES CXX_STANDARD 17)
 
+    # MoE FFN-branch validation inside the executor vs an independent float64
+    # reference: router -> routed_down -> expert dispatch -> routed_norm -> routed_up
+    # -> shared experts, with real IQ1_S weights. Closes the one executor path that
+    # had no end-to-end numerical check (layer0 covered dense FFN, mla stopped at
+    # attention). Needs the kernels headers for the GPU expert dequant.
+    add_executable(kimi_k3_moe_ref_check examples/kimi_k3_moe_ref_check.cpp)
+    target_link_libraries(kimi_k3_moe_ref_check PRIVATE sparkinfer_runtime sparkinfer_kernels CUDA::cudart)
+    target_include_directories(kimi_k3_moe_ref_check PRIVATE ${PROJECT_SOURCE_DIR}/../kernels/include)
+    set_target_properties(kimi_k3_moe_ref_check PROPERTIES CXX_STANDARD 17)
+
     add_executable(thermal_sweep examples/thermal_sweep.cpp)   # force each thermal mode, measure W/°C/tok/s
     target_include_directories(thermal_sweep PRIVATE include)
     target_link_libraries(thermal_sweep PRIVATE sparkinfer_runtime CUDA::cudart Threads::Threads)
