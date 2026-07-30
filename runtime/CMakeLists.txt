@@ -168,6 +168,14 @@ if(BUILD_EXAMPLES)
     target_link_libraries(kimi_k3_layer0_ref_check PRIVATE sparkinfer_runtime CUDA::cudart)
     set_target_properties(kimi_k3_layer0_ref_check PROPERTIES CXX_STANDARD 17)
 
+    # Same idea, for the MLA attention branch (q_lora, the q_nope/q_pe deinterleave,
+    # the KV-cache write, absorbed attention, attn_gate) — none of which the KDA
+    # layer above touches. Stops before FFN/MoE/shexp, which have their own
+    # dedicated real-weight validation (kimi_k3_moe_real_test.cu).
+    add_executable(kimi_k3_mla_ref_check examples/kimi_k3_mla_ref_check.cpp)
+    target_link_libraries(kimi_k3_mla_ref_check PRIVATE sparkinfer_runtime CUDA::cudart)
+    set_target_properties(kimi_k3_mla_ref_check PROPERTIES CXX_STANDARD 17)
+
     add_executable(thermal_sweep examples/thermal_sweep.cpp)   # force each thermal mode, measure W/°C/tok/s
     target_include_directories(thermal_sweep PRIVATE include)
     target_link_libraries(thermal_sweep PRIVATE sparkinfer_runtime CUDA::cudart Threads::Threads)
