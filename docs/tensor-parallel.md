@@ -14,12 +14,39 @@ abstraction, the NCCL backend, the hardware validation tool) and **what has not*
 | ✅ **Shard math** | `runtime/src/tp/shard.cpp` — CUDA-free, **4972 checks passing** |
 | ✅ **Backend selection** | `runtime/src/tp/backend_select.cpp` — CUDA-free, **44 checks passing** |
 | ✅ **Tensor→rule mapping** | `runtime/src/tp/weight_plan.cpp` — CUDA-free, **230 checks passing** |
-| ✅ **NCCL collective** | `runtime/src/tp/collective.cpp` — compiles, **not run on hardware** |
-| ✅ **Fast collectives** | `runtime/csrc/tp/` — peer-oneshot + multimem vendored, **not run on hardware** |
-| ✅ **Validation tool** | `tp_allreduce_check` — correctness + latency, **never executed** |
-| ❌ **Forward integration** | `qwen35.cpp` is untouched. Nothing shards a real model yet |
-| ❌ **Sharded weight loading** | `load_gguf()` still loads everything onto one device |
-| ❌ **Any measured number** | There was no GPU on the authoring machine |
+| ✅ **NCCL collective** | bf16 **and f32** — **validated exact on 8× H200, every rank** |
+| ✅ **Fast collectives** | peer-oneshot + multimem — **validated on 8× H200 (bf16 only)** |
+| ✅ **Validation tool** | `tp_allreduce_check` — **run; numbers in `bench/results/`** |
+| ✅ **Reduce points** | corrected: the MoE collective is at `expert_latent`, not hidden — see below |
+| ⚠️ **f32 fast collectives** | peer-oneshot/multimem are bf16-only; K3 f32 falls back to NCCL |
+| ❌ **Forward integration** | no model forward issues a collective yet |
+| ❌ **Sharded weight loading** | the loader still slices by LAYER RANGE, never by row/col/expert |
+
+### Two corrections this table used to hide
+
+**1. The MoE collective is at `expert_latent` (3584), not hidden (7168), and it lands
+BEFORE `routed_norm` — not after `routed_up`.** The routed experts are `ExpertShard`, so
+each rank's dispatch accumulator is a *partial* sum over the top-16. `ffn_routed_norm` is
+an RMS norm and rms_norm is not linear, so the cross-rank sum has to complete first. The
+earlier plan put a single FFN reduce after `routed_up`, which was wrong twice: it skipped
+the reduce the experts need, and by that point `routed_norm`/`routed_up`/`shexp` are all
+`Replicate`, so every rank already held the complete tensor — reducing it **multiplies the
+FFN output by tp_size**. Exactly the failure `kimi_k3_decode_plan.h` warns is unspottable
+by eye at 186 reduces per token. `kimi_k3_decode_plan_cpu_test.cpp` now asserts it, and
+that assertion fails on the old plan.
+
+Note `rule_needs_reduce()` cannot express this: it answers `ColShard` only, and
+`ExpertShard` is *also* used for `attn_k_b`/`attn_v_b`, which band the head axis — heads
+concatenate rather than sum, so those genuinely need no collective. The distinction is the
+**op**, not the rule, which is why the assertion is on `MoeDispatch`.
+
+**2. K3 needs an f32 all-reduce, and the collective was bf16-only.** K3 runs an f32
+residual stream deliberately (every kernel is transcribed from a float64 reference and
+validated near machine epsilon). Routing its activations through `allreduce_bf16` would
+truncate to ~8 mantissa bits **186 times per token, at the layer boundary** — undoing the
+executor's numerics. `allreduce_f32_group()` now exists; `supports_f32()` reports it, and
+`make_collective(..., need_f32=true)` downgrades a bf16-only fast backend to NCCL *before*
+the 20-minute weight load rather than failing at the first collective.
 
 The split is deliberate. TP bugs do not live in the collective — NCCL is correct.
 They live in the shard arithmetic, and that is exactly the part that can be
