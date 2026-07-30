@@ -233,13 +233,27 @@ void moe_router_noaux_tc_f32(float* out_w, int* out_ids, const float* logits,
 // ids/w:    [top_k]             from moe_router_noaux_tc_f32
 // out:      [latent]            accumulated, zeroed by this call
 // scratch:  [top_k * ffn]       caller-owned f32, holds situ activations
+// EXPERT PARALLELISM (tp_size > 1). `ids` always holds GLOBAL expert indices —
+// every rank runs the same router over the same replicated ffn_gate_inp, so all
+// ranks agree on the same top_k — but a rank stores only experts
+// [expert_begin, expert_begin + n_local_experts). Selections outside that band are
+// another rank's and contribute nothing here; the all-reduce that follows the
+// dispatch sums the bands back into the full top_k combine.
+//
+// n_local_experts <= 0 means "this rank holds every expert", i.e. the tp_size 1
+// path, and is byte-for-byte what these kernels did before the band existed.
+//
+// PASSING A GLOBAL ID WITH A BANDED WEIGHT ARRAY READS PAST THE ALLOCATION on every
+// rank but rank 0, and reads whatever the allocator left there rather than faulting,
+// so the band is checked in the kernel rather than assumed by the caller.
 void moe_expert_ffn_iq2xs_f32(float* out, float* scratch,
                               const float* x, const int* ids, const float* w,
                               const void* gate_exps, const void* up_exps,
                               const void* down_exps,
                               int latent, int ffn, int top_k,
                               float situ_beta, float situ_linear_beta,
-                              cudaStream_t stream);
+                              cudaStream_t stream,
+                              int expert_begin = 0, int n_local_experts = 0);
 
 // ---------------------------------------------------------------------------
 // 4b. IQ1_S — the UD-IQ1_S target's expert type
@@ -262,7 +276,8 @@ void moe_expert_ffn_iq1s_f32(float* out, float* scratch,
                              const void* down_exps,
                              int latent, int ffn, int top_k,
                              float situ_beta, float situ_linear_beta,
-                             cudaStream_t stream);
+                             cudaStream_t stream,
+                             int expert_begin = 0, int n_local_experts = 0);
 
 // Type-dispatched front doors. PREFER THESE over the per-type entry points.
 //
@@ -280,7 +295,8 @@ bool moe_expert_ffn_f32_by_type(float* out, float* scratch,
                                 const void* down_exps,
                                 int latent, int ffn, int top_k,
                                 float situ_beta, float situ_linear_beta,
-                                int ggml_type, cudaStream_t stream);
+                                int ggml_type, cudaStream_t stream,
+                                int expert_begin = 0, int n_local_experts = 0);
 
 // ---------------------------------------------------------------------------
 // 5. MLA output gate
