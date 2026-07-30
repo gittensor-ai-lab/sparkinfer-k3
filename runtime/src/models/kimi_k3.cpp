@@ -6,6 +6,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <algorithm>
+#include <cstdlib>
 
 namespace sparkinfer {
 
@@ -100,15 +102,26 @@ bool upload_force_f32(const GGUF& g, const std::string& name, KimiK3Weights& w,
 bool kimi_k3_load_weights(const GGUF& g, const KimiK3Config& cfg,
                          const K3PlanOptions& opt, KimiK3Weights& out,
                          int first_layer, int last_layer) {
+    return kimi_k3_load_weights_scoped(g, cfg, opt, out, first_layer, last_layer,
+                                      /*load_embed=*/true, /*load_head=*/true);
+}
+
+bool kimi_k3_load_weights_scoped(const GGUF& g, const KimiK3Config& cfg,
+                                const K3PlanOptions& opt, KimiK3Weights& out,
+                                int first_layer, int last_layer,
+                                bool load_embed, bool load_head) {
     out.layers.assign(cfg.n_layers, KimiK3LayerWeights{});
 
     bool ok = true;
-    ok &= upload_raw(g, "token_embd.weight", out, out.token_embd, true);
-    ok &= upload_raw(g, "output_norm.weight", out, out.output_norm, true);
-    ok &= upload_raw(g, "output.weight", out, out.output, true);
-    if (cfg.attn_res_block_size > 0) {
-        out.has_output_res_score = true;
-        ok &= upload_raw(g, "output_res_score.weight", out, out.output_res_score, true);
+    if (load_embed)
+        ok &= upload_raw(g, "token_embd.weight", out, out.token_embd, true);
+    if (load_head) {
+        ok &= upload_raw(g, "output_norm.weight", out, out.output_norm, true);
+        ok &= upload_raw(g, "output.weight", out, out.output, true);
+        if (cfg.attn_res_block_size > 0) {
+            out.has_output_res_score = true;
+            ok &= upload_raw(g, "output_res_score.weight", out, out.output_res_score, true);
+        }
     }
     if (!ok) return false;
 
@@ -794,6 +807,199 @@ bool kimi_k3_forward_token(KimiK3Forward& fwd, int token_id, float* out_logits) 
     cudaFree(x);
     cudaFree(x_next);
     return ok;
+}
+
+// ---------------------------------------------------------------------------
+// Layer-split pipeline
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Per-layer device-byte cost, from the GGUF index (no data read). Used to balance
+// stages: the leading dense layer is ~1.2 GiB against ~6 GiB for a MoE layer, so
+// splitting by layer COUNT would leave stage 0 carrying a fraction of its share.
+std::vector<long> layer_bytes(const GGUF& g, const KimiK3Config& cfg) {
+    std::vector<long> out(cfg.n_layers, 0);
+    for (const auto& name : g.tensor_names()) {
+        if (name.rfind("blk.", 0) != 0) continue;
+        const size_t dot = name.find('.', 4);
+        if (dot == std::string::npos) continue;
+        const int idx = std::atoi(name.substr(4, dot - 4).c_str());
+        if (idx < 0 || idx >= cfg.n_layers) continue;
+        const GGUFTensor* t = g.tensor(name);
+        if (t) out[idx] += t->n_bytes;
+    }
+    return out;
+}
+
+}  // namespace
+
+bool kimi_k3_pipeline_init(const GGUF& g, const KimiK3Config& cfg,
+                          const K3PlanOptions& opt,
+                          const std::vector<int>& devices, int max_ctx,
+                          KimiK3Pipeline& out) {
+    if (devices.empty()) return false;
+    out.cfg = cfg;
+    out.opt = opt;
+    out.stages.clear();
+    out.stages.resize(devices.size());
+    out.host_hidden.assign(cfg.hidden, 0.0f);
+
+    // Balance by cumulative byte cost rather than layer count.
+    const std::vector<long> lb = layer_bytes(g, cfg);
+    long total = 0;
+    for (long v : lb) total += v;
+    const long per_stage = total / (long)devices.size();
+
+    int layer = 0;
+    for (size_t si = 0; si < devices.size(); ++si) {
+        KimiK3PipelineStage& st = out.stages[si];
+        st.device = devices[si];
+        st.first_layer = layer;
+        long acc = 0;
+        // Last stage takes whatever remains, so no layer is ever dropped by rounding.
+        while (layer < cfg.n_layers &&
+               (si + 1 == devices.size() || acc < per_stage || layer == st.first_layer)) {
+            acc += lb[layer];
+            ++layer;
+            if (si + 1 < devices.size() && acc >= per_stage) break;
+        }
+        st.last_layer = layer - 1;
+    }
+    if (layer != cfg.n_layers) {
+        std::fprintf(stderr, "[k3] pipeline split covered %d of %d layers\n",
+                     layer, cfg.n_layers);
+        return false;
+    }
+
+    for (size_t si = 0; si < out.stages.size(); ++si) {
+        KimiK3PipelineStage& st = out.stages[si];
+        if (cudaSetDevice(st.device) != cudaSuccess) return false;
+        const bool first = (si == 0), last = (si + 1 == out.stages.size());
+        if (!kimi_k3_load_weights_scoped(g, cfg, opt, st.weights,
+                                        st.first_layer, st.last_layer,
+                                        /*load_embed=*/first, /*load_head=*/last))
+            return false;
+        if (!kimi_k3_alloc_state(cfg, max_ctx, st.state)) return false;
+        st.fwd.cfg = &out.cfg;
+        st.fwd.w = &st.weights;
+        st.fwd.state = &st.state;
+        st.fwd.opt = out.opt;
+        st.fwd.stream = nullptr;
+        if (!kimi_k3_forward_alloc_scratch(cfg, st.fwd)) return false;
+        if (cudaMalloc(&st.hidden, (size_t)cfg.hidden * sizeof(float)) != cudaSuccess)
+            return false;
+        if (last && cudaMalloc(&st.logits, (size_t)cfg.vocab * sizeof(float)) != cudaSuccess)
+            return false;
+        std::fprintf(stderr, "[k3] stage %zu: device %d, layers %d-%d (%.2f GiB)\n",
+                     si, st.device, st.first_layer, st.last_layer,
+                     [&]{ long a = 0; for (int i = st.first_layer; i <= st.last_layer; ++i) a += lb[i];
+                          return a / 1073741824.0; }());
+    }
+    out.host_bank.assign((size_t)cfg.hidden * out.stages[0].state.max_ckpt, 0.0f);
+    return true;
+}
+
+bool kimi_k3_pipeline_forward_token(KimiK3Pipeline& p, int token_id, float* out_logits) {
+    if (p.stages.empty()) return false;
+    const KimiK3Config& cfg = p.cfg;
+    const int H = cfg.hidden;
+
+    // The residual bank is per-TOKEN and spans every layer, so it starts empty and
+    // then follows the hidden state across every stage boundary. See the header.
+    for (auto& st : p.stages) st.state.n_ckpt = 0;
+
+    // ---- stage 0: embed ----
+    KimiK3PipelineStage& s0 = p.stages[0];
+    if (cudaSetDevice(s0.device) != cudaSuccess) return false;
+    if (!s0.weights.token_embd.ok()) return false;
+    {
+        long row_bytes = 0;
+        const int ty = s0.weights.token_embd.type;
+        if (ty == 0) row_bytes = (long)H * sizeof(float);
+        else if (ty == 8) row_bytes = (long)(H / 32) * 34;
+        else return false;
+        const char* base = (const char*)s0.weights.token_embd.data +
+                           (size_t)token_id * row_bytes;
+        if (!k3k::dequant_f32_by_type(s0.hidden, base, H, ty, nullptr)) return false;
+    }
+
+    int n_ckpt_carry = 0;
+    for (size_t si = 0; si < p.stages.size(); ++si) {
+        KimiK3PipelineStage& st = p.stages[si];
+        if (cudaSetDevice(st.device) != cudaSuccess) return false;
+
+        if (si > 0) {
+            // HANDOFF: hidden state AND the residual bank. Transferring only the
+            // hidden state would leave this stage's res_mix scoring against an
+            // empty bank — fluent, wrong, and invisible without a reference.
+            if (cudaMemcpy(st.hidden, p.host_hidden.data(), (size_t)H * sizeof(float),
+                          cudaMemcpyHostToDevice) != cudaSuccess) return false;
+            st.state.n_ckpt = n_ckpt_carry;
+            if (n_ckpt_carry > 0 &&
+                cudaMemcpy(st.state.res_bank, p.host_bank.data(),
+                          (size_t)n_ckpt_carry * H * sizeof(float),
+                          cudaMemcpyHostToDevice) != cudaSuccess) return false;
+        }
+
+        for (int L = st.first_layer; L <= st.last_layer; ++L) {
+            if (!kimi_k3_forward_layer(st.fwd, L, st.hidden, st.hidden)) {
+                std::fprintf(stderr, "[k3] pipeline: layer %d failed on stage %zu\n", L, si);
+                return false;
+            }
+        }
+        if (cudaDeviceSynchronize() != cudaSuccess) return false;
+
+        if (si + 1 < p.stages.size()) {
+            if (cudaMemcpy(p.host_hidden.data(), st.hidden, (size_t)H * sizeof(float),
+                          cudaMemcpyDeviceToHost) != cudaSuccess) return false;
+            n_ckpt_carry = st.state.n_ckpt;
+            if (n_ckpt_carry > 0 &&
+                cudaMemcpy(p.host_bank.data(), st.state.res_bank,
+                          (size_t)n_ckpt_carry * H * sizeof(float),
+                          cudaMemcpyDeviceToHost) != cudaSuccess) return false;
+        }
+    }
+
+    // ---- last stage: final mix, norm, lm_head ----
+    KimiK3PipelineStage& sl = p.stages.back();
+    if (cudaSetDevice(sl.device) != cudaSuccess) return false;
+    float* x = sl.hidden;
+    float* tmp = sl.fwd.s->mixed;   // reuse an H-wide scratch slot
+    if (cfg.attn_res_block_size > 0) {
+        if (!sl.weights.has_output_res_score || !sl.weights.output_res_score.ok())
+            return false;
+        k3k::attn_res_mix_f32(tmp, sl.state.res_bank, x,
+                              (const float*)sl.weights.output_res_score.data, H,
+                              sl.state.n_ckpt, cfg.rms_eps, nullptr);
+        std::swap(x, tmp);
+    }
+    if (!sl.weights.output_norm.ok()) return false;
+    k3k::rms_norm_f32(tmp, x, (const float*)sl.weights.output_norm.data, H,
+                      cfg.rms_eps, nullptr);
+    if (!sl.weights.output.ok()) return false;
+    if (!k3k::k3_proj_f32(sl.logits, tmp, sl.weights.output.data,
+                          sl.weights.output.type, cfg.vocab, H, nullptr))
+        return false;
+    if (cudaDeviceSynchronize() != cudaSuccess) return false;
+    if (cudaMemcpy(out_logits, sl.logits, (size_t)cfg.vocab * sizeof(float),
+                  cudaMemcpyDeviceToHost) != cudaSuccess) return false;
+
+    for (auto& st : p.stages) ++st.state.position;
+    return true;
+}
+
+void kimi_k3_pipeline_free(KimiK3Pipeline& p) {
+    for (auto& st : p.stages) {
+        cudaSetDevice(st.device);
+        kimi_k3_forward_free_scratch(st.fwd);
+        kimi_k3_free_state(st.state);
+        kimi_k3_free_weights(st.weights);
+        if (st.hidden) cudaFree(st.hidden);
+        if (st.logits) cudaFree(st.logits);
+        st.hidden = nullptr; st.logits = nullptr;
+    }
+    p.stages.clear();
 }
 
 }  // namespace sparkinfer

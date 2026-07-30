@@ -131,6 +131,16 @@ bool kimi_k3_load_weights(const GGUF& g, const KimiK3Config& cfg,
                          const K3PlanOptions& opt, KimiK3Weights& out,
                          int first_layer, int last_layer);
 
+// Same, but with control over the NON-layer tensors. A pipeline stage needs this:
+// token_embd belongs on the FIRST stage's device and output_norm/output/
+// output_res_score on the LAST stage's, so the middle stages must load neither.
+// Loading them everywhere would work but waste ~2.5 GiB per stage (token_embd and
+// output are each 163840 x 7168) on tensors that stage can never use.
+bool kimi_k3_load_weights_scoped(const GGUF& g, const KimiK3Config& cfg,
+                                const K3PlanOptions& opt, KimiK3Weights& out,
+                                int first_layer, int last_layer,
+                                bool load_embed, bool load_head);
+
 void kimi_k3_free_weights(KimiK3Weights& w);
 
 // ---------------------------------------------------------------------------
@@ -238,5 +248,65 @@ bool kimi_k3_forward_token(KimiK3Forward& fwd, int token_id, float* out_logits);
 // other, not just against llama.cpp.
 bool kimi_k3_forward_layer(KimiK3Forward& fwd, int layer, const float* hidden_in,
                           float* hidden_out);
+
+// ---------------------------------------------------------------------------
+// Layer-split pipeline across multiple GPUs.
+//
+// WHY LAYER-SPLIT RATHER THAN TENSOR-PARALLEL, for this model on this hardware:
+// UD-IQ1_S is 594 GB and 8x H200 is 1128 GB, so the model FITS with each GPU
+// owning a contiguous range of layers. That needs no collectives at all — just a
+// device-to-device handoff of a few hundred KB at each stage boundary — where TP
+// would need 186 all-reduces per token (2 per layer x 93). The TP shard rules and
+// reduce points in kimi_k3_decode_plan.h remain correct and are what a TP path
+// would use; this is simply the cheaper answer when the model fits.
+//
+// It also reuses kimi_k3_forward_layer completely unchanged: a stage is just a
+// KimiK3Weights loaded over a layer range plus its own KimiK3RuntimeState, both of
+// which the single-GPU code already supports.
+//
+// THE HANDOFF IS NOT JUST THE HIDDEN STATE. The cross-layer residual bank is READ
+// AT EVERY LAYER and written at every attn_res.block_size-th one, so it spans the
+// whole 93-layer pass. A stage boundary at layer 40 means layer 41 mixes over
+// checkpoints banked back on layer 36 — on a different GPU. So each boundary
+// transfers the bank (and n_ckpt) alongside the hidden vector. Transferring only
+// the hidden state is the obvious implementation and it silently corrupts every
+// mix after the first boundary: the model stays fluent, the residual scale drifts.
+// Per boundary that is hidden (7168 f32 = 28 KiB) plus up to
+// ceil(n_layers/block_size) = 8 bank rows (229 KiB) — trivial next to the ~6 GiB
+// of weights each stage already holds.
+struct KimiK3PipelineStage {
+    int device = 0;
+    int first_layer = 0;
+    int last_layer = -1;
+    KimiK3Weights weights;
+    KimiK3RuntimeState state;
+    KimiK3Forward fwd;
+    float* hidden = nullptr;    // [hidden], on this stage's device
+    float* logits = nullptr;    // [vocab], last stage only
+};
+
+struct KimiK3Pipeline {
+    KimiK3Config cfg;
+    K3PlanOptions opt;
+    std::vector<KimiK3PipelineStage> stages;
+    std::vector<float> host_hidden;   // staging for cross-device handoff
+    std::vector<float> host_bank;     // staging for the residual bank
+};
+
+// Split cfg.n_layers across `devices`, balancing by each layer's real byte cost
+// (the leading dense layer is ~1.2 GiB against ~6 GiB for a MoE layer, so an even
+// layer-count split would leave stage 0 badly under-loaded). Pass the same device
+// twice to simulate a multi-stage split on one GPU — which is how the handoff
+// logic gets tested without 8 GPUs.
+bool kimi_k3_pipeline_init(const GGUF& g, const KimiK3Config& cfg,
+                          const K3PlanOptions& opt,
+                          const std::vector<int>& devices, int max_ctx,
+                          KimiK3Pipeline& out);
+
+// One decode step through every stage in order. Equivalent to
+// kimi_k3_forward_token on a single device, and that equivalence is the test.
+bool kimi_k3_pipeline_forward_token(KimiK3Pipeline& p, int token_id, float* out_logits);
+
+void kimi_k3_pipeline_free(KimiK3Pipeline& p);
 
 }  // namespace sparkinfer

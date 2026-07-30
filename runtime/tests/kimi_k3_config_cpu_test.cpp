@@ -192,6 +192,28 @@ int main() {
     CHECK((int)cfg.layer_is_kda.size() == 93);
     CHECK(cfg.n_kda_layers() == 69);
     CHECK(cfg.n_mla_layers() == 24);
+
+    // REDUCING n_layers WITHOUT TRUNCATING layer_is_kda must stay consistent.
+    // n_mla_layers() is n_layers - n_kda_layers(), so if the KDA count ranged over
+    // the whole map while n_layers was smaller, the difference would go NEGATIVE and
+    // then blow up far away (a negative int widening into vector::resize()'s size_t,
+    // throwing std::length_error with no hint of the cause). A caller capping depth
+    // to what fits in VRAM, or bringing up a partial model, does exactly this.
+    {
+        sparkinfer::KimiK3Config c = cfg;   // full 93-entry map retained on purpose
+        c.n_layers = 13;
+        CHECK((int)c.layer_is_kda.size() == 93);          // map deliberately longer
+        CHECK(c.n_kda_layers() + c.n_mla_layers() == 13);  // the invariant that matters
+        CHECK(c.n_kda_layers() >= 0 && c.n_mla_layers() >= 0);
+        CHECK(c.n_kda_layers() <= 13 && c.n_mla_layers() <= 13);
+        // Layers 0..12 under the real map: MLA at 3, 7, 11 -> 3 MLA, 10 KDA.
+        CHECK(c.n_mla_layers() == 3);
+        CHECK(c.n_kda_layers() == 10);
+
+        sparkinfer::KimiK3Config z = cfg;
+        z.n_layers = 0;
+        CHECK(z.n_kda_layers() == 0 && z.n_mla_layers() == 0);
+    }
     // Layer 0 (1-based 1) is KDA; layer 3 (1-based 4) is MLA; layer 92 (1-based 93) is MLA.
     CHECK(cfg.is_kda_layer(0));
     CHECK(!cfg.is_kda_layer(3));

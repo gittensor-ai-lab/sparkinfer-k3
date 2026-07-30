@@ -185,6 +185,14 @@ if(BUILD_EXAMPLES)
     target_link_libraries(kimi_k3_state_check PRIVATE sparkinfer_runtime CUDA::cudart)
     set_target_properties(kimi_k3_state_check PROPERTIES CXX_STANDARD 17)
 
+    # Layer-split pipeline equivalence: an N-stage pipeline must produce
+    # BIT-IDENTICAL logits to a 1-stage one (a stage boundary only adds an exact f32
+    # round-trip). Really a test of the residual-bank handoff — the bank spans all
+    # layers, so a boundary after any checkpoint layer needs it carried across.
+    add_executable(kimi_k3_pipeline_check examples/kimi_k3_pipeline_check.cpp)
+    target_link_libraries(kimi_k3_pipeline_check PRIVATE sparkinfer_runtime CUDA::cudart)
+    set_target_properties(kimi_k3_pipeline_check PROPERTIES CXX_STANDARD 17)
+
     add_executable(thermal_sweep examples/thermal_sweep.cpp)   # force each thermal mode, measure W/°C/tok/s
     target_include_directories(thermal_sweep PRIVATE include)
     target_link_libraries(thermal_sweep PRIVATE sparkinfer_runtime CUDA::cudart Threads::Threads)
