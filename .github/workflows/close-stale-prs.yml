@@ -1,8 +1,26 @@
 name: close-stale-prs
 
-# Close open PRs with no GitHub activity for 2+ days (commits, comments, reviews, labels).
-# Also close PRs with more than 2 completed eval:none / eval:REJECT verdicts.
-# Skips PRs labeled `hold` or `merge-first`. Same policy as eval/pr_eval_bot.py.
+# Close open PRs with no GitHub activity for STALE_DAYS (commits, comments, reviews,
+# labels). Skips PRs labeled `hold` or `merge-first`.
+#
+# THREE CHANGES FROM THE INHERITED VERSION, all of them load-bearing:
+#
+#   1. `REPO` was HARDCODED to `gittensor-ai-lab/sparkinfer`. Running here, this workflow
+#      would have tried to close pull requests in the UPSTREAM repo using this repo's
+#      token. It would have failed on permissions rather than actually done it — but a
+#      scheduled job reaching into another repository is not a failure mode to leave armed.
+#      Now uses ${{ github.repository }}.
+#
+#   2. Dropped the "unticked RTX 5090 checkbox" step. Wrong hardware for this repo — see
+#      .github/workflows/node-attestation.yml, which labels instead of closing.
+#
+#   3. Dropped the "exhausted by none/REJECT evals" step. That reads verdicts posted by the
+#      SN74 eval bot, which does not run against this repo; with no verdicts to count it
+#      was dead code that still imported the whole bot.
+#
+# And one policy change: 2 days -> 14. A PR here can legitimately sit waiting on 8x H200
+# node availability, and closing somebody's work because they could not rent a GPU for a
+# fortnight is the wrong default.
 
 on:
   schedule:
@@ -11,8 +29,12 @@ on:
     inputs:
       days:
         description: "Inactive days before auto-close"
-        default: "2"
+        default: "14"
         required: false
+      dry_run:
+        description: "Report what would close, close nothing"
+        type: boolean
+        default: false
 
 permissions:
   pull-requests: write
@@ -26,59 +48,60 @@ jobs:
   close:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          ref: main
-
-      - name: Close PRs with unticked RTX 5090 checkbox
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: gittensor-ai-lab/sparkinfer
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import os, sys
-          sys.path.insert(0, "eval")
-          import pr_eval_bot as bot
-
-          repo = os.environ.get("REPO", "gittensor-ai-lab/sparkinfer")
-          closed = bot.close_unchecked_rtx5090_prs(repo)
-          print(f">> close-unchecked-rtx5090: closed {len(closed)} PR(s): {sorted(closed)}")
-          PY
-
       - name: Close stale open PRs
+        uses: actions/github-script@v7
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SPARKINFER_STALE_PR_DAYS: ${{ github.event.inputs.days || '2' }}
-          REPO: gittensor-ai-lab/sparkinfer
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import os, sys
-          sys.path.insert(0, "eval")
-          import pr_eval_bot as bot
+          STALE_DAYS: ${{ github.event.inputs.days || '14' }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+        with:
+          script: |
+            const days = parseInt(process.env.STALE_DAYS, 10) || 14;
+            const dryRun = process.env.DRY_RUN === 'true';
+            const SKIP_LABELS = new Set(['hold', 'merge-first']);
+            const { owner, repo } = context.repo;
+            const cutoff = Date.now() - days * 86400_000;
 
-          repo = os.environ.get("REPO", "gittensor-ai-lab/sparkinfer")
-          days = int(os.environ.get("SPARKINFER_STALE_PR_DAYS", "2"))
-          closed = bot.close_stale_prs(repo, days=days)
-          print(f">> close-stale-prs: closed {len(closed)} PR(s): {sorted(closed)}")
-          PY
+            const prs = await github.paginate(github.rest.pulls.list,
+              { owner, repo, state: 'open', per_page: 100 });
+            core.info(`${prs.length} open PR(s); cutoff ${days}d (dry_run=${dryRun})`);
 
-      - name: Close PRs exhausted by none/REJECT evals
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SPARKINFER_EXHAUSTED_EVAL_MAX: "2"
-          REPO: gittensor-ai-lab/sparkinfer
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import os, sys
-          sys.path.insert(0, "eval")
-          import pr_eval_bot as bot
+            let closed = 0;
+            for (const pr of prs) {
+              if (pr.draft) { core.info(`#${pr.number}: draft — skip`); continue; }
+              const labels = (pr.labels || []).map(l => l.name);
+              if (labels.some(l => SKIP_LABELS.has(l))) {
+                core.info(`#${pr.number}: labeled ${labels.join(',')} — skip`);
+                continue;
+              }
+              // updated_at moves on commits, comments, reviews and label changes, which is
+              // exactly the definition of activity we want.
+              const updated = new Date(pr.updated_at).getTime();
+              if (updated >= cutoff) continue;
 
-          repo = os.environ.get("REPO", "gittensor-ai-lab/sparkinfer")
-          limit = int(os.environ.get("SPARKINFER_EXHAUSTED_EVAL_MAX", "2"))
-          closed = bot.close_exhausted_eval_prs(repo, max_none_reject=limit)
-          print(f">> close-exhausted-evals: closed {len(closed)} PR(s): {sorted(closed)}")
-          PY
+              const ageDays = Math.floor((Date.now() - updated) / 86400_000);
+              if (dryRun) {
+                core.notice(`#${pr.number}: would close (idle ${ageDays}d)`);
+                closed++;
+                continue;
+              }
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: pr.number,
+                body: [
+                  '<!-- sparkinfer-k3-stale -->',
+                  `Auto-closed after **${ageDays} days** with no activity.`,
+                  '',
+                  'Nothing is wrong with the change — this only keeps the open queue honest.',
+                  'Push a commit or comment and **reopen**; nothing is lost.',
+                  '',
+                  'Waiting on 8x H200 / B200 / B300 node availability rather than on review?',
+                  'Ask a maintainer for the `hold` label and this job will leave it alone.',
+                  '',
+                  '<sub>Automated by close-stale-prs.</sub>',
+                ].join('\n'),
+              });
+              await github.rest.pulls.update(
+                { owner, repo, pull_number: pr.number, state: 'closed' });
+              core.notice(`closed #${pr.number} (idle ${ageDays}d)`);
+              closed++;
+            }
+            core.notice(`close-stale-prs: ${dryRun ? 'would close' : 'closed'} ${closed} PR(s)`);

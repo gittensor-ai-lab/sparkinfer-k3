@@ -49,8 +49,16 @@ export SPARKINFER_ROOT="$(pwd)"
 
 ### RTX PRO 6000 deploy (32k / 4k)
 
-See [`changelog-pro6000.md`](../changelog-pro6000.md) for the full 5090→PRO 6000 migration
-notes and benchmark table.
+See [`CHANGELOG.md`](../CHANGELOG.md) for the 5090→PRO 6000 migration notes, and
+[`bench/results/qwen3-30b-a3b_q4km_pro6000.md`](../bench/results/qwen3-30b-a3b_q4km_pro6000.md)
+for the benchmark table.
+
+<!-- Was ../changelog-pro6000.md, which has never existed in this tree — a dead link
+     inherited from sparkinfer and caught by the `ci` link check. -->
+
+> Note: this section, and `server/` generally, is Qwen-shaped. The PRO 6000 is a 96 GB
+> `sm_120` card; Kimi K3 at the target quant is 802 GiB and does not fit it at any context.
+> See [`docs/kimi-k3-baseline.md`](../docs/kimi-k3-baseline.md) for the milestone nodes.
 
 ```bash
 export CTX=36864          # 32k prompt + 4k completion KV pool

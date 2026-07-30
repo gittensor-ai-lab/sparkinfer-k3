@@ -1,15 +1,34 @@
-# Sensitive / scoring-governance paths — only maintainers may change these.
+# Sensitive / baseline-governance paths — only maintainers may change these.
 #
 # CODEOWNERS requests maintainer review automatically. The hard enforcement is the
 # `sensitive-paths-guard` status check (see .github/workflows/sensitive-paths-guard.yml)
-# plus the branch ruleset on `main` that requires it. These files decide SN74 scoring,
-# so a change here by a non-maintainer must never merge or be trusted by the evaluator.
+# plus a branch ruleset on `main` that requires it. Keep the two lists in sync.
+#
+# RETARGETED FOR sparkinfer-k3. The inherited list owned all of `bench/scripts/`, which was
+# right in sparkinfer — there the harness is scoring infrastructure and the product is
+# `runtime/`. Here the harness IS the deliverable: the entire Kimi K3 baseline lives in
+# bench/scripts/, so owning the whole directory would gate every contribution this repo
+# exists to receive.
+#
+# What actually determines a verdict here is narrower — the pins and the recorded
+# measurements:
+#
+#   reference.lock   decides what every future run is scored against
+#   *.sha256         decides which bytes count as the baseline weights
+#   bench/results/   is the provenance check_reference_lock.py accepts for a pinned number
+#
+# Everything else in bench/scripts/ (the runner, the fit model, the tests) is reviewable
+# like any other code.
 
-# The PR-evaluation pipeline (bot, vast runner) and the on-box scoring harness
-/eval/                              @ai-hpc
-/bench/scripts/                     @ai-hpc
+# The pins and the measurements behind them
+/bench/scripts/reference.lock        @ai-hpc
+/bench/scripts/kimi_k3_*.sha256      @ai-hpc
+/bench/results/                      @ai-hpc
+
+# The PR-evaluation pipeline inherited from sparkinfer
+/eval/                               @ai-hpc
 
 # Emission weights, the frontier ledger, and CI/governance itself
-/.gittensor/                        @ai-hpc
-/dashboard/data.json                @ai-hpc
-/.github/                           @ai-hpc
+/.gittensor/                         @ai-hpc
+/dashboard/data.json                 @ai-hpc
+/.github/                            @ai-hpc

@@ -3,6 +3,78 @@
 Notable changes to sparkinfer. Format loosely follows [Keep a Changelog](https://keepachangelog.com);
 versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkinfer/releases).
 
+## [Unreleased] — CI retargeted for the H200×8 setup
+
+The seven workflows inherited from sparkinfer were SN74 competition governance for an
+RTX 5090 Qwen frontier. They provided **zero coverage of the K3 harness** — `eval-policy`
+linted four hand-listed Qwen-era files — while actively obstructing the work this repo
+exists to do. Replaced with CI built around one honest limit: no hosted runner will ever
+run an 802 GiB model, so gate what is cheap here and expensive on a rented node.
+
+### Added
+
+- **`ci.yml`** — five jobs, all runnable locally:
+  - `shell` — `bash -n` over **every** tracked script (not a hand list) + a CRLF guard
+  - `python` — `py_compile` over every tracked file + every **discovered** `test_*.py`
+  - `configs` — YAML parses, derived arch arithmetic is self-consistent (layer split, MLA
+    key length, KV bytes/token, KDA state bytes recomputed from the reference formulas),
+    relative links resolve
+  - `plans` — `--dry-run` resolves for all three nodes; the fork pin does not leak into the
+    upstream harness
+  - `lock` — **every pinned baseline traces to a committed measurement**
+- **`bench/scripts/check_reference_lock.py`** — the enforcement behind the `lock` job. `0`
+  means not measured and is always allowed; any non-zero baseline must match a recorded
+  sweep for the same node *and* context (prefill and decode are not interchangeable). This
+  is what makes the repo's central claim unfakeable rather than merely stated.
+- **`bench/scripts/audit_baseline_pins.py`** + **`pin-audit.yml`** — weekly drift watch on
+  the two external things the baseline depends on and cannot control: PR #48 can be
+  force-pushed, and a quant can be re-uploaded with a different shard count. Verified live
+  against both APIs. Opens/updates an issue on drift; fails the check on a PR.
+- **`build-gate.yml`** — compiles for `sm_90` (M1) and `sm_100` (M2), path-filtered.
+  `sm_103` is deliberately absent: an arch the installed toolkit doesn't recognise breaks
+  configure for every node.
+- **`node-attestation.yml`** — labels `needs-node-run` on perf-bearing changes with no node
+  attested. **Labels only; never closes a PR.**
+- **`.gitattributes`** — pins source to LF. See the CRLF fix below for why.
+
+### Changed
+
+- **`sensitive-paths-guard`** retargeted. It guarded all of `bench/scripts/`, which is
+  correct in sparkinfer (harness = scoring infrastructure, product = `runtime/`) but wrong
+  here, where the harness **is** the deliverable — it would have gated every contribution
+  the repo exists to receive. Narrowed to what actually determines a verdict:
+  `reference.lock`, the `*.sha256` manifests, and `bench/results/`. `CODEOWNERS` matched.
+- **`close-stale-prs`** rewritten. It **hardcoded `REPO: gittensor-ai-lab/sparkinfer`** —
+  a scheduled job here would have tried to close pull requests in the *upstream* repo. It
+  would have failed on permissions rather than succeeded, but that is not a failure mode to
+  leave armed. Now uses `github.repository`, drops the RTX-5090 and eval-verdict steps
+  (dead code without the SN74 bot), and moves 2 days → 14: a PR here can legitimately wait
+  on node availability.
+- **`copycat-guard`** now skips cleanly when `OPENAI_API_KEY` is absent. It passed on PR #1
+  only because the author was a MEMBER; the first external PR would have failed on the
+  missing secret.
+- **PR template** retargeted from "Tested on RTX 5090" to the three milestone nodes, with
+  the 1M capability probe and a pin-provenance checklist item.
+- Tests 58 → 76.
+
+### Removed
+
+- `eval-policy.yml` (superseded by `ci.yml`), `rtx5090-required.yml` (wrong hardware, and
+  auto-closed PRs on a criterion no PR here can satisfy), `build-attested-binaries.yml`
+  (built `sm_120` Linux+Windows binaries and published release tarballs; this repo ships no
+  binaries, and `sm_120` is not a node here).
+
+### Fixed
+
+- **`server/scripts/bench_api_vs_native.sh` was unrunnable.** Committed with CRLF, so its
+  heredoc terminator was `PY\r`, which never matches `PY` — `bash` reported "unexpected end
+  of file" and the script could not execute at all. Found within seconds of linting every
+  script instead of four. Also fixed a second bug in the same file: the interpreter args sat
+  on the line *after* the heredoc terminator, where the shell read them as a command to run
+  and the Python saw an empty `argv` (so `sys.argv[1]` raised `IndexError`).
+- CRLF normalised in five inherited source files under `server/`.
+- `server/README.md` linked `../changelog-pro6000.md`, which has never existed in this tree.
+
 ## [Unreleased] — target retargeted to UD-Q2_K_XL @ 1M, four milestones
 
 Repoints the whole repo at **UD-Q2_K_XL (802 GiB, 19 shards, 90.4% top-1)** at the full

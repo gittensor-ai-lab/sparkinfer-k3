@@ -1,4 +1,4 @@
-![sparkinfer banner](docs/sparkinfer.png)
+![SparkInfer K3 — Kimi K3 inference, 2.8T parameters, 1M context, one node](docs/k3.png)
 
 # SP⚡RKINFER-K3 · Powered by SN74
 
@@ -14,9 +14,10 @@ This repo currently contains **the measuring stick, not the runtime.**
 
 | | |
 |---|---|
-| ✅ **Evaluation baseline** | Pinned llama.cpp reference, 19-shard verification, accuracy reference server, 58 tests |
+| ✅ **Evaluation baseline** | Pinned llama.cpp reference, 19-shard verification, accuracy reference server, 76 tests |
 | ✅ **Architecture spec** | Every hparam traced to `config.json` or the reference implementation's source |
 | ✅ **Node + fit model** | H200/B200/B300 profiles, context-aware fits-in-HBM refusal, per-node reference slots |
+| ✅ **CI** | Retargeted off the RTX 5090 / SN74 gates; every pinned baseline must trace to a measurement |
 | ❌ **Native K3 runtime** | No `kimi-k3` GGUF loader. `runtime/` loaders are Qwen-shaped — M2 work |
 | ❌ **Tuned kernel path** | `kernels/` targets `sm_120`/`sm_121`; the milestone nodes are `sm_90`/`sm_100`/`sm_103` |
 | ❌ **Vision** | `llama-mtmd-cli` + `mmproj` wired up, no image benchmark — M4 work |
@@ -132,7 +133,7 @@ bench/scripts/kimi_k3_reference_server.sh --ctx 8704
 
 `--node` picks the `reference.lock` prefix (`KIMI_K3_H200X8_LLAMA_*` and friends), so **M1/M2/M3 cannot overwrite each other's reference** — they run the same quant at the same context, so the node is the only variable and a shared slot would conflate them. It also warns when the detected box doesn't match the claimed profile.
 
-Results land in `bench/results/`. Tests need no GPU: `python3 bench/scripts/test_kimi_k3_baseline.py` (58 tests).
+Results land in `bench/results/`. Tests need no GPU: `python3 bench/scripts/test_kimi_k3_baseline.py` (76 tests).
 
 K3 ships a **tiktoken vocab, not `tokenizer.json`**, so eval prompt ids come from the GGUF itself via `gen_eval_prompt.py --gguf` — strictly more correct than a side-loaded tokenizer, and cheap (`vocab_only`, metadata not weights).
 
@@ -220,6 +221,27 @@ ctest --test-dir build
 The default arch list in `CMakeLists.txt` is `89;90;100;120;121`. **103 is not in it**, and adding it requires a toolkit that recognises the target — otherwise configure fails for every node, not just B300. Confirm with `nvidia-smi --query-gpu=compute_cap --format=csv,noheader` before you add it.
 
 The baseline scripts build the pinned llama.cpp reference themselves into `.llamacpp-k3/` — a separate checkout from the upstream pin, so the two references never fight over one tree.
+
+## CI
+
+CI is built around one honest limit: **no hosted runner will ever run an 802 GiB model.** So it gates what is cheap here and expensive to discover on a rented node, and it does not pretend to gate anything else.
+
+| job | what it proves |
+|---|---|
+| `shell` | `bash -n` over **every** tracked script + no CRLF in source |
+| `python` | `py_compile` over every tracked file + every discovered `test_*.py` (76 K3 tests) |
+| `configs` | all YAML parses; the derived arch arithmetic is self-consistent; relative links resolve |
+| `plans` | `--dry-run` resolves for all three nodes; the fork pin does **not** leak into the upstream harness |
+| `lock` | **every pinned baseline traces to a committed `bench/results/*.json`** |
+
+That last job is the one that matters. The repo's whole claim is that a native runtime gets scored against a reference someone else can reproduce — which collapses the moment a number can be typed in, because downstream a hand-filled baseline is indistinguishable from a measured one. `check_reference_lock.py` makes that unfakeable: `0` means not measured and is always fine, but any non-zero value must match a recorded sweep for the same node *and* context.
+
+Two more, both path-filtered so harness PRs don't pay for them:
+
+- **`build-gate`** — compiles for `sm_90` and `sm_100` on changes to `kernels/`, `moe/`, `runtime/`, `server/`, `CMakeLists.txt`. (`sm_103` is deliberately absent; see the arch caveat above.)
+- **`pin-audit`** — weekly, plus on pin changes. The baseline is a PR head on someone else's fork and the weights live in someone else's HF repo; neither is immutable. Catches a force-push or a re-uploaded quant *before* you're paying for a node.
+
+`node-attestation` labels PRs that change perf-bearing code with no node run attested. It **labels only — it never closes a PR**, unlike the RTX-5090 gate it replaces.
 
 ## Automated evaluation
 

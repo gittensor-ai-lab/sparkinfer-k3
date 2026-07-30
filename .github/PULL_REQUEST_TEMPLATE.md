@@ -3,40 +3,61 @@
 <!-- What this PR adds or changes, and why. One or two lines. -->
 
 
-## Proof of speedup
+## What kind of change is this?
 
-> ⚠️ **The on-device eval runs only when BOTH are true:** (1) the box below is ticked, and
-> (2) at least one **decode tok/s** or **Qwythos prefill pp** table shows a **real end-to-end
-> improvement** (`after > before`, filled from `bench/scripts/bench.sh` — *not* an isolated-kernel
-> microbenchmark). A ticked box with empty/placeholder tables (or no claimed gain on either metric)
-> gets `needs-benchmark` and is **not** evaluated.
+<!-- Tick one. Most PRs in this repo are harness/docs and need no GPU at all. -->
+
+- [ ] **Harness / configs / docs / CI** — verified entirely by the `ci` workflow, no node needed
+- [ ] **Perf-bearing code** (`runtime/`, `kernels/`, `moe/`, `server/`, `CMakeLists.txt`) — needs a node run below
+- [ ] **Pin change** (`reference.lock`, a `*.sha256` manifest) — needs the backing `bench/results/*.json` committed
+
+---
+
+## Node run
+
+> Only required for perf-bearing changes. CI covers syntax, the no-GPU test suite, configs
+> and the `--dry-run` plans — but it cannot run an 802 GiB model, so it cannot tell whether
+> this moved the numbers. The `node-attestation` job adds a `needs-node-run` label when
+> perf-bearing files change with no node ticked. It **labels only — it never closes a PR.**
 >
-> Tick the box **only if you actually ran it on an RTX 5090**. False attestation is treated as
-> gaming — the account is **blocked** ([`.github/blocked-contributors.txt`](blocked-contributors.txt)),
-> same as copycatting or sybil farming.
+> Tick a box only if you actually ran it. A pinned baseline must be backed by the
+> `bench/results/*.json` the sweep emitted, and the `lock` CI job enforces that.
 
-- [ ] Tested on **RTX 5090** (`sm_120`)
+- [ ] Tested on **8× H200** (`sm_90`) — M1
+- [ ] Tested on **8× B200** (`sm_100`) — M2
+- [ ] Tested on **4×+ B300** (`sm_103`) — M3
 
-**Decode tok/s** (end-to-end, from `bench/scripts/bench.sh` — fill if this PR targets decode):
+**Decode tok/s** — from `bench/scripts/kimi_k3_baseline.sh --node <node>`, UD-Q2_K_XL:
 
-| | decode tok/s |
-|---|--:|
-| before (main) |  |
-| after (this PR) |  |
+| context | before (main) | after (this PR) |
+|---|--:|--:|
+| 128 | | |
+| 512 | | |
+| 4k | | |
+| 32k | | |
 
-**Prefill pp tok/s** (Qwythos / Qwen3.5 — fill if this PR targets prefill; use `--ctx 4096`, `32768`,
-`65536`, or `131072` and copy the `prefill pp` line — report your best context):
+**Prefill pp tok/s** — same command, same node:
 
-| | prefill pp tok/s |
-|---|--:|
-| before prefill (main) |  |
-| after prefill (this PR) |  |
+| context | before (main) | after (this PR) |
+|---|--:|--:|
+| 4k | | |
+| 32k | | |
 
-<!-- Paste the bench output backing the numbers above (baseline -> this PR). Isolated-kernel
-     microbenchmarks are welcome as extra evidence but do NOT count as before/after. -->
+**1M context** (`--longctx`, 1 rep — capability probe, not a median):
+
+| | loads | decode tok/s | prefill pp |
+|---|:-:|--:|--:|
+| this PR at 1,048,576 | | | |
+
+<!-- Paste the sweep output backing the numbers above. Isolated-kernel microbenchmarks are
+     welcome as extra evidence but do NOT substitute for an end-to-end before/after. -->
 
 ```text
-# paste bench/scripts/bench.sh output here (before -> after)
+# paste bench/scripts/kimi_k3_baseline.sh output here (before -> after)
 ```
 
-<!-- More checklist items will be added here later. -->
+## Checklist
+
+- [ ] `python3 bench/scripts/test_kimi_k3_baseline.py` passes
+- [ ] `bench/scripts/kimi_k3_baseline.sh --node <node> --dry-run` resolves
+- [ ] If a baseline was pinned: the emitted `bench/results/*.json` is committed alongside it
