@@ -192,19 +192,37 @@ struct Builder {
 
         op(K3Op::L2NormHeads, i, true, "l2_qk", qkv, qkv, "", "per-head L2 on q and k");
 
-        // Decay is per-channel: a low-rank f_a/f_b pair plus ssm_a and the dt bias.
-        // UNPINNED: the low-rank decay pair's inner rank is not derivable from any
-        // config key read out of the GGUF, so these widths are inferred. Run
-        // k3_validate_plan_shapes() against real weights to learn the true dims, then
-        // pin them. Asserting a guess here would be worse than reporting it.
-        mm_unpinned(i, true, "f_a", blk(i, "ssm_f_a.weight"), H,
-                    cfg.n_q_heads * cfg.kda_head_dim);
-        mm_unpinned(i, true, "f_b", blk(i, "ssm_f_b.weight"),
-                    cfg.n_q_heads * cfg.kda_head_dim, qkv);
+        // Decay gate. PINNED from the reference loader's create_tensor() calls
+        // (unslothai/llama.cpp src/models/kimi-k3.cpp), which are ground truth for
+        // what the file must contain — if a real GGUF disagreed, llama.cpp itself
+        // would fail to load it. ssm_a's shape is independently confirmed from the
+        // real UD-IQ1_S file (96x1x1); the rest are not yet cross-checked against
+        // file bytes, only against the loader source, so treat them as high-
+        // confidence rather than file-verified until k3_validate_plan_shapes() runs
+        // against real weights.
+        //
+        // f_a/f_b IS A LOW-RANK BOTTLENECK THROUGH head_dim, NOT qkv. An earlier
+        // version of this plan assumed f_a projected hidden -> qkv directly (as if
+        // decay were computed per-head-group at full width); the reference shows a
+        // single [n_embd, head_dim] projection shared before f_b fans it out to
+        // d_inner. Getting this backwards would silently run f_a/f_b at 96x the
+        // intended compute with a shape that still happens to chain (H -> qkv ->
+        // qkv), which is exactly the "well-formed activation, wrong number" trap
+        // this schedule exists to catch — and did, once the real shapes were read.
+        mm(i, true, "f_a", blk(i, "ssm_f_a.weight"), H, cfg.kda_head_dim);
+        mm(i, true, "f_b", blk(i, "ssm_f_b.weight"), cfg.kda_head_dim, qkv);
+        // Bias add BEFORE the decay gate, not after: kda_decay_gate_f32's contract is
+        // that g_raw already includes +dt_bias (see the kernel header doc). An earlier
+        // version of this schedule listed dt_bias as the step AFTER decay_gate, which
+        // is backwards from the dataflow even though the kernel itself takes g_raw as
+        // an opaque input and was never wrong.
+        vec(K3Op::MatMul, i, true, "dt_bias", qkv, blk(i, "ssm_dt.bias"));
         op(K3Op::KdaDecayGate, i, true, "decay_gate", qkv, qkv, blk(i, "ssm_a"),
-           "per-channel, NOT a scalar per head");
-        op(K3Op::MatMul, i, true, "dt_bias", qkv, qkv, blk(i, "ssm_dt.bias"));   // unpinned
-        mm_unpinned(i, true, "beta", blk(i, "ssm_beta.weight"), H, cfg.n_q_heads);
+           "A (ssm_a) is PER-HEAD [n_head]; g_raw (f_b(f_a(x))+dt_bias) is "
+           "PER-CHANNEL [d_inner]. The gate's output is per-channel because g_raw is, "
+           "even though A broadcasts one scalar across every channel in its head.");
+        pin1(cfg.n_q_heads);   // ssm_a is 1-D over heads — confirmed from the real file
+        mm(i, true, "beta", blk(i, "ssm_beta.weight"), H, cfg.n_q_heads);
 
         op(K3Op::KdaDecodeStep, i, true, "delta_rule", qkv, qkv, "",
            "gated delta rule, recurrent state update");

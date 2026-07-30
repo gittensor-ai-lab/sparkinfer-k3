@@ -351,17 +351,51 @@ int main() {
               first["blk.5.ffn_down_exps.weight"]->expect_ne1 == cfg.expert_latent,
               "down_exps pinned to [moe_ffn, expert_latent, n_experts]");
 
-        // Inferred, NOT verified: must stay unasserted so the validator reports them
-        // instead of a guess being enforced as truth.
-        for (const char* n : {"blk.5.ssm_f_a.weight", "blk.5.ssm_f_b.weight",
-                              "blk.5.ssm_beta.weight", "blk.5.ssm_dt.bias",
-                              "blk.5.ssm_a", "blk.5.ssm_conv1d_q.weight"}) {
-            auto it = first.find(n);
-            check(it != first.end(), std::string(n) + " is in the plan");
-            if (it == first.end()) continue;
-            check(it->second->expect_ne0 == 0 && it->second->expect_ne1 == 0,
-                  std::string(n) + " is UNPINNED (its layout was inferred, not read)");
+        // PINNED from the reference loader's create_tensor() calls (kimi-k3.cpp) —
+        // ssm_f_a/f_b were WRONG in an earlier version of this plan (see the
+        // comment at the build site) until this reading corrected them.
+        auto fa = first.find("blk.5.ssm_f_a.weight");
+        check(fa != first.end() && fa->second->expect_ne0 == cfg.hidden &&
+                  fa->second->expect_ne1 == cfg.kda_head_dim,
+              "ssm_f_a pins [hidden, kda_head_dim] — NOT [hidden, qkv]");
+        auto fb = first.find("blk.5.ssm_f_b.weight");
+        check(fb != first.end() && fb->second->expect_ne0 == cfg.kda_head_dim &&
+                  fb->second->expect_ne1 == cfg.n_q_heads * cfg.kda_head_dim,
+              "ssm_f_b pins [kda_head_dim, qkv] — the low-rank bottleneck is "
+              "kda_head_dim wide, not qkv wide");
+        auto beta_t = first.find("blk.5.ssm_beta.weight");
+        check(beta_t != first.end() && beta_t->second->expect_ne0 == cfg.hidden &&
+                  beta_t->second->expect_ne1 == cfg.n_q_heads,
+              "ssm_beta pins [hidden, n_q_heads]");
+        auto dtb = first.find("blk.5.ssm_dt.bias");
+        check(dtb != first.end() && dtb->second->expect_ne0 == cfg.n_q_heads * cfg.kda_head_dim &&
+                  dtb->second->expect_ne1 == 0,
+              "ssm_dt.bias pins ne0=d_inner (qkv) as a 1-D bias");
+        auto ssma = first.find("blk.5.ssm_a");
+        check(ssma != first.end() && ssma->second->expect_ne0 == cfg.n_q_heads &&
+                  ssma->second->expect_ne1 == 0,
+              "ssm_a pins ne0=n_head — CONFIRMED against the real UD-IQ1_S file (96x1x1)");
+
+        // dt_bias must precede decay_gate in the STEP ORDER, not just in the tensor
+        // set: kda_decay_gate_f32's contract is that g_raw already includes +dt_bias.
+        // An earlier version of this plan had the order backwards.
+        int idx_dt = -1, idx_gate = -1, idx_fb = -1;
+        for (size_t k = 0; k < plan.steps.size(); ++k) {
+            if (plan.steps[k].layer != 5) continue;
+            if (plan.steps[k].label == std::string("dt_bias")) idx_dt = (int)k;
+            if (plan.steps[k].op == K3Op::KdaDecayGate) idx_gate = (int)k;
+            if (plan.steps[k].label == std::string("f_b")) idx_fb = (int)k;
         }
+        check(idx_fb >= 0 && idx_dt >= 0 && idx_gate >= 0 &&
+                  idx_fb < idx_dt && idx_dt < idx_gate,
+              "order is f_b -> dt_bias -> decay_gate, matching the reference dataflow");
+
+        // Still genuinely unpinned: the conv1d weight's exact axis layout (3-D vs 4-D
+        // storage, trailing dim of 1 possibly squeezed) has ambiguity a naive pin
+        // could get wrong, so it stays reported rather than asserted.
+        auto conv = first.find("blk.5.ssm_conv1d_q.weight");
+        check(conv != first.end() && conv->second->expect_ne0 == 0,
+              "ssm_conv1d_q is still UNPINNED (axis-order ambiguity, not yet resolved)");
 
         // A 1-D norm asserts its width and nothing else — pinning ne1 on a 1-D tensor
         // would fail against every real file, where ne1 is 1.
