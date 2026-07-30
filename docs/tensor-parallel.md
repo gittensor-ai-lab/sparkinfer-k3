@@ -13,6 +13,7 @@ abstraction, the NCCL backend, the hardware validation tool) and **what has not*
 |---|---|
 | ✅ **Shard math** | `runtime/src/tp/shard.cpp` — CUDA-free, **4972 checks passing** |
 | ✅ **Backend selection** | `runtime/src/tp/backend_select.cpp` — CUDA-free, **44 checks passing** |
+| ✅ **Tensor→rule mapping** | `runtime/src/tp/weight_plan.cpp` — CUDA-free, **230 checks passing** |
 | ✅ **NCCL collective** | `runtime/src/tp/collective.cpp` — compiles, **not run on hardware** |
 | ✅ **Fast collectives** | `runtime/csrc/tp/` — peer-oneshot + multimem vendored, **not run on hardware** |
 | ✅ **Validation tool** | `tp_allreduce_check` — correctness + latency, **never executed** |
@@ -179,10 +180,18 @@ benchmark measure one card.
 
 1. **Run `tp_allreduce_check` on the 8× H200 node.** Nothing below is worth
    starting until the collective is proven correct and its latency is known.
-2. **Sharded weight loading.** `load_gguf()` currently loads to one device;
-   it needs to consult `ShardDims` and place each rank's slice. The slicing
-   primitives (`row_shard`, `col_shard`, `col_shard_row_offset`) are done and
-   tested — this is plumbing, not design.
+2. **Sharded weight loading.** `load_gguf()` currently loads to one device; it
+   needs to walk its tensors through `plan_for()` and place each rank's slice. The
+   decisions are done and tested — the slicing primitives (`row_shard`,
+   `col_shard`, `col_shard_row_offset`) and the per-tensor rules
+   (`weight_plan.h`) — so what remains is copy plumbing, not design.
+
+   Two things the plan will tell the loader that it must handle rather than
+   ignore: a **fused `attn_qkv` with replicated kv is refused** (`Rule::Unknown`
+   with a note), because q shards while kv replicates and that is not one rule —
+   the loader has to split the fused tensor first. And any tensor with no rule is
+   a **hard load error**, so a K3 tensor sparkinfer has no loader for (`attn_kv_b`,
+   `attn_res_proj`) stops the load instead of being mis-sharded.
 3. **Forward integration.** Insert the two all-reduces per layer at the points
    `ReducePoint` enumerates, and shard the lm_head with a cross-rank argmax
    (each rank's local max + index is all that needs exchanging, so that

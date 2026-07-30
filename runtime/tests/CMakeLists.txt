@@ -13,6 +13,16 @@ add_executable(tp_backend_cpu_test tp_backend_cpu_test.cpp ../src/tp/backend_sel
 set_target_properties(tp_backend_cpu_test PROPERTIES CXX_STANDARD 17)
 add_test(NAME tp_backend_cpu_test COMMAND tp_backend_cpu_test)
 
+# Tensor -> shard-rule mapping. Worst-consequence layer in the TP stack: a wrong
+# rule is not a crash and not a shape mismatch — every rank computes a well-formed
+# activation over the wrong slice, the all-reduce sums eight wrong partials into a
+# plausible answer, and the model stays fluent. Asserted against the real GGUF
+# tensor names the loader reads.
+add_executable(tp_weight_plan_cpu_test tp_weight_plan_cpu_test.cpp
+               ../src/tp/weight_plan.cpp ../src/tp/shard.cpp)
+set_target_properties(tp_weight_plan_cpu_test PROPERTIES CXX_STANDARD 17)
+add_test(NAME tp_weight_plan_cpu_test COMMAND tp_weight_plan_cpu_test)
+
 add_executable(decode_layer_cpu_test decode_layer_cpu_test.cpp)
 set_target_properties(decode_layer_cpu_test PROPERTIES CXX_STANDARD 17)
 add_test(NAME decode_layer_cpu_test COMMAND decode_layer_cpu_test)
