@@ -785,6 +785,18 @@ __global__ void proj_f32_kernel(float* __restrict__ y, const float* __restrict__
     if (threadIdx.x == 0) y[n] = acc;
 }
 
+
+template <int BLOCK>
+__global__ void rms_norm_kernel(float* __restrict__ out, const float* __restrict__ x,
+                                const float* __restrict__ w, int n, float eps) {
+    __shared__ float shm[BLOCK / 32 + 1];
+    float acc = 0.0f;
+    for (int d = threadIdx.x; d < n; d += BLOCK) acc += x[d] * x[d];
+    const float ss = block_sum<BLOCK>(acc, shm);
+    const float inv = rsqrtf(ss / (float)n + eps);
+    for (int d = threadIdx.x; d < n; d += BLOCK) out[d] = x[d] * inv * w[d];
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -1057,6 +1069,13 @@ bool k3_proj_f32(float* y, const float* x, const void* W, int wtype,
         default:
             return false;
     }
+}
+
+void rms_norm_f32(float* out, const float* x, const float* w, int n, float eps,
+                  cudaStream_t stream) {
+    if (n <= 0) return;
+    constexpr int BLOCK = 128;
+    rms_norm_kernel<BLOCK><<<1, BLOCK, 0, stream>>>(out, x, w, n, eps);
 }
 
 }  // namespace k3

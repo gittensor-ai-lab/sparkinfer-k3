@@ -402,6 +402,17 @@ void mla_decode_attn_f32(float* out, const float* q, const float* k_cache,
 bool k3_proj_f32(float* y, const float* x, const void* W, int wtype,
                  int N, int K, cudaStream_t stream);
 
+// ---------------------------------------------------------------------------
+// 15. Plain RMS norm (full width, elementwise)
+// ---------------------------------------------------------------------------
+// The ordinary case: attn_norm, ffn_norm, q_a_norm, kv_a_norm, ffn_routed_norm.
+// Every OTHER norm in this file is a variant fused with something else
+// (kda_gate_out_f32 norms per-head then gates; attn_res_mix_f32 norms internally
+// while scoring) — this is the one for a learned weight applied over the WHOLE
+// vector at once, out[d] = x[d]/sqrt(mean(x^2)+eps) * w[d]. In-place is fine.
+void rms_norm_f32(float* out, const float* x, const float* w, int n, float eps,
+                  cudaStream_t stream);
+
 }  // namespace k3
 }  // namespace kernels
 }  // namespace sparkinfer

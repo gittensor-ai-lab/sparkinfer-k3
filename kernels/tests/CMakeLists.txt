@@ -34,3 +34,10 @@ add_executable(kimi_k3_row_dequant_test kimi_k3_row_dequant_test.cu)
 target_link_libraries(kimi_k3_row_dequant_test PRIVATE si_k3)
 target_include_directories(kimi_k3_row_dequant_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
 add_test(NAME kimi_k3_row_dequant_test COMMAND kimi_k3_row_dequant_test)
+
+# Plain full-width RMS norm — attn_norm, ffn_norm, q_a_norm, kv_a_norm,
+# ffn_routed_norm all use this; every other norm in kimi_k3.h is a fused variant.
+add_executable(kimi_k3_rms_norm_test kimi_k3_rms_norm_test.cu)
+target_link_libraries(kimi_k3_rms_norm_test PRIVATE si_k3)
+target_include_directories(kimi_k3_rms_norm_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
+add_test(NAME kimi_k3_rms_norm_test COMMAND kimi_k3_rms_norm_test)
