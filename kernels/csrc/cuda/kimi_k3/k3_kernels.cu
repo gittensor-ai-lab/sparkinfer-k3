@@ -723,6 +723,47 @@ __global__ void mla_decode_attn_kernel(float* __restrict__ out,
     }
 }
 
+// --- generic f32-activation GEMV --------------------------------------------
+// One CUDA thread block per output row n; threads stride over K.
+
+struct BlockQ8_0 {   // 34 bytes, matches ggml block_q8_0 exactly
+    uint16_t d;       // fp16 scale
+    int8_t   qs[32];
+};
+
+template <int BLOCK>
+__global__ void proj_q8_0_kernel(float* __restrict__ y, const float* __restrict__ x,
+                                 const BlockQ8_0* __restrict__ W, int blocks_per_row) {
+    const int n = blockIdx.x;
+    const BlockQ8_0* row = W + (size_t)n * blocks_per_row;
+    __shared__ float shm[BLOCK / 32 + 1];
+
+    float acc = 0.0f;
+    for (int b = threadIdx.x; b < blocks_per_row; b += BLOCK) {
+        const float d = __half2float(__ushort_as_half(row[b].d));
+        const float* xb = x + (size_t)b * 32;
+        float s = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 32; ++j) s += (float)row[b].qs[j] * xb[j];
+        acc += d * s;
+    }
+    acc = block_sum<BLOCK>(acc, shm);
+    if (threadIdx.x == 0) y[n] = acc;
+}
+
+template <int BLOCK>
+__global__ void proj_f32_kernel(float* __restrict__ y, const float* __restrict__ x,
+                                const float* __restrict__ W, int K) {
+    const int n = blockIdx.x;
+    const float* row = W + (size_t)n * K;
+    __shared__ float shm[BLOCK / 32 + 1];
+
+    float acc = 0.0f;
+    for (int k = threadIdx.x; k < K; k += BLOCK) acc += row[k] * x[k];
+    acc = block_sum<BLOCK>(acc, shm);
+    if (threadIdx.x == 0) y[n] = acc;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -958,6 +999,26 @@ void mla_decode_attn_f32(float* out, const float* q, const float* k_cache,
     const size_t shm = ((size_t)n_ctx + (size_t)kv_lora + BLOCK / 32 + 1) * sizeof(float);
     mla_decode_attn_kernel<BLOCK><<<(unsigned)n_head, BLOCK, shm, stream>>>(
         out, q, k_cache, wv_b, key_length, kv_lora, v_dim, n_ctx, scale);
+}
+
+bool k3_proj_f32(float* y, const float* x, const void* W, int wtype,
+                 int N, int K, cudaStream_t stream) {
+    if (N <= 0 || K <= 0) return false;
+    constexpr int BLOCK = 128;
+    switch (wtype) {
+        case 0:   // F32, dense
+            proj_f32_kernel<BLOCK><<<(unsigned)N, BLOCK, 0, stream>>>(
+                y, x, (const float*)W, K);
+            return true;
+        case 8: {  // Q8_0
+            if (K % 32 != 0) return false;
+            proj_q8_0_kernel<BLOCK><<<(unsigned)N, BLOCK, 0, stream>>>(
+                y, x, (const BlockQ8_0*)W, K / 32);
+            return true;
+        }
+        default:
+            return false;
+    }
 }
 
 }  // namespace k3

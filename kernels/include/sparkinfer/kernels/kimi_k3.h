@@ -375,6 +375,33 @@ void mla_decode_attn_f32(float* out, const float* q, const float* k_cache,
                          int v_dim, int n_head, int n_ctx, float scale,
                          cudaStream_t stream);
 
+// ---------------------------------------------------------------------------
+// 14. Generic projection (GEMV), f32 activation in, f32 out
+// ---------------------------------------------------------------------------
+// Every other GEMV in this codebase (kernels/include/sparkinfer/kernels/gemm.h,
+// launch_gemv / launch_gemv_q) takes a BF16 activation, because the Qwen models run
+// their residual stream in bf16. K3's kernels above are all f32 in/out, transcribed
+// directly from a float64 reference and validated bit-for-bit against ggml — running
+// the hidden state in bf16 would truncate to ~8 bits of mantissa at every one of
+// K3's ~2 projections per layer times 93 layers, and the whole point of this
+// project's per-kernel float64 validation is to keep error near machine epsilon, not
+// to reintroduce it at the one place a "GEMV" would otherwise seem interchangeable.
+// So this is a SEPARATE, f32-native GEMV rather than a cast to bf16 and a reuse of
+// launch_gemv_q.
+//
+//   y[n] = sum_k x[k] * W[k + n*K]     W is GGUF-native [N,K] (ne0=K fastest)
+//
+// wtype is the ggml type id. Only types actually present in K3's non-expert tensors
+// are implemented — F32 (0, dense passthrough: norms are already stored this way,
+// though norms go through rms_norm, not this) and Q8_0 (8, dequant_row_q8_0's
+// y=qs*d, the block layout the attention/FFN projections and the LM head use in the
+// UD-IQ1_S/UD-Q2_K_XL dumps this project has read off the real file). Anything else
+// returns false — a caller that decoded an unsupported type by falling through to a
+// wrong reader would produce a right-shaped, wrong-valued tensor, the same trap
+// dequant_f32_by_type exists to refuse elsewhere.
+bool k3_proj_f32(float* y, const float* x, const void* W, int wtype,
+                 int N, int K, cudaStream_t stream);
+
 }  // namespace k3
 }  // namespace kernels
 }  // namespace sparkinfer
