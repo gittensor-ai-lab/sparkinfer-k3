@@ -413,6 +413,15 @@ bool k3_proj_f32(float* y, const float* x, const void* W, int wtype,
 void rms_norm_f32(float* out, const float* x, const float* w, int n, float eps,
                   cudaStream_t stream);
 
+// ---------------------------------------------------------------------------
+// 16. Elementwise add (residual combine)
+// ---------------------------------------------------------------------------
+// out[i] = a[i] + b[i]. Safe in-place with out==a (the residual-add case: prefix_sum
+// += layer_output). The "replace" case (a checkpointed layer's residual combine)
+// needs no kernel at all — it is a plain device-to-device copy of the layer output.
+void k3_add_f32(float* out, const float* a, const float* b, int64_t n,
+                cudaStream_t stream);
+
 }  // namespace k3
 }  // namespace kernels
 }  // namespace sparkinfer

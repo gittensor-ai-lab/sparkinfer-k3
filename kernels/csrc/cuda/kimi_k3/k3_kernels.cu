@@ -786,6 +786,12 @@ __global__ void proj_f32_kernel(float* __restrict__ y, const float* __restrict__
 }
 
 
+__global__ void add_f32_kernel(float* __restrict__ out, const float* __restrict__ a,
+                               const float* __restrict__ b, int64_t n) {
+    const int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
+    if (i < n) out[i] = a[i] + b[i];
+}
+
 template <int BLOCK>
 __global__ void rms_norm_kernel(float* __restrict__ out, const float* __restrict__ x,
                                 const float* __restrict__ w, int n, float eps) {
@@ -1076,6 +1082,14 @@ void rms_norm_f32(float* out, const float* x, const float* w, int n, float eps,
     if (n <= 0) return;
     constexpr int BLOCK = 128;
     rms_norm_kernel<BLOCK><<<1, BLOCK, 0, stream>>>(out, x, w, n, eps);
+}
+
+void k3_add_f32(float* out, const float* a, const float* b, int64_t n,
+               cudaStream_t stream) {
+    if (n <= 0) return;
+    const int T = 256;
+    const int64_t blocks = (n + T - 1) / T;
+    add_f32_kernel<<<(unsigned)blocks, T, 0, stream>>>(out, a, b, n);
 }
 
 }  // namespace k3
