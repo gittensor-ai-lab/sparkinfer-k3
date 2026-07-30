@@ -46,6 +46,47 @@ target_compile_options(sparkinfer_runtime PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:-O3;--use_fast_math;-lineinfo>)
 set_target_properties(sparkinfer_runtime PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
+# ---- Tensor parallelism (multi-GPU) ----------------------------------------
+# OFF by default, deliberately. src/tp/*.cpp always compiles (the shard math and
+# backend selection are plain C++ and carry no CUDA-multi-GPU dependency), so the
+# default single-GPU build is unchanged and TP=1 takes the same code path it
+# always did. Turning this ON only adds the NCCL collective.
+option(SPARKINFER_TP "Enable multi-GPU tensor parallelism (requires NCCL)" OFF)
+
+if(SPARKINFER_TP)
+    # NCCL is not exported as a CMake package by the CUDA toolkit, so look for it
+    # where the toolkit and the distro packages put it.
+    find_path(NCCL_INCLUDE_DIR nccl.h
+        HINTS ${CUDAToolkit_INCLUDE_DIRS} ENV NCCL_HOME ENV CUDA_HOME
+        PATH_SUFFIXES include)
+    find_library(NCCL_LIBRARY NAMES nccl
+        HINTS ${CUDAToolkit_LIBRARY_DIR} ENV NCCL_HOME ENV CUDA_HOME
+        PATH_SUFFIXES lib lib64 lib/x86_64-linux-gnu)
+
+    if(NCCL_INCLUDE_DIR AND NCCL_LIBRARY)
+        target_include_directories(sparkinfer_runtime PUBLIC ${NCCL_INCLUDE_DIR})
+        target_link_libraries(sparkinfer_runtime PUBLIC ${NCCL_LIBRARY})
+        target_compile_definitions(sparkinfer_runtime PUBLIC SPARKINFER_TP_NCCL)
+        message(STATUS "sparkinfer: TP enabled — NCCL ${NCCL_LIBRARY}")
+
+        # The CUDA driver API is needed only to probe multicast/NVLS support for
+        # the (not-yet-vendored) multimem backend. Optional: without it the probe
+        # reports multicast unsupported, which is the safe answer.
+        if(TARGET CUDA::cuda_driver)
+            target_link_libraries(sparkinfer_runtime PUBLIC CUDA::cuda_driver)
+            target_compile_definitions(sparkinfer_runtime PUBLIC SPARKINFER_TP_CUDA_DRIVER)
+            message(STATUS "sparkinfer: TP multicast probe enabled (CUDA driver API)")
+        endif()
+    else()
+        # Hard error, not a silent downgrade: -DSPARKINFER_TP=ON is an explicit
+        # request for multi-GPU, and quietly producing a single-GPU binary would
+        # let a "TP" benchmark measure one card.
+        message(FATAL_ERROR
+            "SPARKINFER_TP=ON but NCCL was not found. Install NCCL (libnccl-dev) or set "
+            "NCCL_HOME, or configure with -DSPARKINFER_TP=OFF.")
+    endif()
+endif()
+
 if(BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
@@ -81,4 +122,13 @@ if(BUILD_EXAMPLES)
     add_executable(thermal_sweep examples/thermal_sweep.cpp)   # force each thermal mode, measure W/°C/tok/s
     target_include_directories(thermal_sweep PRIVATE include)
     target_link_libraries(thermal_sweep PRIVATE sparkinfer_runtime CUDA::cudart Threads::Threads)
+
+    # Validate the TP collective on real hardware BEFORE any forward path trusts
+    # it: correctness on every rank first, then per-call latency at the payloads
+    # that matter. Built unconditionally (it runs and reports "no CUDA device"
+    # without a GPU, and reports the no-op backend without -DSPARKINFER_TP=ON),
+    # because a check you have to opt into is a check nobody runs.
+    add_executable(tp_allreduce_check examples/tp_allreduce_check.cpp)
+    target_include_directories(tp_allreduce_check PRIVATE include)
+    target_link_libraries(tp_allreduce_check PRIVATE sparkinfer_runtime CUDA::cudart)
 endif()

@@ -1,4 +1,18 @@
 # CPU composition tests — pure C++, validate the wiring math (no GPU needed).
+
+# Tensor-parallel shard math + all-reduce backend selection. Both are CUDA-free by
+# construction so they run in ordinary CI, which matters more here than usual: a
+# wrong row/column split, a GQA kv group split across ranks, or a silent fall back
+# to a different collective all produce a model that loads, runs at full speed,
+# and is subtly wrong — the one failure mode a rented 8-GPU box will not surface.
+add_executable(tp_shard_cpu_test tp_shard_cpu_test.cpp ../src/tp/shard.cpp)
+set_target_properties(tp_shard_cpu_test PROPERTIES CXX_STANDARD 17)
+add_test(NAME tp_shard_cpu_test COMMAND tp_shard_cpu_test)
+
+add_executable(tp_backend_cpu_test tp_backend_cpu_test.cpp ../src/tp/backend_select.cpp)
+set_target_properties(tp_backend_cpu_test PROPERTIES CXX_STANDARD 17)
+add_test(NAME tp_backend_cpu_test COMMAND tp_backend_cpu_test)
+
 add_executable(decode_layer_cpu_test decode_layer_cpu_test.cpp)
 set_target_properties(decode_layer_cpu_test PROPERTIES CXX_STANDARD 17)
 add_test(NAME decode_layer_cpu_test COMMAND decode_layer_cpu_test)
