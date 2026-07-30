@@ -376,6 +376,45 @@ int main() {
                   ssma->second->expect_ne1 == 0,
               "ssm_a pins ne0=n_head — CONFIRMED against the real UD-IQ1_S file (96x1x1)");
 
+        // ssm_norm.weight is [head_dim] (128), NOT [d_inner]/qkv (12288) — an earlier
+        // version of this plan pinned it at qkv width AND scheduled a separate
+        // RmsNorm step for it, when kda_gate_out_f32 already does rms_norm internally
+        // and consumes ssm_norm.weight itself. There is no standalone "ssm_norm" step.
+        int idx_ssmnorm_step = -1;
+        for (size_t k = 0; k < plan.steps.size(); ++k)
+            if (plan.steps[k].layer == 5 && plan.steps[k].op == K3Op::RmsNorm &&
+                plan.steps[k].tensor == "blk.5.ssm_norm.weight")
+                idx_ssmnorm_step = (int)k;
+        check(idx_ssmnorm_step < 0,
+              "no standalone RmsNorm step consumes ssm_norm.weight — it is folded "
+              "into kda_gate_out");
+        auto ssmnorm = first.find("blk.5.ssm_norm.weight");
+        check(ssmnorm != first.end() && ssmnorm->second->op == K3Op::KdaGateOut,
+              "ssm_norm.weight is consumed by the KdaGateOut step");
+        check(ssmnorm != first.end() && ssmnorm->second->expect_ne0 == cfg.kda_head_dim &&
+                  ssmnorm->second->expect_ne1 == 0,
+              "ssm_norm.weight pins ne0=kda_head_dim (128), not qkv (12288)");
+
+        // wk_b/wv_b: 3-D, head-major, consumed directly by MlaAbsorbQ/MlaDecodeAttn —
+        // an earlier version of this plan modeled them as 2-D GEMV projections
+        // (mm() calls) that don't correspond to anything in the reference. Layer 0
+        // is MLA in this test's synthetic layer map.
+        auto kb = first.find("blk.0.attn_k_b.weight");
+        const int qk_nope = cfg.key_length_mla - cfg.rope_dim;
+        check(kb != first.end() && kb->second->op == K3Op::MlaAbsorbQ,
+              "attn_k_b.weight is consumed by MlaAbsorbQ, not a separate MatMul");
+        check(kb != first.end() && kb->second->expect_ne0 == qk_nope &&
+                  kb->second->expect_ne1 == cfg.kv_lora_rank &&
+                  kb->second->expect_ne2 == cfg.n_q_heads,
+              "attn_k_b.weight pins [qk_nope_head_dim, kv_lora_rank, n_head]");
+        auto vb = first.find("blk.0.attn_v_b.weight");
+        check(vb != first.end() && vb->second->op == K3Op::MlaDecodeAttn,
+              "attn_v_b.weight is consumed by MlaDecodeAttn, not a separate MatMul");
+        check(vb != first.end() && vb->second->expect_ne0 == cfg.kv_lora_rank &&
+                  vb->second->expect_ne1 == cfg.value_length_mla &&
+                  vb->second->expect_ne2 == cfg.n_q_heads,
+              "attn_v_b.weight pins [kv_lora_rank, n_embd_head_v, n_head]");
+
         // dt_bias must precede decay_gate in the STEP ORDER, not just in the tensor
         // set: kda_decay_gate_f32's contract is that g_raw already includes +dt_bias.
         // An earlier version of this plan had the order backwards.
@@ -442,18 +481,28 @@ int main() {
 
         // Layer 0 is a checkpoint layer (0 % 12 == 0) in every configuration —
         // block_size divides 0 regardless of its value.
+        //
+        // attn_res_score.weight is NOT a separate MatMul step — it is a 1-D scoring
+        // vector consumed directly by AttnResMix (see the build-site comment), so the
+        // check here is on AttnResMix's own tensor field, not a preceding step.
         const int L = 0;
-        const int i_score  = idx_of(L, K3Op::MatMul, "attn_res_score");
         const int i_mix    = idx_of(L, K3Op::AttnResMix, "attn_res_mix");
         const int i_push   = idx_of(L, K3Op::ResBankPush, "res_bank_push");
         const int i_norm   = idx_of(L, K3Op::RmsNorm, "attn_norm");
         const int i_replace = idx_of(L, K3Op::AddResidual, "replace_attn");
         const int i_add_attn = idx_of(L, K3Op::AddResidual, "add_attn");
 
-        check(i_score >= 0 && i_mix >= 0 && i_push >= 0 && i_norm >= 0,
-              "layer 0 has attn_res_score, attn_res_mix, res_bank_push, attn_norm");
-        check(i_score < i_mix && i_mix < i_push && i_push < i_norm,
-              "order is attn_res_score -> attn_res_mix -> res_bank_push -> attn_norm "
+        check(i_mix >= 0 && i_push >= 0 && i_norm >= 0,
+              "layer 0 has attn_res_mix, res_bank_push, attn_norm");
+        check(i_mix >= 0 && plan.steps[i_mix].tensor == "blk.0.attn_res_score.weight",
+              "attn_res_mix's own tensor is attn_res_score.weight, not a preceding "
+              "MatMul's output");
+        check(i_mix >= 0 && plan.steps[i_mix].expect_ne0 == cfg.hidden &&
+                  plan.steps[i_mix].expect_ne1 == 0,
+              "attn_res_score.weight pins ne0=hidden only — it is 1-D, not a "
+              "[hidden, block_size] matrix");
+        check(i_mix < i_push && i_push < i_norm,
+              "order is attn_res_mix -> res_bank_push -> attn_norm "
               "(mix and bank BEFORE the norm, not after)");
         check(i_replace >= 0, "layer 0's attention residual combine is labelled "
                               "'replace_attn' (it is a checkpoint layer)");

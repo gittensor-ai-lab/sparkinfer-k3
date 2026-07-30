@@ -237,9 +237,23 @@ struct Builder {
 
         op(K3Op::KdaDecodeStep, i, true, "delta_rule", qkv, qkv, "",
            "gated delta rule, recurrent state update");
-        op(K3Op::RmsNorm, i, true, "ssm_norm", qkv, qkv, blk(i, "ssm_norm.weight"));  // unpinned
         mm(i, true, "g_proj", blk(i, "ssm_g.weight"), H, qkv);
-        op(K3Op::KdaGateOut, i, true, "gate_out", qkv, qkv);
+        // kda_gate_out_f32 does rms_norm AND the sigmoid gate in ONE call — see its
+        // header doc: "normed = rms_norm(o, ssm_o_norm); gated = normed*sigmoid(g2)".
+        // An earlier version of this plan scheduled a SEPARATE RmsNorm step first,
+        // consuming the same ssm_norm.weight tensor — that would have normalised the
+        // delta-rule output twice (once standalone, once again inside the kernel it
+        // fed into), or worse, fed the kernel a value it does not expect. There is no
+        // separate norm step; ssm_norm.weight is a parameter OF gate_out, exactly like
+        // ssm_a is a parameter of decay_gate above.
+        //
+        // ssm_norm.weight is [head_dim] (128), NOT [d_inner]/qkv (12288) — the
+        // reference creates it as {head_dim} and the norm runs per (head, token) over
+        // head_dim with the SAME weight shared across every head, not a per-channel
+        // weight over the full qkv width. Confirmed from create_tensor in the
+        // reference loader.
+        op(K3Op::KdaGateOut, i, true, "gate_out", qkv, qkv, blk(i, "ssm_norm.weight"));
+        pin1(cfg.kda_head_dim);
 
         mm(i, true, "attn_out", blk(i, "attn_output.weight"), qkv, H);
         reduce(i, true, "reduce_attn", H);
@@ -270,20 +284,41 @@ struct Builder {
         vec(K3Op::RmsNorm, i, false, "kv_a_norm", cfg.kv_lora_rank,
             blk(i, "attn_kv_a_norm.weight"));
 
+        // wk_b/wv_b are NOT separate GEMV projections — an earlier version of this
+        // plan modeled them as mm() calls producing qh*key_length_mla /
+        // qh*value_length_mla, which is wrong on two counts. Per the reference's
+        // create_tensor calls they are 3-D, head-major: wk_b is
+        // [qk_nope_head_dim, kv_lora_rank, n_head], wv_b is
+        // [kv_lora_rank, n_embd_head_v, n_head] — and neither is consumed by a plain
+        // GEMV at all. wk_b is read directly inside mla_absorb_q_f32 (folding it into
+        // q_nope per head, see that kernel's doc), and wv_b is read directly inside
+        // mla_decode_attn_f32 (decompressing the attended latent back to v_dim per
+        // head). So the tensor is attached to the STEP THAT ACTUALLY CONSUMES it,
+        // pinned at its real 3-D shape, with no intervening "projection" step.
+        const int qk_nope = cfg.key_length_mla - cfg.rope_dim;   // 192 - 64 = 128
         if (opt.has_fused_kv_b) {
-            mm(i, false, "kv_b", blk(i, "attn_kv_b.weight"), cfg.kv_lora_rank,
-               qh * (cfg.key_length_mla + cfg.value_length_mla));
+            // The reference's fused wkv_b is one tensor that build_mla_layer splits
+            // via a ggml_view into k_b- and v_b-equivalent halves; this plan does not
+            // yet model that split precisely (the exact view offsets are not derived
+            // here), so the fused path is left UNPINNED rather than asserting a shape
+            // that might not match how the split is actually laid out. The real
+            // UD-IQ1_S file is expected to ship the split k_b/v_b form (has_fused_kv_b
+            // defaults false); resolve this properly if a file is ever seen without
+            // attn_k_b/attn_v_b.
+            op(K3Op::MlaAbsorbQ, i, false, "absorb_q", qh * cfg.key_length_mla,
+               qh * cfg.kv_lora_rank, blk(i, "attn_kv_b.weight"),
+               "fold k_b (fused kv_b, split not modeled) into q");
+            op(K3Op::MlaDecodeAttn, i, false, "decode_attn", qh * cfg.kv_lora_rank,
+               qh * cfg.value_length_mla, "", "NoPE-only");
         } else {
-            mm(i, false, "k_b", blk(i, "attn_k_b.weight"), cfg.kv_lora_rank,
-               qh * cfg.key_length_mla);
-            mm(i, false, "v_b", blk(i, "attn_v_b.weight"), cfg.kv_lora_rank,
-               qh * cfg.value_length_mla);
+            op(K3Op::MlaAbsorbQ, i, false, "absorb_q", qh * cfg.key_length_mla,
+               qh * cfg.kv_lora_rank, blk(i, "attn_k_b.weight"),
+               "fold k_b into q so attention runs in latent space");
+            pin3(qk_nope, cfg.kv_lora_rank, qh);
+            op(K3Op::MlaDecodeAttn, i, false, "decode_attn", qh * cfg.kv_lora_rank,
+               qh * cfg.value_length_mla, blk(i, "attn_v_b.weight"), "NoPE-only");
+            pin3(cfg.kv_lora_rank, cfg.value_length_mla, qh);
         }
-
-        op(K3Op::MlaAbsorbQ, i, false, "absorb_q", qh * cfg.key_length_mla,
-           qh * cfg.kv_lora_rank, "", "fold k_b into q so attention runs in latent space");
-        op(K3Op::MlaDecodeAttn, i, false, "decode_attn", qh * cfg.kv_lora_rank,
-           qh * cfg.value_length_mla, "", "NoPE-only");
 
         if (opt.has_attn_gate) {
             mm(i, false, "attn_gate", blk(i, "attn_gate.weight"), H,
@@ -322,8 +357,8 @@ struct Builder {
         // THE LATENT HOP. Routed experts do not live at hidden width.
         mm(i, kda, "routed_down", blk(i, "ffn_routed_down.weight"), H, cfg.expert_latent);
         if (opt.has_routed_norm) {
-            op(K3Op::RmsNorm, i, kda, "routed_norm", cfg.expert_latent, cfg.expert_latent,
-               blk(i, "ffn_routed_norm.weight"));
+            vec(K3Op::RmsNorm, i, kda, "routed_norm", cfg.expert_latent,
+                blk(i, "ffn_routed_norm.weight"));
         }
 
         // Pinned from a direct read of the real model (blk.1): gate/up are
@@ -342,10 +377,15 @@ struct Builder {
         pin3(cfg.moe_ffn, cfg.expert_latent, cfg.n_experts);
 
         if (opt.has_shared_experts) {
-            mm(i, kda, "shexp_gate", blk(i, "ffn_gate_shexp.weight"), H, cfg.moe_ffn);
-            mm(i, kda, "shexp_up", blk(i, "ffn_up_shexp.weight"), H, cfg.moe_ffn);
+            // UNPINNED: n_ff_shexp (the reference's shared-expert intermediate width)
+            // is a distinct hparam from n_ff_exp (moe_ffn) and nothing confirms they
+            // are equal for K3. has_shared_experts defaults false — this branch is
+            // not known to be exercised by the real UD-IQ1_S file — so widths here
+            // are a placeholder pending confirmation, not asserted as fact.
+            mm_unpinned(i, kda, "shexp_gate", blk(i, "ffn_gate_shexp.weight"), H, cfg.moe_ffn);
+            mm_unpinned(i, kda, "shexp_up", blk(i, "ffn_up_shexp.weight"), H, cfg.moe_ffn);
             op(K3Op::Situ, i, kda, "shexp_situ", cfg.moe_ffn, cfg.moe_ffn);
-            mm(i, kda, "shexp_down", blk(i, "ffn_down_shexp.weight"), cfg.moe_ffn, H);
+            mm_unpinned(i, kda, "shexp_down", blk(i, "ffn_down_shexp.weight"), cfg.moe_ffn, H);
         }
 
         mm(i, kda, "routed_up", blk(i, "ffn_routed_up.weight"), cfg.expert_latent, H);
@@ -356,6 +396,7 @@ struct Builder {
         const int H = cfg.hidden;
         const int res_bs = cfg.attn_res_block_size;
         op(K3Op::EmbedLookup, -1, false, "embed", 1, H, "token_embd.weight");
+        pin3(H, cfg.vocab, 0);
 
         for (int i = 0; i < cfg.n_layers; ++i) {
             const bool kda = cfg.is_kda_layer(i);
@@ -365,13 +406,26 @@ struct Builder {
             // and blends over checkpoints banked so far; this layer's own raw input
             // is not banked until after, or the mix would be scoring a checkpoint
             // against itself.
+            //
+            // attn_res_score.weight is a 1-D [n_embd] SCORING VECTOR, not a matmul
+            // weight — the reference creates it as {n_embd} and uses it as
+            // ggml_mul(rms_norm(ckpt), score_w) then sum_rows, i.e. a dot product
+            // against every banked checkpoint (and the current stream), never a
+            // projection to some other width. An earlier version of this plan modeled
+            // it as a MatMul step producing attn_res_block_size outputs, which doesn't
+            // correspond to anything in the reference — attn_res_block_size is a
+            // periodicity config value (how often to bank), not a tensor dimension. So
+            // there is no separate MatMul step here at all: the tensor is consumed
+            // directly by AttnResMix, the same way a norm weight is consumed by
+            // RmsNorm rather than by its own step.
             if (res_bs > 0) {
-                op(K3Op::MatMul, i, kda, "attn_res_score", H, res_bs,
-                   blk(i, "attn_res_score.weight"));
-                op(K3Op::AttnResMix, i, kda, "attn_res_mix", H, H, "",
+                op(K3Op::AttnResMix, i, kda, "attn_res_mix", H, H,
+                   blk(i, "attn_res_score.weight"),
                    "runs BEFORE attn_norm — chooses what the attention block sees, "
                    "not what gets folded in after it. Scores from RMS-normalised "
-                   "checkpoints; the weighted sum uses the RAW ones.");
+                   "checkpoints; the weighted sum uses the RAW ones. score_w is "
+                   "[n_embd], a dot-product scorer, not a projection.");
+                pin1(H);
                 if (banked) {
                     op(K3Op::ResBankPush, i, kda, "res_bank_push", H, H, "",
                        "banks the RAW pre-mix layer input, attention side only — "
@@ -398,12 +452,13 @@ struct Builder {
                 plan.steps.push_back(s);
             }
 
-            // PRE-FFN mix. No bank push on this side, ever.
+            // PRE-FFN mix. No bank push on this side, ever. Same 1-D scoring-vector
+            // contract as attn_res_score above.
             if (res_bs > 0) {
-                op(K3Op::MatMul, i, kda, "ffn_res_score", H, res_bs,
-                   blk(i, "ffn_res_score.weight"));
-                op(K3Op::AttnResMix, i, kda, "ffn_res_mix", H, H, "",
+                op(K3Op::AttnResMix, i, kda, "ffn_res_mix", H, H,
+                   blk(i, "ffn_res_score.weight"),
                    "runs BEFORE ffn_norm, same reasoning as the attention-side mix");
+                pin1(H);
             }
 
             ffn_block(i, kda, opt);
@@ -414,14 +469,14 @@ struct Builder {
         }
 
         if (res_bs > 0) {
-            op(K3Op::MatMul, -1, false, "output_res_score", H, res_bs,
-               "output_res_score.weight");
-            op(K3Op::AttnResMix, -1, false, "output_res_mix", H, H, "",
+            op(K3Op::AttnResMix, -1, false, "output_res_mix", H, H,
+               "output_res_score.weight",
                "final mix, before output_norm — no bank push, last layer's loop "
                "already exited");
+            pin1(H);
         }
-        op(K3Op::RmsNorm, -1, false, "output_norm", H, H, "output_norm.weight");
-        op(K3Op::MatMul, -1, false, "lm_head", H, cfg.vocab, "output.weight");
+        vec(K3Op::RmsNorm, -1, false, "output_norm", H, "output_norm.weight");
+        mm(-1, false, "lm_head", "output.weight", H, cfg.vocab);
     }
 };
 
