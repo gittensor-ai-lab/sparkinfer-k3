@@ -41,27 +41,47 @@ alt_quants:
     size_gib: 1453.0
     fits_at_1m: false
 
+# MEASURED per-rank budget, not weights/8. The naive figure is 802/8 = 100 GiB;
+# the real number is 129.0 because 32.9 GiB REPLICATES on every rank (token_embd,
+# shared experts, ffn_routed_*, the MQA latent projections) — 263 GiB of
+# duplication node-wide. Produced by planning all 2573 real tensors through
+# tp::plan_for() at tp_size 8; every rank came out identical at 129.0 GiB.
 memory_budget_gib:
   hbm_total: 1128               # 141 GB x 8
-  weights: 802.0
+  hbm_per_gpu_usable: 140
+  weights_whole_model: 802.1    # verified against the GGUF, matches HF
+  weights_per_rank: 129.0       # MEASURED
+  replicated_per_rank: 32.9     # the reason it is not 100.3
+  shard_breakdown:
+    expert: 744.5               # sharded on the expert axis — the bulk
+    replicate: 32.9
+    row: 16.4
+    col: 8.3                    # the two tensors that force a collective
   # 24 MLA layers * 576 * 2 B/token = 27648 B/token, K only (MLA stores no V cache).
   kv_at_32k: 0.84
   kv_at_128k: 3.38
   kv_at_256k: 6.75
+  kv_at_512k: 13.50
   kv_at_1m: 27.00
   # 69 KDA layers * (128*128*96 + 3*3*96*128) * 4 B, per sequence.
   kda_recurrent_state_per_seq: 0.43
-  compute_buffers_allowance: 24
-  total_at_1m: 854
-  headroom_at_1m: 274
+  compute_buffers_allowance: 4  # decode, bs=1, ubatch 512 — ESTIMATE, not measured
+  # Per-rank total = 129.0 + KV + 0.43 + 4. Against 140 GiB:
+  #   128k  136.8  fits            <- current target
+  #   256k  140.2  over by 0.2
+  #   512k  146.9  over by 6.9     needs the shared experts sharded (-> 118.5)
+  #   1M    160.4  over by 20.4    use UD-IQ1_S on this node instead
+  total_at_128k: 136.8
+  headroom_at_128k: 3.2
 
 decode:
   batch_sizes: [1]
   # Scored contexts — affordable, 3-rep median. These are what reference.lock pins.
   eval_sweep: [128, 512, 4096, 32768]
-  # Long-context capability probe — 1 rep, opt-in. A 1M-token prefill is minutes of
-  # wall-clock per rep, so this measures "does it work and at what rate", not a median.
-  longctx_probe: [131072, 262144, 1048576]
+  # Long-context capability probe — 1 rep, opt-in.
+  # Capped at 131072: that is what UD-Q2_K_XL fits on this node once the MEASURED
+  # 129.0 GiB/rank is accounted for. 256k is over by 0.2 GiB, 512k by 6.9.
+  longctx_probe: [131072]
   dtype: bfloat16
 
   # llama.cpp reference, tok/s, same GGUF + same node.
@@ -72,7 +92,7 @@ decode:
     bs1_ctx512: null
     bs1_ctx4k: null
     bs1_ctx32k: null
-    bs1_ctx1m: null
+    bs1_ctx128k: null
 
   # sparkinfer native decode: no loader exists yet.
   sparkinfer_toks_per_sec:
@@ -80,23 +100,24 @@ decode:
     bs1_ctx512: null
     bs1_ctx4k: null
     bs1_ctx32k: null
-    bs1_ctx1m: null
+    bs1_ctx128k: null
 
 prefill:
   eval_sweep: [4096, 32768]
-  longctx_probe: [131072, 1048576]
+  longctx_probe: [131072]
   llama_pp_toks_per_sec:
     ctx4k: null
     ctx32k: null
-    ctx1m: null
+    ctx128k: null
   sparkinfer_pp_toks_per_sec:
     ctx4k: null
     ctx32k: null
-    ctx1m: null
+    ctx128k: null
 
 # The M1 exit criteria. All three must hold before M2 is worth starting.
 exit_criteria:
-  - 1M context loads and decodes on 8x H200 with all weights in HBM
+  - 128k context loads and decodes on 8x H200 with all weights in HBM
+  #  1M on this node is a UD-IQ1_S target (553 GiB), not UD-Q2_K_XL
   - decode + prefill medians pinned in reference.lock at 128/512/4k/32k
   - shard sha256 manifest pinned (bench/scripts/kimi_k3_ud_q2_k_xl.sha256)
 
@@ -111,7 +132,7 @@ sampling:
     temperature: 1.0
     top_p: 1.0
   reasoning_effort: [low, high, max]
-  max_context: 1048576
+  max_context: 131072           # UD-Q2_K_XL ceiling on 8x H200; see memory_budget_gib
 
 llama_cpp_flags:
   n_gpu_layers: 99              # 93 layers; 99 offloads everything

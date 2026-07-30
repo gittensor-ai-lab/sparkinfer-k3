@@ -62,9 +62,29 @@ const std::unordered_map<std::string, Rule>& table() {
         {"ffn_up_exps.weight",      Rule::ExpertShard},
         {"ffn_down_exps.weight",    Rule::ExpertShard},
 
-        // --- shared expert: runs for EVERY token on every rank, so replicating it
-        // avoids a collective for a tensor that is small next to the routed set.
-        // Sharding it would add a third all-reduce per layer to save very little.
+        // --- shared expert: REPLICATED for now. This is a context-budget call,
+        // not a correctness one, and it is revisited at 512k.
+        //
+        // MEASURED on the real UD-Q2_K_XL: the three shexp tensors are 12.0 GiB
+        // replicated = 10.5 GiB per rank of the 32.9 GiB total duplication, putting
+        // a rank at 129.0 GiB. Per-rank budget on a 140 GiB H200:
+        //     ctx     KV      total     verdict
+        //     128k    3.4     136.8     fits            <- current target
+        //     256k    6.8     140.2     over by 0.2
+        //     512k   13.5     146.9     over by 6.9
+        // So 128k fits replicated; 512k does not, and needs weights <= 122.1 GiB.
+        //
+        // SHARDING THEM IS FREE WHEN IT IS NEEDED. The earlier reasoning here —
+        // "sharding adds a third all-reduce per layer" — was wrong. The reference
+        // computes moe_out = moe_out + shexp, so adding the shared-expert PARTIAL
+        // sum before the existing after-FFN all-reduce lets one reduce cover both.
+        // gate/up become RowShard (split the ffn width), down becomes ColShard,
+        // and a rank drops to 118.5 GiB, which clears 512k.
+        //
+        // Not doing it yet, because it imposes an ordering constraint (the shexp
+        // add MUST precede the reduce) on a forward that does not exist to verify
+        // it. Replicated is provably correct regardless of ordering; switch when
+        // the forward exists and 512k is the target.
         {"ffn_gate_shexp.weight",   Rule::Replicate},
         {"ffn_up_shexp.weight",     Rule::Replicate},
         {"ffn_down_shexp.weight",   Rule::Replicate},

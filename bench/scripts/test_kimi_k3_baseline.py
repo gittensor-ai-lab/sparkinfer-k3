@@ -170,9 +170,17 @@ class NodeProfileTest(unittest.TestCase):
             text = f.read_text()
             self.assertIn(f"milestone: {milestone}", text)
             self.assertIn(f"node:     {node}", text)
-            # every hardware milestone is a 1M-context milestone
-            self.assertIn("max_context: 1048576", text)
-            self.assertIn("kv_at_1m: 27.00", text)
+            # Each target declares a context ceiling and the KV cost that sets it.
+            # NOT hardcoded to 1M any more: the measured per-rank weight share
+            # (129.0 GiB on H200, not 802/8) caps UD-Q2_K_XL at 128k there, while
+            # B200/B300 have the headroom for more. What must hold is that the
+            # declared max_context is one the budget actually supports.
+            self.assertIn("kv_at_128k: 3.38", text)
+            import re as _re
+            m = _re.search(r"max_context: (\d+)", text)
+            self.assertIsNotNone(m, f"{node}: no max_context")
+            self.assertIn(int(m.group(1)), (131072, 262144, 524288, 1048576),
+                          f"{node}: odd max_context {m.group(1)}")
 
     def test_m4_is_a_capability_not_a_node(self):
         text = (ROOT / "bench" / "configs" / "targets" / "kimi_k3_vision_m4.yaml").read_text()
@@ -196,12 +204,17 @@ class ContextBudgetTest(unittest.TestCase):
         for ctx, want in ((32768, 1), (131072, 4), (262144, 7), (1048576, 27)):
             self.assertEqual(int(bash(f"kimi_k3_kv_gib {ctx}")), want, ctx)
 
-    def test_default_max_ctx_is_1m(self):
-        self.assertEqual(bash('echo "$KIMI_K3_MAX_CTX"'), "1048576")
+    def test_default_max_ctx_is_128k(self):
+        # 128k, not 1M: the MEASURED per-rank weight share on 8x H200 is 129.0 GiB
+        # (not 802/8 = 100.3, because 32.9 GiB replicates per rank), which leaves
+        # room for 128k of KV on a 140 GiB card but not 256k or beyond.
+        self.assertEqual(bash('echo "$KIMI_K3_MAX_CTX"'), "131072")
 
-    def test_headroom_includes_kv_at_1m(self):
-        # 27 GiB KV + 24 GiB compute buffers + 1 GiB state
-        self.assertEqual(int(bash("kimi_k3_headroom_gib")), 52)
+    def test_headroom_includes_kv_at_the_default_ctx(self):
+        # 4 GiB KV @128k + 24 GiB compute buffers + 1 GiB state
+        self.assertEqual(int(bash("kimi_k3_headroom_gib")), 29)
+        # ...and still prices 1M correctly when asked for it explicitly.
+        self.assertEqual(int(bash("kimi_k3_headroom_gib", {"KIMI_K3_MAX_CTX": "1048576"})), 52)
 
     def test_lower_max_ctx_shrinks_headroom(self):
         got = int(bash("kimi_k3_headroom_gib", {"KIMI_K3_MAX_CTX": "32768"}))
@@ -289,7 +302,8 @@ class FitCheckTest(unittest.TestCase):
     def test_8x_b200_rejects_q4_at_1m_but_accepts_at_32k(self):
         # 1407 + 52 = 1459 > 1440 at 1M; 1407 + 26 = 1433 < 1440 at 32k. The context-aware
         # headroom is what makes this distinction possible at all.
-        base = {"PRIMARY_QUANT": "UD-Q4_K_XL", "KIMI_K3_NODE": "b200x8"}
+        base = {"PRIMARY_QUANT": "UD-Q4_K_XL", "KIMI_K3_NODE": "b200x8",
+                "KIMI_K3_MAX_CTX": "1048576"}   # explicit: the default is now 128k
         self.assertEqual(bash_rc("kimi_k3_check_fits", self._with_fake_smi(self.B200, 8, base)), 1)
         at32k = {**base, "KIMI_K3_MAX_CTX": "32768"}
         self.assertEqual(bash_rc("kimi_k3_check_fits", self._with_fake_smi(self.B200, 8, at32k)), 0)
@@ -330,7 +344,7 @@ class BaselineDryRunTest(unittest.TestCase):
         out = self._dry()
         self.assertIn("Kimi-K3-UD-Q2_K_XL-00001-of-00019.gguf", out)
         self.assertIn("--split-mode layer", out)
-        self.assertIn("802 GiB + 52 GiB headroom", out)
+        self.assertIn("802 GiB + 29 GiB headroom", out)
         self.assertIn(PINNED_COMMIT, out)
 
     def test_longctx_probe_is_opt_in(self):

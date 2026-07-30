@@ -165,9 +165,14 @@ kimi_k3_check_node() {
 }
 
 # ---- context / memory sizing ----
-# All three hardware milestones target the full 1M context, so the fit check has to price
-# the KV cache in rather than assume a flat headroom.
-KIMI_K3_MAX_CTX="${KIMI_K3_MAX_CTX:-1048576}"
+# Context target. 128k is the UD-Q2_K_XL ceiling on 8x H200 once the MEASURED
+# per-rank weight share is accounted for: planning all 2573 real tensors at
+# tp_size 8 gives 129.0 GiB/rank, NOT 802/8 = 100.3, because 32.9 GiB replicates
+# on every rank. Budget against 140 GiB/GPU (weights + KV + state + ~4 buffers):
+#     128k  136.8  fits      256k  140.2  over      512k  146.9  over
+# 512k becomes reachable by sharding the shared experts (-> 118.5 GiB/rank); 1M on
+# this node is a UD-IQ1_S (553 GiB) target rather than UD-Q2_K_XL.
+KIMI_K3_MAX_CTX="${KIMI_K3_MAX_CTX:-131072}"
 
 # MLA stores K only (llama-kv-cache.cpp: is_mla() -> has_v = false):
 #   24 full-attn layers * (kv_lora_rank 512 + qk_rope_head_dim 64) * 2 B = 27648 B/token
