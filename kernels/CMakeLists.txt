@@ -25,8 +25,9 @@ add_subdirectory(csrc/cuda/gemm)        # GEMM, GEMV, batched GEMM
 add_subdirectory(csrc/cuda/moe)         # MoE router, grouped GEMM + SwiGLU
 add_subdirectory(csrc/cuda/quant)       # quantization helpers
 add_subdirectory(csrc/cuda/fused)       # fused GEMM + epilogue (non-CuTe path)
+add_subdirectory(csrc/cuda/kimi_k3)     # K3-only ops: situ, KDA scan, attn residual
 
-set(SPARKINFER_KERNEL_LIBS si_attn si_gemm si_moe si_quant si_fused)
+set(SPARKINFER_KERNEL_LIBS si_attn si_gemm si_moe si_quant si_fused si_k3)
 
 if(MSVC)
   # MSVC device link of RDC static libs into a DLL is brittle; whole-TU compile is fine.

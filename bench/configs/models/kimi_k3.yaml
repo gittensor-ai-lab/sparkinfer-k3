@@ -185,11 +185,21 @@ runtime:
   # (runtime/src/models/qwen35.cpp, runtime/include/sparkinfer/models/qwen_config.h).
   # This branch lands the measurable llama.cpp reference FIRST so any native work has
   # a same-box number to beat.
+  # DONE — kernels/csrc/cuda/kimi_k3/, each validated against a float64 CPU reference
+  # on an H200 (kernels/tests/kimi_k3_numeric_test.cu, rel-L2 < 3e-7). Semantics
+  # transcribed from unslothai/llama.cpp @ efc8bc38, not inferred. These are
+  # correctness-first f32 reference kernels; quantised/bf16/fused variants come after.
+  implemented_kernels:
+    - situ_activation                  # beta*tanh(g/beta)*sigmoid(g) * lb*tanh(u/lb)
+    - kda_decode_step                  # gated delta rule, PER-CHANNEL decay
+    - kda_output_gating                # rms_norm then full-rank sigmoid gate
+    - cross_layer_attn_residual        # block_size 12; scores normalised, sum over RAW
+    - mla_output_gate                  # sigmoid before o_proj
+
   required_work:
     - kimi_k3_gguf_loader              # 93 layers, per-layer KDA/MLA layout, 896 experts
-    - kda_linear_attention_decode      # full-rank gate, conv state, f32 recurrent state
-    - mla_nope_decode_with_output_gate
     - latent_moe_expert_dispatch       # routed experts at 3584, not 7168
-    - situ_activation
-    - cross_layer_attn_residual        # block_size 12
-    - multi_gpu_weight_sharding        # 553 GiB does not fit one card at any quant
+    - kda_conv_state                   # short_conv_kernel_size 4, not yet implemented
+    - mla_nope_attention               # the attention itself; only its output gate exists
+    - coalesced_kda_state_access       # current state walk is stride-head_dim
+    - multi_gpu_weight_sharding        # 802 GiB does not fit one card at any quant
