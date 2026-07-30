@@ -420,6 +420,83 @@ int main() {
         check(pinned > unpinned, "most tensors are pinned");
     }
 
+    // -------------------------------------- cross-layer residual: order + banking
+    // Read directly off unslothai/llama.cpp's graph builder (src/models/kimi-k3.cpp):
+    // res_mix runs BEFORE each norm, not after; a checkpointed layer REPLACES the
+    // residual stream on the attention side instead of adding; the bank push happens
+    // only on the attention side, using the RAW pre-mix value. An earlier version of
+    // this plan had all of this backwards (mix after, unconditional add) — plausible
+    // and wrong, exactly the class of bug this project is built to catch before it
+    // reaches a kernel.
+    std::printf("\n[cross-layer residual: pre-norm mix, attention-side replace]\n");
+    {
+        auto idx_of = [&](int layer, K3Op op, const char* label) -> int {
+            for (size_t k = 0; k < plan.steps.size(); ++k) {
+                const auto& s = plan.steps[k];
+                if (s.layer == layer && s.op == op &&
+                    (label == nullptr || s.label == std::string(label)))
+                    return (int)k;
+            }
+            return -1;
+        };
+
+        // Layer 0 is a checkpoint layer (0 % 12 == 0) in every configuration —
+        // block_size divides 0 regardless of its value.
+        const int L = 0;
+        const int i_score  = idx_of(L, K3Op::MatMul, "attn_res_score");
+        const int i_mix    = idx_of(L, K3Op::AttnResMix, "attn_res_mix");
+        const int i_push   = idx_of(L, K3Op::ResBankPush, "res_bank_push");
+        const int i_norm   = idx_of(L, K3Op::RmsNorm, "attn_norm");
+        const int i_replace = idx_of(L, K3Op::AddResidual, "replace_attn");
+        const int i_add_attn = idx_of(L, K3Op::AddResidual, "add_attn");
+
+        check(i_score >= 0 && i_mix >= 0 && i_push >= 0 && i_norm >= 0,
+              "layer 0 has attn_res_score, attn_res_mix, res_bank_push, attn_norm");
+        check(i_score < i_mix && i_mix < i_push && i_push < i_norm,
+              "order is attn_res_score -> attn_res_mix -> res_bank_push -> attn_norm "
+              "(mix and bank BEFORE the norm, not after)");
+        check(i_replace >= 0, "layer 0's attention residual combine is labelled "
+                              "'replace_attn' (it is a checkpoint layer)");
+        check(i_add_attn < 0, "layer 0 has NO 'add_attn' step — checkpoint layers "
+                              "replace, they do not also add");
+        if (i_replace >= 0)
+            check(plan.steps[i_replace].residual_replace,
+                  "layer 0's residual-combine step has residual_replace = true");
+
+        // Layer 5 is NOT a checkpoint layer (5 % 12 != 0): ordinary add, no bank push.
+        const int L2 = 5;
+        check(idx_of(L2, K3Op::ResBankPush, nullptr) < 0,
+              "layer 5 (not a checkpoint layer) has no res_bank_push");
+        const int i_add5 = idx_of(L2, K3Op::AddResidual, "add_attn");
+        check(i_add5 >= 0, "layer 5's attention residual combine is labelled 'add_attn'");
+        if (i_add5 >= 0)
+            check(!plan.steps[i_add5].residual_replace,
+                  "layer 5's residual-combine step has residual_replace = false");
+
+        // The FFN side NEVER replaces, checkpoint layer or not — and never gets a
+        // bank push either.
+        for (int layer : {0, 5}) {
+            const int i_ffn_mix = idx_of(layer, K3Op::AttnResMix, "ffn_res_mix");
+            const int i_ffn_norm = idx_of(layer, K3Op::RmsNorm, "ffn_norm");
+            const int i_ffn_add = idx_of(layer, K3Op::AddResidual, "add_ffn");
+            check(i_ffn_mix >= 0 && i_ffn_norm >= 0 && i_ffn_mix < i_ffn_norm,
+                  "layer " + std::to_string(layer) +
+                      ": ffn_res_mix runs before ffn_norm");
+            check(i_ffn_add >= 0 && !plan.steps[i_ffn_add].residual_replace,
+                  "layer " + std::to_string(layer) +
+                      ": FFN-side residual combine is always 'add_ffn', never replace");
+        }
+
+        // Exactly one bank push per res_bs-layer cycle, i.e. ceil(n_layers/res_bs).
+        int n_pushes = 0;
+        for (const auto& s : plan.steps) if (s.op == K3Op::ResBankPush) ++n_pushes;
+        const int want_pushes = (cfg.attn_res_block_size > 0)
+            ? (cfg.n_layers + cfg.attn_res_block_size - 1) / cfg.attn_res_block_size
+            : 0;
+        check_eq(n_pushes, want_pushes,
+                 "one bank push per res_block_size-layer cycle");
+    }
+
     // ------------------------------------------------------------ TP invariance
     std::printf("\n[TP changes placement, never the graph]\n");
     {

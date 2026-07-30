@@ -26,6 +26,7 @@ const char* k3_op_name(K3Op op) {
         case K3Op::MlaDecodeAttn: return "mla_decode_attn";
         case K3Op::MlaGateOut:    return "mla_gate_out";
         case K3Op::AttnResMix:    return "attn_res_mix";
+        case K3Op::ResBankPush:   return "res_bank_push";
         case K3Op::MoeRouter:     return "moe_router_noaux_tc";
         case K3Op::MoeDispatch:   return "moe_expert_ffn_iq2xs";
     }
@@ -54,6 +55,7 @@ bool k3_op_has_dedicated_kernel(K3Op op) {
         case K3Op::MatMul:
         case K3Op::AddResidual:
         case K3Op::AllReduce:
+        case K3Op::ResBankPush:
             return false;
     }
     return false;
@@ -352,37 +354,73 @@ struct Builder {
 
     void build(const K3PlanOptions& opt) {
         const int H = cfg.hidden;
+        const int res_bs = cfg.attn_res_block_size;
         op(K3Op::EmbedLookup, -1, false, "embed", 1, H, "token_embd.weight");
 
         for (int i = 0; i < cfg.n_layers; ++i) {
             const bool kda = cfg.is_kda_layer(i);
+            const bool banked = res_bs > 0 && (i % res_bs == 0);
+
+            // PRE-ATTENTION mix, then the bank push — in that order. The mix scores
+            // and blends over checkpoints banked so far; this layer's own raw input
+            // is not banked until after, or the mix would be scoring a checkpoint
+            // against itself.
+            if (res_bs > 0) {
+                op(K3Op::MatMul, i, kda, "attn_res_score", H, res_bs,
+                   blk(i, "attn_res_score.weight"));
+                op(K3Op::AttnResMix, i, kda, "attn_res_mix", H, H, "",
+                   "runs BEFORE attn_norm — chooses what the attention block sees, "
+                   "not what gets folded in after it. Scores from RMS-normalised "
+                   "checkpoints; the weighted sum uses the RAW ones.");
+                if (banked) {
+                    op(K3Op::ResBankPush, i, kda, "res_bank_push", H, H, "",
+                       "banks the RAW pre-mix layer input, attention side only — "
+                       "the FFN-side mix below never pushes a checkpoint");
+                }
+            }
+
             if (kda) { ++plan.n_kda_layers; kda_block(i, opt); }
             else     { ++plan.n_mla_layers; mla_block(i, opt); }
 
-            // Cross-layer residual attention: a learned mix over the last block_size
-            // layers' residuals, scored per layer. Runs AFTER the reduce, on the
-            // full-width tensor.
-            if (cfg.attn_res_block_size > 0) {
-                op(K3Op::MatMul, i, kda, "attn_res_score", H, cfg.attn_res_block_size,
-                   blk(i, "attn_res_score.weight"));
-                op(K3Op::AttnResMix, i, kda, "attn_res_mix", H, H, "",
-                   "raw residuals, NOT renormalised");
+            // Combine the attention output into the residual stream. REPLACE on a
+            // banked layer (the pre-mix input was just banked, so it is not lost —
+            // adding it again here would double-count it), ADD otherwise.
+            {
+                K3Step s;
+                s.op = K3Op::AddResidual;
+                s.label = banked ? "replace_attn" : "add_attn";
+                s.layer = i;
+                s.is_kda_layer = kda;
+                s.in_dim = H;
+                s.out_dim = H;
+                s.residual_replace = banked;
+                s.note = banked ? "REPLACE, not add: see res_bank_push above" : "";
+                plan.steps.push_back(s);
             }
-            op(K3Op::AddResidual, i, kda, "add_attn", H, H);
+
+            // PRE-FFN mix. No bank push on this side, ever.
+            if (res_bs > 0) {
+                op(K3Op::MatMul, i, kda, "ffn_res_score", H, res_bs,
+                   blk(i, "ffn_res_score.weight"));
+                op(K3Op::AttnResMix, i, kda, "ffn_res_mix", H, H, "",
+                   "runs BEFORE ffn_norm, same reasoning as the attention-side mix");
+            }
 
             ffn_block(i, kda, opt);
-            if (cfg.attn_res_block_size > 0) {
-                op(K3Op::MatMul, i, kda, "ffn_res_score", H, cfg.attn_res_block_size,
-                   blk(i, "ffn_res_score.weight"));
-                op(K3Op::AttnResMix, i, kda, "ffn_res_mix", H, H);
-            }
+
+            // FFN-side residual combine is ALWAYS an add — there is no replace
+            // variant here, only on the attention side.
             op(K3Op::AddResidual, i, kda, "add_ffn", H, H);
         }
 
-        op(K3Op::RmsNorm, -1, false, "output_norm", H, H, "output_norm.weight");
-        if (cfg.attn_res_block_size > 0)
-            op(K3Op::MatMul, -1, false, "output_res_score", H, cfg.attn_res_block_size,
+        if (res_bs > 0) {
+            op(K3Op::MatMul, -1, false, "output_res_score", H, res_bs,
                "output_res_score.weight");
+            op(K3Op::AttnResMix, -1, false, "output_res_mix", H, H, "",
+               "final mix, before output_norm — no bank push, last layer's loop "
+               "already exited");
+        }
+        op(K3Op::RmsNorm, -1, false, "output_norm", H, H, "output_norm.weight");
         op(K3Op::MatMul, -1, false, "lm_head", H, cfg.vocab, "output.weight");
     }
 };
