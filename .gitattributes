@@ -1,0 +1,41 @@
+# Normalise line endings on source files.
+#
+# WHY THIS EXISTS: four inherited files under server/ were committed with CRLF, and
+# server/scripts/bench_api_vs_native.sh was consequently BROKEN — its heredoc terminator
+# was `PY\r`, which never matches `PY`, so bash reported "unexpected end of file" and the
+# script could not run at all. Nothing caught it because the old eval-policy CI linted four
+# hand-listed files. The `ci` workflow now runs `bash -n` over every tracked shell script
+# and rejects CRLF in source, and this file stops it being reintroduced by a checkout.
+
+*               text=auto
+
+# Shell scripts MUST be LF: a CR before a heredoc terminator or after a line continuation
+# is a hard syntax error, not a cosmetic issue.
+*.sh            text eol=lf
+*.bash          text eol=lf
+
+*.py            text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+*.json          text eol=lf
+*.md            text eol=lf
+*.cpp           text eol=lf
+*.cu            text eol=lf
+*.cuh           text eol=lf
+*.h             text eol=lf
+*.hpp           text eol=lf
+*.cmake         text eol=lf
+CMakeLists.txt  text eol=lf
+*.jinja         text eol=lf
+*.sha256        text eol=lf
+reference.lock  text eol=lf
+
+# Captured tool output is a record of what a tool printed, CRLF included — leave it byte
+# for byte rather than rewriting somebody's evidence.
+*.log           -text
+*.jsonl         -text
+
+# Binary
+*.png           binary
+*.gguf          binary
+*.pub           binary

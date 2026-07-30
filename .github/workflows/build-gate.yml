@@ -1,0 +1,93 @@
+name: build-gate
+
+# Replaces the inherited `build-attested-binaries` workflow. That one built
+# qwen3_gguf_bench for Linux AND Windows at sm_120, attested the binaries, and published
+# release tarballs. Three things did not apply here:
+#
+#   - sm_120 is Blackwell consumer/edge. This repo's nodes are sm_90 / sm_100 / sm_103, so
+#     it was compile-checking an architecture nothing here runs on.
+#   - Windows. The milestone nodes are Linux HGX boxes.
+#   - Release publishing. sparkinfer-k3 ships no binaries; the deliverable is the harness
+#     and, later, a native loader. Attesting a Qwen binary from this repo would be noise.
+#
+# What remains is the part that has value: prove the tree still COMPILES for the milestone
+# architectures. That is a genuine regression guard for M2/M3 native work, and it is the
+# only GPU-adjacent thing a hosted runner can do — it compiles, it never executes.
+#
+# Path-filtered, so the harness/docs PRs that make up most of this repo's traffic do not
+# pay the CUDA-toolkit install.
+
+on:
+  pull_request:
+    paths:
+      - "CMakeLists.txt"
+      - "kernels/**"
+      - "moe/**"
+      - "runtime/**"
+      - "server/**"
+      - ".github/workflows/build-gate.yml"
+  push:
+    branches: [main]
+    paths:
+      - "CMakeLists.txt"
+      - "kernels/**"
+      - "moe/**"
+      - "runtime/**"
+      - "server/**"
+      - ".github/workflows/build-gate.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-gate-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compile:
+    name: compile sm_${{ matrix.arch }} (${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: "90"
+            node: M1 · H200 · Hopper
+          - arch: "100"
+            node: M2 · B200 · Blackwell
+          # sm_103 (M3 · B300) is deliberately absent. The installed CUDA toolkit must
+          # recognise the target or configure fails outright, and 103 is not in the
+          # top-level CMakeLists arch list yet — see bench/configs/b300.yaml. Add a matrix
+          # entry only once compute_cap is confirmed on real hardware.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CUDA toolkit
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: "12.8.1"
+          use-github-cache: false
+
+      - name: Configure
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CUDA_ARCHITECTURES="${{ matrix.arch }}" \
+            -DBUILD_TESTS=OFF \
+            -DBUILD_EXAMPLES=ON
+
+      # -j2, matching bench/scripts/_common.sh: cc1plus for a single CUDA arch takes
+      # ~2-3 GB, and a hosted runner has 4 cores / 16 GB. -j$(nproc) OOMs.
+      - name: Build
+        run: cmake --build build -j2 --target qwen3_gguf_bench
+
+      - name: Report
+        run: |
+          set -euo pipefail
+          f=build/runtime/qwen3_gguf_bench
+          [ -x "$f" ] || { echo "::error::binary missing after build"; exit 1; }
+          echo "sm_${{ matrix.arch }}: $(stat -c%s "$f") bytes"
+          # No K3 binary exists yet, so this only proves the inherited Qwen tree still
+          # builds for this arch. It is a floor, not coverage of the K3 path.
+          echo "::notice::compiled the inherited Qwen runtime for sm_${{ matrix.arch }}; no kimi-k3 loader exists yet"

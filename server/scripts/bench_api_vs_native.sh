@@ -14,7 +14,11 @@ if [ ! -x "$BENCH" ]; then
   exit 1
 fi
 
-python3 <<'PY'
+# Args must go on the python3 line, before the heredoc. They used to sit on a line AFTER
+# the `PY` terminator, where the shell read them as a command to execute (and the script
+# saw an empty sys.argv, so sys.argv[1] raised IndexError). `python3 -` reads the program
+# from stdin and still forwards the arguments.
+python3 - "$ROOT" "$GGUF" "$API" "$BENCH" "$DECODE_N" "${CONTEXTS[*]}" <<'PY'
 import json, subprocess, sys, time, urllib.request
 from tokenizers import Tokenizer
 
@@ -117,4 +121,3 @@ for ctx in CONTEXTS:
         f"{api['ttft_s']:8.2f}  {api['prompt_tokens']:10d}"
     )
 PY
-"$ROOT" "$GGUF" "$API" "$BENCH" "$DECODE_N" "${CONTEXTS[*]}"

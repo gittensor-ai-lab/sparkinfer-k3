@@ -128,6 +128,24 @@ It prices context in, so it correctly rejects UD-Q4_K_XL on 8× B200 at 1M while
 at 32k. K3 also ships no `tokenizer.json` (tiktoken vocab), so prompt ids come from the GGUF
 via `gen_eval_prompt.py --gguf <model.gguf>` + `llama-tokenize` instead of `ensure_tokenizer`.
 
+### Local pre-flight (what CI runs)
+
+```bash
+python3 bench/scripts/test_kimi_k3_baseline.py        # 76 tests, no GPU / weights
+python3 bench/scripts/check_reference_lock.py         # every pinned baseline has a measurement
+python3 bench/scripts/audit_baseline_pins.py          # fork pin + shard counts vs reality (network)
+bench/scripts/kimi_k3_baseline.sh --node h200x8 --dry-run
+```
+
+`check_reference_lock.py` is the one to know about. A baseline of `0` means *not measured* and
+is always allowed; any non-zero value must match a recorded sweep in `bench/results/` for the
+same node **and** context. Hand-filling `reference.lock` is a CI failure, because downstream a
+hand-filled number is indistinguishable from a measured one.
+
+`audit_baseline_pins.py` watches the two external things the baseline can't control — PR #48
+can be force-pushed, and a quant can be re-uploaded with a different shard count. `--offline`
+describes the checks without making requests.
+
 sparkinfer has **no kimi-k3 loader yet**; this is the baseline half of the eval only. M4 adds
 vision. Details, memory budget and architecture traps:
 [`docs/kimi-k3-baseline.md`](../../docs/kimi-k3-baseline.md).

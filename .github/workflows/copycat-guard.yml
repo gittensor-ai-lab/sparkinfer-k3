@@ -7,6 +7,16 @@ name: copycat-guard
 #   ≥92% per-function containment -> copycat-warn only (never block alone; PR-level ≥85% required)
 #   3 warnings -> block+close
 
+# NOTE FOR THIS REPO: the guard needs an OPENAI_API_KEY secret, which sparkinfer-k3 does
+# not have. It passed on PR #1 only because the author_association check skipped it for a
+# MEMBER — the first external PR would have run it and failed on the missing key. The job
+# now checks for the secret and skips cleanly when it is absent, so a missing secret is a
+# visible skip rather than a red check nobody can fix.
+#
+# Whether this guard is wanted here at all is a separate question: it exists to police
+# plagiarism between competing SN74 miners, and this is a private repo. Left wired up
+# rather than deleted, because that decision belongs to a maintainer.
+
 on:
   pull_request_target:
     types: [opened]
@@ -22,12 +32,26 @@ jobs:
     # Skip maintainer PRs
     if: github.event.pull_request.author_association != 'OWNER' && github.event.pull_request.author_association != 'MEMBER' && github.event.pull_request.author_association != 'COLLABORATOR'
     steps:
+      - name: Check for the LLM key
+        id: key
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ -n "${OPENAI_API_KEY:-}" ]; then
+            echo "have_key=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "have_key=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::OPENAI_API_KEY is not set — skipping the copycat guard. Set the secret to enable it, or remove this workflow."
+          fi
+
       - uses: actions/checkout@v4
+        if: steps.key.outputs.have_key == 'true'
         with:
           ref: main
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Run copycat guard
+        if: steps.key.outputs.have_key == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}

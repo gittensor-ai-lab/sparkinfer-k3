@@ -246,10 +246,35 @@ spec, every field traced to either `moonshotai/Kimi-K3/config.json` or the fork'
   `hidden_size = 7168`; expert FFN is 3072 wide. Sizing expert GEMMs off `hidden_size` will
   be wrong by 2×.
 
+## CI
+
+CI is shaped by one limit: no GitHub-hosted runner will ever load an 802 GiB model. So it
+gates what is cheap here and expensive on a rented node, and claims nothing more.
+
+| job | what it proves |
+|---|---|
+| `shell` | `bash -n` over **every** tracked script; no CRLF in source |
+| `python` | `py_compile` over every tracked file; every discovered `test_*.py` |
+| `configs` | YAML parses; derived arch arithmetic self-consistent; links resolve |
+| `plans` | `--dry-run` resolves for all three nodes; fork pin does not leak upstream |
+| `lock` | every pinned baseline traces to a committed `bench/results/*.json` |
+| `build-gate` | compiles for `sm_90` + `sm_100` (path-filtered) |
+| `pin-audit` | weekly: PR #48 head + published shard counts still match the pins |
+
+The `lock` job is the load-bearing one. `0` means not measured and is always allowed; a
+non-zero baseline must match a recorded sweep for the same node **and** context, with prefill
+and decode not interchangeable. Without it, `reference.lock` is just a text file somebody can
+type a favourable number into — and downstream that is indistinguishable from a measurement.
+
+`node-attestation` labels `needs-node-run` when perf-bearing code changes with no node run
+attested. It labels only; it never closes a PR.
+
 ## Tests
 
 ```bash
-python3 bench/scripts/test_kimi_k3_baseline.py     # 58 tests, no GPU / weights needed
+python3 bench/scripts/test_kimi_k3_baseline.py     # 76 tests, no GPU / weights needed
+python3 bench/scripts/check_reference_lock.py      # pinned baselines have measurements
+python3 bench/scripts/audit_baseline_pins.py       # external pins vs reality (network)
 ```
 
 Covers the things that are cheap to get wrong here and expensive to discover on a rented

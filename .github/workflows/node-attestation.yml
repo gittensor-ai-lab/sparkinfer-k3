@@ -1,0 +1,144 @@
+name: node-attestation
+
+# Replaces the inherited `rtx5090-required` workflow, which auto-closed any PR that left
+# "Tested on RTX 5090" unticked. Two things were wrong with that here:
+#
+#   1. WRONG HARDWARE. This repo's milestones are 8x H200 (sm_90), 8x B200 (sm_100) and
+#      4x+ B300 (sm_103). No PR here will ever have RTX 5090 evidence, so the gate closed
+#      everything that touched runtime/ on a criterion that cannot be satisfied.
+#
+#   2. WRONG SEVERITY. Auto-closing was an anti-spam measure for a public competition repo
+#      taking hundreds of miner PRs. This repo is private. Closing a colleague's PR because
+#      a checkbox is unticked costs more than it saves, so this workflow LABELS and COMMENTS
+#      and leaves the close decision to a maintainer.
+#
+# Safe by design: pull_request_target never checks out or runs PR code — GitHub API only.
+
+on:
+  pull_request_target:
+    types: [opened, edited, reopened, ready_for_review, synchronize]
+  workflow_dispatch:
+
+permissions:
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: node-attestation-${{ github.event.pull_request.number || 'sweep' }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Label PRs that change perf-bearing code without a node run
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const LABEL = 'needs-node-run';
+            const MARKER = '<!-- sparkinfer-k3-node-attestation -->';
+            const SKIP_LABELS = new Set(['hold', 'no-node-run']);
+
+            // Paths where a change can move a measured number. Everything else — configs,
+            // bench/scripts, docs, CI — is verifiable by the `ci` workflow alone.
+            const PERF_PREFIXES = ['runtime/', 'kernels/', 'moe/', 'server/', 'CMakeLists.txt'];
+
+            // The milestone nodes. A PR needs a ticked box for at least one of them.
+            const NODES = [
+              { key: 'h200', re: /h200/i,  label: '8x H200 (sm_90)' },
+              { key: 'b200', re: /b200/i,  label: '8x B200 (sm_100)' },
+              { key: 'b300', re: /b300/i,  label: '4x+ B300 (sm_103)' },
+            ];
+
+            function tickedNodes(body) {
+              if (!body) return [];
+              const out = [];
+              for (const ln of body.split('\n')) {
+                if (!/-\s*\[\s*[xX]\s*\]/.test(ln)) continue;
+                for (const n of NODES) if (n.re.test(ln)) out.push(n.label);
+              }
+              return [...new Set(out)];
+            }
+
+            const { owner, repo } = context.repo;
+            const num = context.payload.pull_request?.number;
+            if (!num) { core.info('no PR in context — nothing to do'); return; }
+
+            const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: num });
+            const labels = (await github.paginate(github.rest.issues.listLabelsOnIssue,
+              { owner, repo, issue_number: num, per_page: 100 })).map(l => l.name);
+
+            if (pr.draft || pr.user?.type === 'Bot' || labels.some(l => SKIP_LABELS.has(l))) {
+              core.info(`#${num}: draft/bot/exempt — skip`);
+              return;
+            }
+
+            const files = await github.paginate(github.rest.pulls.listFiles,
+              { owner, repo, pull_number: num, per_page: 100 });
+            const perfFiles = files
+              .map(f => f.filename)
+              .filter(n => PERF_PREFIXES.some(p => n.startsWith(p)));
+
+            const ticked = tickedNodes(pr.body);
+
+            async function setLabel(on) {
+              const has = labels.includes(LABEL);
+              if (on && !has) {
+                await github.rest.issues.addLabels(
+                  { owner, repo, issue_number: num, labels: [LABEL] }).catch(() => {});
+              } else if (!on && has) {
+                await github.rest.issues.removeLabel(
+                  { owner, repo, issue_number: num, name: LABEL }).catch(() => {});
+              }
+            }
+
+            if (perfFiles.length === 0) {
+              core.info(`#${num}: touches no perf-bearing paths — no node run required`);
+              await setLabel(false);
+              return;
+            }
+            if (ticked.length > 0) {
+              core.info(`#${num}: attested on ${ticked.join(', ')}`);
+              await setLabel(false);
+              return;
+            }
+
+            core.notice(`#${num}: ${perfFiles.length} perf-bearing file(s), no node attested`);
+            await setLabel(true);
+
+            // One comment per PR, updated rather than repeated on every synchronize.
+            const comments = await github.paginate(github.rest.issues.listComments,
+              { owner, repo, issue_number: num, per_page: 100 });
+            const existing = comments.find(c => c.body?.includes(MARKER));
+            const body = [
+              MARKER,
+              '## `needs-node-run`',
+              '',
+              'This PR changes code that can move a measured number:',
+              '',
+              ...perfFiles.slice(0, 20).map(f => `- \`${f}\``),
+              perfFiles.length > 20 ? `- …and ${perfFiles.length - 20} more` : '',
+              '',
+              'CI covers syntax, the no-GPU test suite, configs and the `--dry-run` plans — but it',
+              'cannot run an 802 GiB model, so it cannot tell whether this changed the numbers.',
+              '',
+              '**To clear this label**, edit the PR description and tick the node you measured on:',
+              '',
+              ...NODES.map(n => `- [ ] Tested on **${n.label}**`),
+              '',
+              'then paste the before/after from `bench/scripts/kimi_k3_baseline.sh` and commit the',
+              'emitted `bench/results/*.json`. If a pinned baseline changed, the `lock` CI job will',
+              'require that JSON to back it.',
+              '',
+              'Not a perf change? A maintainer can add `no-node-run` or `hold`.',
+              '',
+              '<sub>Automated by node-attestation CI. This label is advisory — it never closes a PR.</sub>',
+            ].filter(l => l !== '').join('\n');
+
+            if (existing) {
+              await github.rest.issues.updateComment(
+                { owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment(
+                { owner, repo, issue_number: num, body });
+            }

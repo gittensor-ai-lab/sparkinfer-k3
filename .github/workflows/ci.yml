@@ -1,0 +1,252 @@
+name: ci
+
+# The real CI for sparkinfer-k3. Replaces the inherited `eval-policy` workflow, which
+# linted a hand-listed set of Qwen-era files and never touched the K3 harness at all.
+#
+# WHAT CI CAN AND CANNOT DO HERE. The target is an 8x H200 node holding an 802 GiB model;
+# no GitHub-hosted runner will ever run that. So CI covers exactly the things that are
+# cheap here and expensive to discover on a rented node: syntax, the no-GPU test suite,
+# config validity, the three --dry-run plans, and the reference.lock provenance invariant.
+#
+# What CI deliberately does NOT gate: anything needing a GPU. That happens on the node and
+# its output is a committed bench/results/*.json — which the `lock` job then holds you to.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  shell:
+    name: shell syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # bash -n on EVERY tracked shell script, not a hand-maintained list. The inherited
+      # workflow named four files explicitly, so the K3 scripts were invisible to it and a
+      # syntax error in kimi_k3_baseline.sh would have reached a rented node first.
+      - name: bash -n (all tracked shell scripts)
+        run: |
+          set -euo pipefail
+          n=0
+          while IFS= read -r f; do
+            bash -n "$f" || { echo "::error file=$f::bash -n failed"; exit 1; }
+            n=$((n + 1))
+          done < <(git ls-files '*.sh')
+          echo "checked $n shell scripts"
+
+      # A CR before a heredoc terminator is a hard syntax error, not a cosmetic issue: it
+      # is what made server/scripts/bench_api_vs_native.sh unrunnable for its whole life in
+      # the inherited tree. .gitattributes prevents reintroduction on checkout; this catches
+      # a file added with CRLF already staged. Captured tool output (*.log, *.jsonl) is
+      # exempt — that is somebody's evidence and should stay byte for byte.
+      - name: No CRLF in source
+        run: |
+          set -euo pipefail
+          bad=""
+          while IFS= read -r f; do
+            [ -f "$f" ] || continue
+            if grep -qU $'\r' "$f"; then
+              echo "::error file=$f::source file contains CRLF line endings"
+              bad="$bad $f"
+            fi
+          done < <(git ls-files '*.sh' '*.py' '*.yml' '*.yaml' '*.md' '*.cpp' '*.cu' '*.cuh' '*.h' '*.hpp' '*.json' 'CMakeLists.txt')
+          [ -z "$bad" ] || exit 1
+          echo "no CRLF in tracked source"
+
+      - name: shellcheck (K3 harness, informational)
+        continue-on-error: true
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck -S warning -e SC1091 \
+            bench/scripts/_common.sh \
+            bench/scripts/_kimi_k3.sh \
+            bench/scripts/kimi_k3_baseline.sh \
+            bench/scripts/kimi_k3_reference_server.sh
+
+  python:
+    name: python compile + unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test deps
+        run: python3 -m pip install --quiet pyyaml tokenizers
+
+      - name: py_compile (all tracked python)
+        run: |
+          set -euo pipefail
+          git ls-files '*.py' | xargs -r python3 -m py_compile
+          echo "compiled $(git ls-files '*.py' | wc -l) python files"
+
+      # Every test_*.py, discovered — so a new suite is covered the moment it lands.
+      - name: Unit tests
+        run: |
+          set -euo pipefail
+          rc=0
+          while IFS= read -r t; do
+            echo "::group::$t"
+            python3 "$t" || { echo "::error file=$t::test suite failed"; rc=1; }
+            echo "::endgroup::"
+          done < <(git ls-files '*/test_*.py' 'test_*.py')
+          exit $rc
+
+  configs:
+    name: configs + docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python3 -m pip install --quiet pyyaml
+
+      - name: YAML parses
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import sys, yaml, subprocess
+          files = subprocess.check_output(
+              ["git", "ls-files", "*.yaml", "*.yml"], text=True).split()
+          bad = []
+          for f in files:
+              try:
+                  yaml.safe_load(open(f))
+              except Exception as e:
+                  bad.append((f, e))
+          for f, e in bad:
+              print(f"::error file={f}::YAML parse failed: {e}")
+          print(f"parsed {len(files) - len(bad)}/{len(files)} YAML files")
+          sys.exit(1 if bad else 0)
+          PY
+
+      # Cross-check the arithmetic the configs assert, against the formulas in the
+      # reference implementation. A wrong KV figure here silently mis-sizes a rented node.
+      - name: Derived arch numbers are self-consistent
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import sys, yaml
+          m = yaml.safe_load(open("bench/configs/models/kimi_k3.yaml"))
+          errs = []
+          a, t, d = m["attention"], m["text"], m["derived"]
+          if a["full_attention_layers"] + a["kda_layers"] != t["num_hidden_layers"]:
+              errs.append("MLA + KDA layer counts do not sum to num_hidden_layers")
+          if len(a["full_attention_layers_1based"]) != a["full_attention_layers"]:
+              errs.append("full_attention_layers_1based length != full_attention_layers")
+          fa = a["full_attention"]
+          want_key_len = fa["kv_lora_rank"] + fa["qk_rope_head_dim"]
+          if fa["gguf_key_length"] != want_key_len:
+              errs.append(f"gguf_key_length != kv_lora + qk_rope ({want_key_len})")
+          # MLA stores K only (is_mla() -> has_v = false)
+          want_kv = a["full_attention_layers"] * want_key_len * 2
+          if d["mla_kv_bytes_per_token"] != want_kv:
+              errs.append(f"mla_kv_bytes_per_token != {want_kv}")
+          la = a["linear_attention"]
+          want_state = (la["head_dim"] ** 2 * la["num_heads"]
+                        + 3 * (la["short_conv_kernel_size"] - 1) * la["num_heads"] * la["head_dim"]) * 4
+          if d["kda_state_bytes_per_seq_per_layer"] != want_state:
+              errs.append(f"kda_state_bytes_per_seq_per_layer != {want_state}")
+          for e in errs:
+              print(f"::error file=bench/configs/models/kimi_k3.yaml::{e}")
+          print("checked layer split, MLA key length, KV bytes/token, KDA state bytes")
+          sys.exit(1 if errs else 0)
+          PY
+
+      - name: Relative links resolve
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, re, subprocess, sys
+          # A link that resolves ABOVE the repo root is not a file reference — it is
+          # GitHub-URL-relative (e.g. ../../labels/copycat from .github/ points at
+          # github.com/<owner>/<repo>/labels/copycat). Those are valid and unresolvable
+          # here, so skip them rather than reporting five permanent false failures.
+          root = os.path.realpath(".")
+          bad, skipped = [], 0
+          for f in subprocess.check_output(["git", "ls-files", "*.md"], text=True).split():
+              base = os.path.dirname(f)
+              for link in re.findall(r'\]\(([^)\s]+)\)', open(f, encoding="utf-8").read()):
+                  link = link.split("#")[0]
+                  if not link or link.startswith(("http://", "https://", "mailto:", "/")):
+                      continue
+                  target = os.path.realpath(os.path.join(base, link))
+                  if os.path.commonpath([root, target]) != root:
+                      skipped += 1
+                      continue
+                  if not os.path.exists(target):
+                      bad.append((f, link))
+          for f, l in bad:
+              print(f"::error file={f}::broken relative link: {l}")
+          print(f"{len(bad)} broken link(s); {skipped} GitHub-URL-relative link(s) skipped")
+          sys.exit(1 if bad else 0)
+          PY
+
+  plans:
+    name: baseline --dry-run (all nodes)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # --dry-run touches no network and no GPU, so CI can prove the plan resolves for
+      # every milestone node: shard paths, fork pin, flags, headroom, reference.lock prefix.
+      - name: Plan resolves for h200x8 / b200x8 / b300x4
+        run: |
+          set -euo pipefail
+          for node in h200x8 b200x8 b300x4; do
+            echo "::group::--node $node"
+            out="$(bash bench/scripts/kimi_k3_baseline.sh --node "$node" --dry-run --longctx)"
+            echo "$out"
+            echo "$out" | grep -q "Kimi-K3-UD-Q2_K_XL-00001-of-00019.gguf" \
+              || { echo "::error::$node: target shard path did not resolve"; exit 1; }
+            echo "$out" | grep -q "efc8bc38f0a9950cbb10ccef2cf48b951c39d3b2" \
+              || { echo "::error::$node: fork pin missing from plan"; exit 1; }
+            echo "$out" | grep -qi "KIMI_K3_$(echo "$node" | tr 'a-z' 'A-Z')_LLAMA_" \
+              || { echo "::error::$node: wrong reference.lock prefix"; exit 1; }
+            echo "$out" | grep -q "1048576" \
+              || { echo "::error::$node: 1M context missing from longctx plan"; exit 1; }
+            echo "::endgroup::"
+          done
+
+      # The Qwen evals must keep the upstream ggml-org pin. Sourcing _kimi_k3.sh is what
+      # switches to the fork, so nothing may leak the fork pin into _common.sh alone.
+      - name: Fork pin does not leak into the upstream harness
+        run: |
+          set -euo pipefail
+          got="$(bash -c 'source bench/scripts/_common.sh; echo "$LLAMACPP_REPO|$LLAMACPP_REF"')"
+          echo "_common.sh alone -> $got"
+          [ "$got" = "https://github.com/ggml-org/llama.cpp|" ] \
+            || { echo "::error::fork pin leaked into _common.sh: $got"; exit 1; }
+          got="$(bash -c 'source bench/scripts/_common.sh; source bench/scripts/_kimi_k3.sh; echo "$LLAMACPP_REPO"')"
+          echo "with _kimi_k3.sh -> $got"
+          [ "$got" = "https://github.com/unslothai/llama.cpp" ] \
+            || { echo "::error::_kimi_k3.sh did not switch the engine: $got"; exit 1; }
+
+  lock:
+    name: reference.lock provenance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The repo's central claim is that a native runtime is scored against a reference
+      # somebody else can reproduce. That collapses if a baseline can be typed in, because
+      # downstream a hand-filled number is indistinguishable from a measured one. Every
+      # non-zero baseline must trace to a committed bench/results JSON for the same node
+      # and context. 0 = not measured, always allowed.
+      - name: Every pinned baseline traces to a measurement
+        run: python3 bench/scripts/check_reference_lock.py

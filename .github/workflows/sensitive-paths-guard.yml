@@ -35,7 +35,19 @@ jobs:
           MAINTAINERS="ai-hpc"
 
           # Verdict-determining / governance paths. Keep in sync with .github/CODEOWNERS.
-          SENSITIVE='^(eval/|bench/scripts/|\.github/|\.gittensor/|dashboard/data\.json$)'
+          #
+          # RETARGETED FOR THIS REPO. The inherited list guarded all of `bench/scripts/`,
+          # which made sense in sparkinfer (where the harness is scoring infrastructure and
+          # the product is runtime/). Here the harness IS the deliverable — the entire K3
+          # baseline lives in bench/scripts/ — so guarding the whole directory would block
+          # every contribution the repo exists to receive.
+          #
+          # What genuinely determines a verdict here is narrower: the pins and the recorded
+          # measurements. Change reference.lock and you change what every future run is
+          # scored against; change a weight manifest and you change which bytes count as the
+          # baseline; change bench/results/ and you change what `check_reference_lock.py`
+          # will accept as provenance for a pinned number.
+          SENSITIVE='^(eval/|\.github/|\.gittensor/|bench/scripts/reference\.lock$|bench/scripts/kimi_k3_.*\.sha256$|bench/results/|dashboard/data\.json$)'
 
           # Read-only: the changed-file list from the API. Never runs PR code.
           FILES="$(gh pr diff "$NUM" -R "$REPO" --name-only)"

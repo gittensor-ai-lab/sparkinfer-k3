@@ -13,6 +13,7 @@ Run from the repo root:
 """
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -514,6 +515,214 @@ class ArchConfigTest(unittest.TestCase):
             self.assertTrue((cdir / f).exists(), f)
         # B300's arch is a guess and must say so, or a mislabelled result looks authoritative.
         self.assertIn("arch_verified: false", (cdir / "b300.yaml").read_text())
+
+
+class ReferenceLockProvenanceTest(unittest.TestCase):
+    """check_reference_lock.py is the CI job that makes the repo's central claim
+    enforceable: a pinned baseline must trace to a recorded measurement, because
+    downstream a hand-filled number is indistinguishable from a measured one."""
+
+    CHECKER = SCRIPTS / "check_reference_lock.py"
+
+    def _run(self, lock_text=None, results=None):
+        """Run the checker against a temp lock + results dir. Returns (rc, stdout)."""
+        tmp = Path(tempfile.mkdtemp())
+        # The checker reads the real reference.lock, so exercise it by running in a copy
+        # of the tree layout it expects.
+        scripts = tmp / "bench" / "scripts"
+        scripts.mkdir(parents=True)
+        (tmp / "bench" / "results").mkdir(parents=True)
+        (scripts / "reference.lock").write_text(
+            lock_text if lock_text is not None
+            else (SCRIPTS / "reference.lock").read_text())
+        shutil.copy(self.CHECKER, scripts / self.CHECKER.name)
+        rdir = tmp / "bench" / "results"
+        for name, payload in (results or {}).items():
+            (rdir / name).write_text(json.dumps(payload))
+        out = subprocess.run(
+            [sys.executable, str(scripts / self.CHECKER.name), "--results-dir", str(rdir)],
+            capture_output=True, text=True)
+        return out.returncode, out.stdout + out.stderr
+
+    def test_shipped_lock_is_clean(self):
+        rc, out = self._run()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("24 K3 baseline slots", out)
+        self.assertIn("0 pinned", out)
+
+    def test_hand_filled_baseline_is_rejected(self):
+        lock = (SCRIPTS / "reference.lock").read_text().replace(
+            'KIMI_K3_H200X8_LLAMA_4K="${KIMI_K3_H200X8_LLAMA_4K:-0}"',
+            'KIMI_K3_H200X8_LLAMA_4K="${KIMI_K3_H200X8_LLAMA_4K:-311.20}"')
+        rc, out = self._run(lock)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("NO results file records", out)
+
+    def test_backed_baseline_is_accepted(self):
+        lock = (SCRIPTS / "reference.lock").read_text().replace(
+            'KIMI_K3_H200X8_LLAMA_4K="${KIMI_K3_H200X8_LLAMA_4K:-0}"',
+            'KIMI_K3_H200X8_LLAMA_4K="${KIMI_K3_H200X8_LLAMA_4K:-311.20}"')
+        rc, out = self._run(lock, {
+            "kimi_k3_UD-Q2_K_XL_h200x8_baseline_20260730T000000Z.json": {
+                "node_profile": "h200x8",
+                "contexts": {"4096": {"decode_tps": 311.2013, "prefill_pp": 8000.0}},
+            }})
+        self.assertEqual(rc, 0, out)
+
+    def test_mismatched_value_is_rejected(self):
+        lock = (SCRIPTS / "reference.lock").read_text().replace(
+            'KIMI_K3_H200X8_LLAMA_4K="${KIMI_K3_H200X8_LLAMA_4K:-0}"',
+            'KIMI_K3_H200X8_LLAMA_4K="${KIMI_K3_H200X8_LLAMA_4K:-311.20}"')
+        rc, out = self._run(lock, {
+            "kimi_k3_UD-Q2_K_XL_h200x8_baseline_20260730T000000Z.json": {
+                "node_profile": "h200x8",
+                "contexts": {"4096": {"decode_tps": 222.0}},
+            }})
+        self.assertEqual(rc, 1, out)
+        self.assertIn("does not match any measurement", out)
+
+    def test_wrong_node_does_not_satisfy(self):
+        # A B200 measurement must not back an H200 pin — that is the whole point of the
+        # per-node prefixes.
+        lock = (SCRIPTS / "reference.lock").read_text().replace(
+            'KIMI_K3_H200X8_LLAMA_4K="${KIMI_K3_H200X8_LLAMA_4K:-0}"',
+            'KIMI_K3_H200X8_LLAMA_4K="${KIMI_K3_H200X8_LLAMA_4K:-311.20}"')
+        rc, out = self._run(lock, {
+            "kimi_k3_UD-Q2_K_XL_b200x8_baseline_20260730T000000Z.json": {
+                "node_profile": "b200x8",
+                "contexts": {"4096": {"decode_tps": 311.2013}},
+            }})
+        self.assertEqual(rc, 1, out)
+
+    def test_prefill_and_decode_are_not_interchangeable(self):
+        # A _PP pin needs a prefill_pp measurement, not a decode one at the same context.
+        lock = (SCRIPTS / "reference.lock").read_text().replace(
+            'KIMI_K3_H200X8_LLAMA_4K_PP="${KIMI_K3_H200X8_LLAMA_4K_PP:-0}"',
+            'KIMI_K3_H200X8_LLAMA_4K_PP="${KIMI_K3_H200X8_LLAMA_4K_PP:-8000.00}"')
+        rc, _ = self._run(lock, {
+            "kimi_k3_UD-Q2_K_XL_h200x8_baseline_x.json": {
+                "node_profile": "h200x8",
+                "contexts": {"4096": {"decode_tps": 8000.0}},
+            }})
+        self.assertEqual(rc, 1)
+        rc, _ = self._run(lock, {
+            "kimi_k3_UD-Q2_K_XL_h200x8_baseline_x.json": {
+                "node_profile": "h200x8",
+                "contexts": {"4096": {"prefill_pp": 8000.0}},
+            }})
+        self.assertEqual(rc, 0)
+
+
+class PinAuditTest(unittest.TestCase):
+    """audit_baseline_pins.py watches the two external things the baseline depends on and
+    cannot control. Only its parsers are tested here — the live checks need network."""
+
+    AUDIT = SCRIPTS / "audit_baseline_pins.py"
+
+    def test_offline_mode_makes_no_requests(self):
+        out = subprocess.run([sys.executable, str(self.AUDIT), "--offline"],
+                             capture_output=True, text=True, cwd=ROOT)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("refs/pull/48/head", out.stdout)
+        self.assertIn(PINNED_COMMIT, out.stdout)
+        for q in ("UD-Q2_K_XL", "UD-IQ1_S", "UD-Q8_K_XL"):
+            self.assertIn(q, out.stdout)
+
+    def test_shard_pins_parse_from_the_shell_source(self):
+        # The audit reads kimi_k3_n_shards()'s case arms; if that function is restructured
+        # the audit must not silently start comparing an empty set.
+        sys.path.insert(0, str(SCRIPTS))
+        try:
+            import audit_baseline_pins as audit
+        finally:
+            sys.path.pop(0)
+        pins = audit.pinned_shards((SCRIPTS / "_kimi_k3.sh").read_text())
+        self.assertEqual(pins, {"UD-IQ1_S": 14, "UD-IQ1_M": 15, "UD-IQ2_XXS": 16,
+                                "UD-Q2_K_XL": 19, "UD-Q4_K_XL": 32, "UD-Q8_K_XL": 34})
+
+    def test_lock_vars_parse(self):
+        sys.path.insert(0, str(SCRIPTS))
+        try:
+            import audit_baseline_pins as audit
+        finally:
+            sys.path.pop(0)
+        text = (SCRIPTS / "reference.lock").read_text()
+        self.assertEqual(audit.lock_var("KIMI_K3_LLAMACPP_COMMIT", text), PINNED_COMMIT)
+        self.assertEqual(audit.lock_var("KIMI_K3_LLAMACPP_REF", text), PINNED_REF)
+        self.assertEqual(audit.lock_var("KIMI_K3_LLAMACPP_REPO", text), PINNED_REPO)
+
+
+class CiWorkflowTest(unittest.TestCase):
+    """The inherited CI linted four hand-listed files and never touched the K3 harness.
+    These assert the replacement actually covers this repo."""
+
+    WF = ROOT / ".github" / "workflows"
+
+    def test_superseded_workflows_are_gone(self):
+        for gone in ("eval-policy.yml", "rtx5090-required.yml", "build-attested-binaries.yml"):
+            self.assertFalse((self.WF / gone).exists(), gone)
+
+    def test_replacements_exist(self):
+        for f in ("ci.yml", "build-gate.yml", "node-attestation.yml", "pin-audit.yml"):
+            self.assertTrue((self.WF / f).exists(), f)
+
+    def test_ci_has_the_five_jobs(self):
+        import yaml
+        d = yaml.safe_load((self.WF / "ci.yml").read_text())
+        self.assertEqual(sorted(d["jobs"]), ["configs", "lock", "plans", "python", "shell"])
+
+    def test_ci_lints_every_script_not_a_hand_list(self):
+        # The specific failure mode being prevented: a hand-maintained file list meant
+        # server/scripts/bench_api_vs_native.sh was broken by CRLF for its whole life.
+        text = (self.WF / "ci.yml").read_text()
+        self.assertIn("git ls-files '*.sh'", text)
+        self.assertIn("No CRLF in source", text)
+
+    def test_no_workflow_targets_the_upstream_repo(self):
+        # close-stale-prs.yml used to hardcode REPO=gittensor-ai-lab/sparkinfer, so a
+        # scheduled job here would have reached into another repository.
+        for f in sorted(self.WF.glob("*.yml")):
+            for i, line in enumerate(f.read_text().splitlines(), 1):
+                if line.lstrip().startswith("#"):
+                    continue
+                self.assertNotIn("gittensor-ai-lab/sparkinfer\n", line + "\n",
+                                 f"{f.name}:{i} targets the upstream repo")
+
+    def test_build_gate_targets_milestone_arches_not_sm120(self):
+        text = (self.WF / "build-gate.yml").read_text()
+        self.assertIn('arch: "90"', text)
+        self.assertIn('arch: "100"', text)
+        self.assertNotIn('arch: "120"', text)
+
+    def test_node_attestation_never_closes(self):
+        # Deliberate severity change from the inherited rtx5090-required gate.
+        text = (self.WF / "node-attestation.yml").read_text()
+        self.assertIn("needs-node-run", text)
+        self.assertNotIn("state: 'closed'", text)
+
+    def test_sensitive_paths_no_longer_guards_the_whole_harness(self):
+        # bench/scripts/ IS the deliverable here; guarding all of it would gate every
+        # contribution the repo exists to receive.
+        text = (self.WF / "sensitive-paths-guard.yml").read_text()
+        sensitive = [l for l in text.splitlines() if l.strip().startswith("SENSITIVE=")]
+        self.assertEqual(len(sensitive), 1, sensitive)
+        pattern = sensitive[0]
+        # The narrow, verdict-determining paths must be there (the dot is regex-escaped).
+        self.assertIn(r"reference\.lock", pattern)
+        self.assertIn("bench/results/", pattern)
+        # ...and the blanket bench/scripts/ alternative must NOT be.
+        self.assertNotIn("bench/scripts/|", pattern)
+        # Prove it behaves: the guard must fire on reference.lock and not on the runner.
+        import re as _re
+        rx = _re.compile(pattern.split("'")[1])
+        self.assertTrue(rx.search("bench/scripts/reference.lock"))
+        self.assertTrue(rx.search("bench/results/kimi_k3_x.json"))
+        self.assertFalse(rx.search("bench/scripts/kimi_k3_baseline.sh"))
+        self.assertFalse(rx.search("bench/scripts/_kimi_k3.sh"))
+
+    def test_gitattributes_pins_shell_to_lf(self):
+        text = (ROOT / ".gitattributes").read_text()
+        self.assertIn("*.sh            text eol=lf", text)
 
 
 if __name__ == "__main__":
