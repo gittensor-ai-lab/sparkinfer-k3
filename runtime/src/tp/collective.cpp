@@ -55,6 +55,8 @@ public:
     Backend backend() const override { return Backend::None; }
     int size() const override { return 1; }
     bool allreduce_bf16(void*, std::size_t, int, cudaStream_t) override { return true; }
+    bool allreduce_bf16_group(const std::vector<void*>&, std::size_t,
+                              const std::vector<cudaStream_t>&) override { return true; }
     bool barrier() override { return true; }
 };
 
@@ -111,6 +113,65 @@ public:
             return false;
         }
         return true;
+    }
+
+    // The correct single-thread path: ncclGroupStart/End defers launch until every
+    // rank's call is registered, so no rank blocks waiting for one that has not been
+    // enqueued yet. Without this, a single thread looping over ranks deadlocks at
+    // the first collective — measured on 8x H200, hung with no output.
+    bool allreduce_bf16_group(const std::vector<void*>& bufs, std::size_t count,
+                              const std::vector<cudaStream_t>& streams) override {
+        const int n = size();
+        if (static_cast<int>(streams.size()) != n) return false;
+        if (static_cast<int>(bufs.size()) != n) return false;
+        if (count == 0) return true;
+
+        // MEASURED: 8 cudaSetDevice calls per collective x 186 collectives/token is
+        // real host overhead on the critical path. NCCL requires the comm's device to
+        // be current at enqueue, so the calls cannot be dropped — but the redundant
+        // ones can. Track what is current and only switch when it actually changes,
+        // which for a rank-ordered loop is still 8 switches on the first collective
+        // and then only when another caller has moved the device underneath us.
+        int cur = -1;
+        if (cudaGetDevice(&cur) != cudaSuccess) cur = -1;
+        const int entry_device = cur;
+
+        ncclResult_t r = ncclGroupStart();
+        if (r != ncclSuccess) {
+            std::fprintf(stderr, "[tp] ncclGroupStart: %s\n", ncclGetErrorString(r));
+            return false;
+        }
+        bool ok = true;
+        for (int i = 0; i < n; ++i) {
+            if (!bufs[static_cast<std::size_t>(i)]) { ok = false; break; }
+            const int want = devices_[static_cast<std::size_t>(i)];
+            if (want != cur) {
+                if (cudaSetDevice(want) != cudaSuccess) { ok = false; break; }
+                cur = want;
+            }
+            r = ncclAllReduce(bufs[static_cast<std::size_t>(i)],
+                              bufs[static_cast<std::size_t>(i)], count,
+                              ncclBfloat16, ncclSum,
+                              comms_[static_cast<std::size_t>(i)],
+                              streams[static_cast<std::size_t>(i)]);
+            if (r != ncclSuccess) {
+                std::fprintf(stderr, "[tp] ncclAllReduce rank %d: %s\n", i,
+                             ncclGetErrorString(r));
+                ok = false; break;
+            }
+        }
+        // GroupEnd must run even on a mid-group failure, or the group state leaks
+        // and every later collective on these comms fails.
+        r = ncclGroupEnd();
+        if (r != ncclSuccess) {
+            std::fprintf(stderr, "[tp] ncclGroupEnd: %s\n", ncclGetErrorString(r));
+            ok = false;
+        }
+        // Leave the device as the caller had it: a collective that silently changes
+        // the current device makes every subsequent kernel launch in the forward
+        // land on the wrong GPU, which is a spectacular and very confusing failure.
+        if (entry_device >= 0 && cur != entry_device) cudaSetDevice(entry_device);
+        return ok;
     }
 
     // Stream-level: each rank's stream is synchronized, which is enough for the
@@ -170,6 +231,13 @@ public:
     // collective. Returning false makes a mis-wired forward fail immediately
     // instead of quietly paying that on every one of 186 collectives per token.
     bool allreduce_bf16(void*, std::size_t, int, cudaStream_t) override { return false; }
+
+    // bufs is ignored: these backends reduce their OWN multicast-bound /
+    // peer-registered memory, which the caller wrote via reduce_in().
+    bool allreduce_bf16_group(const std::vector<void*>&, std::size_t count,
+                              const std::vector<cudaStream_t>& streams) override {
+        return allreduce_group(count, streams);
+    }
 
     bool allreduce_group(std::size_t count,
                          const std::vector<cudaStream_t>& streams) override {

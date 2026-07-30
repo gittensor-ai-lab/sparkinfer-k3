@@ -149,20 +149,12 @@ int main(int argc, char** argv) {
             if (!check(cudaMemcpyAsync(dst, host.data(), count * sizeof(uint16_t),
                                        cudaMemcpyHostToDevice, streams[r]), "H2D")) return 1;
         }
-        if (owned) {
-            // ONE group launch across every stream; the barrier is in the kernel.
-            if (!coll->allreduce_group(count, streams)) {
-                std::printf("  FAIL: allreduce_group returned false (count %zu)\n", count);
-                return 1;
-            }
-        } else {
-            for (int r = 0; r < tp_size; ++r) {
-                if (!check(cudaSetDevice(devices[r]), "set")) return 1;
-                if (!coll->allreduce_bf16(bufs[r], count, r, streams[r])) {
-                    std::printf("  FAIL: allreduce returned false (rank %d, count %zu)\n", r, count);
-                    return 1;
-                }
-            }
+        // ONE group launch for every backend. For NCCL this is ncclGroupStart/End
+        // (a single thread looping ncclAllReduce per rank deadlocks); for the fast
+        // backends it is one kernel per rank with the barrier inside the kernel.
+        if (!coll->allreduce_bf16_group(bufs, count, streams)) {
+            std::printf("  FAIL: allreduce_bf16_group returned false (count %zu)\n", count);
+            return 1;
         }
         for (int r = 0; r < tp_size; ++r) {
             if (!check(cudaSetDevice(devices[r]), "set")) return 1;
@@ -210,13 +202,7 @@ int main(int argc, char** argv) {
     std::printf("\n=== latency (%d iters, median-free mean of the steady state) ===\n", iters);
     std::printf("  %10s  %10s  %12s  %14s\n", "elems", "KiB", "us/call", "us/token(186)");
     for (std::size_t count : payloads) {
-        auto issue = [&]() {
-            if (owned) { coll->allreduce_group(count, streams); return; }
-            for (int r = 0; r < tp_size; ++r) {
-                cudaSetDevice(devices[r]);
-                coll->allreduce_bf16(bufs[r], count, r, streams[r]);
-            }
-        };
+        auto issue = [&]() { coll->allreduce_bf16_group(bufs, count, streams); };
         for (int warm = 0; warm < 20; ++warm) issue();
         for (int r = 0; r < tp_size; ++r) {
             cudaSetDevice(devices[r]);

@@ -72,11 +72,32 @@ public:
     virtual Backend backend() const = 0;
     virtual int size() const = 0;
 
-    // Mode A. In-place sum-reduce of `count` bf16 elements in `buf` (device
-    // memory on rank `rank`'s device), across all ranks. Returns false on
-    // failure — and a false must be treated as fatal, because continuing with a
-    // partial reduction presents as a quality regression rather than a bug.
-    // Returns false unconditionally when owns_buffers() is true.
+    // Mode A, GROUP form — the primary entry point, and the only correct one for a
+    // single host thread driving every rank (which is sparkinfer's model).
+    //
+    // MEASURED: calling the per-rank allreduce_bf16() below in a loop from one
+    // thread DEADLOCKS with NCCL. ncclAllReduce on rank 0's communicator blocks
+    // waiting for the other ranks to join a collective that the same thread has not
+    // enqueued yet. NCCL's fix is ncclGroupStart/ncclGroupEnd around the whole set,
+    // which defers launch until every rank's call is registered. This hung on an
+    // 8x H200 node at the first collective and produced no output at all, which is
+    // exactly why the group form is now the default rather than a variant.
+    //
+    // `bufs[r]` is rank r's in-place buffer on devices[r]; ignored (may be empty)
+    // when owns_buffers() is true, because those backends reduce their own memory.
+    // `streams` size must equal size().
+    virtual bool allreduce_bf16_group(const std::vector<void*>& bufs,
+                                      std::size_t count,
+                                      const std::vector<cudaStream_t>& streams) = 0;
+
+    // Mode A, PER-RANK form. Safe ONLY when each rank is driven by its own host
+    // thread, so the calls genuinely overlap. From a single thread iterating ranks
+    // this deadlocks — use allreduce_bf16_group() instead.
+    //
+    // In-place sum-reduce of `count` bf16 elements in `buf` (device memory on rank
+    // `rank`'s device). Returns false on failure, and a false must be treated as
+    // fatal: continuing with a partial reduction presents as a quality regression
+    // rather than a bug. Returns false unconditionally when owns_buffers() is true.
     virtual bool allreduce_bf16(void* buf, std::size_t count, int rank,
                                 cudaStream_t stream) = 0;
 
