@@ -47,7 +47,14 @@ static double h2f(uint16_t h) {
     const uint32_t sign = (uint32_t)(h & 0x8000) << 16;
     const uint32_t exp = (h >> 10) & 0x1f, man = h & 0x3ff;
     uint32_t bits;
-    if (exp == 0) bits = sign;
+    if (exp == 0) {
+        if (man == 0) bits = sign;   // signed zero
+        else {                       // SUBNORMAL half — must not be flushed to zero;
+            int e = -1; uint32_t m = man;   // that is what silently zeroed IQ1_S/Q8_0
+            do { m <<= 1; ++e; } while (!(m & 0x400));   // scales with tiny fp16 d and
+            bits = sign | ((uint32_t)(127 - 15 - e) << 23) | ((m & 0x3ff) << 13);  // made
+        }                            // the CPU ref disagree with the executor's __half2float
+    }
     else if (exp == 31) bits = sign | 0x7f800000u | (man << 13);
     else bits = sign | ((exp - 15 + 127) << 23) | (man << 13);
     float f; std::memcpy(&f, &bits, 4); return (double)f;

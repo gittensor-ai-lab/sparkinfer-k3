@@ -642,6 +642,7 @@ bool kimi_k3_forward_layer(KimiK3Forward& fwd, int layer, const float* hidden_in
         k3k::rms_norm_f32(s.kv_cmpr_normed, s.kv_a_out,
                           (const float*)L.attn_kv_a_norm.data, cfg.kv_lora_rank, eps,
                           stream);
+        if (fwd.debug) fwd.debug("dbg_kvcmpr", layer, s.kv_cmpr_normed, cfg.kv_lora_rank);
 
         // K-cache row for this position: concat(normed kv_cmpr, RAW k_pe).
         float* row = st.mla_kv_cache[mla_ord] + (size_t)st.position * cfg.key_length;
@@ -662,12 +663,15 @@ bool kimi_k3_forward_layer(KimiK3Forward& fwd, int layer, const float* hidden_in
                                  (const float*)L.attn_v_b.data, cfg.key_length,
                                  cfg.kv_lora_rank, cfg.value_length_mla, qh,
                                  st.position + 1, mla_scale, stream);
+        if (fwd.debug) fwd.debug("dbg_preattn", layer, s.mla_attn_out, qh * cfg.value_length_mla);
 
         if (L.has_attn_gate) {
             if (!proj(s.gate_proj_out, s.normed, L.attn_gate, qh * cfg.value_length_mla, H))
                 return false;
+            if (fwd.debug) fwd.debug("dbg_gateproj", layer, s.gate_proj_out, qh * cfg.value_length_mla);
             k3k::mla_gate_out_f32(s.mla_attn_out, s.mla_attn_out, s.gate_proj_out,
                                   (int64_t)qh * cfg.value_length_mla, stream);
+            if (fwd.debug) fwd.debug("dbg_postgate", layer, s.mla_attn_out, qh * cfg.value_length_mla);
         }
 
         if (!proj(s.attn_out, s.mla_attn_out, L.attn_output, H, qh * cfg.value_length_mla))

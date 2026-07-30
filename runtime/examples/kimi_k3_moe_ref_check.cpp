@@ -38,7 +38,11 @@ struct BlockQ8_0 { uint16_t d; int8_t qs[32]; };
 static double h2f(uint16_t h) {
     const uint32_t s = (uint32_t)(h & 0x8000) << 16, e = (h >> 10) & 0x1f, m = h & 0x3ff;
     uint32_t b;
-    if (e == 0) b = s; else if (e == 31) b = s | 0x7f800000u | (m << 13);
+    if (e == 0) {
+        if (m == 0) b = s;
+        else { int ee = -1; uint32_t mm = m; do { mm <<= 1; ++ee; } while (!(mm & 0x400));
+               b = s | ((uint32_t)(127 - 15 - ee) << 23) | ((mm & 0x3ff) << 13); }  // subnormal
+    } else if (e == 31) b = s | 0x7f800000u | (m << 13);
     else b = s | ((e - 15 + 127) << 23) | (m << 13);
     float f; std::memcpy(&f, &b, 4); return (double)f;
 }

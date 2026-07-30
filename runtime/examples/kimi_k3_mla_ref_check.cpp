@@ -35,7 +35,14 @@ static double h2f(uint16_t h) {
     const uint32_t sign = (uint32_t)(h & 0x8000) << 16;
     const uint32_t exp = (h >> 10) & 0x1f, man = h & 0x3ff;
     uint32_t bits;
-    if (exp == 0) bits = sign;
+    if (exp == 0) {
+        if (man == 0) bits = sign;   // signed zero
+        else {                       // SUBNORMAL half — must not be flushed to zero;
+            int e = -1; uint32_t m = man;   // that is what silently zeroed IQ1_S/Q8_0
+            do { m <<= 1; ++e; } while (!(m & 0x400));   // scales with tiny fp16 d and
+            bits = sign | ((uint32_t)(127 - 15 - e) << 23) | ((m & 0x3ff) << 13);  // made
+        }                            // the CPU ref disagree with the executor's __half2float
+    }
     else if (exp == 31) bits = sign | 0x7f800000u | (man << 13);
     else bits = sign | ((exp - 15 + 127) << 23) | (man << 13);
     float f; std::memcpy(&f, &bits, 4); return (double)f;
@@ -203,15 +210,33 @@ int main(int argc, char** argv) {
     }
     (void)mla_scale;   // scale only matters with >1 cached token; n_ctx=1 softmax ignores it
     std::printf("[cpu ref] mla_attn_out (pre-gate) rms=%.6g\n", rms(mla_attn_out));
+    const std::vector<double> cpu_preattn = mla_attn_out;   // keep for a per-element check
 
+    std::vector<double> cpu_gateproj, cpu_postgate;
     if (has_attn_gate) {
-        auto gate_proj = matvec(Wgate, normed, qh * cfg.value_length_mla, H);
+        cpu_gateproj = matvec(Wgate, normed, qh * cfg.value_length_mla, H);
         for (size_t i = 0; i < mla_attn_out.size(); ++i)
-            mla_attn_out[i] *= 1.0 / (1.0 + std::exp(-gate_proj[i]));
+            mla_attn_out[i] *= 1.0 / (1.0 + std::exp(-cpu_gateproj[i]));
+        cpu_postgate = mla_attn_out;
         std::printf("[cpu ref] mla_attn_out (post-gate) rms=%.6g\n", rms(mla_attn_out));
     }
 
     auto attn_out = matvec(Wo, mla_attn_out, H, qh * cfg.value_length_mla);
+
+    // Same o_proj but with FLOAT accumulation (matching the GPU kernel's fp32 sum),
+    // to separate a precision artifact from a real bug: if the GPU matches THIS far
+    // better than the double-precision attn_out, the divergence is fp32 cancellation
+    // in the 12288-term o_proj (near-zero true output), not a wiring error.
+    std::vector<double> attn_out_f32(H);
+    {
+        const int K = qh * cfg.value_length_mla;
+        for (int n = 0; n < H; ++n) {
+            float acc = 0.0f;
+            const double* wr = &Wo[(size_t)n * K];
+            for (int k = 0; k < K; ++k) acc += (float)wr[k] * (float)mla_attn_out[k];
+            attn_out_f32[n] = (double)acc;
+        }
+    }
     std::printf("[cpu ref] attn_out (pre-combine) rms=%.6g  first4=%.6g,%.6g,%.6g,%.6g\n",
                 rms(attn_out), attn_out[0], attn_out[1], attn_out[2], attn_out[3]);
 
@@ -225,6 +250,23 @@ int main(int argc, char** argv) {
 
     KimiK3Weights w;
     if (!kimi_k3_load_weights(g, cfg, opt, w, LAYER, LAYER)) { std::printf("load failed\n"); return 1; }
+
+    // DIRECT byte compare: the loaded GPU attn_output vs the GGUF mmap bytes the CPU
+    // ref reads. If these differ, the loader mis-uploaded this tensor.
+    {
+        const GGUFTensor* wo_t = T("attn_output.weight");
+        const long nb = wo_t->n_bytes;
+        std::vector<uint8_t> gpu_bytes(nb), mmap_bytes(nb);
+        cudaMemcpy(gpu_bytes.data(), w.layers[LAYER].attn_output.data, nb, cudaMemcpyDeviceToHost);
+        std::memcpy(mmap_bytes.data(), wo_t->data, nb);
+        long ndiff = 0, first = -1;
+        for (long i = 0; i < nb; ++i)
+            if (gpu_bytes[i] != mmap_bytes[i]) { ++ndiff; if (first < 0) first = i; }
+        std::printf("  attn_output BYTES: %ld/%ld differ (loaded GPU vs mmap)%s\n",
+                    ndiff, nb, ndiff ? "  <- LOADER BUG" : "  (identical)");
+        if (ndiff) std::printf("    first diff at byte %ld: gpu=%u mmap=%u\n",
+                               first, gpu_bytes[first], mmap_bytes[first]);
+    }
     KimiK3RuntimeState state;
     if (!kimi_k3_alloc_state(cfg, 64, state)) { std::printf("state alloc failed\n"); return 1; }
     KimiK3Forward fwd;
@@ -267,11 +309,22 @@ int main(int argc, char** argv) {
     // and the GPU's own "mla_out" debug tag value (also pre-combine) — both printed
     // above; compute it here directly rather than asking the reader to eyeball rms.
     std::vector<float> gpu_attn_out(H);
-    bool got_attn = false;
+    const int VD = qh * cfg.value_length_mla;
+    std::vector<float> gpu_preattn(VD), gpu_gateproj, gpu_postgate;
+    bool got_attn = false, got_pre = false;
     fwd.debug = [&](const char* tag, int layer, const float* dev_ptr, int64_t n) {
         if (std::string(tag) == "mla_out" && (int)n == H) {
             cudaMemcpy(gpu_attn_out.data(), dev_ptr, H * sizeof(float), cudaMemcpyDeviceToHost);
             got_attn = true;
+        } else if (std::string(tag) == "dbg_preattn" && (int)n == VD) {
+            cudaMemcpy(gpu_preattn.data(), dev_ptr, VD * sizeof(float), cudaMemcpyDeviceToHost);
+            got_pre = true;
+        } else if (std::string(tag) == "dbg_gateproj" && (int)n == VD) {
+            gpu_gateproj.resize(VD);
+            cudaMemcpy(gpu_gateproj.data(), dev_ptr, VD * sizeof(float), cudaMemcpyDeviceToHost);
+        } else if (std::string(tag) == "dbg_postgate" && (int)n == VD) {
+            gpu_postgate.resize(VD);
+            cudaMemcpy(gpu_postgate.data(), dev_ptr, VD * sizeof(float), cudaMemcpyDeviceToHost);
         }
     };
     // Re-run once more purely to capture the attn_out debug value cleanly (state
@@ -285,6 +338,30 @@ int main(int argc, char** argv) {
     kimi_k3_forward_layer(fwd, LAYER, d_in, d_out);
     cudaDeviceSynchronize();
 
+    auto rel = [&](const std::vector<float>& g, const std::vector<double>& c) {
+        double n2 = 0, d2 = 0;
+        for (size_t i = 0; i < c.size(); ++i) { double d=(double)g[i]-c[i]; n2+=d*d; d2+=c[i]*c[i]; }
+        return std::sqrt(n2 / (d2 + 1e-30));
+    };
+    if (got_pre)
+        std::printf("  PRE-GATE (decode_attn)   relL2 = %.3e\n", rel(gpu_preattn, cpu_preattn));
+    if (!gpu_gateproj.empty())
+        std::printf("  GATE_PROJ (attn_gate@x)  relL2 = %.3e\n", rel(gpu_gateproj, cpu_gateproj));
+    if (!gpu_postgate.empty())
+        std::printf("  POST-GATE (x*sigmoid)    relL2 = %.3e\n", rel(gpu_postgate, cpu_postgate));
+    // DECISIVE: apply the CPU o_proj (with the mmap Wo) to the GPU'"'"'s OWN post-gate.
+    // If this matches the GPU'"'"'s mla_out, the o_proj kernel + its weight are self-
+    // consistent and the divergence is upstream. If it does NOT, the GPU'"'"'s loaded
+    // attn_output weight differs from the mmap bytes the CPU reads.
+    if (!gpu_postgate.empty() && got_attn) {
+        std::vector<double> pg(gpu_postgate.begin(), gpu_postgate.end());
+        auto oproj_of_gpu_pg = matvec(Wo, pg, H, VD);
+        double n2=0,d2=0;
+        for (int i=0;i<H;++i){ double d=(double)gpu_attn_out[i]-oproj_of_gpu_pg[i]; n2+=d*d; d2+=oproj_of_gpu_pg[i]*oproj_of_gpu_pg[i]; }
+        std::printf("  O_PROJ(gpu_postgate) vs gpu mla_out relL2 = %.3e  "
+                    "(large => loaded attn_output weight is wrong)\n",
+                    std::sqrt(n2/(d2+1e-30)));
+    }
     if (got_attn) {
         double num = 0, den = 0, worst = 0; int worst_i = -1;
         for (int i = 0; i < H; ++i) {
@@ -294,6 +371,15 @@ int main(int argc, char** argv) {
             if (rel > worst) { worst = rel; worst_i = i; }
         }
         const double rl2 = std::sqrt(num / (den + 1e-30));
+        // relL2 of GPU against the FLOAT-accumulated o_proj — if this is tiny while
+        // the double one is not, the divergence is fp32 o_proj cancellation.
+        double nf = 0, df = 0;
+        for (int i = 0; i < H; ++i) {
+            const double d = (double)gpu_attn_out[i] - attn_out_f32[i];
+            nf += d * d; df += attn_out_f32[i] * attn_out_f32[i];
+        }
+        std::printf("  vs FLOAT-accumulated o_proj: relL2 = %.3e   (attn_out RMS = %.4g)\n",
+                    std::sqrt(nf / (df + 1e-30)), std::sqrt(den / H));
         std::printf("\nMLA ATTENTION BRANCH (pre-combine): GPU vs independent float64 CPU ref\n");
         std::printf("  relL2 = %.3e   worst_rel = %.3e @ %d (ref=%.6g gpu=%.6g)\n",
                     rl2, worst, worst_i, attn_out[worst_i], (double)gpu_attn_out[worst_i]);
