@@ -128,7 +128,11 @@ int main(int argc, char** argv) {
     for (int r = 0; r < tp_size; ++r) {
         if (!check(cudaSetDevice(devices[r]), "cudaSetDevice")) return 1;
         if (!check(cudaStreamCreate(&streams[r]), "cudaStreamCreate")) return 1;
-        if (!check(cudaMalloc(&bufs[r], max_count * sizeof(uint16_t)), "cudaMalloc")) return 1;
+        // Sized for the WIDER dtype so the same buffers serve both passes: f32 is
+        // 4 B/elem against bf16's 2. Allocating for bf16 and then running the f32
+        // pass would overrun by exactly 2x — silently, since cudaMemcpy past a
+        // suballocation usually lands in the same page.
+        if (!check(cudaMalloc(&bufs[r], max_count * sizeof(float)), "cudaMalloc")) return 1;
     }
 
     // ---- correctness, before any timing ----
@@ -219,6 +223,100 @@ int main(int argc, char** argv) {
         const double us = std::chrono::duration<double, std::micro>(t1 - t0).count() / iters;
         std::printf("  %10zu  %10.1f  %12.2f  %14.1f\n", count, count * 2.0 / 1024.0, us,
                     us * tp::reduce_count_per_token(93));
+    }
+
+    // ---- f32: Kimi K3's dtype ----
+    //
+    // K3 runs an f32 residual stream by design, so its 186 collectives/token go
+    // through allreduce_f32_group, NOT the bf16 path validated above. A backend that
+    // reduces bf16 correctly tells you nothing about its f32 path — different NCCL
+    // datatype, different element size, and for the fast backends a different kernel
+    // entirely. So it is validated separately, with the same
+    // correctness-before-timing discipline.
+    //
+    // The sum here is EXACT, not approximate: rank r writes the integer (r+1), and
+    // integers through 36 are exactly representable in f32, so the comparison is ==
+    // rather than a tolerance. Any drift at all is a real bug, not rounding.
+    std::printf("\n=== f32 (Kimi K3's residual dtype) ===\n");
+    if (!coll->supports_f32()) {
+        std::printf("  SKIPPED: %s has no f32 reduce (bf16-only kernels).\n",
+                    tp::backend_name(coll->backend()));
+        std::printf("  K3 TP must select a backend that does — make_collective(need_f32=true)\n"
+                    "  downgrades to nccl for exactly this reason.\n");
+    } else {
+        bool f32_ok = true;
+        for (std::size_t count : payloads) {
+            std::vector<float> host(count);
+            for (int r = 0; r < tp_size; ++r) {
+                for (std::size_t i = 0; i < count; ++i) host[i] = static_cast<float>(r + 1);
+                if (!check(cudaSetDevice(devices[r]), "set")) return 1;
+                void* dst = owned ? coll->reduce_in(r) : bufs[r];
+                if (!dst) { std::printf("  FAIL: no input buffer for rank %d\n", r); return 1; }
+                if (!check(cudaMemcpyAsync(dst, host.data(), count * sizeof(float),
+                                           cudaMemcpyHostToDevice, streams[r]), "H2D")) return 1;
+            }
+            if (!coll->allreduce_f32_group(bufs, count, streams)) {
+                std::printf("  FAIL: allreduce_f32_group returned false (count %zu)\n", count);
+                return 1;
+            }
+            for (int r = 0; r < tp_size; ++r) {
+                if (!check(cudaSetDevice(devices[r]), "set")) return 1;
+                if (!check(cudaStreamSynchronize(streams[r]), "sync")) return 1;
+            }
+            bool ok = true;
+            int bad_rank = 0; std::size_t bad_idx = 0; float bad_val = 0;
+            for (int r = 0; r < tp_size && ok; ++r) {
+                if (!check(cudaSetDevice(devices[r]), "set")) return 1;
+                const void* src = owned ? coll->reduce_out(r) : bufs[r];
+                if (!check(cudaMemcpy(host.data(), src, count * sizeof(float),
+                                      cudaMemcpyDeviceToHost), "D2H")) return 1;
+                for (std::size_t i = 0; i < count; ++i) {
+                    if (host[i] != expect) {
+                        ok = false; bad_rank = r; bad_idx = i; bad_val = host[i];
+                        break;
+                    }
+                }
+            }
+            std::printf("  count %8zu (%7.1f KiB)  %s", count, count * 4.0 / 1024.0,
+                        ok ? "OK (exact)\n" : "");
+            if (!ok) {
+                std::printf("FAIL — rank %d elem %zu = %.6f, want %.1f\n",
+                            bad_rank, bad_idx, bad_val, expect);
+                f32_ok = false;
+            }
+        }
+        if (!f32_ok) {
+            std::printf("\nFAIL: the f32 reduce is wrong. K3 TP must not run on this.\n");
+            return 1;
+        }
+
+        // K3's two real payloads, named: the attention collective is at hidden width
+        // and the MoE one at expert_latent — they are NOT the same size, which is why
+        // both are timed rather than assuming one number covers the token.
+        std::printf("\n=== f32 latency (%d iters) — K3's actual per-layer payloads ===\n", iters);
+        std::printf("  %10s  %10s  %12s  %s\n", "elems", "KiB", "us/call", "what");
+        struct { std::size_t n; const char* what; } k3[] = {
+            {3584, "MoE reduce  @ expert_latent (1/layer, 92 layers)"},
+            {7168, "attn reduce @ hidden        (1/layer, 93 layers)"},
+        };
+        double us_attn = 0, us_moe = 0;
+        for (const auto& p : k3) {
+            auto issue = [&]() { coll->allreduce_f32_group(bufs, p.n, streams); };
+            for (int warm = 0; warm < 20; ++warm) issue();
+            for (int r = 0; r < tp_size; ++r) { cudaSetDevice(devices[r]); cudaStreamSynchronize(streams[r]); }
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int it = 0; it < iters; ++it) issue();
+            for (int r = 0; r < tp_size; ++r) { cudaSetDevice(devices[r]); cudaStreamSynchronize(streams[r]); }
+            const auto t1 = std::chrono::steady_clock::now();
+            const double us = std::chrono::duration<double, std::micro>(t1 - t0).count() / iters;
+            std::printf("  %10zu  %10.1f  %12.2f  %s\n", p.n, p.n * 4.0 / 1024.0, us, p.what);
+            if (p.n == 7168) us_attn = us; else us_moe = us;
+        }
+        // 93 attention reduces + 92 MoE reduces (layer 0 is the leading dense layer,
+        // whose FFN reduce is at hidden width — counted with the attention ones).
+        const double per_token = us_attn * 93 + us_moe * 92 + us_attn * 1;
+        std::printf("  => %.0f us/token of pure collective at tp=%d, before any compute\n",
+                    per_token, tp_size);
     }
 
     for (int r = 0; r < tp_size; ++r) {

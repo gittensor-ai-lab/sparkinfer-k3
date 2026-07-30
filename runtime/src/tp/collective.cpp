@@ -57,6 +57,12 @@ public:
     bool allreduce_bf16(void*, std::size_t, int, cudaStream_t) override { return true; }
     bool allreduce_bf16_group(const std::vector<void*>&, std::size_t,
                               const std::vector<cudaStream_t>&) override { return true; }
+    // A sum over one rank is the identity, so the no-op is the CORRECT f32 reduce at
+    // tp_size 1 — not a stub. This is what lets the K3 forward call the collective
+    // unconditionally and stay bit-identical to the pre-TP path.
+    bool allreduce_f32_group(const std::vector<void*>&, std::size_t,
+                             const std::vector<cudaStream_t>&) override { return true; }
+    bool supports_f32() const override { return true; }
     bool barrier() override { return true; }
 };
 
@@ -121,6 +127,23 @@ public:
     // the first collective — measured on 8x H200, hung with no output.
     bool allreduce_bf16_group(const std::vector<void*>& bufs, std::size_t count,
                               const std::vector<cudaStream_t>& streams) override {
+        return group_impl(bufs, count, streams, ncclBfloat16, "bf16");
+    }
+
+    // K3's f32 residual stream. Identical orchestration — only the element type
+    // differs, so it shares group_impl rather than duplicating the group/device
+    // bookkeeping, which is the part that was measured and fixed on hardware.
+    bool allreduce_f32_group(const std::vector<void*>& bufs, std::size_t count,
+                             const std::vector<cudaStream_t>& streams) override {
+        return group_impl(bufs, count, streams, ncclFloat32, "f32");
+    }
+
+    bool supports_f32() const override { return true; }
+
+private:
+    bool group_impl(const std::vector<void*>& bufs, std::size_t count,
+                    const std::vector<cudaStream_t>& streams,
+                    ncclDataType_t dtype, const char* dtype_name) {
         const int n = size();
         if (static_cast<int>(streams.size()) != n) return false;
         if (static_cast<int>(bufs.size()) != n) return false;
@@ -151,11 +174,11 @@ public:
             }
             r = ncclAllReduce(bufs[static_cast<std::size_t>(i)],
                               bufs[static_cast<std::size_t>(i)], count,
-                              ncclBfloat16, ncclSum,
+                              dtype, ncclSum,
                               comms_[static_cast<std::size_t>(i)],
                               streams[static_cast<std::size_t>(i)]);
             if (r != ncclSuccess) {
-                std::fprintf(stderr, "[tp] ncclAllReduce rank %d: %s\n", i,
+                std::fprintf(stderr, "[tp] ncclAllReduce(%s) rank %d: %s\n", dtype_name, i,
                              ncclGetErrorString(r));
                 ok = false; break;
             }
@@ -174,6 +197,7 @@ public:
         return ok;
     }
 
+public:
     // Stream-level: each rank's stream is synchronized, which is enough for the
     // graph-boundary use. Deliberately NOT called per-collective — the point of
     // NCCL here is that the reduction is stream-ordered and needs no host barrier.
@@ -428,9 +452,22 @@ Capabilities probe_capabilities() {
 std::unique_ptr<Collective> make_collective(const std::vector<int>& devices,
                                             Backend requested,
                                             std::string* error,
-                                            std::size_t max_count) {
+                                            std::size_t max_count,
+                                            bool need_f32) {
     const int tp_size = static_cast<int>(devices.size());
     Capabilities caps = probe_capabilities();
+
+    // The owned-buffer backends reduce bf16 only. Downgrade BEFORE selection rather
+    // than after construction: K3 spends ~20 minutes loading weights, and finding out
+    // at the first collective that the chosen backend cannot reduce f32 wastes all of
+    // it. NCCL reduces both, so the downgrade always has somewhere to land.
+    if (need_f32 && (requested == Backend::PeerOneShot || requested == Backend::Multimem)) {
+        std::fprintf(stderr,
+                     "[tp] %s reduces bf16 only; f32 was requested (Kimi K3 runs an f32 "
+                     "residual stream) — using nccl\n",
+                     backend_name(requested));
+        requested = Backend::Nccl;
+    }
 
     std::string reason;
     const Backend chosen = select_backend(requested, tp_size, caps, &reason);
