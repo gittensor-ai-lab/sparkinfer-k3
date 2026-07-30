@@ -82,8 +82,14 @@ jobs:
         with:
           python-version: "3.12"
 
+      # Exactly what the discovered suites need, verified in a clean venv — not a guess:
+      #   pyyaml        config tests
+      #   tokenizers    gen_eval_prompt's tokenizer.json backend
+      #   cryptography  eval/polaris receipt signing (inherited; the suites import it)
+      # Nothing else. datasets/numpy/safetensors/torch/vastai are imported only by scripts
+      # CI does not execute, and py_compile parses without resolving imports.
       - name: Install test deps
-        run: python3 -m pip install --quiet pyyaml tokenizers
+        run: python3 -m pip install --quiet pyyaml tokenizers cryptography
 
       - name: py_compile (all tracked python)
         run: |
