@@ -566,6 +566,56 @@ int main() {
                  "one bank push per res_block_size-layer cycle");
     }
 
+    // ---------------------------------------------------- routed_norm + shexp order
+    // Read directly off the reference's build_latent_moe: routed_norm runs on the
+    // DISPATCH OUTPUT (right before routed_up), not on routed_down's output (the
+    // dispatch's input). An earlier version of this plan had it backwards — the
+    // same class of bug as the ssm_norm fix, caught the same way, by reading the
+    // actual control flow rather than assuming a norm sits next to its same-named
+    // projection. Also checks n_ff_shexp = moe_ffn * n_shared, confirmed against
+    // the real UD-IQ1_S file (blk.3.ffn_gate_shexp.weight is 7168x6144).
+    std::printf("\n[routed_norm normalises the dispatch OUTPUT, not its input]\n");
+    {
+        K3PlanOptions opt2;
+        opt2.has_q_lora = true;
+        opt2.has_routed_norm = true;
+        opt2.has_shared_experts = true;
+        const K3DecodePlan p2 = build_k3_decode_plan(cfg, d, opt2);
+
+        const int L = 5;   // a KDA MoE layer
+        int idx_down = -1, idx_dispatch_last = -1, idx_norm = -1, idx_up = -1;
+        int idx_shexp_gate = -1, idx_shexp_down = -1;
+        for (size_t k = 0; k < p2.steps.size(); ++k) {
+            const auto& s = p2.steps[k];
+            if (s.layer != L) continue;
+            if (s.label == std::string("routed_down")) idx_down = (int)k;
+            if (s.op == K3Op::MoeDispatch) idx_dispatch_last = (int)k;   // last wins
+            if (s.op == K3Op::RmsNorm && s.label == std::string("routed_norm"))
+                idx_norm = (int)k;
+            if (s.label == std::string("routed_up")) idx_up = (int)k;
+            if (s.label == std::string("shexp_gate")) idx_shexp_gate = (int)k;
+            if (s.label == std::string("shexp_down")) idx_shexp_down = (int)k;
+        }
+        check(idx_down >= 0 && idx_dispatch_last >= 0 && idx_norm >= 0 && idx_up >= 0,
+              "layer 5 has routed_down, a MoeDispatch step, routed_norm, routed_up");
+        check(idx_down < idx_dispatch_last && idx_dispatch_last < idx_norm &&
+                  idx_norm < idx_up,
+              "order is routed_down -> dispatch -> routed_norm -> routed_up "
+              "(norm AFTER the dispatch, not between routed_down and it)");
+        check(idx_norm >= 0 && p2.steps[idx_norm].expect_ne0 == cfg.expert_latent,
+              "routed_norm pins ne0=expert_latent (it normalises a latent-width "
+              "tensor either way)");
+
+        const int want_shexp = cfg.moe_ffn * cfg.n_shared;
+        check(idx_shexp_gate >= 0 &&
+                  p2.steps[idx_shexp_gate].out_dim == want_shexp &&
+                  p2.steps[idx_shexp_gate].expect_ne1 == want_shexp,
+              "shexp_gate out_dim/pin is moe_ffn*n_shared (6144 for K3), not moe_ffn "
+              "(3072) alone");
+        check(idx_shexp_down >= 0 && p2.steps[idx_shexp_down].in_dim == want_shexp,
+              "shexp_down in_dim matches the same derived width");
+    }
+
     // ------------------------------------------------------------ TP invariance
     std::printf("\n[TP changes placement, never the graph]\n");
     {

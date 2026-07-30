@@ -369,10 +369,6 @@ struct Builder {
 
         // THE LATENT HOP. Routed experts do not live at hidden width.
         mm(i, kda, "routed_down", blk(i, "ffn_routed_down.weight"), H, cfg.expert_latent);
-        if (opt.has_routed_norm) {
-            vec(K3Op::RmsNorm, i, kda, "routed_norm", cfg.expert_latent,
-                blk(i, "ffn_routed_norm.weight"));
-        }
 
         // Pinned from a direct read of the real model (blk.1): gate/up are
         // [3584, 3072, 896] and down is [3072, 3584, 896], all IQ2_XS.
@@ -389,16 +385,34 @@ struct Builder {
            blk(i, "ffn_down_exps.weight"));
         pin3(cfg.moe_ffn, cfg.expert_latent, cfg.n_experts);
 
+        // routed_norm normalises the DISPATCH OUTPUT, not its input. Read directly
+        // off the reference (src/models/kimi-k3.cpp build_latent_moe): build_moe_ffn
+        // runs first on the UNNORMALISED routed_in, THEN
+        // "if (layer.ffn_routed_norm) moe_out = build_norm(moe_out, ...)", and only
+        // after that does ffn_routed_up run. An earlier version of this plan put the
+        // norm between routed_down and the dispatch — normalising the wrong tensor,
+        // the same class of ordering bug as the ssm_norm double-normalization fix
+        // above, caught by the same discipline of reading the actual control flow
+        // rather than assuming a norm sits next to the projection it's named after.
+        if (opt.has_routed_norm) {
+            vec(K3Op::RmsNorm, i, kda, "routed_norm", cfg.expert_latent,
+                blk(i, "ffn_routed_norm.weight"));
+        }
+
         if (opt.has_shared_experts) {
-            // UNPINNED: n_ff_shexp (the reference's shared-expert intermediate width)
-            // is a distinct hparam from n_ff_exp (moe_ffn) and nothing confirms they
-            // are equal for K3. has_shared_experts defaults false — this branch is
-            // not known to be exercised by the real UD-IQ1_S file — so widths here
-            // are a placeholder pending confirmation, not asserted as fact.
-            mm_unpinned(i, kda, "shexp_gate", blk(i, "ffn_gate_shexp.weight"), H, cfg.moe_ffn);
-            mm_unpinned(i, kda, "shexp_up", blk(i, "ffn_up_shexp.weight"), H, cfg.moe_ffn);
-            op(K3Op::Situ, i, kda, "shexp_situ", cfg.moe_ffn, cfg.moe_ffn);
-            mm_unpinned(i, kda, "shexp_down", blk(i, "ffn_down_shexp.weight"), cfg.moe_ffn, H);
+            // n_ff_shexp = n_ff_exp * n_expert_shared = moe_ffn * n_shared. Read
+            // directly off the reference (src/models/kimi-k3.cpp:170): "const int64_t
+            // n_ff_shexp = n_ff_exp * (hparams.n_expert_shared > 0 ? ... : 1);" — not
+            // a free-standing hparam, a derived one. CONFIRMED against the real
+            // UD-IQ1_S file: blk.3.ffn_gate_shexp.weight is 7168x6144, and
+            // moe_ffn(3072) * n_shared(2) = 6144 exactly. An earlier version of this
+            // plan guessed n_ff_shexp == moe_ffn (3072) and left it unpinned pending
+            // confirmation — the real value is 2x that.
+            const int n_ff_shexp = cfg.moe_ffn * cfg.n_shared;
+            mm(i, kda, "shexp_gate", blk(i, "ffn_gate_shexp.weight"), H, n_ff_shexp);
+            mm(i, kda, "shexp_up", blk(i, "ffn_up_shexp.weight"), H, n_ff_shexp);
+            op(K3Op::Situ, i, kda, "shexp_situ", n_ff_shexp, n_ff_shexp);
+            mm(i, kda, "shexp_down", blk(i, "ffn_down_shexp.weight"), n_ff_shexp, H);
         }
 
         mm(i, kda, "routed_up", blk(i, "ffn_routed_up.weight"), cfg.expert_latent, H);

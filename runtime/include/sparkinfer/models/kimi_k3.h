@@ -150,6 +150,14 @@ struct KimiK3RuntimeState {
     int max_ctx = 0;
     int position = 0;   // next token's position; incremented by forward_token
 
+    // Sizes needed to zero each buffer correctly in kimi_k3_reset_state() — stored
+    // here rather than re-threading a KimiK3Config through that call. Populated by
+    // kimi_k3_alloc_state().
+    int conv_state_elems = 0;    // (kda_conv_kernel-1) * qkv, per KDA layer
+    int delta_state_elems = 0;   // kda_head_dim^2 * n_q_heads, per KDA layer
+    int kv_cache_elems = 0;      // key_length * max_ctx, per MLA layer
+    int res_bank_row_elems = 0;  // hidden, per banked checkpoint
+
     // Indexed by KDA-layer ordinal (0..n_kda_layers-1), NOT the global layer index —
     // see kda_layer_ordinal() below.
     std::vector<float*> conv_state_q, conv_state_k, conv_state_v;   // [d_conv-1, qkv]

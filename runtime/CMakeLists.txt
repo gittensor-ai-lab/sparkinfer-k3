@@ -151,6 +151,14 @@ if(BUILD_EXAMPLES)
     target_link_libraries(kimi_k3_plan_check PRIVATE sparkinfer_runtime)
     set_target_properties(kimi_k3_plan_check PROPERTIES CXX_STANDARD 17)
 
+    # Loads real weights for one layer (from a possibly-partial shard set) and runs
+    # kimi_k3_forward_layer on a synthetic hidden vector: does it load, execute
+    # without a CUDA error, and produce finite, non-degenerate output? First real
+    # exercise of the executor — numerical comparison against llama.cpp is separate.
+    add_executable(kimi_k3_smoke_test examples/kimi_k3_smoke_test.cpp)
+    target_link_libraries(kimi_k3_smoke_test PRIVATE sparkinfer_runtime CUDA::cudart)
+    set_target_properties(kimi_k3_smoke_test PROPERTIES CXX_STANDARD 17)
+
     add_executable(thermal_sweep examples/thermal_sweep.cpp)   # force each thermal mode, measure W/°C/tok/s
     target_include_directories(thermal_sweep PRIVATE include)
     target_link_libraries(thermal_sweep PRIVATE sparkinfer_runtime CUDA::cudart Threads::Threads)
