@@ -751,6 +751,27 @@ __global__ void proj_q8_0_kernel(float* __restrict__ y, const float* __restrict_
     if (threadIdx.x == 0) y[n] = acc;
 }
 
+// Plain per-block dequant of N CONTIGUOUS values (no reduction) — what a row gather
+// needs (token_embd's row for one token), as opposed to k3_proj_f32's per-ROW dot
+// product. Shares the same block layouts.
+__global__ void dequant_q8_0_kernel(float* __restrict__ out,
+                                    const BlockQ8_0* __restrict__ blocks,
+                                    int64_t n_blocks) {
+    const int64_t b = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
+    if (b >= n_blocks) return;
+    const float d = __half2float(__ushort_as_half(blocks[b].d));
+    float* dst = out + b * 32;
+#pragma unroll
+    for (int j = 0; j < 32; ++j) dst[j] = (float)blocks[b].qs[j] * d;
+}
+
+__global__ void dequant_f32_passthrough_kernel(float* __restrict__ out,
+                                               const float* __restrict__ src,
+                                               int64_t n) {
+    const int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
+    if (i < n) out[i] = src[i];
+}
+
 template <int BLOCK>
 __global__ void proj_f32_kernel(float* __restrict__ y, const float* __restrict__ x,
                                 const float* __restrict__ W, int K) {
@@ -929,6 +950,23 @@ void moe_expert_ffn_iq1s_f32(float* out, float* scratch,
 bool dequant_f32_by_type(float* out, const void* src, int64_t n, int ggml_type,
                          cudaStream_t stream) {
     switch (ggml_type) {
+        case 0: {  // F32 passthrough — used for a single row of token_embd.weight
+            if (n <= 0) return false;
+            const int T = 256;
+            const int64_t blocks = (n + T - 1) / T;
+            dequant_f32_passthrough_kernel<<<(unsigned)blocks, T, 0, stream>>>(
+                out, (const float*)src, n);
+            return true;
+        }
+        case 8: {  // Q8_0 — the other type token_embd.weight / output.weight may use
+            if (n <= 0 || n % 32 != 0) return false;
+            const int64_t n_blocks = n / 32;
+            const int T = 256;
+            const int64_t blocks = (n_blocks + T - 1) / T;
+            dequant_q8_0_kernel<<<(unsigned)blocks, T, 0, stream>>>(
+                out, (const BlockQ8_0*)src, n_blocks);
+            return true;
+        }
         case 17: dequant_iq2_xs_f32(out, src, n, stream); return true;   // IQ2_XS
         case 19: dequant_iq1_s_f32(out, src, n, stream);  return true;   // IQ1_S
         default: return false;
