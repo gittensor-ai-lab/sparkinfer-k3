@@ -46,6 +46,72 @@ target_compile_options(sparkinfer_runtime PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:-O3;--use_fast_math;-lineinfo>)
 set_target_properties(sparkinfer_runtime PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
+# ---- Tensor parallelism (multi-GPU) ----------------------------------------
+# OFF by default, deliberately. src/tp/*.cpp always compiles (the shard math and
+# backend selection are plain C++ and carry no CUDA-multi-GPU dependency), so the
+# default single-GPU build is unchanged and TP=1 takes the same code path it
+# always did. Turning this ON only adds the NCCL collective.
+option(SPARKINFER_TP "Enable multi-GPU tensor parallelism (requires NCCL)" OFF)
+
+if(SPARKINFER_TP)
+    # NCCL is not exported as a CMake package by the CUDA toolkit, so look for it
+    # where the toolkit and the distro packages put it.
+    find_path(NCCL_INCLUDE_DIR nccl.h
+        HINTS ${CUDAToolkit_INCLUDE_DIRS} ENV NCCL_HOME ENV CUDA_HOME
+        PATH_SUFFIXES include)
+    find_library(NCCL_LIBRARY NAMES nccl
+        HINTS ${CUDAToolkit_LIBRARY_DIR} ENV NCCL_HOME ENV CUDA_HOME
+        PATH_SUFFIXES lib lib64 lib/x86_64-linux-gnu)
+
+    if(NCCL_INCLUDE_DIR AND NCCL_LIBRARY)
+        target_include_directories(sparkinfer_runtime PUBLIC ${NCCL_INCLUDE_DIR})
+        target_link_libraries(sparkinfer_runtime PUBLIC ${NCCL_LIBRARY})
+        target_compile_definitions(sparkinfer_runtime PUBLIC SPARKINFER_TP_NCCL)
+        message(STATUS "sparkinfer: TP enabled — NCCL ${NCCL_LIBRARY}")
+
+        # ---- fast collectives: peer-oneshot + multimem -----------------------
+        # Added to the target only under SPARKINFER_TP, because they need the CUDA
+        # driver API (multicast VMM) and multimem.* PTX. Both are internally
+        # arch-guarded (__CUDA_ARCH__ >= 900 around the PTX, CUDA_VERSION >= 12010
+        # around the driver calls), so they still COMPILE for the sm_89 entry in
+        # the default arch list — the multimem path just compiles out there and
+        # multimem_allreduce_supported() reports false at run time.
+        #
+        # NOT VALIDATED ON HARDWARE. Their own headers say so. make_collective()
+        # falls back to NCCL when construction fails, and tp_allreduce_check is
+        # what proves them. Attribution for the vLLM-derived barrier: see NOTICE.
+        file(GLOB TP_FAST_SRC "${CMAKE_CURRENT_SOURCE_DIR}/csrc/tp/*.cu")
+        if(TP_FAST_SRC)
+            target_sources(sparkinfer_runtime PRIVATE ${TP_FAST_SRC})
+            target_compile_definitions(sparkinfer_runtime PUBLIC SPARKINFER_TP_FAST_COLLECTIVES)
+            # csrc/tp/*.cu include tp_allreduce.cuh / tp_error.hpp as siblings.
+            target_include_directories(sparkinfer_runtime PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/csrc/tp)
+            message(STATUS "sparkinfer: TP fast collectives compiled (peer-oneshot, multimem)")
+        endif()
+
+        # The CUDA driver API is required by the multimem backend (cuMulticast*)
+        # and used to probe NVLS support. Without it the probe reports multicast
+        # unsupported, which is the safe answer, and multimem construction fails
+        # into the NCCL fallback.
+        if(TARGET CUDA::cuda_driver)
+            target_link_libraries(sparkinfer_runtime PUBLIC CUDA::cuda_driver)
+            target_compile_definitions(sparkinfer_runtime PUBLIC SPARKINFER_TP_CUDA_DRIVER)
+            message(STATUS "sparkinfer: TP multicast probe enabled (CUDA driver API)")
+        else()
+            message(WARNING "sparkinfer: CUDA driver API not found — the multimem "
+                            "backend will be unavailable at run time (NCCL fallback)")
+        endif()
+    else()
+        # Hard error, not a silent downgrade: -DSPARKINFER_TP=ON is an explicit
+        # request for multi-GPU, and quietly producing a single-GPU binary would
+        # let a "TP" benchmark measure one card.
+        message(FATAL_ERROR
+            "SPARKINFER_TP=ON but NCCL was not found. Install NCCL (libnccl-dev) or set "
+            "NCCL_HOME, or configure with -DSPARKINFER_TP=OFF.")
+    endif()
+endif()
+
 if(BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
@@ -78,7 +144,23 @@ if(BUILD_EXAMPLES)
     add_executable(qwen3_gguf_dflash_bench examples/qwen3_gguf_dflash_bench.cpp)
     target_include_directories(qwen3_gguf_dflash_bench PRIVATE include)
     target_link_libraries(qwen3_gguf_dflash_bench PRIVATE sparkinfer_runtime CUDA::cudart)
+    # Validate the K3 decode plan + per-rank residency against REAL weights. Reads only
+    # the GGUF index, so it is fast even on the 802 GiB model, and it is the tool that
+    # turns the plan's inferred widths into pinned ones.
+    add_executable(kimi_k3_plan_check examples/kimi_k3_plan_check.cpp)
+    target_link_libraries(kimi_k3_plan_check PRIVATE sparkinfer_runtime)
+    set_target_properties(kimi_k3_plan_check PROPERTIES CXX_STANDARD 17)
+
     add_executable(thermal_sweep examples/thermal_sweep.cpp)   # force each thermal mode, measure W/°C/tok/s
     target_include_directories(thermal_sweep PRIVATE include)
     target_link_libraries(thermal_sweep PRIVATE sparkinfer_runtime CUDA::cudart Threads::Threads)
+
+    # Validate the TP collective on real hardware BEFORE any forward path trusts
+    # it: correctness on every rank first, then per-call latency at the payloads
+    # that matter. Built unconditionally (it runs and reports "no CUDA device"
+    # without a GPU, and reports the no-op backend without -DSPARKINFER_TP=ON),
+    # because a check you have to opt into is a check nobody runs.
+    add_executable(tp_allreduce_check examples/tp_allreduce_check.cpp)
+    target_include_directories(tp_allreduce_check PRIVATE include)
+    target_link_libraries(tp_allreduce_check PRIVATE sparkinfer_runtime CUDA::cudart)
 endif()
