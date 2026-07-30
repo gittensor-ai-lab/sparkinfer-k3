@@ -25,7 +25,7 @@ struct KimiK3Config {
     int   dense_ffn   = 33792;   // leading dense block only
     int   leading_dense = 1;
     float rms_eps     = 1e-5f;
-    int   eos_id      = 163839;  // placeholder until tokenizer metadata is read
+    int   eos_id      = 163586;  // READ from the real UD-IQ1_S metadata shard
     int   max_seq     = 1048576;
 
     // situ — both REQUIRED in GGUF
@@ -50,6 +50,12 @@ struct KimiK3Config {
 
     // Per-layer type map. layer_is_kda[i] == true when head_count_kv[i] == 0.
     // Length must equal n_layers. Derived from the GGUF int array — never baked.
+    //
+    // The real pattern, read off the file, is period 4 with the full-attention layer
+    // LAST in each group: k k k M | k k k M | …  So layer 0 is KDA and layer 3 is the
+    // first MLA. Recorded as an observation only — the map is still read from the GGUF
+    // every time, because baking a period-4 assumption would silently mistype every
+    // layer in any model that interleaves differently.
     std::vector<char> layer_is_kda;
 
     int n_kda_layers() const {

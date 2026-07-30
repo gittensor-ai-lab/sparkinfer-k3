@@ -33,6 +33,26 @@ bool gguf_type_known(int ggml_type);
 // parses metadata + tensor table(s), exposes scalar metadata, integer arrays,
 // and tensor data pointers.
 //
+// Options for open(). Default is STRICT: every sibling shard must be present.
+struct GGUFOpenOptions {
+    // Accept a shard set with holes. Tensors living in absent shards are simply not in
+    // the index — open() succeeds and reports what is missing rather than failing.
+    //
+    // This exists for development on a box that cannot hold the whole model. K3 at
+    // UD-IQ1_S is 553 GiB across 14 shards; shard 1 is ~7 MB of pure metadata, so a
+    // trivial download yields the entire real config, and one 45 GiB shard yields real
+    // tensors for the early layers. That is enough to pin shapes and validate a layer
+    // against llama.cpp on a single GPU.
+    //
+    // DEFAULT IS OFF, deliberately. A partial model that loads silently is a model that
+    // generates from uninitialised weights. Callers that opt in MUST check coverage —
+    // see is_partial() / missing_shards(), and kimi_k3_layer_coverage() for the
+    // per-layer question that actually matters.
+    bool allow_missing_shards = false;
+    // Log each shard as it is mapped. Useful when a 14-shard open takes minutes.
+    bool verbose = false;
+};
+
 // Split models: open() the FIRST shard (…-00001-of-NNNNN.gguf). If
 // split.count > 1, siblings are discovered via the llama.cpp naming convention
 // and their tensor tables are merged. Metadata always comes from shard 0.
@@ -41,7 +61,16 @@ public:
     ~GGUF();
 
     // Open a single-file GGUF, or the first shard of a split set.
-    bool open(const std::string& path);
+    bool open(const std::string& path, const GGUFOpenOptions& opt = {});
+
+    // What the file claims the shard count is (1 for a single-file model).
+    int  split_count()   const { return split_count_; }
+    // How many shards were actually mapped.
+    int  shards_loaded() const { return (int)maps_.size(); }
+    // True when shards are missing — only possible under allow_missing_shards.
+    bool is_partial()    const { return !missing_shards_.empty(); }
+    // 1-based shard numbers that were not found, ascending.
+    const std::vector<int>& missing_shards() const { return missing_shards_; }
 
     long        meta_int(const std::string& key, long def = 0) const;
     double      meta_float(const std::string& key, double def = 0) const;
@@ -67,6 +96,10 @@ private:
         size_t size = 0;
     };
 
+    // Drop every tensor that came from one shard — rollback for a shard that parsed
+    // partway before failing (truncated or still-downloading file).
+    void drop_shard_tensors(int shard_idx);
+
     // Parse one already-mapped file. capture_meta=true only for shard 0.
     // shard_idx is stored on every tensor resolved from this file.
     bool parse_mapped(MappedFile& mf, bool capture_meta, int shard_idx);
@@ -82,6 +115,8 @@ private:
                              int split_count, std::string& out_prefix);
 
     std::vector<MappedFile> maps_;
+    int              split_count_ = 1;
+    std::vector<int> missing_shards_;   // 1-based, ascending
     std::unordered_map<std::string, long>               ints_;
     std::unordered_map<std::string, double>             floats_;
     std::unordered_map<std::string, std::string>        strs_;

@@ -365,10 +365,21 @@ bool GGUF::parse_mapped(MappedFile& mf, bool capture_meta, int shard_idx) {
     return true;
 }
 
-bool GGUF::open(const std::string& path) {
+// Remove every tensor resolved from one shard. Used to roll back a shard that parsed
+// partway before failing; see the call site.
+void GGUF::drop_shard_tensors(int shard_idx) {
+    for (auto it = tensors_.begin(); it != tensors_.end(); ) {
+        if (it->second.shard == shard_idx) it = tensors_.erase(it);
+        else ++it;
+    }
+}
+
+bool GGUF::open(const std::string& path, const GGUFOpenOptions& opt) {
     for (auto& m : maps_) unmap_file(m);
     maps_.clear();
     ints_.clear(); floats_.clear(); strs_.clear(); int_arrays_.clear(); tensors_.clear();
+    missing_shards_.clear();
+    split_count_ = 1;
 
     MappedFile first;
     if (!map_file(path, first)) return false;
@@ -376,6 +387,7 @@ bool GGUF::open(const std::string& path) {
     if (!parse_mapped(maps_.back(), /*capture_meta=*/true, /*shard_idx=*/0)) return false;
 
     long n_split = ints_.count("split.count") ? ints_["split.count"] : 1;
+    split_count_ = (int)(n_split > 0 ? n_split : 1);
     if (n_split <= 1) return true;
 
     if (ints_.count("split.no") && ints_["split.no"] != 0) {
@@ -394,19 +406,62 @@ bool GGUF::open(const std::string& path) {
     for (int i = 1; i < (int)n_split; ++i) {
         const std::string sp = split_path(prefix, i, (int)n_split);
         MappedFile mf;
-        if (!map_file(sp, mf)) return false;
+        if (!map_file(sp, mf)) {
+            // Under allow_missing_shards a hole is data, not an error: record it and
+            // keep going. The tensors this shard held simply will not be in the index,
+            // which is exactly what a coverage check has to be able to observe.
+            if (opt.allow_missing_shards) {
+                missing_shards_.push_back(i + 1);   // 1-based, matching the filename
+                continue;
+            }
+            return false;
+        }
         maps_.push_back(mf);
         // Clear per-shard split.no before parse so a missing key is distinguishable.
         ints_.erase("split.no");
-        if (!parse_mapped(maps_.back(), /*capture_meta=*/false, /*shard_idx=*/i)) return false;
+        if (!parse_mapped(maps_.back(), /*capture_meta=*/false, /*shard_idx=*/i)) {
+            if (opt.allow_missing_shards) {
+                // A shard can parse PARTWAY and then fail — a truncated file, or one
+                // still being downloaded. Everything it already contributed must be
+                // rolled back, because a tensor whose data pointer aims into a file that
+                // is still growing is strictly worse than an absent tensor: it reads as
+                // present, sizes correctly, and yields garbage now and SIGBUS later as
+                // the mapping is extended under us.
+                //
+                // Observed for real: opening K3 shard 1 while shard 2 was mid-download
+                // left 32 tensors in the index, sized and typed correctly, backed by
+                // 4.97 GB of a 45.6 GB file.
+                drop_shard_tensors(i);
+                unmap_file(maps_.back());
+                maps_.pop_back();
+                missing_shards_.push_back(i + 1);
+                continue;
+            }
+            return false;
+        }
+        if (opt.verbose)
+            fprintf(stderr, "[gguf] shard %d/%ld mapped (%zu tensors so far)\n",
+                    i + 1, n_split, tensors_.size());
     }
 
     if (ints_.count("split.tensors.count")) {
-        long want = ints_["split.tensors.count"];
+        const long want = ints_["split.tensors.count"];
         if (want != (long)tensors_.size()) {
-            fprintf(stderr, "[gguf] split.tensors.count=%ld but loaded %zu tensors\n",
-                    want, tensors_.size());
-            return false;
+            // With holes this mismatch is EXPECTED and is the honest signal of how much
+            // is absent, so report it as coverage rather than as corruption.
+            if (!missing_shards_.empty()) {
+                fprintf(stderr,
+                        "[gguf] PARTIAL model: %zu of %ld tensors present, %zu of %d "
+                        "shard(s) missing (",
+                        tensors_.size(), want, missing_shards_.size(), split_count_);
+                for (size_t k = 0; k < missing_shards_.size(); ++k)
+                    fprintf(stderr, "%s%d", k ? "," : "", missing_shards_[k]);
+                fprintf(stderr, ")\n");
+            } else {
+                fprintf(stderr, "[gguf] split.tensors.count=%ld but loaded %zu tensors\n",
+                        want, tensors_.size());
+                return false;
+            }
         }
     }
     // Later shards overwrite split.no during validation; restore the canonical
