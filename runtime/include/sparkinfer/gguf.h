@@ -16,6 +16,19 @@ struct GGUFTensor {
     int   shard = 0;                // which split file owns the bytes
 };
 
+// Block layout of a ggml quantisation type: how many bytes one block occupies and
+// how many logical values it encodes. `elems == 0` means the type is NOT KNOWN.
+//
+// Public because sizing is not only the reader's business. Anything that slices,
+// offsets, or uploads tensor bytes needs the same table, and a second copy of it
+// would be free to drift — the failure that cost 745 GiB (IQ2_XS absent => experts
+// measured zero bytes) is exactly a table that did not cover the real file.
+//
+// CALLERS MUST CHECK gguf_type_known() before trusting a size. An unknown type
+// yields zero, and zero is indistinguishable from "empty tensor" downstream.
+void gguf_block_info(int ggml_type, long& bytes, long& elems);
+bool gguf_type_known(int ggml_type);
+
 // Minimal read-only GGUF (v3) reader. Mmaps the file (or every split shard),
 // parses metadata + tensor table(s), exposes scalar metadata, integer arrays,
 // and tensor data pointers.

@@ -144,6 +144,13 @@ if(BUILD_EXAMPLES)
     add_executable(qwen3_gguf_dflash_bench examples/qwen3_gguf_dflash_bench.cpp)
     target_include_directories(qwen3_gguf_dflash_bench PRIVATE include)
     target_link_libraries(qwen3_gguf_dflash_bench PRIVATE sparkinfer_runtime CUDA::cudart)
+    # Validate the K3 decode plan + per-rank residency against REAL weights. Reads only
+    # the GGUF index, so it is fast even on the 802 GiB model, and it is the tool that
+    # turns the plan's inferred widths into pinned ones.
+    add_executable(kimi_k3_plan_check examples/kimi_k3_plan_check.cpp)
+    target_link_libraries(kimi_k3_plan_check PRIVATE sparkinfer_runtime)
+    set_target_properties(kimi_k3_plan_check PROPERTIES CXX_STANDARD 17)
+
     add_executable(thermal_sweep examples/thermal_sweep.cpp)   # force each thermal mode, measure W/°C/tok/s
     target_include_directories(thermal_sweep PRIVATE include)
     target_link_libraries(thermal_sweep PRIVATE sparkinfer_runtime CUDA::cudart Threads::Threads)

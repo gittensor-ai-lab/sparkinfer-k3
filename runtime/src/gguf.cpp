@@ -57,7 +57,9 @@ struct Cursor {
 // Q8_0, experts in an IQ2 variant, norms in F32 — so a table covering only the
 // common K-quants is not enough. The IQ family below is what UD quants actually
 // reach for. Sizes are ggml's block layouts (ggml/src/ggml.c type_traits).
-void block_info(int t, long& bytes, long& elems) {
+}  // namespace  (block table is public: see gguf.h)
+
+void gguf_block_info(int t, long& bytes, long& elems) {
     switch (t) {
         case 0:  bytes=4;   elems=1;   break;   // F32
         case 1:  bytes=2;   elems=1;   break;   // F16
@@ -93,15 +95,14 @@ void block_info(int t, long& bytes, long& elems) {
     }
 }
 
-// True when block_info() knows the type. Callers that need a real size (upload,
+// True when gguf_block_info() knows the type. Callers that need a real size (upload,
 // sharding, offset arithmetic) must check this and refuse rather than treat an
 // unknown type as a zero-byte tensor — see the comment above.
-bool block_known(int t) {
+bool gguf_type_known(int t) {
     long b = 0, e = 0;
-    block_info(t, b, e);
+    gguf_block_info(t, b, e);
     return e != 0;
 }
-} // namespace
 
 bool GGUF::map_file(const std::string& path, MappedFile& mf) {
 #ifdef _WIN32
@@ -321,7 +322,7 @@ bool GGUF::parse_mapped(MappedFile& mf, bool capture_meta, int shard_idx) {
         in.offset = c.rd<uint64_t>();
         in.t.n_values = nv;
         in.t.shard = shard_idx;
-        long bb, be; block_info(in.t.ggml_type, bb, be);
+        long bb, be; gguf_block_info(in.t.ggml_type, bb, be);
         in.t.n_bytes = be ? (nv / be) * bb : 0;
         // An unknown type silently sizes to 0, which downstream reads as "empty
         // tensor" rather than "cannot size this". That is how 745 GiB of IQ2_XS
@@ -331,7 +332,7 @@ bool GGUF::parse_mapped(MappedFile& mf, bool capture_meta, int shard_idx) {
             if (std::find(warned.begin(), warned.end(), in.t.ggml_type) == warned.end()) {
                 warned.push_back(in.t.ggml_type);
                 fprintf(stderr, "[gguf] WARNING: unknown ggml_type %d (first seen on '%s') — "
-                                "n_bytes=0 for every tensor of this type. Add it to block_info() "
+                                "n_bytes=0 for every tensor of this type. Add it to gguf_block_info() "
                                 "before sharding or uploading.\n",
                         in.t.ggml_type, in.name.c_str());
             }

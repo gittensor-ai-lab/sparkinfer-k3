@@ -72,3 +72,31 @@ add_test(NAME decode_runner_gpu_test COMMAND decode_runner_gpu_test)
 add_executable(qwen35_gpu_test qwen35_gpu_test.cpp)
 target_link_libraries(qwen35_gpu_test PRIVATE sparkinfer_runtime CUDA::cudart)
 add_test(NAME qwen35_gpu_test COMMAND qwen35_gpu_test)
+
+# GGUF bytes -> per-rank device buffers. Links gguf.cpp for the public block table:
+# the residency planner MUST size quantised tensors with the same table the reader
+# uses, since a second copy would be free to drift.
+#
+# Worth its own test because of one asymmetry in GGUF layout — quant blocks tile ne0,
+# and ne0 is the CONTRACTED dim, so a column shard cuts inside every block row. A cut
+# that lands mid-block yields half a block: no scale, misaligned codepoints, noise on
+# dequant, and nothing downstream can tell. K3's leading-dense ffn_down is exactly
+# that case at tp=8 (33792/8 = 16.5 blocks of 256), so this is not a theoretical guard.
+add_executable(tp_weight_residency_cpu_test tp_weight_residency_cpu_test.cpp
+               ../src/tp/weight_residency.cpp ../src/tp/weight_plan.cpp
+               ../src/tp/shard.cpp ../src/gguf.cpp)
+set_target_properties(tp_weight_residency_cpu_test PROPERTIES CXX_STANDARD 17)
+target_include_directories(tp_weight_residency_cpu_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
+add_test(NAME tp_weight_residency_cpu_test COMMAND tp_weight_residency_cpu_test)
+
+# The K3 decode schedule: op order, widths, and collective placement as DATA, so the
+# properties that would otherwise only show up as degraded output are assertable
+# without a GPU. Strongest check inside is the plan/manifest cross-check — two tensor
+# sets written from different sources (kernel signatures vs the reference loader) that
+# must name exactly the same tensors.
+add_executable(kimi_k3_decode_plan_cpu_test kimi_k3_decode_plan_cpu_test.cpp
+               ../src/models/kimi_k3_decode_plan.cpp
+               ../src/tp/weight_plan.cpp ../src/tp/shard.cpp ../src/gguf.cpp)
+set_target_properties(kimi_k3_decode_plan_cpu_test PROPERTIES CXX_STANDARD 17)
+target_include_directories(kimi_k3_decode_plan_cpu_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
+add_test(NAME kimi_k3_decode_plan_cpu_test COMMAND kimi_k3_decode_plan_cpu_test)
