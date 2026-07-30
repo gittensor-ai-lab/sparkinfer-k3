@@ -1,0 +1,103 @@
+# NVIDIA B300 (Blackwell Ultra) benchmark profile — 4+ GPU node. Milestone 3.
+#
+# 288 GB per GPU is the point: FOUR B300s (1152 GiB) hold the 802 GiB target quant with
+# the full 1M context, where H200 and B200 need eight. That halves the layer-split fan-out
+# and the number of NVLink hops an expert dispatch crosses — which is why M3 is its own
+# milestone and not just "M2 with more memory".
+#
+# ⚠ UNVERIFIED ON HARDWARE. Two things in this file must be confirmed on first contact
+# rather than trusted:
+#
+#   1. arch. This profile assumes sm_103 for Blackwell Ultra. detect_arch reads
+#      compute_cap from nvidia-smi at run time and WINS over this value, so a wrong guess
+#      here mis-labels a result but does not mis-build. Confirm with:
+#          nvidia-smi --query-gpu=compute_cap --format=csv,noheader
+#      Override the profile's expectation with KIMI_K3_B300_ARCH=<n> if it differs.
+#
+#   2. the build. The top-level CMakeLists arch list is "89;90;100;120;121" — there is no
+#      103. A native sm_103 build needs 103 added there AND a CUDA toolkit that knows the
+#      target; an older toolkit fails configure outright rather than falling back. It is
+#      deliberately NOT added pre-emptively: adding an arch the installed toolkit does not
+#      recognise breaks the build for every other node in this repo.
+#
+#   Until both are checked, run with ARCH set explicitly and treat sm_103 as a label.
+
+hardware:
+  name: B300 (Blackwell Ultra) 288GB
+  arch: sm_103                  # UNVERIFIED — see the warning above
+  arch_verified: false
+  gpu_count_min: 4              # floor, not a fixed count; kimi_k3_node_gpus checks >=
+  # nvidia-smi is expected to report ~294912 MiB per B300.
+  vram_gb_per_gpu: 288
+  vram_gib_at_4_gpu: 1152
+  vram_gib_at_8_gpu: 2304
+  bandwidth_tbps_per_gpu: 8.0
+  interconnect: nvlink5
+  tensor_cores_gen: 5           # Blackwell Ultra
+  fp8_native: true
+  fp4_native: true
+
+quantization_notes:
+  mxfp4_tensor_core: true
+  low_bit_path: native_fp4_mma_available
+  llama_cpp_path: dequantize_to_bf16_then_mma
+
+topology:
+  split_mode: layer
+  tensor_split: auto
+  main_gpu: 0
+  # THE M3 QUESTION: at 4 GPUs the split is ~23 layers each instead of ~12. Fewer, fatter
+  # shards means fewer cross-GPU expert dispatches per token but a coarser balance between
+  # the 24 MLA layers (all the KV) and the 69 KDA layers (all the recurrent state). Whether
+  # 4x288 beats 8x180 on decode is an open measurement, not a foregone conclusion.
+  layers_per_gpu_at_4: 23
+  layers_per_gpu_at_8: 12
+
+# Fit at the milestone target on the 4-GPU floor: 802 + 27 + ~25 = ~854 GiB of 1152 GiB.
+# ~298 GiB spare. At 8 GPUs (2304 GiB) the lossless UD-Q8_K_XL comes into range, which
+# would make same-node quant-vs-quant quality measurement possible for the first time.
+fits:
+  target_quant: UD-Q2_K_XL
+  target_context: 1048576
+  weights_gib: 802
+  kv_gib_at_target: 27
+  headroom_gib_at_4_gpu: 298
+  headroom_gib_at_8_gpu: 1450
+
+attention:
+  batch_sizes: [1, 4, 16, 64, 256]
+  context_lens: [4096, 32768, 131072, 262144, 1048576]
+  dtype: bfloat16
+
+moe:
+  token_counts: [1, 16, 64, 256, 1024]
+  num_experts: [896]
+  top_k: [16]
+  hidden_dim: 7168
+  ffn_dim: 3072
+  latent_dim: 3584
+  dtype: bfloat16
+  expert_paging: false
+
+gemm:
+  shapes:
+    - [1, 7168, 7168]
+    - [16, 7168, 7168]
+    - [256, 7168, 7168]
+    - [4096, 7168, 7168]
+    - [1, 3584, 3072]
+    - [1, 3072, 3584]
+  dtype: bfloat16
+
+model_targets:
+  - name: Kimi K3 UD-Q2_K_XL
+    gib: 802
+    fits_at_1m_4gpu: true       # milestone target
+  - name: Kimi K3 UD-Q4_K_XL
+    gib: 1407
+    fits_at_1m_4gpu: false
+    fits_at_1m_8gpu: true
+  - name: Kimi K3 UD-Q8_K_XL
+    gib: 1453
+    fits_at_1m_4gpu: false
+    fits_at_1m_8gpu: true       # lossless reference on the same node — M3 stretch goal

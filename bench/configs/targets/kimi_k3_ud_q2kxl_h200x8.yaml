@@ -1,0 +1,136 @@
+# M1 — Kimi K3 UD-Q2_K_XL on 8x H200 SXM, full 1M context.
+#
+# Milestone 1 of 4. Establishes the reference on the first node that can hold the target
+# quant at 1M context. Baseline engine only: sparkinfer has no kimi-k3 loader yet, so every
+# sparkinfer slot below is null and the numbers filled first are llama.cpp's.
+#
+# Baseline engine: unslothai/llama.cpp @ kimi-k3-fullsize-vision (PR #48), pinned in
+# bench/scripts/reference.lock. Upstream ggml-org/llama.cpp cannot load this model —
+# 896 experts exceeds its LLAMA_MAX_EXPERTS.
+#
+#   KIMI_K3_NODE=h200x8 PRIMARY_QUANT=UD-Q2_K_XL bench/scripts/kimi_k3_baseline.sh --download
+
+milestone: M1
+node:     h200x8
+model:    configs/models/kimi_k3.yaml
+hardware: configs/h200_sxm.yaml
+quant:    ud_q2_k_xl
+
+weights:
+  hf_repo: unsloth/Kimi-K3-GGUF
+  # Point llama.cpp at shard 00001 and it pulls the rest. Shard count for this quant is
+  # resolved off disk rather than pinned — see kimi_k3_n_shards().
+  shard_glob: "UD-Q2_K_XL/Kimi-K3-UD-Q2_K_XL-*.gguf"
+  size_gb: 861.3
+  size_gib: 802.0
+  mmproj: mmproj-BF16.gguf      # M4 only; text milestones do not load it
+  # Why this quant is the target: 90.4% top-1 against the lossless UD-Q8_K_XL reference is
+  # the accuracy knee. UD-IQ1_S is 249 GiB smaller but drops to 78.9%, which is too lossy
+  # to be the thing an optimization frontier is judged on.
+  reported_top1_agree_pct: 90.390
+  reported_ppl: 1.7359
+  reported_mean_kld: 0.1779
+
+alt_quants:
+  ud_iq1_s:
+    size_gib: 553.0
+    fits_at_1m: true
+    reported_top1_agree_pct: 78.875
+    note: smaller fallback if a node is partially allocated
+  ud_q8_k_xl:
+    size_gib: 1453.0
+    fits_at_1m: false
+
+memory_budget_gib:
+  hbm_total: 1128               # 141 GB x 8
+  weights: 802.0
+  # 24 MLA layers * 576 * 2 B/token = 27648 B/token, K only (MLA stores no V cache).
+  kv_at_32k: 0.84
+  kv_at_128k: 3.38
+  kv_at_256k: 6.75
+  kv_at_1m: 27.00
+  # 69 KDA layers * (128*128*96 + 3*3*96*128) * 4 B, per sequence.
+  kda_recurrent_state_per_seq: 0.43
+  compute_buffers_allowance: 24
+  total_at_1m: 854
+  headroom_at_1m: 274
+
+decode:
+  batch_sizes: [1]
+  # Scored contexts — affordable, 3-rep median. These are what reference.lock pins.
+  eval_sweep: [128, 512, 4096, 32768]
+  # Long-context capability probe — 1 rep, opt-in. A 1M-token prefill is minutes of
+  # wall-clock per rep, so this measures "does it work and at what rate", not a median.
+  longctx_probe: [131072, 262144, 1048576]
+  dtype: bfloat16
+
+  # llama.cpp reference, tok/s, same GGUF + same node.
+  # null = NOT MEASURED. Do not fill by hand — kimi_k3_baseline.sh writes these and the
+  # measured values get pinned into reference.lock.
+  llama_toks_per_sec:
+    bs1_ctx128: null
+    bs1_ctx512: null
+    bs1_ctx4k: null
+    bs1_ctx32k: null
+    bs1_ctx1m: null
+
+  # sparkinfer native decode: no loader exists yet.
+  sparkinfer_toks_per_sec:
+    bs1_ctx128: null
+    bs1_ctx512: null
+    bs1_ctx4k: null
+    bs1_ctx32k: null
+    bs1_ctx1m: null
+
+prefill:
+  eval_sweep: [4096, 32768]
+  longctx_probe: [131072, 1048576]
+  llama_pp_toks_per_sec:
+    ctx4k: null
+    ctx32k: null
+    ctx1m: null
+  sparkinfer_pp_toks_per_sec:
+    ctx4k: null
+    ctx32k: null
+    ctx1m: null
+
+# The M1 exit criteria. All three must hold before M2 is worth starting.
+exit_criteria:
+  - 1M context loads and decodes on 8x H200 with all weights in HBM
+  - decode + prefill medians pinned in reference.lock at 128/512/4k/32k
+  - shard sha256 manifest pinned (bench/scripts/kimi_k3_ud_q2_k_xl.sha256)
+
+# Sampling params Moonshot specifies for K3. K3 is thinking-only: preserve_thinking is
+# always on and there is no instant mode, so a chat-shaped eval must not strip reasoning
+# traces. The teacher-forced accuracy gate is greedy and unaffected by these.
+sampling:
+  default:
+    temperature: 1.0
+    top_p: 0.95
+  agentic:
+    temperature: 1.0
+    top_p: 1.0
+  reasoning_effort: [low, high, max]
+  max_context: 1048576
+
+llama_cpp_flags:
+  n_gpu_layers: 99              # 93 layers; 99 offloads everything
+  split_mode: layer
+  # Hybrid recurrent arch: context shift and slot restore are not supported, so the
+  # reference server must run with --no-context-shift or it will fail mid-eval.
+  no_context_shift: true
+  no_mmap: true
+  flash_attn: auto
+  # Conservative first-run batch; the fork's n_tokens*160 node budget is sized for large
+  # ubatch but compute buffers are per-GPU. Raise once a 1M run is known to fit.
+  n_batch: 2048
+  n_ubatch: 512
+
+runtime:
+  sparkinfer_native_decode: false
+  required_work:
+    - kimi_k3_gguf_loader
+    - sm90_kernel_path              # kernels/ targets Blackwell; H200 is sm_90
+    - multi_gpu_weight_sharding
+    - llama_cpp_same_gguf_baseline_128_512_4k_32k
+    - kv_cache_at_1m_context

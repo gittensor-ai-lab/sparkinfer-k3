@@ -1,0 +1,89 @@
+# M4 — Kimi K3 vision (MoonViT-3d) support.
+#
+# Milestone 4 of 4, and the only one that is a CAPABILITY rather than a node. M1-M3 are all
+# text-only on the same quant at 1M context; M4 adds the image path on whichever of those
+# nodes is available, because the vision tower is small (27 layers, 1024 wide) next to the
+# 802 GiB text model — it does not change the fit maths.
+#
+# The mmproj is a SEPARATE GGUF from the text shards and is loaded with --mmproj. Nothing in
+# M1-M3 loads it, so vision work cannot regress the text baselines.
+
+milestone: M4
+node:     any                   # h200x8 | b200x8 | b300x4 — vision adds ~1 GiB, not a constraint
+model:    configs/models/kimi_k3.yaml
+quant:    ud_q2_k_xl
+
+weights:
+  hf_repo: unsloth/Kimi-K3-GGUF
+  mmproj: mmproj-BF16.gguf      # F16 and F32 variants also published
+  mmproj_alternatives: [mmproj-F16.gguf, mmproj-F32.gguf]
+  # The text shards are unchanged from M1-M3.
+  shard_glob: "UD-Q2_K_XL/Kimi-K3-UD-Q2_K_XL-*.gguf"
+
+# MoonViT-3d. Similar to the Kimi-K2.5 tower but with four differences that all had to be
+# handled in the reference implementation, and that any native implementation must repeat:
+vision_tower:
+  projector_type: kimik3        # PROJECTOR_TYPE_KIMIK3 / VisionProjectorType.KIMIK3
+  vt_num_hidden_layers: 27
+  vt_hidden_size: 1024
+  vt_intermediate_size: 4096
+  vt_num_attention_heads: 12
+  patch_size: 14
+  merge_kernel_size: [2, 2]
+  merge_type: sd2_tpool
+  mm_projector_type: patchmergerv2
+  mm_hidden_size: 1024
+  text_hidden_size: 7168
+  pos_emb_type: divided_fixed
+  init_pos_emb: [64, 64]
+  init_pos_emb_time: 4
+  resize_algo: bilinear
+  rope_theta: 10000.0
+
+  # THE FOUR DIFFERENCES — each one is a silent-wrong-output trap, not a compile error:
+  differences_from_kimi_k25:
+    non_square_fused_qkv:
+      qkv_hidden_size: 1536
+      n_embd: 1024
+      head_dim: 128             # 1536/12, NOT n_embd/n_head = 85.3
+      # PR #48 adds clip.vision.attention.head_dim and stops deriving d_head from
+      # n_embd/n_head. It also fixes the K and V view offsets in build_vit from
+      # n_embd to n_head*d_head — with a non-square QKV those differ.
+    rmsnorm: true               # norm_type rmsnorm, not layernorm
+    bias_free: true             # attn_bias, linear_bias, patch_embed_proj_bias all false
+    post_norm_projector: true   # mm_post_norm applied AFTER the projection
+
+special_tokens:
+  media_placeholder_token_id: 163605
+  image_placeholder: "<|kimi_image_placeholder|>"
+
+# Baseline tooling. llama-mtmd-cli is built via LLAMACPP_EXTRA_TARGETS; nothing in the
+# harness invokes it yet, which is exactly the gap M4 closes.
+baseline:
+  binary: llama-mtmd-cli
+  built_by: LLAMACPP_EXTRA_TARGETS
+  wired_up: true
+  benchmark_exists: false       # <- the actual M4 deliverable
+
+# What a vision baseline has to measure, none of which exists yet. Deliberately NOT
+# copied from the text harness: image encode is a one-shot cost per image, not a
+# per-token rate, so decode tok/s is the wrong primary metric.
+required_work:
+  - image_encode_latency_per_resolution   # dynamic patch count; cost scales with pixels
+  - n_output_tokens_vs_resolution         # clip_n_output_tokens is dynamic for this projector
+  - end_to_end_ttft_with_one_image
+  - text_only_regression_guard            # loading mmproj must not move the M1-M3 numbers
+  - accuracy_reference_for_image_prompts  # agreement vs the same fork on identical weights
+
+# Deferred, and why. Vision quality benchmarks (MMMU-Pro, MathVision) need a scored dataset
+# and a judge; that is a separate build from "the image path produces the same logits as the
+# reference implementation does". Correctness first, quality second.
+deferred:
+  - mmmu_pro_scored_eval
+  - mathvision_scored_eval
+  - video_path                  # temporal_patch_size / init_pos_emb_time suggest video, untested
+
+exit_criteria:
+  - llama-mtmd-cli encodes an image and completes a prompt on the M1 node
+  - image-prompt logits agree with the reference implementation on identical weights
+  - text-only M1 decode/prefill medians unchanged with the mmproj resident

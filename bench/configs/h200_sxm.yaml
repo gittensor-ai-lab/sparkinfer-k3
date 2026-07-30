@@ -1,0 +1,87 @@
+# NVIDIA H200 SXM benchmark profile — 8-GPU node. Milestone 1.
+#
+# NOTE ON SCOPE: H200 is Hopper (sm_90), NOT Blackwell. Every profile inherited from
+# SparkInfer (rtx5090, pro6000, rtx_spark) is sm_120/sm_121, and the kernels in kernels/
+# are written for Blackwell. This profile exists because Kimi K3 at the target quant is
+# 802 GiB — it does not fit any Blackwell edge card, or eight of them.
+#
+# The CMake arch list already carries 90 (top-level CMakeLists.txt), so a source build
+# targets sm_90 without changes; what does NOT exist yet is any sm_90-tuned kernel path.
+# Treat sparkinfer numbers on this profile as untuned until that work lands.
+
+hardware:
+  name: H200 SXM 141GB
+  arch: sm_90
+  gpu_count: 8
+  # Vendor "GB" for HBM is binary here: nvidia-smi reports ~144384 MiB per H200 SXM.
+  # gpu_vram_gib_total() is the authority at run time; these are the expectation.
+  vram_gb_per_gpu: 141
+  vram_gib_total: 1128
+  bandwidth_tbps_per_gpu: 4.8
+  bandwidth_tbps_aggregate: 38.4
+  interconnect: nvlink          # NVSwitch on an HGX H200 baseboard; 900 GB/s per GPU
+  tensor_cores_gen: 4           # Hopper 4th-gen
+  fp8_native: true
+  fp4_native: false
+
+# Why this matters for K3: the routed experts ship as MXFP4 and the target GGUF is 2-bit.
+# Hopper has no FP4 tensor core, so every low-bit expert GEMM dequantizes to bf16/fp8
+# before the MMA. llama.cpp takes the same path, so the baseline is fair — but it caps the
+# ceiling relative to a Blackwell node, which is exactly what M2/M3 are for.
+quantization_notes:
+  mxfp4_tensor_core: false
+  low_bit_path: dequantize_to_bf16_then_mma
+
+topology:
+  # llama.cpp splits by layer across all visible devices by default. 93 layers over
+  # 8 GPUs is 11-12 each, but the layers are NOT uniform (24 MLA layers carry the whole
+  # KV cache; 69 KDA layers carry the recurrent state), so let llama.cpp size the split
+  # from tensor bytes rather than forcing -ts.
+  split_mode: layer
+  tensor_split: auto
+  main_gpu: 0
+
+# Fit at the milestone target: 802 GiB weights + 27 GiB KV @ 1M + ~25 GiB compute/state
+# = ~854 GiB of 1128 GiB. ~274 GiB spare.
+fits:
+  target_quant: UD-Q2_K_XL
+  target_context: 1048576
+  weights_gib: 802
+  kv_gib_at_target: 27
+  headroom_gib: 274
+
+attention:
+  batch_sizes: [1, 4, 16, 64]
+  context_lens: [4096, 32768, 131072, 262144, 1048576]
+  dtype: bfloat16
+
+moe:
+  token_counts: [1, 16, 64, 256, 1024]
+  num_experts: [896]
+  top_k: [16]
+  hidden_dim: 7168
+  ffn_dim: 3072
+  latent_dim: 3584
+  dtype: bfloat16
+  expert_paging: false          # at UD-Q2_K_XL all experts stay resident
+
+gemm:
+  shapes:
+    - [1, 7168, 7168]           # single decode token
+    - [16, 7168, 7168]
+    - [256, 7168, 7168]
+    - [4096, 7168, 7168]        # prefill tile
+    - [1, 3584, 3072]           # latent expert up
+    - [1, 3072, 3584]           # latent expert down
+  dtype: bfloat16
+
+model_targets:
+  - name: Kimi K3 UD-Q2_K_XL
+    gib: 802
+    fits_at_1m: true            # milestone target
+  - name: Kimi K3 UD-IQ1_S
+    gib: 553
+    fits_at_1m: true            # smaller fallback; 78.9% top-1, too lossy to judge on
+  - name: Kimi K3 UD-Q8_K_XL
+    gib: 1453
+    fits_at_1m: false           # needs host offload; out of scope

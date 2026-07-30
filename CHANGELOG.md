@@ -3,6 +3,131 @@
 Notable changes to sparkinfer. Format loosely follows [Keep a Changelog](https://keepachangelog.com);
 versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkinfer/releases).
 
+## [Unreleased] — target retargeted to UD-Q2_K_XL @ 1M, four milestones
+
+Repoints the whole repo at **UD-Q2_K_XL (802 GiB, 19 shards, 90.4% top-1)** at the full
+**1,048,576**-token context, and structures the work as four milestones. Still no measured
+numbers on any node.
+
+Why Q2_K_XL and not IQ1_S: 90.4% top-1 against the lossless reference is the accuracy knee.
+IQ1_S is 249 GiB smaller but drops to 78.9% — a 2% kernel win means little next to a
+12-point quality gap in the weights being measured.
+
+| | node | arch | total HBM | headroom @ 1M |
+|---|---|---|---:|---:|
+| **M1** | 8× H200 SXM | `sm_90` Hopper | 1128 GiB | 274 GiB |
+| **M2** | 8× B200 SXM | `sm_100` Blackwell | 1440 GiB | 586 GiB |
+| **M3** | 4×+ B300 | `sm_103` ⚠ unverified | 1152 GiB | 298 GiB |
+| **M4** | vision (any node) | — | — | tower adds ~1 GiB |
+
+M1–M3 change **only the node** — same quant, context and flags — so every delta is
+attributable to hardware rather than a moving target. M4 is the one capability milestone.
+
+### Added
+
+- `bench/configs/b200_sxm.yaml`, `bench/configs/b300.yaml` — M2/M3 hardware profiles. B300
+  carries `arch_verified: false`: `sm_103` is a guess, `detect_arch` wins at run time, and
+  103 is deliberately **not** added to the CMake arch list because an arch the installed
+  toolkit doesn't recognise breaks configure for every node, not just B300.
+- `bench/configs/targets/kimi_k3_ud_q2kxl_{h200x8,b200x8,b300x4}.yaml` — one per hardware
+  milestone, each with its exit criteria and the open questions it exists to answer.
+- `bench/configs/targets/kimi_k3_vision_m4.yaml` — M4. Documents the four MoonViT-3d
+  differences from the K2.5 tower (non-square fused QKV, RMSNorm, bias-free, post-norm
+  projector), each a silent-wrong-output trap rather than a compile error.
+- `--node h200x8|b200x8|b300x4` selects the `reference.lock` prefix and warns when the
+  detected box doesn't match the claimed profile. Per-node prefixes matter *because* M1–M3
+  are otherwise identical: one shared set of slots would conflate three GPU generations.
+- `--longctx` probes 128k/256k/1M at 1 rep, recorded as `"kind": "probe"` not a median — a
+  1M-token prefill is minutes of wall-clock per rep. Opt-in, but required to close a
+  milestone; runs without it print a reminder.
+
+### Changed
+
+- **Default quant is now UD-Q2_K_XL.** Shard counts pinned for all six published quants
+  (14/15/16/19/32/34) rather than discovered, so an interrupted download fails loudly.
+- **The fit check prices context in.** `kimi_k3_headroom_gib` = KV at `KIMI_K3_MAX_CTX`
+  (27 GiB at 1M) + compute buffers + state, replacing a flat 40 GiB. This is what lets it
+  correctly reject UD-Q4_K_XL on 8× B200 at 1M while accepting it at 32k — and reject
+  UD-IQ1_S on 4× H200 despite 553 < 564.
+- `reference.lock` baselines are per-node (`KIMI_K3_H200X8_LLAMA_*` etc.) with `_1M` and
+  `_1M_PP` slots added. All still `0` = not measured.
+- Removed `bench/configs/targets/kimi_k3_ud_iq1s_h200x8.yaml` — two files each claiming to
+  be "the target" is how a stale reference gets scored.
+- Test suite 35 → 58: node profiles, every published quant's shard path, and the fit check
+  at every node/quant/context combination.
+
+### Fixed
+
+- `ensure_model_split` accepts shard 1 under whatever `-of-NNNNN` it actually carries. The
+  caller may have to guess the total before downloading, and a guessed total that didn't
+  match reality read as a missing file — which would have failed every download for a quant
+  whose shard count wasn't pinned.
+
+## [Unreleased] — Kimi K3 evaluation baseline
+
+Lands the **Kimi K3 evaluation baseline** on 8× H200. Baseline half only: sparkinfer has no
+`kimi-k3` loader yet, so this branch adds nothing to the runtime and changes no existing verdict.
+It exists so native K3 work is scored against a pinned, same-box, third-party-reproducible
+reference instead of a claim. Details: [`docs/kimi-k3-baseline.md`](docs/kimi-k3-baseline.md).
+
+### The baseline engine is a fork — necessarily
+
+Kimi K3 has **896 routed experts**. Upstream `ggml-org/llama.cpp` asserts
+`n_expert <= LLAMA_MAX_EXPERTS` (512) and **cannot load the model at all**, so there is no
+upstream number to compare against. The reference is `unslothai/llama.cpp` PR #48
+(`kimi-k3-fullsize-vision`, `efc8bc38`) on top of `kimi-k3-text-base` (`cf67f0d2`), pinned as
+`KIMI_K3_LLAMACPP_{REPO,REF,COMMIT,BASE_COMMIT}` in `bench/scripts/reference.lock`.
+
+Load-bearing pieces of the fork: `LLAMA_MAX_EXPERTS 1024`; the `LLM_ARCH_KIMI_K3` graph
+(hybrid KDA + MLA, `situ` activation, latent MoE, cross-layer attention residual, MLA output
+gate, full-rank KDA gate); `graph_max_nodes = max(n_tokens*160, 64*n_tensors)` because the
+shared `*40` budget dies at ubatch 3840; and PR #48 making `expert_latent_length`,
+`attn_res.block_size` and both `situ` betas **required** KV keys rather than silent defaults.
+
+### Added
+
+- `bench/scripts/kimi_k3_baseline.sh` — builds the pinned fork for sm_90, verifies the 14-shard
+  GGUF, sweeps `llama-bench` decode + prefill at 128/512/4k/32k, writes JSON to `bench/results/`.
+  `--dry-run` prints the full plan with no network and no GPU.
+- `bench/scripts/kimi_k3_reference_server.sh` — accuracy reference for `accuracy_compare.py`,
+  with the two mandatory K3 flags: `--no-context-shift` (hybrid recurrent arch — llama.cpp
+  can't context-shift or restore slots, so a long eval dies mid-run) and `--no-jinja` (the gate
+  posts raw token ids; a chat template would prepend tokens the candidate never saw).
+- `bench/scripts/_kimi_k3.sh` — quant/shard/flag definitions. Sourcing it is the single act
+  that switches the baseline engine to the fork, so the Qwen evals keep the upstream pin and no
+  fork commit can leak into their verdicts. Uses a separate `.llamacpp-k3` checkout so the two
+  pins don't fight over one tree.
+- `bench/configs/models/kimi_k3.yaml` — full arch spec, every field traced to
+  `moonshotai/Kimi-K3/config.json` or the fork's `conversion/kimi_k3.py` / `src/models/kimi-k3.cpp`.
+- `bench/configs/h200_sxm.yaml`, `bench/configs/targets/kimi_k3_ud_iq1s_h200x8.yaml`.
+- `bench/scripts/test_kimi_k3_baseline.py` — 35 tests, no GPU or weights required.
+
+### Changed
+
+- `_common.sh`: `LLAMACPP_REF` lets the builder pin a fork/PR head (GitHub refuses fetch-by-sha
+  there) and then **asserts** the ref resolves to `LLAMACPP_COMMIT` — a force-push fails the run
+  instead of silently moving the baseline. Adds `LLAMACPP_EXTRA_TARGETS`, `gpu_count`,
+  `gpu_vram_gib_total`, and `ensure_model_split` / `verify_model_split` for multi-shard weights.
+- `gen_eval_prompt.py`: new `--gguf` backend tokenizes via `llama-tokenize` (opened `vocab_only`).
+  K3 ships a tiktoken vocab, not `tokenizer.json`, so `Tokenizer.from_file` has nothing to load.
+  The `tokenizer.json` path is untouched; `tokenizers` is now imported lazily.
+
+### Guardrails, not conveniences
+
+- `kimi_k3_check_fits` **refuses** to run when the weights + 40 GiB headroom exceed visible HBM.
+  UD-IQ1_S is 553 GiB; a silently half-offloaded baseline is not reproducible and not accepted.
+- Every measured slot ships **unset**: `KIMI_K3_LLAMA_*` are `0` in `reference.lock` and every
+  sparkinfer slot in the target YAML is `null`. Downstream, a hand-filled baseline is
+  indistinguishable from a measured one.
+
+### Known limits
+
+H200 is Hopper (`sm_90`); `kernels/` targets Blackwell `sm_120`/`sm_121`, so a source build
+compiles but no sm_90 path is tuned. Hopper has no FP4 tensor core, so K3's MXFP4/1–2-bit expert
+GEMMs dequantize before the MMA — llama.cpp takes the same path, so the comparison is fair, but
+the ceiling is lower than on Blackwell. No vision baseline yet (`mmproj` and `llama-mtmd-cli` are
+wired up, but there's no image benchmark). **No numbers measured** — the sweep has not been run.
+
 ## [0.4.4] — 2026-07-28
 
 sparkinfer lands **DFlash block-diffusion speculative decode** for Qwen3.6-35B-A3B — the first

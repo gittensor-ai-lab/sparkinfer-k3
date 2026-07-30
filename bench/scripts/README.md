@@ -88,6 +88,51 @@ build/runtime/qwen3_gguf_score model.gguf 20 <token-ids...>   # compare argmax +
 | `SPARKINFER_EVAL_PREFILL_CHECK_PREFIX` | `512` | prefix length for H3 |
 | `SPARKINFER_EVAL_PREFILL_CHECK_TOP1_BAR` | `0.80` | H3 veto if TOP1 below this |
 | `SPARKINFER_EVAL_PREFILL_CHECK_KL_BAR` | `0.05` | H3 veto if mean KL above this |
+| `LLAMACPP_REF` | *(empty)* | ref to fetch when the pinned commit isn't fetchable by sha (fork/PR heads); the sha is still asserted |
+| `LLAMACPP_EXTRA_TARGETS` | *(empty)* | extra llama.cpp targets to build, e.g. `llama-tokenize llama-mtmd-cli` |
+
+## Kimi K3 baseline — UD-Q2_K_XL @ 1M, three nodes
+
+Kimi K3 is 2.8T / A50B with **896 routed experts** — upstream `ggml-org/llama.cpp` asserts
+`n_expert <= LLAMA_MAX_EXPERTS` (512) and cannot load it, so the reference engine is
+`unslothai/llama.cpp` PR #48, pinned in `reference.lock` as `KIMI_K3_LLAMACPP_*`. Since a
+fork PR head isn't fetchable by sha, `_common.sh` fetches `LLAMACPP_REF` and then asserts it
+resolves to the pinned commit — a force-push fails the run instead of moving the baseline.
+
+Target is **UD-Q2_K_XL** (802 GiB, 19 shards, 90.4% top-1 — the accuracy knee) at the full
+**1,048,576**-token context. M1–M3 change only the node:
+
+```bash
+bench/scripts/kimi_k3_baseline.sh --node h200x8 --dry-run    # plan only; no network, no GPU
+bench/scripts/kimi_k3_baseline.sh --node h200x8 --download   # M1: shards + build + sweep
+bench/scripts/kimi_k3_baseline.sh --node h200x8 --longctx    # ...then probe 128k/256k/1M
+bench/scripts/kimi_k3_baseline.sh --node b200x8 --download --longctx   # M2
+bench/scripts/kimi_k3_baseline.sh --node b300x4 --download --longctx   # M3
+bench/scripts/kimi_k3_reference_server.sh --ctx 8704         # accuracy reference
+```
+
+| `--node` | hardware | arch | reference.lock prefix |
+|---|---|---|---|
+| `h200x8` | 8× H200 141 GB, 1128 GiB | `sm_90` | `KIMI_K3_H200X8_LLAMA_*` |
+| `b200x8` | 8× B200 180 GB, 1440 GiB | `sm_100` | `KIMI_K3_B200X8_LLAMA_*` |
+| `b300x4` | 4×+ B300 288 GB, 1152 GiB | `sm_103` ⚠ unverified | `KIMI_K3_B300X4_LLAMA_*` |
+
+Per-node prefixes exist because M1–M3 are identical except for the node — one shared set of
+slots would silently conflate three hardware generations. `--longctx` is opt-in: a 1M-token
+prefill is minutes per rep, so it runs at 1 rep and is recorded as a capability probe, not a
+median.
+
+`kimi_k3_check_fits` **refuses** to run when the weights plus the KV cache at
+`KIMI_K3_MAX_CTX` exceed visible HBM — a partially-offloaded baseline isn't reproducible.
+It prices context in, so it correctly rejects UD-Q4_K_XL on 8× B200 at 1M while accepting it
+at 32k. K3 also ships no `tokenizer.json` (tiktoken vocab), so prompt ids come from the GGUF
+via `gen_eval_prompt.py --gguf <model.gguf>` + `llama-tokenize` instead of `ensure_tokenizer`.
+
+sparkinfer has **no kimi-k3 loader yet**; this is the baseline half of the eval only. M4 adds
+vision. Details, memory budget and architecture traps:
+[`docs/kimi-k3-baseline.md`](../../docs/kimi-k3-baseline.md).
+Env: `PRIMARY_QUANT`, `KIMI_K3_NODE`, `KIMI_K3_MAX_CTX`, `KIMI_K3_MODELS_DIR`,
+`KIMI_K3_COMPUTE_BUF_GIB`, `KIMI_K3_NGL/_BATCH/_UBATCH/_SPLIT_MODE/_EXTRA_FLAGS`.
 
 ## DFlash speculative decode (Qwen3.6)
 
@@ -119,5 +164,6 @@ Each model uses its own `MODELS_DIR` (different tokenizers) and weight-sha pin (
 See [`eval/README.md`](../../eval/README.md) for the vast.ai orchestration and `--dual`.
 
 Files: `bench.sh`, `accuracy.sh`, `accuracy_compare.py`, `evaluate.sh`, `evaluate_dual.sh`, `label.py`,
-`eval_text.txt`, `reference.lock`, `_common.sh`.
+`eval_text.txt`, `reference.lock`, `_common.sh`,
+`kimi_k3_baseline.sh`, `kimi_k3_reference_server.sh`, `_kimi_k3.sh`.
 Results from reference runs live in [`../results/`](../results).

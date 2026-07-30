@@ -1,0 +1,119 @@
+# M2 — Kimi K3 UD-Q2_K_XL on 8x B200 SXM, full 1M context.
+#
+# Milestone 2 of 4. Same model, same quant, same context as M1 — the ONLY variable is the
+# node. That is deliberate: a like-for-like Hopper->Blackwell delta on identical weights is
+# the cleanest way to size how much of K3's cost is the FP4 dequant that Hopper can't avoid.
+#
+#   KIMI_K3_NODE=b200x8 PRIMARY_QUANT=UD-Q2_K_XL bench/scripts/kimi_k3_baseline.sh --download
+
+milestone: M2
+node:     b200x8
+model:    configs/models/kimi_k3.yaml
+hardware: configs/b200_sxm.yaml
+quant:    ud_q2_k_xl
+
+weights:
+  hf_repo: unsloth/Kimi-K3-GGUF
+  shard_glob: "UD-Q2_K_XL/Kimi-K3-UD-Q2_K_XL-*.gguf"
+  size_gb: 861.3
+  size_gib: 802.0
+  mmproj: mmproj-BF16.gguf      # M4 only
+  reported_top1_agree_pct: 90.390
+  reported_ppl: 1.7359
+  reported_mean_kld: 0.1779
+
+alt_quants:
+  ud_q4_k_xl:
+    size_gib: 1407.0
+    fits_at_1m: false           # 1407 + 27 + 25 > 1440
+    fits_at_32k: true
+    note: reachable here at short context; not on H200 at any context
+  ud_q8_k_xl:
+    size_gib: 1453.0
+    fits_at_1m: false
+
+memory_budget_gib:
+  hbm_total: 1440               # 180 GB x 8
+  weights: 802.0
+  kv_at_32k: 0.84
+  kv_at_128k: 3.38
+  kv_at_256k: 6.75
+  kv_at_1m: 27.00
+  kda_recurrent_state_per_seq: 0.43
+  compute_buffers_allowance: 24
+  total_at_1m: 854
+  headroom_at_1m: 586           # most comfortable of the three nodes
+
+decode:
+  batch_sizes: [1]
+  eval_sweep: [128, 512, 4096, 32768]
+  longctx_probe: [131072, 262144, 1048576]
+  dtype: bfloat16
+  llama_toks_per_sec:
+    bs1_ctx128: null
+    bs1_ctx512: null
+    bs1_ctx4k: null
+    bs1_ctx32k: null
+    bs1_ctx1m: null
+  sparkinfer_toks_per_sec:
+    bs1_ctx128: null
+    bs1_ctx512: null
+    bs1_ctx4k: null
+    bs1_ctx32k: null
+    bs1_ctx1m: null
+
+prefill:
+  eval_sweep: [4096, 32768]
+  longctx_probe: [131072, 1048576]
+  llama_pp_toks_per_sec:
+    ctx4k: null
+    ctx32k: null
+    ctx1m: null
+  sparkinfer_pp_toks_per_sec:
+    ctx4k: null
+    ctx32k: null
+    ctx1m: null
+
+# What M2 is actually for. The node change is the experiment, so the interesting output is
+# a ratio against M1, not an absolute.
+m2_questions:
+  - how much of the H200 decode cost is the MXFP4 -> bf16 dequant Hopper cannot skip
+  - does a native FP4 expert GEMM on sm_100 beat llama.cpp's dequant-then-MMA path
+  - at 1.8 TB/s NVLink5 (2x H200), is sharding experts rather than layers worth it
+  - do the sm_120 kernels in kernels/ port to sm_100 or need distinct tensor-core shapes
+
+exit_criteria:
+  - 1M context loads and decodes on 8x B200 with all weights in HBM
+  - decode + prefill medians pinned in reference.lock at 128/512/4k/32k
+  - H200 -> B200 delta recorded on identical weights and context
+
+sampling:
+  default:
+    temperature: 1.0
+    top_p: 0.95
+  agentic:
+    temperature: 1.0
+    top_p: 1.0
+  reasoning_effort: [low, high, max]
+  max_context: 1048576
+
+llama_cpp_flags:
+  n_gpu_layers: 99
+  split_mode: layer
+  no_context_shift: true
+  no_mmap: true
+  flash_attn: auto
+  n_batch: 2048
+  # 586 GiB of headroom means ubatch can go up once M1 has characterised the compute
+  # buffers; start matched to M1 so the comparison is not confounded.
+  n_ubatch: 512
+
+runtime:
+  sparkinfer_native_decode: false
+  required_work:
+    - kimi_k3_gguf_loader
+    - sm100_kernel_path             # kernels/ targets sm_120/121; B200 is sm_100
+    - native_fp4_expert_gemm        # the M2 opportunity
+    - multi_gpu_weight_sharding
+    - llama_cpp_same_gguf_baseline_128_512_4k_32k
+    - kv_cache_at_1m_context
