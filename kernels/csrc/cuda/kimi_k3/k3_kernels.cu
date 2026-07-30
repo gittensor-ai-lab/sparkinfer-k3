@@ -376,6 +376,105 @@ __global__ void moe_router_noaux_tc_kernel(float* __restrict__ out_w,
 }
 
 // ---------------------------------------------------------------------------
+// 13. Latent MoE expert dispatch
+// ---------------------------------------------------------------------------
+
+// Decode one IQ2_XS block (256 values) into the caller's dot accumulator against
+// `x`. Same arithmetic as dequant_iq2_xs_kernel — kept in one place so the two
+// cannot drift, since that kernel is the one validated bit-exact against ggml.
+__device__ __forceinline__ float iq2xs_block_dot(const BlockIQ2XS& b,
+                                                 const float* __restrict__ x,
+                                                 int lane, int nlanes) {
+    const float d = __half2float(__ushort_as_half(b.d));
+    float acc = 0.0f;
+    // 32 groups of 8 values per block; spread them over the lanes.
+    for (int l = lane; l < 32; l += nlanes) {
+        const int ib32 = l >> 2, sub = l & 3;
+        const uint8_t sc = b.scales[ib32];
+        const float db = (sub < 2) ? d * (0.5f + (float)(sc & 0xf)) * 0.25f
+                                   : d * (0.5f + (float)(sc >> 4))  * 0.25f;
+        const uint16_t q = b.qs[l];
+        const uint8_t* grid = (const uint8_t*)&c_iq2xs_grid[q & 511];
+        const uint8_t signs = c_ksigns_iq2xs[q >> 9];
+        const float* xv = x + l * 8;
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const float wv = db * (float)grid[j] * ((signs & c_kmask_iq2xs[j]) ? -1.0f : 1.0f);
+            acc += wv * xv[j];
+        }
+    }
+    return acc;
+}
+
+// gate/up GEMV + situ. One block per (selected expert k, output chunk).
+template <int BLOCK>
+__global__ void moe_gate_up_situ_kernel(float* __restrict__ scratch,
+                                        const float* __restrict__ x,
+                                        const int* __restrict__ ids,
+                                        const BlockIQ2XS* __restrict__ gate_exps,
+                                        const BlockIQ2XS* __restrict__ up_exps,
+                                        int latent, int ffn,
+                                        float beta, float inv_beta,
+                                        float lb, float inv_lb, int lb_active) {
+    const int k = blockIdx.y;                 // which selected expert
+    const int j = blockIdx.x;                 // which ffn output row
+    if (j >= ffn) return;
+    const int e = ids[k];
+    const int blocks_per_row = latent / 256;
+
+    const BlockIQ2XS* g_row = gate_exps + (size_t)(e * ffn + j) * blocks_per_row;
+    const BlockIQ2XS* u_row = up_exps   + (size_t)(e * ffn + j) * blocks_per_row;
+
+    float gacc = 0.0f, uacc = 0.0f;
+    for (int b = 0; b < blocks_per_row; ++b) {
+        const float* xb = x + b * 256;
+        gacc += iq2xs_block_dot(g_row[b], xb, threadIdx.x, BLOCK);
+        uacc += iq2xs_block_dot(u_row[b], xb, threadIdx.x, BLOCK);
+    }
+    __shared__ float shm[BLOCK / 32 + 1];
+    gacc = block_sum<BLOCK>(gacc, shm);
+    __syncthreads();
+    uacc = block_sum<BLOCK>(uacc, shm);
+
+    if (threadIdx.x == 0) {
+        // situ, identical to situ_kernel
+        const float a  = beta * tanhf(gacc * inv_beta) * sigmoidf_(gacc);
+        const float ub = lb_active ? (lb * tanhf(uacc * inv_lb)) : uacc;
+        scratch[(size_t)k * ffn + j] = a * ub;
+    }
+}
+
+// down GEMV + weighted combine. One block per output element; accumulates the
+// top_k experts so the combine needs no second pass and no atomics.
+template <int BLOCK>
+__global__ void moe_down_combine_kernel(float* __restrict__ out,
+                                        const float* __restrict__ scratch,
+                                        const int* __restrict__ ids,
+                                        const float* __restrict__ w,
+                                        const BlockIQ2XS* __restrict__ down_exps,
+                                        int latent, int ffn, int top_k) {
+    const int o = blockIdx.x;                 // output element in [0, latent)
+    if (o >= latent) return;
+    const int blocks_per_row = ffn / 256;
+    __shared__ float shm[BLOCK / 32 + 1];
+
+    float total = 0.0f;
+    for (int k = 0; k < top_k; ++k) {
+        const int e = ids[k];
+        const BlockIQ2XS* d_row = down_exps + (size_t)(e * latent + o) * blocks_per_row;
+        const float* act = scratch + (size_t)k * ffn;
+        float acc = 0.0f;
+        for (int b = 0; b < blocks_per_row; ++b)
+            acc += iq2xs_block_dot(d_row[b], act + b * 256, threadIdx.x, BLOCK);
+        acc = block_sum<BLOCK>(acc, shm);
+        __syncthreads();
+        if (threadIdx.x == 0) total += w[k] * acc;
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out[o] = total;
+}
+
+// ---------------------------------------------------------------------------
 // 5. MLA output gate
 // ---------------------------------------------------------------------------
 
@@ -613,6 +712,18 @@ void kda_conv_step_f32(float* out, float* state, const float* x, const float* w,
     kda_conv_step_kernel<<<(unsigned)blocks, T, 0, stream>>>(out, state, x, w, d_conv, d_inner);
 }
 
+// Upload the lattice/sign tables once. __constant__ is the right home: every
+// thread in a warp reads the same grid entry for a given codepoint, so the
+// broadcast path is what we want rather than L1 thrash.
+static void ensure_iq2xs_tables() {
+    static bool ready = false;
+    if (ready) return;
+    cudaMemcpyToSymbol(c_iq2xs_grid,   h_iq2xs_grid,   sizeof(h_iq2xs_grid));
+    cudaMemcpyToSymbol(c_ksigns_iq2xs, h_ksigns_iq2xs, sizeof(h_ksigns_iq2xs));
+    cudaMemcpyToSymbol(c_kmask_iq2xs,  h_kmask_iq2xs,  sizeof(h_kmask_iq2xs));
+    ready = true;
+}
+
 void dequant_iq2_xs_f32(float* out, const void* src, int64_t n, cudaStream_t stream) {
     if (n <= 0) return;
     if (n % 256) {
@@ -620,16 +731,7 @@ void dequant_iq2_xs_f32(float* out, const void* src, int64_t n, cudaStream_t str
                      (long long)n);
         return;
     }
-    // Upload the lattice/sign tables once. __constant__ is the right home: every
-    // thread in a warp reads the same grid entry for a given codepoint, so the
-    // broadcast path is what we want rather than L1 thrash.
-    static bool tables_ready = false;
-    if (!tables_ready) {
-        cudaMemcpyToSymbol(c_iq2xs_grid,   h_iq2xs_grid,   sizeof(h_iq2xs_grid));
-        cudaMemcpyToSymbol(c_ksigns_iq2xs, h_ksigns_iq2xs, sizeof(h_ksigns_iq2xs));
-        cudaMemcpyToSymbol(c_kmask_iq2xs,  h_kmask_iq2xs,  sizeof(h_kmask_iq2xs));
-        tables_ready = true;
-    }
+    ensure_iq2xs_tables();
     const int64_t n_groups = n / 8;
     const int T = 256;
     const int64_t blocks = (n_groups + T - 1) / T;
@@ -647,6 +749,30 @@ void moe_router_noaux_tc_f32(float* out_w, int* out_ids, const float* logits,
     const size_t shm = (size_t)2 * n_expert * sizeof(float);
     moe_router_noaux_tc_kernel<256><<<(unsigned)n_tokens, T, shm, stream>>>(
         out_w, out_ids, logits, bias, n_expert, top_k, norm_w, w_scale);
+}
+
+void moe_expert_ffn_iq2xs_f32(float* out, float* scratch,
+                              const float* x, const int* ids, const float* w,
+                              const void* gate_exps, const void* up_exps,
+                              const void* down_exps,
+                              int latent, int ffn, int top_k,
+                              float situ_beta, float situ_linear_beta,
+                              cudaStream_t stream) {
+    if (latent <= 0 || ffn <= 0 || top_k <= 0) return;
+    if (latent % 256 || ffn % 256) {
+        fprintf(stderr, "[k3] moe_expert_ffn: latent=%d ffn=%d must be multiples of 256\n",
+                latent, ffn);
+        return;
+    }
+    ensure_iq2xs_tables();
+    const int lb_active = situ_linear_beta > 0.0f ? 1 : 0;
+    dim3 g1((unsigned)ffn, (unsigned)top_k);
+    moe_gate_up_situ_kernel<128><<<g1, 128, 0, stream>>>(
+        scratch, x, ids, (const BlockIQ2XS*)gate_exps, (const BlockIQ2XS*)up_exps,
+        latent, ffn, situ_beta, 1.0f / situ_beta, situ_linear_beta,
+        lb_active ? 1.0f / situ_linear_beta : 1.0f, lb_active);
+    moe_down_combine_kernel<128><<<(unsigned)latent, 128, 0, stream>>>(
+        out, scratch, ids, w, (const BlockIQ2XS*)down_exps, latent, ffn, top_k);
 }
 
 void mla_gate_out_f32(float* out, const float* attn_out, const float* gate_proj,

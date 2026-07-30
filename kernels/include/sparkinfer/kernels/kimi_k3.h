@@ -204,6 +204,44 @@ void moe_router_noaux_tc_f32(float* out_w, int* out_ids, const float* logits,
                              cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
+// 13. Latent MoE expert dispatch (IQ2_XS, fused dequant + GEMV + situ + combine)
+// ---------------------------------------------------------------------------
+// Reference: kimi_k3_build_moe_layer() in src/models/kimi-k3.cpp, whose expert
+// block is build_moe_ffn(routed_in, ..., LLM_FFN_SITU, logits).
+//
+// Per token, for each of the top_k selected experts e with weight w:
+//     g   = gate_exps[e] @ x            x is the LATENT input, 3584 wide
+//     u   = up_exps[e]   @ x
+//     a   = situ(g, u)                  3072 wide
+//     out += w * (down_exps[e] @ a)     back to 3584
+//
+// THE SHAPES ARE THE LATENT ONES, NOT hidden. K3 down-projects 7168 -> 3584 with
+// ffn_routed_down before the experts and back up after, so an expert GEMV that
+// assumes hidden width is wrong by 2x and will not even be caught by a shape
+// check if the caller passes the wrong buffer.
+//
+// DEQUANT IS FUSED, not staged. Materialising one expert's gate+up at f32 costs
+// 3584*3072*2*4 B = 88 MB per expert per token; at top-16 that is 1.4 GB of
+// traffic per token for weights that are 2.3 bpw on disk. The whole point of
+// IQ2_XS is that the weights stay small in memory, so the blocks are decoded
+// inside the dot product and never written out.
+//
+// Weights are ggml IQ2_XS (type 17), rows of `latent` values = latent/256 blocks.
+// Expert e's gate/up row j starts at block (e*ffn + j) * (latent/256).
+//
+// x:        [latent]            per token
+// ids/w:    [top_k]             from moe_router_noaux_tc_f32
+// out:      [latent]            accumulated, zeroed by this call
+// scratch:  [top_k * ffn]       caller-owned f32, holds situ activations
+void moe_expert_ffn_iq2xs_f32(float* out, float* scratch,
+                              const float* x, const int* ids, const float* w,
+                              const void* gate_exps, const void* up_exps,
+                              const void* down_exps,
+                              int latent, int ffn, int top_k,
+                              float situ_beta, float situ_linear_beta,
+                              cudaStream_t stream);
+
+// ---------------------------------------------------------------------------
 // 5. MLA output gate
 // ---------------------------------------------------------------------------
 // Reference: src/models/kimi-k3.cpp — "K3: sigmoid output gate applied to the
