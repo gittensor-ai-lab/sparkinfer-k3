@@ -720,6 +720,38 @@ class CiWorkflowTest(unittest.TestCase):
         self.assertFalse(rx.search("bench/scripts/kimi_k3_baseline.sh"))
         self.assertFalse(rx.search("bench/scripts/_kimi_k3.sh"))
 
+    def test_baseline_results_are_committable(self):
+        """The `lock` job requires a committed bench/results JSON to back any pinned
+        baseline. bench/.gitignore ignores results/ wholesale, so without an explicit
+        negation that provenance rule is unsatisfiable in normal use and the pins can
+        never be filled legitimately -- which would quietly turn the whole mechanism
+        into decoration. Asserted with git itself rather than by reading the file."""
+        import subprocess as sp
+        probe = ROOT / "bench" / "results" / "kimi_k3_UD-Q2_K_XL_h200x8_baseline_probe.json"
+        stray = ROOT / "bench" / "results" / "_ignore_probe.log"
+        probe.parent.mkdir(parents=True, exist_ok=True)
+        probe.write_text("{}")
+        stray.write_text("x")
+        try:
+            out = sp.run(["git", "status", "--porcelain", "--ignored",
+                          "bench/results/"], cwd=ROOT, capture_output=True, text=True).stdout
+            states = {}
+            for line in out.splitlines():
+                if not line.strip():
+                    continue
+                code, _, path = line.partition(" ")
+                states[path.strip()] = code.strip()
+            self.assertEqual(states.get(str(probe.relative_to(ROOT))), "??",
+                             "a kimi_k3 baseline JSON must be committable, got "
+                             f"{states.get(str(probe.relative_to(ROOT)))!r}")
+            # And the negation must not be so broad that scratch output gets committed.
+            self.assertEqual(states.get(str(stray.relative_to(ROOT))), "!!",
+                             "stray run output must stay ignored, got "
+                             f"{states.get(str(stray.relative_to(ROOT)))!r}")
+        finally:
+            probe.unlink(missing_ok=True)
+            stray.unlink(missing_ok=True)
+
     def test_gitattributes_pins_shell_to_lf(self):
         text = (ROOT / ".gitattributes").read_text()
         self.assertIn("*.sh            text eol=lf", text)

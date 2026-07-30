@@ -1,4 +1,20 @@
+# Generated per-run artefacts under results/ are ignored by default...
 results/
+
+# ...but the Kimi K3 provenance chain REQUIRES its results to be committable.
+# check_reference_lock.py (the `lock` CI job) refuses any non-zero baseline in
+# reference.lock unless a bench/results JSON records the same node and context. With
+# results/ blanket-ignored, that JSON could only be committed with `git add -f`, so
+# the provenance rule was unsatisfiable in normal use and the pins could never be
+# filled legitimately. Un-ignore exactly what the K3 harness emits.
+!results/
+results/*
+!results/kimi_k3_*.json
+!results/kimi_k3_*.md
+!results/tp_*.md
+!results/accuracy_*.md
+!results/qwen3-*.md
+
 !competitors/results/
 !competitors/results/qwen3_awq_rtx5090_20260703/
 !competitors/results/qwen3_awq_rtx5090_20260703/**
