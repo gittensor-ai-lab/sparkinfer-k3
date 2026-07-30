@@ -67,3 +67,49 @@ QWEN36_LLAMA_512_PP="${QWEN36_LLAMA_512_PP:-0}"
 QWEN36_LLAMA_4K_PP="${QWEN36_LLAMA_4K_PP:-0}"
 QWEN36_LLAMA_16K_PP="${QWEN36_LLAMA_16K_PP:-0}"
 QWEN36_LLAMA_32K_PP="${QWEN36_LLAMA_32K_PP:-0}"
+
+# ---------------------------------------------------------------------------------------
+# Kimi K3 (2.8T / A50B) baseline — 8x H200 SXM, UD-IQ1_S.
+#
+# The reference engine here is a FORK, not ggml-org/llama.cpp. That is not a convenience:
+# K3 has 896 routed experts and upstream asserts n_expert <= LLAMA_MAX_EXPERTS (512), so
+# upstream cannot load the model and there is no upstream number to compare against. The
+# unsloth fork raises the cap to 1024 and adds LLM_ARCH_KIMI_K3.
+#
+# Because the pin is a PR head on a fork, fetch-by-sha is refused by GitHub, so we fetch
+# KIMI_K3_LLAMACPP_REF and then assert it resolves to KIMI_K3_LLAMACPP_COMMIT. A
+# force-push to the PR branch therefore FAILS the run instead of silently changing the
+# baseline. Exported into LLAMACPP_* by kimi_k3_baseline.sh, so the Qwen evals keep using
+# the upstream pin above and nothing here can leak into them.
+KIMI_K3_LLAMACPP_REPO="${KIMI_K3_LLAMACPP_REPO:-https://github.com/unslothai/llama.cpp}"
+KIMI_K3_LLAMACPP_REF="${KIMI_K3_LLAMACPP_REF:-refs/pull/48/head}"
+KIMI_K3_LLAMACPP_COMMIT="${KIMI_K3_LLAMACPP_COMMIT:-efc8bc38f0a9950cbb10ccef2cf48b951c39d3b2}"
+# PR #48 = "kimi-k3: full-size model fixes and the MoonViT-3d vision tower", on top of the
+# kimi-k3-text-base branch (cf67f0d24511864d2d3da0769108fd6fc16d00d1). The two commits it
+# adds are the ones that make the FULL-SIZE model correct rather than merely loadable:
+#   47c5bbdf  make expert_latent_length / attn_res.block_size / situ betas REQUIRED KV keys
+#             (they defaulted silently before, which loads cleanly and produces garbage);
+#             raise graph_max_nodes to n_tokens*160 (the generic *40 dies at ubatch 3840);
+#             reject the 0xff NaN E8M0 MXFP4 scale byte at conversion time
+#   efc8bc38  MoonViT-3d vision tower (non-square fused QKV, RMSNorm, post-norm projector)
+KIMI_K3_LLAMACPP_BASE_COMMIT="${KIMI_K3_LLAMACPP_BASE_COMMIT:-cf67f0d24511864d2d3da0769108fd6fc16d00d1}"
+
+# Sharded weights are pinned by manifest file, not a single sha — see
+# bench/scripts/kimi_k3_ud_iq1_s.sha256 (absent = warn-only, matching MODEL_SHA256).
+
+# llama.cpp decode tok/s, 8x H200 SXM, UD-IQ1_S, median of 3, all layers on GPU.
+# 0 = NOT MEASURED. kimi_k3_baseline.sh writes these; do not hand-fill them.
+KIMI_K3_LLAMA_128="${KIMI_K3_LLAMA_128:-0}"
+KIMI_K3_LLAMA_512="${KIMI_K3_LLAMA_512:-0}"
+KIMI_K3_LLAMA_4K="${KIMI_K3_LLAMA_4K:-0}"
+KIMI_K3_LLAMA_32K="${KIMI_K3_LLAMA_32K:-0}"
+
+# llama.cpp prefill pp refs, same box / same GGUF. 0 = NOT MEASURED.
+KIMI_K3_LLAMA_4K_PP="${KIMI_K3_LLAMA_4K_PP:-0}"
+KIMI_K3_LLAMA_32K_PP="${KIMI_K3_LLAMA_32K_PP:-0}"
+
+# sparkinfer has no kimi-k3 loader yet — these stay 0 until runtime/ can load the arch.
+KIMI_K3_SPARKINFER_128="${KIMI_K3_SPARKINFER_128:-0}"
+KIMI_K3_SPARKINFER_512="${KIMI_K3_SPARKINFER_512:-0}"
+KIMI_K3_SPARKINFER_4K="${KIMI_K3_SPARKINFER_4K:-0}"
+KIMI_K3_SPARKINFER_32K="${KIMI_K3_SPARKINFER_32K:-0}"

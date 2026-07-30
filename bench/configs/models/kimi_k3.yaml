@@ -1,0 +1,195 @@
+# Kimi K3 architecture specification (Moonshot AI) — 2.8T total / ~50B active.
+#
+# Every number below was read out of the two sources of truth, not from marketing copy:
+#   arch / hparams : https://huggingface.co/moonshotai/Kimi-K3/blob/main/config.json
+#   GGUF mapping   : unslothai/llama.cpp @ kimi-k3-fullsize-vision (PR #48)
+#                    conversion/kimi_k3.py            -> which KV keys are written
+#                    src/models/kimi-k3.cpp           -> which KV keys are REQUIRED
+#                    src/llama-hparams.cpp            -> n_embd_r / n_embd_s (KDA state)
+#                    src/llama-kv-cache.cpp           -> MLA stores K only, no V
+#
+# llama.cpp calls this arch "kimi-k3" and types it LLM_TYPE_2_8T_A50B.
+
+model:
+  name: Kimi K3
+  family: kimi_k3               # llama.cpp LLM_ARCH_KIMI_K3, GGUF general.architecture = "kimi-k3"
+  llama_cpp_type: 2.8T.A50B     # LLM_TYPE_2_8T_A50B
+  modality: image_text_to_text
+  total_params_t: 2.8
+  hf_repo: moonshotai/Kimi-K3
+  gguf_repo: unsloth/Kimi-K3-GGUF
+
+text:
+  num_hidden_layers: 93
+  hidden_size: 7168
+  intermediate_size: 33792      # dense (non-MoE) layers only
+  max_position_embeddings: 1048576
+  vocab_size: 163840
+  dtype: bfloat16
+  rms_norm_eps: 1e-5
+  tie_word_embeddings: false
+
+# situ replaces SwiGLU everywhere. src/models/kimi-k3.cpp makes both betas REQUIRED
+# KV keys — a silent default loads cleanly and produces garbage.
+activation:
+  type: situ                    # kimi-k3.activation.situ_beta / .situ_linear_beta
+  situ_beta: 4.0
+  situ_linear_beta: 25.0
+
+# Cross-layer residual attention: also a REQUIRED KV key (kimi-k3.attn_res.block_size).
+attn_residual:
+  block_size: 12
+  tensors: [attn_res_proj, attn_res_norm, output_attn_res]
+
+attention:
+  layout: hybrid_kda_mla
+  # config.json linear_attn_config.full_attn_layers is 1-INDEXED (llama.cpp's
+  # converter uses `(il + 1) in full_attn_layers`). An off-by-one here is silent garbage.
+  full_attention_layers_1based: [4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60, 64, 68, 72, 76, 80, 84, 88, 92, 93]
+  full_attention_layers: 24
+  kda_layers: 69
+  # In GGUF, per-layer attention.head_count_kv == 0 marks a KDA (recurrent) layer.
+  head_count_kv_per_layer: "1 on the 24 MLA layers, 0 on the 69 KDA layers"
+
+  # Linear attention: Kimi Delta Attention, full-rank gate (single ssm_g, not ssm_g_a/ssm_g_b).
+  linear_attention:
+    type: kda
+    num_heads: 96
+    head_dim: 128               # kimi-k3.kda.head_dim
+    short_conv_kernel_size: 4   # kimi-k3.ssm.conv_kernel
+    gate_lower_bound: -5.0      # kimi-k3.kda.gate_lower_bound
+    use_full_rank_gate: true
+    state_dtype: float32
+
+  # Full attention: MLA, NoPE-only, with a sigmoid output gate before o_proj.
+  full_attention:
+    type: mla
+    num_attention_heads: 96
+    q_lora_rank: 1536
+    kv_lora_rank: 512
+    qk_nope_head_dim: 128
+    qk_rope_head_dim: 64
+    v_head_dim: 128
+    use_nope: true              # llama.cpp rope type = LLAMA_ROPE_TYPE_NONE for this arch
+    use_output_gate: true
+    # GGUF encoding: MLA is served as MQA with one large head, then decompressed.
+    gguf_head_count_kv: 1
+    gguf_key_length: 576        # kv_lora_rank + qk_rope_head_dim = 512 + 64
+    gguf_key_length_mla: 192    # qk_nope_head_dim + qk_rope_head_dim
+    gguf_value_length_mla: 128
+    gguf_rope_dimension_count: 64
+
+# Latent MoE: routed experts run in a DOWN-PROJECTED space (routed_expert_hidden_size),
+# not at hidden_size. kimi-k3.expert_latent_length is a REQUIRED KV key.
+moe:
+  num_experts: 896              # needs LLAMA_MAX_EXPERTS >= 896; upstream llama.cpp caps at 512
+  num_experts_per_tok: 16
+  num_shared_experts: 2
+  moe_intermediate_size: 3072
+  expert_latent_length: 3584    # routed_expert_hidden_size
+  latent_moe_use_norm: true
+  leading_dense_block_count: 1  # first_k_dense_replace
+  moe_layer_freq: 1
+  gating_func: sigmoid
+  renormalize: true
+  topk_method: noaux_tc
+  routed_scaling_factor: 1.0
+  num_expert_group: 1
+  topk_group: 1
+
+mtp:
+  num_nextn_predict_layers: 0   # K3 has no MTP head — no speculative draft comes free
+
+# MoonViT-3d. Similar to the Kimi-K2.5 tower but: RMSNorm, no biases, a NON-SQUARE
+# fused QKV (qkv width 1536 != n_embd 1024) and a post-norm projector. The non-square
+# QKV is why PR #48 adds clip.vision.attention.head_dim and stops deriving d_head
+# from n_embd / n_head.
+vision:
+  enabled: true
+  projector_type: kimik3        # llama.cpp PROJECTOR_TYPE_KIMIK3 / VisionProjectorType.KIMIK3
+  vt_hidden_size: 1024
+  vt_intermediate_size: 4096
+  vt_num_attention_heads: 12
+  vt_num_hidden_layers: 27
+  qkv_hidden_size: 1536         # -> head_dim 128, NOT 1024/12
+  head_dim: 128
+  patch_size: 14
+  norm_type: rmsnorm
+  attn_bias: false
+  linear_bias: false
+  patch_embed_proj_bias: false
+  merge_kernel_size: [2, 2]
+  merge_type: sd2_tpool
+  mm_projector_type: patchmergerv2
+  mm_hidden_size: 1024
+  text_hidden_size: 7168
+  pos_emb_type: divided_fixed
+  pos_emb_interpolation_mode: bilinear
+  init_pos_emb: [64, 64]
+  init_pos_emb_time: 4
+  projector_ln_eps: 1e-5
+  resize_algo: bilinear
+  rope_theta: 10000.0
+
+special_tokens:
+  bos_token_id: 163584
+  eos_token_id: 163586
+  pad_token_id: 163839
+  media_placeholder_token_id: 163605
+  image_placeholder: "<|kimi_image_placeholder|>"
+
+# Full-precision weights are MXFP4 for the routed experts and BF16 for everything else,
+# which is why unsloth's UD-Q8_K_XL is "truly lossless" against the safetensors release.
+quantization_upstream:
+  format: mxfp4-pack-quantized
+  group_size: 32
+  num_bits: 4
+  applies_to: routed experts only
+  kept_high_precision: [self_attn, shared_experts, dense mlp, lm_head, vision_tower, mm_projector]
+
+# --- Derived optimization-relevant values ---
+# Recomputed from the fork's own sizing functions; see the formulas in the comments.
+derived:
+  # llama-kv-cache.cpp: is_mla() -> K cache only, has_v = false.
+  # bytes/token = n_full_attn_layers * gguf_key_length * sizeof(type_k)
+  #             = 24 * 576 * 2 = 27648  (f16/bf16 KV)
+  mla_kv_bytes_per_token: 27648
+  mla_kv_gib:
+    ctx_4k: 0.106
+    ctx_32k: 0.844
+    ctx_128k: 3.375
+    ctx_256k: 6.750
+    ctx_1m: 27.000
+  # llama-hparams.cpp n_embd_s = head_dim^2 * n_head = 128*128*96 = 1572864
+  #                   n_embd_r = 3 * (d_conv-1) * n_head*head_dim = 3*3*12288 = 110592
+  # per KDA layer per sequence, f32: (1572864 + 110592) * 4 = 6733824 B
+  kda_state_bytes_per_seq_per_layer: 6733824
+  kda_state_mib_per_seq: 443      # * 69 layers
+  # The KV+state cost is trivial next to the weights: the whole 1M-token budget is
+  # ~27 GiB, i.e. the interesting memory pressure is expert residency, not KV.
+  routed_expert_up_shape: [3584, 3072]
+  routed_expert_down_shape: [3072, 3584]
+
+# What llama.cpp must have to load this at all — the reason the BASELINE is a fork,
+# not upstream ggml-org/llama.cpp.
+baseline_requirements:
+  - LLAMA_MAX_EXPERTS >= 896 (fork sets 1024; upstream 512 -> assert fails at load)
+  - LLM_ARCH_KIMI_K3 graph (KDA + MLA hybrid, situ, latent MoE, attn residual, MLA output gate)
+  - graph_max_nodes = max(n_tokens*160, 64*n_tensors); the generic n_tokens*40 budget
+    is exhausted at ubatch 3840
+  - PROJECTOR_TYPE_KIMIK3 + clip.vision.attention.head_dim for the non-square QKV (vision only)
+
+runtime:
+  sparkinfer_native_decode: false
+  # Nothing in runtime/ loads a kimi-k3 GGUF yet: the loaders are Qwen-shaped
+  # (runtime/src/models/qwen35.cpp, runtime/include/sparkinfer/models/qwen_config.h).
+  # This branch lands the measurable llama.cpp reference FIRST so any native work has
+  # a same-box number to beat.
+  required_work:
+    - kimi_k3_gguf_loader              # 93 layers, per-layer KDA/MLA layout, 896 experts
+    - kda_linear_attention_decode      # full-rank gate, conv state, f32 recurrent state
+    - mla_nope_decode_with_output_gate
+    - latent_moe_expert_dispatch       # routed experts at 3584, not 7168
+    - situ_activation
+    - cross_layer_attn_residual        # block_size 12
+    - multi_gpu_weight_sharding        # 553 GiB does not fit one card at any quant

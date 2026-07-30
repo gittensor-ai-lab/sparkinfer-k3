@@ -3,6 +3,71 @@
 Notable changes to sparkinfer. Format loosely follows [Keep a Changelog](https://keepachangelog.com);
 versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkinfer/releases).
 
+## [Unreleased] — `kimi-k3` branch
+
+Lands the **Kimi K3 evaluation baseline** on 8× H200. Baseline half only: sparkinfer has no
+`kimi-k3` loader yet, so this branch adds nothing to the runtime and changes no existing verdict.
+It exists so native K3 work is scored against a pinned, same-box, third-party-reproducible
+reference instead of a claim. Details: [`docs/kimi-k3-baseline.md`](docs/kimi-k3-baseline.md).
+
+### The baseline engine is a fork — necessarily
+
+Kimi K3 has **896 routed experts**. Upstream `ggml-org/llama.cpp` asserts
+`n_expert <= LLAMA_MAX_EXPERTS` (512) and **cannot load the model at all**, so there is no
+upstream number to compare against. The reference is `unslothai/llama.cpp` PR #48
+(`kimi-k3-fullsize-vision`, `efc8bc38`) on top of `kimi-k3-text-base` (`cf67f0d2`), pinned as
+`KIMI_K3_LLAMACPP_{REPO,REF,COMMIT,BASE_COMMIT}` in `bench/scripts/reference.lock`.
+
+Load-bearing pieces of the fork: `LLAMA_MAX_EXPERTS 1024`; the `LLM_ARCH_KIMI_K3` graph
+(hybrid KDA + MLA, `situ` activation, latent MoE, cross-layer attention residual, MLA output
+gate, full-rank KDA gate); `graph_max_nodes = max(n_tokens*160, 64*n_tensors)` because the
+shared `*40` budget dies at ubatch 3840; and PR #48 making `expert_latent_length`,
+`attn_res.block_size` and both `situ` betas **required** KV keys rather than silent defaults.
+
+### Added
+
+- `bench/scripts/kimi_k3_baseline.sh` — builds the pinned fork for sm_90, verifies the 14-shard
+  GGUF, sweeps `llama-bench` decode + prefill at 128/512/4k/32k, writes JSON to `bench/results/`.
+  `--dry-run` prints the full plan with no network and no GPU.
+- `bench/scripts/kimi_k3_reference_server.sh` — accuracy reference for `accuracy_compare.py`,
+  with the two mandatory K3 flags: `--no-context-shift` (hybrid recurrent arch — llama.cpp
+  can't context-shift or restore slots, so a long eval dies mid-run) and `--no-jinja` (the gate
+  posts raw token ids; a chat template would prepend tokens the candidate never saw).
+- `bench/scripts/_kimi_k3.sh` — quant/shard/flag definitions. Sourcing it is the single act
+  that switches the baseline engine to the fork, so the Qwen evals keep the upstream pin and no
+  fork commit can leak into their verdicts. Uses a separate `.llamacpp-k3` checkout so the two
+  pins don't fight over one tree.
+- `bench/configs/models/kimi_k3.yaml` — full arch spec, every field traced to
+  `moonshotai/Kimi-K3/config.json` or the fork's `conversion/kimi_k3.py` / `src/models/kimi-k3.cpp`.
+- `bench/configs/h200_sxm.yaml`, `bench/configs/targets/kimi_k3_ud_iq1s_h200x8.yaml`.
+- `bench/scripts/test_kimi_k3_baseline.py` — 35 tests, no GPU or weights required.
+
+### Changed
+
+- `_common.sh`: `LLAMACPP_REF` lets the builder pin a fork/PR head (GitHub refuses fetch-by-sha
+  there) and then **asserts** the ref resolves to `LLAMACPP_COMMIT` — a force-push fails the run
+  instead of silently moving the baseline. Adds `LLAMACPP_EXTRA_TARGETS`, `gpu_count`,
+  `gpu_vram_gib_total`, and `ensure_model_split` / `verify_model_split` for multi-shard weights.
+- `gen_eval_prompt.py`: new `--gguf` backend tokenizes via `llama-tokenize` (opened `vocab_only`).
+  K3 ships a tiktoken vocab, not `tokenizer.json`, so `Tokenizer.from_file` has nothing to load.
+  The `tokenizer.json` path is untouched; `tokenizers` is now imported lazily.
+
+### Guardrails, not conveniences
+
+- `kimi_k3_check_fits` **refuses** to run when the weights + 40 GiB headroom exceed visible HBM.
+  UD-IQ1_S is 553 GiB; a silently half-offloaded baseline is not reproducible and not accepted.
+- Every measured slot ships **unset**: `KIMI_K3_LLAMA_*` are `0` in `reference.lock` and every
+  sparkinfer slot in the target YAML is `null`. Downstream, a hand-filled baseline is
+  indistinguishable from a measured one.
+
+### Known limits
+
+H200 is Hopper (`sm_90`); `kernels/` targets Blackwell `sm_120`/`sm_121`, so a source build
+compiles but no sm_90 path is tuned. Hopper has no FP4 tensor core, so K3's MXFP4/1–2-bit expert
+GEMMs dequantize before the MMA — llama.cpp takes the same path, so the comparison is fair, but
+the ceiling is lower than on Blackwell. No vision baseline yet (`mmproj` and `llama-mtmd-cli` are
+wired up, but there's no image benchmark). **No numbers measured** — the sweep has not been run.
+
 ## [0.4.4] — 2026-07-28
 
 sparkinfer lands **DFlash block-diffusion speculative decode** for Qwen3.6-35B-A3B — the first

@@ -1,0 +1,116 @@
+# Benchmark target: Kimi K3 UD-IQ1_S GGUF on 8x H200 SXM.
+#
+# This target defines the EVALUATION BASELINE only. sparkinfer has no kimi-k3 loader
+# yet (see bench/configs/models/kimi_k3.yaml -> runtime.required_work), so every
+# sparkinfer slot below is null and the numbers that get filled first are llama.cpp's.
+#
+# Baseline engine: unslothai/llama.cpp @ kimi-k3-fullsize-vision (PR #48), pinned in
+# bench/scripts/reference.lock. Upstream ggml-org/llama.cpp cannot load this model —
+# 896 experts exceeds its LLAMA_MAX_EXPERTS.
+
+model:    configs/models/kimi_k3.yaml
+hardware: configs/h200_sxm.yaml
+quant:    ud_iq1_s
+
+weights:
+  hf_repo: unsloth/Kimi-K3-GGUF
+  # 14 shards; point llama.cpp at shard 00001 and it pulls the rest.
+  first_shard: UD-IQ1_S/Kimi-K3-UD-IQ1_S-00001-of-00014.gguf
+  n_shards: 14
+  size_gb: 594.0
+  size_gib: 553.2
+  mmproj: mmproj-BF16.gguf      # vision tower; text-only eval does not need it
+  # Reported quality vs the lossless UD-Q8_K_XL reference (unsloth's own measurement):
+  reported_top1_agree_pct: 78.875
+  reported_ppl: 2.5789
+  reported_mean_kld: 0.5645
+
+# Alternative quants on the same node, for reference. UD-Q2_K_XL is the accuracy/size
+# knee (90.4% top-1) and also fits; Q8 does not.
+alt_quants:
+  ud_q2_k_xl:
+    size_gib: 802.0
+    fits_in_hbm: true
+    reported_top1_agree_pct: 90.390
+  ud_q8_k_xl:
+    size_gib: 1453.0
+    fits_in_hbm: false
+
+memory_budget_gib:
+  hbm_total: 1051
+  weights: 553.2
+  # 24 MLA layers * 576 * 2 B/token = 27648 B/token, K only (MLA stores no V cache).
+  kv_at_32k: 0.84
+  kv_at_128k: 3.38
+  kv_at_256k: 6.75
+  kv_at_1m: 27.00
+  # 69 KDA layers * (128*128*96 + 3*3*96*128) * 4 B, per sequence.
+  kda_recurrent_state_per_seq: 0.43
+  # graph_max_nodes = max(n_tokens*160, 64*n_tensors) — the fork raises this for K3
+  # specifically; compute buffers scale with ubatch, so keep -ub modest at first.
+  headroom_at_1m: 470
+
+decode:
+  batch_sizes: [1]
+  eval_sweep: [128, 512, 4096, 32768]
+  probe_candidates: [131072, 262144, 524288, 1048576]
+  dtype: bfloat16
+
+  # llama.cpp reference, tok/s, 3-rep median, same GGUF + same node.
+  # null = NOT MEASURED. Do not fill these by hand — kimi_k3_baseline.sh writes them
+  # and the measured values get pinned into reference.lock.
+  llama_toks_per_sec:
+    bs1_ctx128: null
+    bs1_ctx512: null
+    bs1_ctx4k: null
+    bs1_ctx32k: null
+
+  # sparkinfer native decode: no loader exists yet.
+  sparkinfer_toks_per_sec:
+    bs1_ctx128: null
+    bs1_ctx512: null
+    bs1_ctx4k: null
+    bs1_ctx32k: null
+
+prefill:
+  eval_sweep: [4096, 32768]
+  llama_pp_toks_per_sec:
+    ctx4k: null
+    ctx32k: null
+  sparkinfer_pp_toks_per_sec:
+    ctx4k: null
+    ctx32k: null
+
+# Sampling params Moonshot specifies for K3. K3 is thinking-only: preserve_thinking is
+# always on and there is no instant mode, so a chat-shaped eval must not strip reasoning
+# traces. The teacher-forced accuracy gate is greedy and unaffected by these.
+sampling:
+  default:
+    temperature: 1.0
+    top_p: 0.95
+  agentic:
+    temperature: 1.0
+    top_p: 1.0
+  reasoning_effort: [low, high, max]
+  max_context: 1048576
+
+llama_cpp_flags:
+  # 93 layers; -ngl 99 is enough to offload everything.
+  n_gpu_layers: 99
+  split_mode: layer
+  # Hybrid recurrent arch: context shift and slot restore are not supported, so the
+  # reference server must run with --no-context-shift or it will fail mid-eval.
+  no_context_shift: true
+  flash_attn: auto
+  # Conservative first-run batch; the *160 node budget is sized for large ubatch but
+  # compute buffers are per-GPU. Raise once a run is known to fit.
+  n_batch: 2048
+  n_ubatch: 512
+
+runtime:
+  sparkinfer_native_decode: false
+  required_work:
+    - kimi_k3_gguf_loader
+    - sm90_kernel_path              # kernels/ targets Blackwell; H200 is sm_90
+    - multi_gpu_weight_sharding
+    - llama_cpp_same_gguf_baseline_128_512_4k_32k

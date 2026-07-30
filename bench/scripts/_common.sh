@@ -15,6 +15,14 @@ LLAMACPP_DIR="${LLAMACPP_DIR:-$ROOT/.llamacpp}"   # override to reuse an existin
 _HERE_COMMON="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [ -f "$_HERE_COMMON/reference.lock" ] && source "$_HERE_COMMON/reference.lock"
 LLAMACPP_REPO="${LLAMACPP_REPO:-https://github.com/ggml-org/llama.cpp}"
+# Some frontier models are only loadable by a FORK, because upstream rejects them outright
+# (Kimi K3: 896 experts vs upstream's LLAMA_MAX_EXPERTS). LLAMACPP_REF names the ref to fetch
+# when the pinned commit is not reachable by sha alone — a PR head (refs/pull/48/head) or a
+# branch. LLAMACPP_COMMIT stays the thing we verify, so the pin is still exact.
+LLAMACPP_REF="${LLAMACPP_REF:-}"
+# Extra targets to build alongside llama-bench + llama-server (e.g. llama-mtmd-cli for the
+# vision path, llama-tokenize when a model has no HF tokenizer.json).
+LLAMACPP_EXTRA_TARGETS="${LLAMACPP_EXTRA_TARGETS:-}"
 sha256_of() { sha256sum "$1" 2>/dev/null | awk '{print $1}'; }
 
 # compute capability -> CUDA arch (12.0 -> 120). RTX 5090 / PRO 6000 = 120, Spark/Thor = 121.
@@ -27,6 +35,24 @@ detect_arch() {
   else
     echo "$cc"
   fi
+}
+
+# Number of visible GPUs (respects CUDA_VISIBLE_DEVICES, which is how a multi-GPU eval box
+# gets partitioned). 1 when nvidia-smi is absent, so single-GPU callers are unaffected.
+gpu_count() {
+  local n
+  if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
+    n="$(awk -F, '{print NF}' <<<"$CUDA_VISIBLE_DEVICES")"
+  else
+    n="$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | wc -l | tr -d ' ')"
+  fi
+  [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -gt 0 ] && echo "$n" || echo 1
+}
+
+# Total HBM across the visible GPUs, in GiB (integer, floored).
+gpu_vram_gib_total() {
+  nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null \
+    | awk '{s+=$1} END{printf "%d", s/1024}' || echo 0
 }
 
 # Bare-metal SSH boxes often install nvcc outside default PATH (non-interactive ssh).
@@ -192,9 +218,25 @@ ensure_llamacpp() {  # $1 = arch ; builds llama-bench + llama-server, pinned + t
       rm -rf "$LLAMACPP_DIR"; mkdir -p "$LLAMACPP_DIR"
       git -C "$LLAMACPP_DIR" init -q
       git -C "$LLAMACPP_DIR" remote add origin "$LLAMACPP_REPO"
-      git -C "$LLAMACPP_DIR" fetch -q --depth 1 origin "$LLAMACPP_COMMIT" >&2 || {
-        echo ">> FATAL: cannot fetch pinned llama commit $LLAMACPP_COMMIT" >&2; return 1; }
+      # Fetch-by-sha only works when the server allows it (uploadpack.allowReachableSHA1InWant).
+      # GitHub does not for PR heads on forks, so fall back to fetching LLAMACPP_REF and then
+      # verifying it resolves to the pinned sha — the pin is still exact either way.
+      if ! git -C "$LLAMACPP_DIR" fetch -q --depth 1 origin "$LLAMACPP_COMMIT" >&2; then
+        [ -n "$LLAMACPP_REF" ] || {
+          echo ">> FATAL: cannot fetch pinned llama commit $LLAMACPP_COMMIT (set LLAMACPP_REF for fork/PR heads)" >&2
+          return 1; }
+        echo ">> fetch-by-sha refused; fetching ref $LLAMACPP_REF from $LLAMACPP_REPO ..." >&2
+        git -C "$LLAMACPP_DIR" fetch -q --depth 1 origin "$LLAMACPP_REF" >&2 || {
+          echo ">> FATAL: cannot fetch $LLAMACPP_REF from $LLAMACPP_REPO" >&2; return 1; }
+      fi
       git -C "$LLAMACPP_DIR" checkout -q FETCH_HEAD
+      local got_sha
+      got_sha="$(git -C "$LLAMACPP_DIR" rev-parse HEAD 2>/dev/null)"
+      if [ "$got_sha" != "$LLAMACPP_COMMIT" ]; then
+        echo ">> FATAL: llama.cpp ref moved — $LLAMACPP_REF is now $got_sha, pinned $LLAMACPP_COMMIT." >&2
+        echo ">>        A force-pushed PR branch means the baseline changed; re-pin reference.lock deliberately." >&2
+        return 1
+      fi
       rm -rf "$bdir"
     fi
   else
@@ -231,9 +273,73 @@ ensure_llamacpp() {  # $1 = arch ; builds llama-bench + llama-server, pinned + t
       return 1
     fi
   fi
+  for t in $LLAMACPP_EXTRA_TARGETS; do
+    [ -x "$bdir/bin/$t" ] && continue
+    echo ">> building $t ..." >&2
+    if ! cmake --build "$bdir" -j1 --target "$t" 2>&1 \
+          | tee -a /tmp/llama_build.log | awk 'NR<=5 || NR%20==0 || /Built target|error:|FAILED|fatal error/' >&2; then
+      echo ">> FATAL: $t build failed" >&2
+      grep -iE 'error:|fatal error:' /tmp/llama_build.log | tail -20 >&2 || tail -40 /tmp/llama_build.log >&2
+      return 1
+    fi
+  done
   [ -x "$bench" ] && [ -x "$srv" ] || { echo ">> FATAL: llama binaries missing after build" >&2; return 1; }
   sha256_of "$bench" > "$sentinel" 2>/dev/null || true
   echo ">> llama.cpp reference ready ($(git -C "$LLAMACPP_DIR" rev-parse --short HEAD 2>/dev/null))" >&2
+}
+
+# ---- multi-shard GGUF baselines ----
+# ensure_model_split <hf_repo> <dest_dir> <include_glob> <first_shard_relpath> [n_shards]
+# Frontier-scale weights ship as N shards; llama.cpp takes shard 1 and finds the rest. The
+# single-file ensure_model/verify_model above cannot express that, and a partial download
+# looks like a load failure rather than a missing file, so verify the count explicitly.
+ensure_model_split() {
+  local repo="$1" dest="$2" glob="$3" first="$4" want="${5:-0}" have
+  mkdir -p "$dest"
+  # Count siblings by the shard-family prefix: strip the "-00001-of-00014.gguf" tail, NOT just
+  # the last dash-field (that leaves "...-00001-of" and only ever matches shard 1).
+  local base prefix
+  base="$(basename "$first")"
+  prefix="${base%%-[0-9][0-9][0-9][0-9][0-9]-of-*}"
+  _count_shards() {
+    find "$dest" -name "${prefix}-*-of-*.gguf" 2>/dev/null | wc -l | tr -d ' '
+  }
+  have="$(_count_shards)"
+  if [ ! -f "$dest/$first" ] || { [ "$want" -gt 0 ] && [ "$have" -lt "$want" ]; }; then
+    echo ">> downloading $repo ($glob) -> $dest ..." >&2
+    HF_HUB_DISABLE_XET=1 hf download "$repo" --local-dir "$dest" --include "$glob" >&2 || {
+      echo ">> FATAL: shard download failed for $repo ($glob)" >&2; return 1; }
+    have="$(_count_shards)"
+  fi
+  [ -f "$dest/$first" ] || { echo ">> FATAL: missing first shard $dest/$first" >&2; return 1; }
+  if [ "$want" -gt 0 ] && [ "$have" -ne "$want" ]; then
+    echo ">> FATAL: expected $want shards, found $have in $dest — incomplete download" >&2; return 1
+  fi
+  echo ">> shards present: $have" >&2
+}
+
+# verify_model_split <dir> <first_shard_relpath> <manifest_file>
+# C2 for sharded weights. manifest_file holds "<sha256>  <basename>" lines. Missing or empty
+# manifest = warn-only (compute + log), matching verify_model's unpinned behaviour.
+verify_model_split() {
+  local dir="$1" first="$2" manifest="$3" bad=0 got want base
+  local shard_dir; shard_dir="$(dirname "$dir/$first")"
+  if [ ! -s "$manifest" ]; then
+    echo ">> shard sha256 (not pinned, warn-only):" >&2
+    for f in "$shard_dir"/*.gguf; do echo "   $(sha256_of "$f")  $(basename "$f")" >&2; done
+    return 0
+  fi
+  while read -r want base; do
+    [ -z "$want" ] && continue
+    case "$want" in \#*) continue ;; esac
+    got="$(sha256_of "$shard_dir/$base")"
+    if [ "$got" != "$want" ]; then
+      echo ">> WARN: shard sha256 MISMATCH $base (got ${got:-none}, want $want)" >&2; bad=1
+    fi
+  done < "$manifest"
+  [ "$bad" = 0 ] && { echo ">> shard sha256 OK" >&2; return 0; }
+  echo ">> FATAL: baseline weights do not match the pinned manifest — refusing to score" >&2
+  return 1
 }
 
 # ---- prebuilt binaries (GitHub release) with source-build fallback ----
