@@ -185,10 +185,19 @@ struct Builder {
         mm(i, true, "k_proj", blk(i, "attn_k.weight"), H, qkv);
         mm(i, true, "v_proj", blk(i, "attn_v.weight"), H, qkv);
 
+        // conv1d weight is [d_conv, 1, d_inner] (or a 4-D form with a trailing 1 that
+        // quantization squeezes) per the reference's create_tensor call. ne0/ne1/ne2
+        // are (kda_conv_kernel, 1, qkv) either way — GGUFTensor defaults unlisted dims
+        // to 1, so the 3-D/4-D difference only shows up on ne3, which is not checked
+        // here. Pinned via pin3 right after each op() call, since op() (unlike mm())
+        // does not set expect_ne* itself.
         op(K3Op::KdaConvStep, i, true, "conv_q", qkv, qkv, blk(i, "ssm_conv1d_q.weight"),
            "depthwise causal, silu after");
+        pin3(cfg.kda_conv_kernel, 1, qkv);
         op(K3Op::KdaConvStep, i, true, "conv_k", qkv, qkv, blk(i, "ssm_conv1d_k.weight"));
+        pin3(cfg.kda_conv_kernel, 1, qkv);
         op(K3Op::KdaConvStep, i, true, "conv_v", qkv, qkv, blk(i, "ssm_conv1d_v.weight"));
+        pin3(cfg.kda_conv_kernel, 1, qkv);
 
         op(K3Op::L2NormHeads, i, true, "l2_qk", qkv, qkv, "", "per-head L2 on q and k");
 

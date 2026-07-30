@@ -390,12 +390,14 @@ int main() {
                   idx_fb < idx_dt && idx_dt < idx_gate,
               "order is f_b -> dt_bias -> decay_gate, matching the reference dataflow");
 
-        // Still genuinely unpinned: the conv1d weight's exact axis layout (3-D vs 4-D
-        // storage, trailing dim of 1 possibly squeezed) has ambiguity a naive pin
-        // could get wrong, so it stays reported rather than asserted.
+        // PINNED: GGUFTensor defaults unlisted dims to 1, so the reference's 3-D vs
+        // 4-D conv1d storage (trailing 1 squeezed or not) is identical on ne0..ne2 —
+        // there was no real ambiguity here, just an earlier overcautious guess.
         auto conv = first.find("blk.5.ssm_conv1d_q.weight");
-        check(conv != first.end() && conv->second->expect_ne0 == 0,
-              "ssm_conv1d_q is still UNPINNED (axis-order ambiguity, not yet resolved)");
+        check(conv != first.end() && conv->second->expect_ne0 == cfg.kda_conv_kernel &&
+                  conv->second->expect_ne1 == 1 &&
+                  conv->second->expect_ne2 == cfg.n_q_heads * cfg.kda_head_dim,
+              "ssm_conv1d_q pins [kda_conv_kernel, 1, qkv]");
 
         // A 1-D norm asserts its width and nothing else — pinning ne1 on a 1-D tensor
         // would fail against every real file, where ne1 is 1.
