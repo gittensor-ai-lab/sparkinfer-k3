@@ -2,9 +2,9 @@
 
 # SP⚡RKINFER-K3 · Powered by SN74
 
-**Kimi K3 inference. 2.8T parameters, one node.**
+**Kimi K3 inference. 2.8T parameters, 1M context, one node.**
 
-Kimi K3 is the largest open-weight model anyone can actually run: **2.8T total parameters**, hybrid KDA + MLA attention, **896 routed experts**, 1M context, native vision. SparkInfer-K3 is the runtime track for that model class — where the bottleneck stops being one card's bandwidth and becomes expert residency across eight. Continuously optimized by competition at **[SN74 on Gittensor](https://gittensor.io/miners/repository?name=gittensor-ai-lab%2Fsparkinfer)** and **Kernel Design Agents**.
+Kimi K3 is the largest open-weight model anyone can actually run: **2.8T total parameters**, hybrid KDA + MLA attention, **896 routed experts**, 1M context, native vision. SparkInfer-K3 is the runtime track for that model class — where the bottleneck stops being one card's bandwidth and becomes expert residency across the node. Target: **UD-Q2_K_XL at the full 1M context**, on H200 → B200 → B300. Continuously optimized by competition at **[SN74 on Gittensor](https://gittensor.io/miners/repository?name=gittensor-ai-lab%2Fsparkinfer)** and **Kernel Design Agents**.
 
 > **Fewer models. Deeper optimization. Faster evolution.**
 
@@ -14,11 +14,13 @@ This repo currently contains **the measuring stick, not the runtime.**
 
 | | |
 |---|---|
-| ✅ **Evaluation baseline** | Pinned llama.cpp reference, sharded-weight verification, accuracy reference server, 35 tests |
+| ✅ **Evaluation baseline** | Pinned llama.cpp reference, 19-shard verification, accuracy reference server, 58 tests |
 | ✅ **Architecture spec** | Every hparam traced to `config.json` or the reference implementation's source |
-| ❌ **Native K3 runtime** | No `kimi-k3` GGUF loader. `runtime/` loaders are Qwen-shaped |
-| ❌ **sm_90 kernel path** | `kernels/` targets Blackwell `sm_120`/`sm_121`; H200 is Hopper |
-| ❌ **Measured numbers** | The sweep has not been run on hardware. Every reference slot ships `0`/`null` |
+| ✅ **Node + fit model** | H200/B200/B300 profiles, context-aware fits-in-HBM refusal, per-node reference slots |
+| ❌ **Native K3 runtime** | No `kimi-k3` GGUF loader. `runtime/` loaders are Qwen-shaped — M2 work |
+| ❌ **Tuned kernel path** | `kernels/` targets `sm_120`/`sm_121`; the milestone nodes are `sm_90`/`sm_100`/`sm_103` |
+| ❌ **Vision** | `llama-mtmd-cli` + `mmproj` wired up, no image benchmark — M4 work |
+| ❌ **Measured numbers** | No sweep has run on hardware. Every reference slot ships `0`/`null` |
 
 Nothing here claims a speedup, because nothing here has been measured yet. That is deliberate: a baseline you can't reproduce is worse than no baseline. Full detail in [`docs/kimi-k3-baseline.md`](docs/kimi-k3-baseline.md).
 
@@ -58,57 +60,79 @@ Four things in that fork are load-bearing, not cosmetic:
 
 Because the pin is a PR head on a fork, GitHub refuses fetch-by-sha. The harness fetches the ref and then **asserts** it resolves to the pinned commit, so a force-push **fails the run** instead of quietly moving the baseline.
 
-## Hardware · 8× H200 SXM
+## The target · UD-Q2_K_XL at 1M context
 
-The smallest useful K3 quant is **553 GiB**. That fits no Blackwell edge card, and no eight of them. 8× H200 SXM (141 GB each, 1051 GiB total) is the smallest node that holds the weights entirely in HBM — a hard requirement, since a partially-offloaded baseline isn't reproducible.
+One quant, one context, three nodes. **UD-Q2_K_XL (802 GiB)** is the target because 90.4% top-1 against the lossless reference is the accuracy knee — UD-IQ1_S is 249 GiB smaller but drops to 78.9%, which is too lossy to be the thing an optimization frontier is judged on.
 
-| quant | GiB | fits 8× H200 | top-1 vs lossless |
-|---|---:|---|---:|
-| **UD-IQ1_S** | **553** | ✅ default | 78.9% |
-| UD-IQ1_M | 604 | ✅ | 81.2% |
-| UD-IQ2_XXS | 662 | ✅ | 84.1% |
-| **UD-Q2_K_XL** | **802** | ✅ accuracy knee | 90.4% |
-| UD-Q8_K_XL | 1453 | ❌ | lossless |
+| quant | GiB | shards | 8× H200 | 8× B200 | 4× B300 | top-1 vs lossless |
+|---|---:|---:|:-:|:-:|:-:|---:|
+| UD-IQ1_S | 553 | 14 | ✅ | ✅ | ✅ | 78.9% |
+| UD-IQ1_M | 604 | 15 | ✅ | ✅ | ✅ | 81.2% |
+| UD-IQ2_XXS | 662 | 16 | ✅ | ✅ | ✅ | 84.1% |
+| **UD-Q2_K_XL** | **802** | **19** | ✅ | ✅ | ✅ | **90.4%** |
+| UD-Q4_K_XL | 1407 | 32 | ❌ | ❌ | 8× only | — |
+| UD-Q8_K_XL | 1453 | 34 | ❌ | ❌ | 8× only | lossless |
 
-Two caveats stated plainly, because they cap the ceiling:
+✅ = fits with the full **1,048,576**-token KV cache resident. All weights in HBM is a hard requirement — a partially-offloaded baseline isn't reproducible, so `kimi_k3_check_fits` **refuses** to run one.
 
-- **H200 is Hopper (`sm_90`), not Blackwell.** The CMake arch list includes 90, so a source build compiles — but no sm_90 kernel path is tuned. Treat any future SparkInfer number on this node as untuned until that work lands.
-- **Hopper has no FP4 tensor core.** K3's routed experts ship as MXFP4 and the useful GGUFs are 1–2 bit, so every low-bit expert GEMM dequantizes before the MMA. llama.cpp takes the same path, so the comparison is *fair* — the ceiling is simply lower than on Blackwell.
+| node | per-GPU | total | arch | headroom @ 1M |
+|---|---:|---:|---|---:|
+| **M1** 8× H200 SXM | 141 GB | 1128 GiB | `sm_90` Hopper | 274 GiB |
+| **M2** 8× B200 SXM | 180 GB | 1440 GiB | `sm_100` Blackwell | 586 GiB |
+| **M3** 4× B300 | 288 GB | 1152 GiB | `sm_103`* Ultra | 298 GiB |
 
-### Memory budget · UD-IQ1_S
+\* **`sm_103` is unverified here.** `detect_arch` reads `compute_cap` at run time and wins, so a wrong label mis-files a result but doesn't mis-build. The CMake arch list is `89;90;100;120;121` — no 103 — and it is deliberately *not* added pre-emptively, because an arch the installed toolkit doesn't recognise breaks configure for every other node. Confirm on first contact, then add it.
+
+### Memory budget · UD-Q2_K_XL
 
 Derived from the reference implementation's own sizing functions, not estimated:
 
 | item | size |
 |---|---:|
-| weights | 553 GiB |
+| weights | 802 GiB |
 | MLA KV @ 32k | 0.84 GiB |
 | MLA KV @ 128k | 3.38 GiB |
 | MLA KV @ **1M** | **27.0 GiB** |
 | KDA recurrent state | 0.43 GiB / sequence |
-| headroom @ 1M | ~470 GiB |
+| compute buffers (allowance) | 24 GiB |
+| **total @ 1M** | **~854 GiB** |
 
-**KV is not the constraint.** 24 MLA layers × 576 × 2 B = 27,648 B/token, K-only (MLA allocates no V cache), so the entire 1M-token budget is 27 GiB. The pressure on this model is expert residency and compute buffers — which is where a native runtime has to win.
+**KV is not the constraint.** 24 MLA layers × 576 × 2 B = 27,648 B/token, K-only (MLA allocates no V cache), so the entire 1M-token budget is 27 GiB — 3% of the weights. The pressure on this model is expert residency and compute buffers, which is where a native runtime has to win.
+
+The fit check prices context in rather than assuming flat headroom, which is what lets it tell you that 8× B200 holds UD-Q4_K_XL at 32k but *not* at 1M — and that 4× H200 can't hold even UD-IQ1_S once compute buffers are counted, despite 553 < 564.
+
+### Why Blackwell is a milestone, not a footnote
+
+**Hopper has no FP4 tensor core.** K3's routed experts ship as MXFP4 (group size 32, 4-bit) and the target GGUF is 2-bit, so on M1 every low-bit expert GEMM must dequantize to bf16 before the MMA. llama.cpp does the same on every backend, so the M1 comparison is *fair* — but removing that dequant is the M2/M3 opportunity, and it can't be measured until there's an M1 number to measure against.
 
 ## Quickstart
 
-On the 8× H200 node — the scripts detect arch, build the pinned reference for `sm_90`, fetch the 14 shards, and refuse to run if the weights won't fit in HBM:
+The scripts detect arch and GPU count, build the pinned reference, fetch the 19 shards, and refuse to run if the weights plus the 1M KV cache won't fit in HBM:
 
 ```bash
-export KIMI_K3_MODELS_DIR=/workspace/models_k3     # needs ~600 GiB free
-export PRIMARY_QUANT=UD-IQ1_S                      # or UD-Q2_K_XL for the accuracy knee
+export KIMI_K3_MODELS_DIR=/workspace/models_k3     # needs ~900 GiB free
 
 # plan the whole run — no network, no GPU, no weights
-bench/scripts/kimi_k3_baseline.sh --dry-run
+bench/scripts/kimi_k3_baseline.sh --node h200x8 --dry-run
 
-# fetch + build + sweep decode/prefill at 128 / 512 / 4k / 32k
-bench/scripts/kimi_k3_baseline.sh --download
+# M1: fetch + build + sweep decode/prefill at 128 / 512 / 4k / 32k
+bench/scripts/kimi_k3_baseline.sh --node h200x8 --download
+
+# ...then close the milestone by probing 128k / 256k / 1M (1 rep — a 1M prefill is
+# minutes per rep, so it's a capability probe, not a median)
+bench/scripts/kimi_k3_baseline.sh --node h200x8 --longctx
+
+# M2 / M3 are the same command against a different node
+bench/scripts/kimi_k3_baseline.sh --node b200x8 --download --longctx
+bench/scripts/kimi_k3_baseline.sh --node b300x4 --download --longctx
 
 # accuracy reference for accuracy_compare.py
 bench/scripts/kimi_k3_reference_server.sh --ctx 8704
 ```
 
-Results land in `bench/results/`. Tests need no GPU: `python3 bench/scripts/test_kimi_k3_baseline.py`.
+`--node` picks the `reference.lock` prefix (`KIMI_K3_H200X8_LLAMA_*` and friends), so **M1/M2/M3 cannot overwrite each other's reference** — they run the same quant at the same context, so the node is the only variable and a shared slot would conflate them. It also warns when the detected box doesn't match the claimed profile.
+
+Results land in `bench/results/`. Tests need no GPU: `python3 bench/scripts/test_kimi_k3_baseline.py` (58 tests).
 
 K3 ships a **tiktoken vocab, not `tokenizer.json`**, so eval prompt ids come from the GGUF itself via `gen_eval_prompt.py --gguf` — strictly more correct than a side-loaded tokenizer, and cheap (`vocab_only`, metadata not weights).
 
@@ -127,23 +151,44 @@ Miner workflow: [`docs/miner-guide.md`](docs/miner-guide.md).
 
 ## Roadmap
 
-### Milestone 1 · Now — a reference nobody can dispute
+Same model, same quant, same 1M context throughout. M1–M3 change **only the node**, so each delta is attributable to hardware rather than to a moving target. M4 is the one capability milestone.
 
-- Pinned fork baseline, sharded-weight verification, fits-in-HBM refusal — **landed**
-- Run the sweep on 8× H200 and pin the measured decode/prefill numbers — **pending hardware**
-- Vision baseline via `llama-mtmd-cli` + `mmproj` (wired up, no image benchmark yet)
+### M1 · 8× H200 · 1M context — a reference nobody can dispute
 
-### Milestone 2 · Next — load it natively
+`KIMI_K3_NODE=h200x8` · [`targets/kimi_k3_ud_q2kxl_h200x8.yaml`](bench/configs/targets/kimi_k3_ud_q2kxl_h200x8.yaml)
 
-- `kimi-k3` GGUF loader: 93 layers, per-layer KDA/MLA layout, 896 experts
-- KDA linear-attention decode — full-rank gate, conv state, f32 recurrent state
-- MLA NoPE decode with output gate · latent MoE expert dispatch · `situ` · attn residual
-- Multi-GPU weight sharding — 553 GiB fits no single card at any quant
+- Pinned fork baseline, 19-shard verification, context-aware fits-in-HBM refusal — **landed**
+- Sweep 8× H200 and pin measured decode/prefill at 128/512/4k/32k — **pending hardware**
+- Prove 1M context loads and decodes with all weights in HBM (`--longctx`)
 
-### Milestone 3 · Then — beat the reference
+### M2 · 8× B200 · 1M context — the Blackwell delta
 
-- `sm_90` kernel path, then the same correctness-first eval loop the Qwen frontier uses
-- Expert residency and compute-buffer pressure, not KV, is the target
+`KIMI_K3_NODE=b200x8` · [`targets/kimi_k3_ud_q2kxl_b200x8.yaml`](bench/configs/targets/kimi_k3_ud_q2kxl_b200x8.yaml)
+
+- Like-for-like H200 → B200 on identical weights: how much of K3's cost *is* the FP4 dequant
+- Native FP4 expert GEMM on `sm_100` vs llama.cpp's dequant-then-MMA
+- At 1.8 TB/s NVLink5 (2× H200), is sharding experts rather than layers worth it
+- First native work lands here: `kimi-k3` GGUF loader, KDA decode, MLA NoPE + output gate, latent MoE dispatch, `situ`, cross-layer attn residual, multi-GPU sharding
+
+### M3 · 4×+ B300 · 1M context — fewer, fatter GPUs
+
+`KIMI_K3_NODE=b300x4` · [`targets/kimi_k3_ud_q2kxl_b300x4.yaml`](bench/configs/targets/kimi_k3_ud_q2kxl_b300x4.yaml)
+
+- 288 GB/GPU means **four** cards hold it where M1/M2 need eight — ~23 layers each, not ~12
+- Does the reduced NVLink traffic beat the coarser MLA-heavy/KDA-heavy split imbalance?
+- Confirm `compute_cap`, correct the arch label, and only then add it to the CMake arch list
+- Stretch: at 8× B300 (2304 GiB) the lossless UD-Q8_K_XL fits — an **in-repo** quality reference instead of citing published figures
+
+### M4 · Vision — MoonViT-3d
+
+[`targets/kimi_k3_vision_m4.yaml`](bench/configs/targets/kimi_k3_vision_m4.yaml)
+
+Runs on whichever node is available; the tower is 27 layers at 1024 wide, so it doesn't change the fit maths. `llama-mtmd-cli` and the `mmproj` GGUF are already wired up — the missing piece is the benchmark.
+
+- Image-encode latency and output-token count vs resolution (both dynamic for this projector)
+- Image-prompt logit agreement against the reference on identical weights
+- A text-only regression guard: loading the `mmproj` must not move the M1–M3 numbers
+- Deferred: MMMU-Pro / MathVision scored evals, and the video path — correctness before quality
 
 ## Layout & scoring
 
@@ -162,19 +207,23 @@ Miner workflow: [`docs/miner-guide.md`](docs/miner-guide.md).
 
 ## Build
 
-Requires **CUDA Toolkit 12.8+**. H200 is `sm_90`:
+Requires **CUDA Toolkit 12.8+**. Pick the arch for your milestone node:
 
 ```bash
-cmake -B build -DCMAKE_CUDA_ARCHITECTURES=90
+cmake -B build -DCMAKE_CUDA_ARCHITECTURES=90    # M1  H200   Hopper
+cmake -B build -DCMAKE_CUDA_ARCHITECTURES=100   # M2  B200   Blackwell datacenter
+cmake -B build -DCMAKE_CUDA_ARCHITECTURES=103   # M3  B300   Blackwell Ultra — see caveat
 cmake --build build -j
 ctest --test-dir build
 ```
+
+The default arch list in `CMakeLists.txt` is `89;90;100;120;121`. **103 is not in it**, and adding it requires a toolkit that recognises the target — otherwise configure fails for every node, not just B300. Confirm with `nvidia-smi --query-gpu=compute_cap --format=csv,noheader` before you add it.
 
 The baseline scripts build the pinned llama.cpp reference themselves into `.llamacpp-k3/` — a separate checkout from the upstream pin, so the two references never fight over one tree.
 
 ## Automated evaluation
 
-Correctness for K3 is **agreement with the reference on identical weights** — nothing else. There is no second independent K3 implementation, and UD-IQ1_S's own top-1 against full precision is 78.9%, so absolute quality numbers are meaningless.
+Correctness for K3 is **agreement with the reference on identical weights** — nothing else. There is no second independent K3 implementation, and even the target quant's own top-1 against full precision is 90.4%, so absolute quality numbers are meaningless. (M3's stretch goal — UD-Q8_K_XL on 8× B300 — would give this repo its first *in-house* lossless reference, instead of citing published figures.)
 
 Two reference-server flags are mandatory, not tuning:
 

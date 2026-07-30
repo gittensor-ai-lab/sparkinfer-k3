@@ -311,7 +311,15 @@ ensure_model_split() {
       echo ">> FATAL: shard download failed for $repo ($glob)" >&2; return 1; }
     have="$(_count_shards)"
   fi
-  [ -f "$dest/$first" ] || { echo ">> FATAL: missing first shard $dest/$first" >&2; return 1; }
+  # Accept shard 1 under whatever "-of-NNNNN" it actually carries. The caller may have had
+  # to guess the total before the download (kimi_k3_first_shard's off-disk fallback), and a
+  # guessed total that doesn't match reality must not read as a missing file.
+  if [ ! -f "$dest/$first" ]; then
+    local found
+    found="$(find "$dest" -name "${prefix}-00001-of-*.gguf" 2>/dev/null | sort | head -1)"
+    [ -n "$found" ] || { echo ">> FATAL: missing first shard ${prefix}-00001-of-*.gguf in $dest" >&2; return 1; }
+    echo ">> first shard resolved to ${found#"$dest/"} (caller expected ${first})" >&2
+  fi
   if [ "$want" -gt 0 ] && [ "$have" -ne "$want" ]; then
     echo ">> FATAL: expected $want shards, found $have in $dest — incomplete download" >&2; return 1
   fi

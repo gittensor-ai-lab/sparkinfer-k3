@@ -1,0 +1,88 @@
+# NVIDIA B200 SXM benchmark profile — 8-GPU node. Milestone 2.
+#
+# First Blackwell datacenter node in this repo, and the first one where the kernels in
+# kernels/ are architecturally in-family: they target sm_120/sm_121 (Blackwell consumer /
+# edge), B200 is sm_100 (Blackwell datacenter). Same generation, DIFFERENT target — sm_120
+# kernels do not run on sm_100 unmodified and the tensor-core/TMA shapes differ. The
+# CMake arch list already carries 100, so a build compiles; tuning is still M2 work.
+#
+# The reason M2 exists: Blackwell has native FP4 tensor cores. K3's routed experts ship as
+# MXFP4 and the target GGUF is 2-bit, so on Hopper (M1) every low-bit expert GEMM has to
+# dequantize before the MMA. On B200 that dequant step is the thing to remove.
+
+hardware:
+  name: B200 SXM 180GB
+  arch: sm_100
+  gpu_count: 8
+  # nvidia-smi reports ~184320 MiB per B200 SXM. gpu_vram_gib_total() is the authority.
+  vram_gb_per_gpu: 180
+  vram_gib_total: 1440
+  bandwidth_tbps_per_gpu: 8.0
+  bandwidth_tbps_aggregate: 64.0
+  interconnect: nvlink5         # NVSwitch on an HGX/DGX B200 baseboard; 1.8 TB/s per GPU
+  tensor_cores_gen: 5           # Blackwell 5th-gen
+  fp8_native: true
+  fp4_native: true
+
+quantization_notes:
+  mxfp4_tensor_core: true
+  # THE M2 OPPORTUNITY: K3's experts are natively MXFP4 (group_size 32, 4-bit) and the
+  # 2-bit GGUF is close to it. llama.cpp dequantizes to bf16 before the MMA on every
+  # backend, so a native FP4 expert-GEMM path is a genuine gap rather than a micro-opt.
+  low_bit_path: native_fp4_mma_available
+  llama_cpp_path: dequantize_to_bf16_then_mma
+
+topology:
+  split_mode: layer
+  tensor_split: auto
+  main_gpu: 0
+  # 1.8 TB/s NVLink5 per GPU vs 900 GB/s on H200 — expert dispatch across the layer split
+  # is roughly half as expensive here, which changes whether sharding experts (rather than
+  # layers) is worth it. Worth re-measuring, not assuming.
+  nvlink_gbps_per_gpu: 1800
+
+# Fit at the milestone target: 802 GiB weights + 27 GiB KV @ 1M + ~25 GiB compute/state
+# = ~854 GiB of 1440 GiB. ~586 GiB spare — the most comfortable of the three nodes, and
+# enough that UD-Q4_K_XL (1407 GiB) is nearly in reach at short context.
+fits:
+  target_quant: UD-Q2_K_XL
+  target_context: 1048576
+  weights_gib: 802
+  kv_gib_at_target: 27
+  headroom_gib: 586
+
+attention:
+  batch_sizes: [1, 4, 16, 64, 256]
+  context_lens: [4096, 32768, 131072, 262144, 1048576]
+  dtype: bfloat16
+
+moe:
+  token_counts: [1, 16, 64, 256, 1024]
+  num_experts: [896]
+  top_k: [16]
+  hidden_dim: 7168
+  ffn_dim: 3072
+  latent_dim: 3584
+  dtype: bfloat16
+  expert_paging: false
+
+gemm:
+  shapes:
+    - [1, 7168, 7168]
+    - [16, 7168, 7168]
+    - [256, 7168, 7168]
+    - [4096, 7168, 7168]
+    - [1, 3584, 3072]           # latent expert up
+    - [1, 3072, 3584]           # latent expert down
+  dtype: bfloat16
+
+model_targets:
+  - name: Kimi K3 UD-Q2_K_XL
+    gib: 802
+    fits_at_1m: true            # milestone target
+  - name: Kimi K3 UD-Q4_K_XL
+    gib: 1407
+    fits_at_1m: false           # 1407 + 27 + 25 > 1440; fits at short context only
+  - name: Kimi K3 UD-Q8_K_XL
+    gib: 1453
+    fits_at_1m: false

@@ -78,36 +78,133 @@ class ForkPinTest(unittest.TestCase):
         self.assertIn(PINNED_COMMIT, lock)
         self.assertIn("KIMI_K3_LLAMACPP_BASE_COMMIT", lock)
 
-    def test_baselines_start_unmeasured(self):
+    def test_baselines_start_unmeasured_for_every_node(self):
         # A hand-filled baseline is indistinguishable from a measured one downstream, so
-        # the lock must ship zeros until kimi_k3_baseline.sh has actually run.
-        for var in ("KIMI_K3_LLAMA_128", "KIMI_K3_LLAMA_512",
-                    "KIMI_K3_LLAMA_4K", "KIMI_K3_LLAMA_32K",
-                    "KIMI_K3_LLAMA_4K_PP", "KIMI_K3_LLAMA_32K_PP"):
-            self.assertEqual(bash(f'echo "${var}"'), "0", var)
+        # the lock must ship zeros until kimi_k3_baseline.sh has actually run — and it must
+        # ship a SEPARATE set per node, or M2 silently overwrites M1's reference.
+        for node in ("H200X8", "B200X8", "B300X4"):
+            for suffix in ("128", "512", "4K", "32K", "1M", "4K_PP", "32K_PP", "1M_PP"):
+                var = f"KIMI_K3_{node}_LLAMA_{suffix}"
+                self.assertEqual(bash(f'echo "${var}"'), "0", var)
+
+    def test_lock_prefix_matches_node(self):
+        for node, want in (("h200x8", "KIMI_K3_H200X8_LLAMA_"),
+                           ("b200x8", "KIMI_K3_B200X8_LLAMA_"),
+                           ("b300x4", "KIMI_K3_B300X4_LLAMA_")):
+            out = subprocess.run(
+                ["bash", str(SCRIPTS / "kimi_k3_baseline.sh"), "--node", node, "--dry-run"],
+                capture_output=True, text=True, cwd=ROOT)
+            self.assertEqual(out.returncode, 0, out.stderr[-2000:])
+            self.assertIn(want, out.stdout, node)
 
 
 class ShardPathTest(unittest.TestCase):
-    def test_default_quant_and_first_shard(self):
-        self.assertEqual(bash("kimi_k3_quant"), "UD-IQ1_S")
+    # Shard counts as published in unsloth/Kimi-K3-GGUF. Pinned, not discovered — an
+    # interrupted download must fail loudly rather than look complete.
+    PUBLISHED = {"UD-IQ1_S": (14, 553), "UD-IQ1_M": (15, 604), "UD-IQ2_XXS": (16, 662),
+                 "UD-Q2_K_XL": (19, 802), "UD-Q4_K_XL": (32, 1407), "UD-Q8_K_XL": (34, 1453)}
+
+    def test_target_quant_is_q2kxl(self):
+        # UD-Q2_K_XL is the accuracy knee (90.4% top-1). UD-IQ1_S is 249 GiB smaller but
+        # 78.9% top-1 — too lossy to judge an optimization frontier on.
+        self.assertEqual(bash("kimi_k3_quant"), "UD-Q2_K_XL")
         self.assertEqual(bash("kimi_k3_first_shard"),
-                         "UD-IQ1_S/Kimi-K3-UD-IQ1_S-00001-of-00014.gguf")
-        self.assertEqual(bash("kimi_k3_n_shards"), "14")
-        self.assertEqual(bash("kimi_k3_include_glob"), "*UD-IQ1_S*")
+                         "UD-Q2_K_XL/Kimi-K3-UD-Q2_K_XL-00001-of-00019.gguf")
+        self.assertEqual(bash("kimi_k3_n_shards"), "19")
+        self.assertEqual(bash("kimi_k3_include_glob"), "*UD-Q2_K_XL*")
+        self.assertEqual(bash("kimi_k3_size_gib"), "802")
+
+    def test_every_published_quant_resolves(self):
+        for q, (shards, gib) in self.PUBLISHED.items():
+            env = {"PRIMARY_QUANT": q}
+            self.assertEqual(bash("kimi_k3_n_shards", env), str(shards), q)
+            self.assertEqual(bash("kimi_k3_size_gib", env), str(gib), q)
+            self.assertEqual(bash("kimi_k3_first_shard", env),
+                             f"{q}/Kimi-K3-{q}-00001-of-{shards:05d}.gguf", q)
 
     def test_quant_override_changes_every_derived_path(self):
-        env = {"PRIMARY_QUANT": "UD-Q2_K_XL"}
-        self.assertEqual(bash("kimi_k3_quant", env), "UD-Q2_K_XL")
-        self.assertEqual(bash("kimi_k3_include_glob", env), "*UD-Q2_K_XL*")
-        self.assertEqual(bash("kimi_k3_size_gib", env), "802")
-        self.assertTrue(bash("kimi_k3_manifest", env).endswith("kimi_k3_ud_q2_k_xl.sha256"))
+        env = {"PRIMARY_QUANT": "UD-IQ1_S"}
+        self.assertEqual(bash("kimi_k3_include_glob", env), "*UD-IQ1_S*")
+        self.assertTrue(bash("kimi_k3_manifest", env).endswith("kimi_k3_ud_iq1_s.sha256"))
 
     def test_manifest_name_matches_quant(self):
-        self.assertTrue(bash("kimi_k3_manifest").endswith("kimi_k3_ud_iq1_s.sha256"))
+        self.assertTrue(bash("kimi_k3_manifest").endswith("kimi_k3_ud_q2_k_xl.sha256"))
 
     def test_gguf_path_joins_models_dir(self):
         got = bash("kimi_k3_gguf", {"KIMI_K3_MODELS_DIR": "/mnt/w"})
-        self.assertEqual(got, "/mnt/w/UD-IQ1_S/Kimi-K3-UD-IQ1_S-00001-of-00014.gguf")
+        self.assertEqual(got, "/mnt/w/UD-Q2_K_XL/Kimi-K3-UD-Q2_K_XL-00001-of-00019.gguf")
+
+
+class NodeProfileTest(unittest.TestCase):
+    """M1/M2/M3 run the same quant at the same context, so the node is the only variable —
+    a shared reference slot would silently conflate them."""
+
+    EXPECTED = {"h200x8": (90, 8, 1128), "b200x8": (100, 8, 1440), "b300x4": (103, 4, 1152)}
+
+    def test_default_node_is_m1(self):
+        self.assertEqual(bash("kimi_k3_node"), "h200x8")
+
+    def test_each_profile(self):
+        for node, (arch, gpus, gib) in self.EXPECTED.items():
+            env = {"KIMI_K3_NODE": node}
+            self.assertEqual(bash("kimi_k3_node_arch", env), str(arch), node)
+            self.assertEqual(bash("kimi_k3_node_gpus", env), str(gpus), node)
+            self.assertEqual(bash("kimi_k3_node_gib", env), str(gib), node)
+
+    def test_b300_arch_is_overridable(self):
+        # sm_103 is unverified; detect_arch wins at run time, but the profile's expectation
+        # must be correctable without editing the script.
+        env = {"KIMI_K3_NODE": "b300x4", "KIMI_K3_B300_ARCH": "100"}
+        self.assertEqual(bash("kimi_k3_node_arch", env), "100")
+
+    def test_unknown_node_warns_but_does_not_fail(self):
+        env = {"KIMI_K3_NODE": "nonsense"}
+        self.assertEqual(bash_rc("kimi_k3_check_node", env), 0)
+
+    def test_every_target_config_declares_its_node(self):
+        tdir = ROOT / "bench" / "configs" / "targets"
+        for node, milestone in (("h200x8", "M1"), ("b200x8", "M2"), ("b300x4", "M3")):
+            f = tdir / f"kimi_k3_ud_q2kxl_{node}.yaml"
+            self.assertTrue(f.exists(), f)
+            text = f.read_text()
+            self.assertIn(f"milestone: {milestone}", text)
+            self.assertIn(f"node:     {node}", text)
+            # every hardware milestone is a 1M-context milestone
+            self.assertIn("max_context: 1048576", text)
+            self.assertIn("kv_at_1m: 27.00", text)
+
+    def test_m4_is_a_capability_not_a_node(self):
+        text = (ROOT / "bench" / "configs" / "targets" / "kimi_k3_vision_m4.yaml").read_text()
+        self.assertIn("milestone: M4", text)
+        self.assertIn("node:     any", text)
+        # the deliverable is the benchmark that does not exist yet
+        self.assertIn("benchmark_exists: false", text)
+
+    def test_superseded_iq1s_target_is_gone(self):
+        # Two files each claiming to be "the target" is how a stale reference gets scored.
+        self.assertFalse((ROOT / "bench" / "configs" / "targets"
+                          / "kimi_k3_ud_iq1s_h200x8.yaml").exists())
+
+
+class ContextBudgetTest(unittest.TestCase):
+    """All three hardware milestones target 1M context, so the fit check has to price the
+    KV cache in rather than assume a flat headroom."""
+
+    def test_kv_gib_scales_with_context(self):
+        # 24 MLA layers * 576 * 2 B = 27648 B/token, K only.
+        for ctx, want in ((32768, 1), (131072, 4), (262144, 7), (1048576, 27)):
+            self.assertEqual(int(bash(f"kimi_k3_kv_gib {ctx}")), want, ctx)
+
+    def test_default_max_ctx_is_1m(self):
+        self.assertEqual(bash('echo "$KIMI_K3_MAX_CTX"'), "1048576")
+
+    def test_headroom_includes_kv_at_1m(self):
+        # 27 GiB KV + 24 GiB compute buffers + 1 GiB state
+        self.assertEqual(int(bash("kimi_k3_headroom_gib")), 52)
+
+    def test_lower_max_ctx_shrinks_headroom(self):
+        got = int(bash("kimi_k3_headroom_gib", {"KIMI_K3_MAX_CTX": "32768"}))
+        self.assertEqual(got, 26)   # 1 + 24 + 1
 
 
 class LlamaFlagTest(unittest.TestCase):
@@ -130,7 +227,7 @@ class LlamaFlagTest(unittest.TestCase):
 
 
 class FitCheckTest(unittest.TestCase):
-    """A 553 GiB model on a too-small node silently half-offloads and yields a
+    """An 802 GiB model on a too-small node silently half-offloads and yields a
     non-reproducible baseline. The precheck must refuse, not warn."""
 
     def _with_fake_smi(self, total_mib_per_gpu: int, n_gpu: int, env=None):
@@ -152,38 +249,99 @@ class FitCheckTest(unittest.TestCase):
             e.update(env)
         return e
 
-    def test_8x_h200_fits_iq1s(self):
-        env = self._with_fake_smi(144384, 8)         # 141 GiB-ish x 8 ~= 1128 GiB
+    # Target is 802 GiB + 52 GiB headroom at 1M ctx = 854 GiB needed.
+    H200 = 144384   # MiB per GPU, 141 GB
+    B200 = 184320   # 180 GB
+    B300 = 294912   # 288 GB
+
+    def test_m1_8x_h200_fits_target_at_1m(self):
+        env = self._with_fake_smi(self.H200, 8, {"KIMI_K3_NODE": "h200x8"})   # 1128 GiB
         self.assertEqual(bash_rc("kimi_k3_check_fits", env), 0)
         self.assertEqual(bash("gpu_count", env), "8")
 
-    def test_4x_h200_rejects_iq1s(self):
-        env = self._with_fake_smi(144384, 4)         # ~564 GiB < 553 + 40 headroom
+    def test_m2_8x_b200_fits_target_at_1m(self):
+        env = self._with_fake_smi(self.B200, 8, {"KIMI_K3_NODE": "b200x8"})   # 1440 GiB
+        self.assertEqual(bash_rc("kimi_k3_check_fits", env), 0)
+
+    def test_m3_4x_b300_fits_target_at_1m(self):
+        # The whole point of M3: FOUR GPUs hold it, where M1/M2 need eight.
+        env = self._with_fake_smi(self.B300, 4, {"KIMI_K3_NODE": "b300x4"})   # 1152 GiB
+        self.assertEqual(bash_rc("kimi_k3_check_fits", env), 0)
+
+    def test_4x_h200_rejects_target(self):
+        env = self._with_fake_smi(self.H200, 4)      # ~564 GiB < 854
         self.assertEqual(bash_rc("kimi_k3_check_fits", env), 1)
 
-    def test_8x_h200_rejects_q8(self):
-        env = self._with_fake_smi(144384, 8, {"PRIMARY_QUANT": "UD-Q8_K_XL"})
+    def test_2x_b300_rejects_target(self):
+        env = self._with_fake_smi(self.B300, 2)      # ~576 GiB < 854
+        self.assertEqual(bash_rc("kimi_k3_check_fits", env), 1)
+
+    def test_8x_h200_rejects_q8_at_1m(self):
+        env = self._with_fake_smi(self.H200, 8, {"PRIMARY_QUANT": "UD-Q8_K_XL"})
+        self.assertEqual(bash_rc("kimi_k3_check_fits", env), 1)
+
+    def test_8x_b300_accepts_q8_at_1m(self):
+        # 2304 GiB — the M3 stretch goal: a lossless in-repo reference.
+        env = self._with_fake_smi(self.B300, 8, {"PRIMARY_QUANT": "UD-Q8_K_XL"})
+        self.assertEqual(bash_rc("kimi_k3_check_fits", env), 0)
+
+    def test_8x_b200_rejects_q4_at_1m_but_accepts_at_32k(self):
+        # 1407 + 52 = 1459 > 1440 at 1M; 1407 + 26 = 1433 < 1440 at 32k. The context-aware
+        # headroom is what makes this distinction possible at all.
+        base = {"PRIMARY_QUANT": "UD-Q4_K_XL", "KIMI_K3_NODE": "b200x8"}
+        self.assertEqual(bash_rc("kimi_k3_check_fits", self._with_fake_smi(self.B200, 8, base)), 1)
+        at32k = {**base, "KIMI_K3_MAX_CTX": "32768"}
+        self.assertEqual(bash_rc("kimi_k3_check_fits", self._with_fake_smi(self.B200, 8, at32k)), 0)
+
+    def test_smaller_quant_rescues_an_undersized_node(self):
+        # 5x H200 (705 GiB) can't hold the 802 GiB target, but holds IQ1_S (553 + 26 = 579).
+        small = {"PRIMARY_QUANT": "UD-IQ1_S", "KIMI_K3_MAX_CTX": "32768"}
+        self.assertEqual(bash_rc("kimi_k3_check_fits", self._with_fake_smi(self.H200, 5, small)), 0)
+        self.assertEqual(bash_rc("kimi_k3_check_fits", self._with_fake_smi(self.H200, 5)), 1)
+
+    def test_4x_h200_cannot_hold_even_iq1s(self):
+        # 564 GiB vs 553 GiB weights leaves 11 GiB — less than the compute buffers alone.
+        # Worth asserting: "553 < 564 so it fits" is the exact mistake the context-aware
+        # headroom exists to prevent.
+        env = self._with_fake_smi(self.H200, 4, {"PRIMARY_QUANT": "UD-IQ1_S",
+                                                 "KIMI_K3_MAX_CTX": "32768"})
         self.assertEqual(bash_rc("kimi_k3_check_fits", env), 1)
 
     def test_cuda_visible_devices_narrows_gpu_count(self):
-        env = self._with_fake_smi(144384, 8)
+        env = self._with_fake_smi(self.H200, 8)
         env["CUDA_VISIBLE_DEVICES"] = "0,1,2"
         self.assertEqual(bash("gpu_count", env), "3")
 
     def test_detects_sm90(self):
-        env = self._with_fake_smi(144384, 8)
+        env = self._with_fake_smi(self.H200, 8)
         self.assertEqual(bash("detect_arch", env), "90")
 
 
 class BaselineDryRunTest(unittest.TestCase):
-    def test_dry_run_needs_no_gpu_or_weights(self):
+    def _dry(self, *args):
         out = subprocess.run(
-            ["bash", str(SCRIPTS / "kimi_k3_baseline.sh"), "--dry-run"],
+            ["bash", str(SCRIPTS / "kimi_k3_baseline.sh"), "--dry-run", *args],
             capture_output=True, text=True, cwd=ROOT)
         self.assertEqual(out.returncode, 0, out.stderr[-2000:])
-        self.assertIn("Kimi-K3-UD-IQ1_S-00001-of-00014.gguf", out.stdout)
-        self.assertIn("--split-mode layer", out.stdout)
-        self.assertIn(PINNED_COMMIT, out.stdout + out.stderr)
+        return out.stdout
+
+    def test_dry_run_needs_no_gpu_or_weights(self):
+        out = self._dry()
+        self.assertIn("Kimi-K3-UD-Q2_K_XL-00001-of-00019.gguf", out)
+        self.assertIn("--split-mode layer", out)
+        self.assertIn("802 GiB + 52 GiB headroom", out)
+        self.assertIn(PINNED_COMMIT, out)
+
+    def test_longctx_probe_is_opt_in(self):
+        # A 1M-token prefill is minutes per rep, so it must not be in the default sweep —
+        # but every hardware milestone requires it, so it has to be one flag away.
+        self.assertNotIn("1048576  (reps=1", self._dry())
+        self.assertIn("1048576", self._dry("--longctx"))
+
+    def test_node_flag_overrides_profile(self):
+        out = self._dry("--node", "b300x4")
+        self.assertIn("4x+ B300", out)
+        self.assertIn(">=4 GPU(s)", out)
 
     def test_rejects_unknown_args(self):
         out = subprocess.run(
@@ -342,12 +500,20 @@ class ArchConfigTest(unittest.TestCase):
                     "situ_beta: 4.0", "situ_linear_beta: 25.0"):
             self.assertIn(key, self.text)
 
-    def test_target_declares_no_native_runtime(self):
-        target = (ROOT / "bench" / "configs" / "targets"
-                  / "kimi_k3_ud_iq1s_h200x8.yaml").read_text()
-        self.assertIn("sparkinfer_native_decode: false", target)
-        # Every sparkinfer slot must be null, not a guess.
-        self.assertNotIn("bs1_ctx128: 0", target)
+    def test_targets_declare_no_native_runtime(self):
+        tdir = ROOT / "bench" / "configs" / "targets"
+        for node in ("h200x8", "b200x8", "b300x4"):
+            target = (tdir / f"kimi_k3_ud_q2kxl_{node}.yaml").read_text()
+            self.assertIn("sparkinfer_native_decode: false", target, node)
+            # Every sparkinfer slot must be null, not a guess.
+            self.assertNotIn("bs1_ctx128: 0", target, node)
+
+    def test_hardware_profiles_exist_for_every_node(self):
+        cdir = ROOT / "bench" / "configs"
+        for f in ("h200_sxm.yaml", "b200_sxm.yaml", "b300.yaml"):
+            self.assertTrue((cdir / f).exists(), f)
+        # B300's arch is a guess and must say so, or a mislabelled result looks authoritative.
+        self.assertIn("arch_verified: false", (cdir / "b300.yaml").read_text())
 
 
 if __name__ == "__main__":

@@ -1,0 +1,139 @@
+# M3 — Kimi K3 UD-Q2_K_XL on a 4+ GPU B300 node, full 1M context.
+#
+# Milestone 3 of 4. 288 GB per GPU means FOUR B300s (1152 GiB) hold the target quant at 1M
+# context, where M1 and M2 need eight. Halving the fan-out changes the shape of the problem
+# — fewer, fatter layer shards and fewer NVLink hops per expert dispatch — so whether
+# 4x288 beats 8x180 on decode is an open measurement, not a foregone conclusion.
+#
+# ⚠ sm_103 is UNVERIFIED here. See bench/configs/b300.yaml for what must be confirmed on
+# first contact (compute_cap, and adding 103 to the CMake arch list only once a toolkit
+# that knows the target is installed).
+#
+#   KIMI_K3_NODE=b300x4 PRIMARY_QUANT=UD-Q2_K_XL bench/scripts/kimi_k3_baseline.sh --download
+
+milestone: M3
+node:     b300x4
+model:    configs/models/kimi_k3.yaml
+hardware: configs/b300.yaml
+quant:    ud_q2_k_xl
+
+weights:
+  hf_repo: unsloth/Kimi-K3-GGUF
+  shard_glob: "UD-Q2_K_XL/Kimi-K3-UD-Q2_K_XL-*.gguf"
+  size_gb: 861.3
+  size_gib: 802.0
+  mmproj: mmproj-BF16.gguf      # M4 only
+  reported_top1_agree_pct: 90.390
+  reported_ppl: 1.7359
+  reported_mean_kld: 0.1779
+
+# At 8x B300 (2304 GiB) the lossless UD-Q8_K_XL fits with the full 1M context. That would
+# make same-node quant-vs-quant quality measurement possible for the first time in this
+# repo — every accuracy number so far is vs unsloth's published figures, not ours.
+alt_quants:
+  ud_q4_k_xl:
+    size_gib: 1407.0
+    fits_at_1m_4gpu: false
+    fits_at_1m_8gpu: true
+  ud_q8_k_xl:
+    size_gib: 1453.0
+    fits_at_1m_4gpu: false
+    fits_at_1m_8gpu: true
+    note: lossless reference on the same node — M3 stretch goal
+
+memory_budget_gib:
+  hbm_total_4gpu: 1152          # 288 GB x 4
+  hbm_total_8gpu: 2304
+  weights: 802.0
+  kv_at_32k: 0.84
+  kv_at_128k: 3.38
+  kv_at_256k: 6.75
+  kv_at_1m: 27.00
+  kda_recurrent_state_per_seq: 0.43
+  compute_buffers_allowance: 24
+  total_at_1m: 854
+  headroom_at_1m_4gpu: 298
+  headroom_at_1m_8gpu: 1450
+
+topology:
+  # 93 layers over 4 GPUs is ~23 each vs ~12 over 8. Coarser shards make the balance between
+  # the 24 MLA layers (all the KV cache) and the 69 KDA layers (all the recurrent state)
+  # harder for llama.cpp's byte-proportional split to get right — worth checking -ts by hand
+  # here even though M1/M2 deliberately do not.
+  gpu_count_min: 4
+  layers_per_gpu_at_4: 23
+  layers_per_gpu_at_8: 12
+  split_mode: layer
+  tensor_split: auto            # but verify the per-GPU balance in the load log
+
+decode:
+  batch_sizes: [1]
+  eval_sweep: [128, 512, 4096, 32768]
+  longctx_probe: [131072, 262144, 1048576]
+  dtype: bfloat16
+  llama_toks_per_sec:
+    bs1_ctx128: null
+    bs1_ctx512: null
+    bs1_ctx4k: null
+    bs1_ctx32k: null
+    bs1_ctx1m: null
+  sparkinfer_toks_per_sec:
+    bs1_ctx128: null
+    bs1_ctx512: null
+    bs1_ctx4k: null
+    bs1_ctx32k: null
+    bs1_ctx1m: null
+
+prefill:
+  eval_sweep: [4096, 32768]
+  longctx_probe: [131072, 1048576]
+  llama_pp_toks_per_sec:
+    ctx4k: null
+    ctx32k: null
+    ctx1m: null
+  sparkinfer_pp_toks_per_sec:
+    ctx4k: null
+    ctx32k: null
+    ctx1m: null
+
+m3_questions:
+  - does 4x288 GB beat 8x180 GB on decode, or does the coarser layer split lose more than
+    the reduced NVLink traffic gains
+  - is a hand-tuned -ts needed at 23 layers/GPU to balance MLA-heavy against KDA-heavy shards
+  - at 8 GPUs, can UD-Q8_K_XL serve as an in-repo lossless reference for quant quality
+
+exit_criteria:
+  - 1M context loads and decodes on 4x B300 with all weights in HBM
+  - compute_cap confirmed and the arch label corrected if sm_103 is wrong
+  - decode + prefill medians pinned in reference.lock at 128/512/4k/32k
+  - 4-GPU vs 8-GPU split compared on the same node
+
+sampling:
+  default:
+    temperature: 1.0
+    top_p: 0.95
+  agentic:
+    temperature: 1.0
+    top_p: 1.0
+  reasoning_effort: [low, high, max]
+  max_context: 1048576
+
+llama_cpp_flags:
+  n_gpu_layers: 99
+  split_mode: layer
+  no_context_shift: true
+  no_mmap: true
+  flash_attn: auto
+  n_batch: 2048
+  n_ubatch: 512
+
+runtime:
+  sparkinfer_native_decode: false
+  required_work:
+    - kimi_k3_gguf_loader
+    - sm103_kernel_path             # arch unverified; confirm before building natively
+    - native_fp4_expert_gemm
+    - multi_gpu_weight_sharding
+    - four_gpu_layer_balance        # MLA-heavy vs KDA-heavy shards at 23 layers/GPU
+    - llama_cpp_same_gguf_baseline_128_512_4k_32k
+    - kv_cache_at_1m_context

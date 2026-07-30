@@ -69,7 +69,7 @@ QWEN36_LLAMA_16K_PP="${QWEN36_LLAMA_16K_PP:-0}"
 QWEN36_LLAMA_32K_PP="${QWEN36_LLAMA_32K_PP:-0}"
 
 # ---------------------------------------------------------------------------------------
-# Kimi K3 (2.8T / A50B) baseline — 8x H200 SXM, UD-IQ1_S.
+# Kimi K3 (2.8T / A50B) baseline — UD-Q2_K_XL at 1M context across three nodes.
 #
 # The reference engine here is a FORK, not ggml-org/llama.cpp. That is not a convenience:
 # K3 has 896 routed experts and upstream asserts n_expert <= LLAMA_MAX_EXPERTS (512), so
@@ -94,22 +94,57 @@ KIMI_K3_LLAMACPP_COMMIT="${KIMI_K3_LLAMACPP_COMMIT:-efc8bc38f0a9950cbb10ccef2cf4
 #   efc8bc38  MoonViT-3d vision tower (non-square fused QKV, RMSNorm, post-norm projector)
 KIMI_K3_LLAMACPP_BASE_COMMIT="${KIMI_K3_LLAMACPP_BASE_COMMIT:-cf67f0d24511864d2d3da0769108fd6fc16d00d1}"
 
+# Target quant is UD-Q2_K_XL (802 GiB, 90.4% top-1 vs lossless) — the accuracy knee.
+# UD-IQ1_S is 249 GiB smaller but drops to 78.9% top-1, too lossy to judge a frontier on.
 # Sharded weights are pinned by manifest file, not a single sha — see
-# bench/scripts/kimi_k3_ud_iq1_s.sha256 (absent = warn-only, matching MODEL_SHA256).
+# bench/scripts/kimi_k3_ud_q2_k_xl.sha256 (absent = warn-only, matching MODEL_SHA256).
 
-# llama.cpp decode tok/s, 8x H200 SXM, UD-IQ1_S, median of 3, all layers on GPU.
-# 0 = NOT MEASURED. kimi_k3_baseline.sh writes these; do not hand-fill them.
-KIMI_K3_LLAMA_128="${KIMI_K3_LLAMA_128:-0}"
-KIMI_K3_LLAMA_512="${KIMI_K3_LLAMA_512:-0}"
-KIMI_K3_LLAMA_4K="${KIMI_K3_LLAMA_4K:-0}"
-KIMI_K3_LLAMA_32K="${KIMI_K3_LLAMA_32K:-0}"
+# Baselines are pinned PER NODE, not once. The three hardware milestones run the SAME quant
+# at the SAME 1M context, so the node is the only variable and a single set of slots would
+# silently overwrite one milestone's reference with another's. kimi_k3_baseline.sh selects
+# the prefix from KIMI_K3_NODE.
+#
+#   M1  KIMI_K3_H200X8_*   8x H200 SXM   141 GB  sm_90    1128 GiB
+#   M2  KIMI_K3_B200X8_*   8x B200 SXM   180 GB  sm_100   1440 GiB
+#   M3  KIMI_K3_B300X4_*   4x+ B300      288 GB  sm_103   1152 GiB  (arch unverified)
+#
+# 0 = NOT MEASURED. kimi_k3_baseline.sh writes these; do not hand-fill them — downstream a
+# hand-filled baseline is indistinguishable from a measured one. _1M slots are single-rep
+# capability probes, not medians: a 1M-token prefill is minutes of wall-clock per rep.
 
-# llama.cpp prefill pp refs, same box / same GGUF. 0 = NOT MEASURED.
-KIMI_K3_LLAMA_4K_PP="${KIMI_K3_LLAMA_4K_PP:-0}"
-KIMI_K3_LLAMA_32K_PP="${KIMI_K3_LLAMA_32K_PP:-0}"
+# --- M1: 8x H200 SXM (sm_90) ---
+KIMI_K3_H200X8_LLAMA_128="${KIMI_K3_H200X8_LLAMA_128:-0}"
+KIMI_K3_H200X8_LLAMA_512="${KIMI_K3_H200X8_LLAMA_512:-0}"
+KIMI_K3_H200X8_LLAMA_4K="${KIMI_K3_H200X8_LLAMA_4K:-0}"
+KIMI_K3_H200X8_LLAMA_32K="${KIMI_K3_H200X8_LLAMA_32K:-0}"
+KIMI_K3_H200X8_LLAMA_1M="${KIMI_K3_H200X8_LLAMA_1M:-0}"
+KIMI_K3_H200X8_LLAMA_4K_PP="${KIMI_K3_H200X8_LLAMA_4K_PP:-0}"
+KIMI_K3_H200X8_LLAMA_32K_PP="${KIMI_K3_H200X8_LLAMA_32K_PP:-0}"
+KIMI_K3_H200X8_LLAMA_1M_PP="${KIMI_K3_H200X8_LLAMA_1M_PP:-0}"
 
-# sparkinfer has no kimi-k3 loader yet — these stay 0 until runtime/ can load the arch.
-KIMI_K3_SPARKINFER_128="${KIMI_K3_SPARKINFER_128:-0}"
-KIMI_K3_SPARKINFER_512="${KIMI_K3_SPARKINFER_512:-0}"
-KIMI_K3_SPARKINFER_4K="${KIMI_K3_SPARKINFER_4K:-0}"
-KIMI_K3_SPARKINFER_32K="${KIMI_K3_SPARKINFER_32K:-0}"
+# --- M2: 8x B200 SXM (sm_100) ---
+KIMI_K3_B200X8_LLAMA_128="${KIMI_K3_B200X8_LLAMA_128:-0}"
+KIMI_K3_B200X8_LLAMA_512="${KIMI_K3_B200X8_LLAMA_512:-0}"
+KIMI_K3_B200X8_LLAMA_4K="${KIMI_K3_B200X8_LLAMA_4K:-0}"
+KIMI_K3_B200X8_LLAMA_32K="${KIMI_K3_B200X8_LLAMA_32K:-0}"
+KIMI_K3_B200X8_LLAMA_1M="${KIMI_K3_B200X8_LLAMA_1M:-0}"
+KIMI_K3_B200X8_LLAMA_4K_PP="${KIMI_K3_B200X8_LLAMA_4K_PP:-0}"
+KIMI_K3_B200X8_LLAMA_32K_PP="${KIMI_K3_B200X8_LLAMA_32K_PP:-0}"
+KIMI_K3_B200X8_LLAMA_1M_PP="${KIMI_K3_B200X8_LLAMA_1M_PP:-0}"
+
+# --- M3: 4x+ B300 (sm_103, UNVERIFIED — confirm compute_cap on first contact) ---
+KIMI_K3_B300X4_LLAMA_128="${KIMI_K3_B300X4_LLAMA_128:-0}"
+KIMI_K3_B300X4_LLAMA_512="${KIMI_K3_B300X4_LLAMA_512:-0}"
+KIMI_K3_B300X4_LLAMA_4K="${KIMI_K3_B300X4_LLAMA_4K:-0}"
+KIMI_K3_B300X4_LLAMA_32K="${KIMI_K3_B300X4_LLAMA_32K:-0}"
+KIMI_K3_B300X4_LLAMA_1M="${KIMI_K3_B300X4_LLAMA_1M:-0}"
+KIMI_K3_B300X4_LLAMA_4K_PP="${KIMI_K3_B300X4_LLAMA_4K_PP:-0}"
+KIMI_K3_B300X4_LLAMA_32K_PP="${KIMI_K3_B300X4_LLAMA_32K_PP:-0}"
+KIMI_K3_B300X4_LLAMA_1M_PP="${KIMI_K3_B300X4_LLAMA_1M_PP:-0}"
+
+# sparkinfer has no kimi-k3 loader yet (M2/M3 runtime work) — these stay 0 until runtime/
+# can load the arch. Same per-node prefixing applies once they are real.
+KIMI_K3_H200X8_SPARKINFER_128="${KIMI_K3_H200X8_SPARKINFER_128:-0}"
+KIMI_K3_H200X8_SPARKINFER_512="${KIMI_K3_H200X8_SPARKINFER_512:-0}"
+KIMI_K3_H200X8_SPARKINFER_4K="${KIMI_K3_H200X8_SPARKINFER_4K:-0}"
+KIMI_K3_H200X8_SPARKINFER_32K="${KIMI_K3_H200X8_SPARKINFER_32K:-0}"

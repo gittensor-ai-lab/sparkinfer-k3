@@ -3,7 +3,67 @@
 Notable changes to sparkinfer. Format loosely follows [Keep a Changelog](https://keepachangelog.com);
 versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkinfer/releases).
 
-## [Unreleased] — `kimi-k3` branch
+## [Unreleased] — target retargeted to UD-Q2_K_XL @ 1M, four milestones
+
+Repoints the whole repo at **UD-Q2_K_XL (802 GiB, 19 shards, 90.4% top-1)** at the full
+**1,048,576**-token context, and structures the work as four milestones. Still no measured
+numbers on any node.
+
+Why Q2_K_XL and not IQ1_S: 90.4% top-1 against the lossless reference is the accuracy knee.
+IQ1_S is 249 GiB smaller but drops to 78.9% — a 2% kernel win means little next to a
+12-point quality gap in the weights being measured.
+
+| | node | arch | total HBM | headroom @ 1M |
+|---|---|---|---:|---:|
+| **M1** | 8× H200 SXM | `sm_90` Hopper | 1128 GiB | 274 GiB |
+| **M2** | 8× B200 SXM | `sm_100` Blackwell | 1440 GiB | 586 GiB |
+| **M3** | 4×+ B300 | `sm_103` ⚠ unverified | 1152 GiB | 298 GiB |
+| **M4** | vision (any node) | — | — | tower adds ~1 GiB |
+
+M1–M3 change **only the node** — same quant, context and flags — so every delta is
+attributable to hardware rather than a moving target. M4 is the one capability milestone.
+
+### Added
+
+- `bench/configs/b200_sxm.yaml`, `bench/configs/b300.yaml` — M2/M3 hardware profiles. B300
+  carries `arch_verified: false`: `sm_103` is a guess, `detect_arch` wins at run time, and
+  103 is deliberately **not** added to the CMake arch list because an arch the installed
+  toolkit doesn't recognise breaks configure for every node, not just B300.
+- `bench/configs/targets/kimi_k3_ud_q2kxl_{h200x8,b200x8,b300x4}.yaml` — one per hardware
+  milestone, each with its exit criteria and the open questions it exists to answer.
+- `bench/configs/targets/kimi_k3_vision_m4.yaml` — M4. Documents the four MoonViT-3d
+  differences from the K2.5 tower (non-square fused QKV, RMSNorm, bias-free, post-norm
+  projector), each a silent-wrong-output trap rather than a compile error.
+- `--node h200x8|b200x8|b300x4` selects the `reference.lock` prefix and warns when the
+  detected box doesn't match the claimed profile. Per-node prefixes matter *because* M1–M3
+  are otherwise identical: one shared set of slots would conflate three GPU generations.
+- `--longctx` probes 128k/256k/1M at 1 rep, recorded as `"kind": "probe"` not a median — a
+  1M-token prefill is minutes of wall-clock per rep. Opt-in, but required to close a
+  milestone; runs without it print a reminder.
+
+### Changed
+
+- **Default quant is now UD-Q2_K_XL.** Shard counts pinned for all six published quants
+  (14/15/16/19/32/34) rather than discovered, so an interrupted download fails loudly.
+- **The fit check prices context in.** `kimi_k3_headroom_gib` = KV at `KIMI_K3_MAX_CTX`
+  (27 GiB at 1M) + compute buffers + state, replacing a flat 40 GiB. This is what lets it
+  correctly reject UD-Q4_K_XL on 8× B200 at 1M while accepting it at 32k — and reject
+  UD-IQ1_S on 4× H200 despite 553 < 564.
+- `reference.lock` baselines are per-node (`KIMI_K3_H200X8_LLAMA_*` etc.) with `_1M` and
+  `_1M_PP` slots added. All still `0` = not measured.
+- Removed `bench/configs/targets/kimi_k3_ud_iq1s_h200x8.yaml` — two files each claiming to
+  be "the target" is how a stale reference gets scored.
+- Test suite 35 → 58: node profiles, every published quant's shard path, and the fit check
+  at every node/quant/context combination.
+
+### Fixed
+
+- `ensure_model_split` accepts shard 1 under whatever `-of-NNNNN` it actually carries. The
+  caller may have to guess the total before downloading, and a guessed total that didn't
+  match reality read as a missing file — which would have failed every download for a quant
+  whose shard count wasn't pinned.
+
+## [Unreleased] — Kimi K3 evaluation baseline
 
 Lands the **Kimi K3 evaluation baseline** on 8× H200. Baseline half only: sparkinfer has no
 `kimi-k3` loader yet, so this branch adds nothing to the runtime and changes no existing verdict.
