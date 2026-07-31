@@ -436,6 +436,22 @@ void mla_decode_attn_f32(float* out, const float* q, const float* k_cache,
 bool k3_proj_f32(float* y, const float* x, const void* W, int wtype,
                  int N, int K, cudaStream_t stream);
 
+// Four projections that share ONE activation and one [N, K] shape, in a single launch.
+//
+// This is the KDA block's attn_q / attn_k / attn_v / ssm_g, all computed from the same
+// normed hidden state at N=qkv, K=hidden, on all 69 KDA layers of every token. As four
+// separate calls that is four grids each re-reading the same activation.
+//
+// Deliberately narrow — Q8_0 only, all four the same shape, all four pointers non-null.
+// Returns FALSE for anything else so the caller falls back to four ordinary k3_proj_f32
+// calls, rather than this path quietly handling a case it was not written for. Callers
+// must treat false as "use the slow path", not as an error.
+//
+// Bit-identical to four separate k3_proj_f32 calls.
+bool k3_proj_f32_x4(float* y0, float* y1, float* y2, float* y3, const float* x,
+                    const void* W0, const void* W1, const void* W2, const void* W3,
+                    int wtype, int N, int K, cudaStream_t stream);
+
 // llama.cpp's CPU mul_mat does not multiply quantised weights by the original f32
 // activation. It first converts the activation to the weight type's vec_dot_type:
 // Q8_0 weights use block_q8_0 activations, while IQ1_S/IQ2_XS use block_q8_K.
