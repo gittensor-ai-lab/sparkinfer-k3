@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SparkInfer-K3 — Kimi K3 on 8× H200</title>
+<meta name="description" content="Kimi K3 (2.8T params, 896 experts) inference on one 8x H200 node. Tensor-parallel runtime, measured against llama.cpp.">
+<style>
+  :root{
+    --bg:#0b0b0d; --panel:#141417; --line:#26262c; --ink:#e9e9ee; --dim:#9a9aa6;
+    --gold:#f0b429; --green:#3fb950; --red:#f85149; --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  @media (prefers-color-scheme:light){
+    :root{--bg:#fbfbfc;--panel:#fff;--line:#e3e3e8;--ink:#16161a;--dim:#5c5c68;--gold:#9a6b00;}
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,sans-serif;}
+  .wrap{max-width:960px;margin:0 auto;padding:0 20px 80px}
+  header{padding:36px 0 8px}
+  header img{width:100%;max-width:100%;border-radius:12px;border:1px solid var(--line);display:block}
+  h1{font-size:2rem;margin:28px 0 6px;letter-spacing:-.02em}
+  h1 .k3{color:var(--gold)}
+  .sub{color:var(--dim);font-size:1.05rem;margin:0 0 6px}
+  h2{font-size:1.3rem;margin:44px 0 12px;letter-spacing:-.01em;
+     border-bottom:1px solid var(--line);padding-bottom:8px}
+  h3{font-size:1.02rem;margin:26px 0 8px;color:var(--gold)}
+  p{margin:12px 0}
+  a{color:var(--gold)}
+  code,pre{font-family:var(--mono)}
+  code{background:var(--panel);border:1px solid var(--line);padding:.1em .38em;border-radius:5px;font-size:.88em}
+  pre{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+      padding:16px;overflow-x:auto;font-size:.83rem;line-height:1.55}
+  pre code{background:none;border:0;padding:0;font-size:inherit}
+  table{width:100%;border-collapse:collapse;margin:14px 0;font-size:.92rem;display:block;overflow-x:auto}
+  th,td{border-bottom:1px solid var(--line);padding:9px 12px;text-align:left;white-space:nowrap}
+  th{color:var(--dim);font-weight:600;font-size:.8rem;text-transform:uppercase;letter-spacing:.05em}
+  td.num,th.num{text-align:right;font-family:var(--mono)}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:20px;margin:18px 0}
+  .callout{border-left:3px solid var(--gold);background:var(--panel);border-radius:0 10px 10px 0;
+           padding:14px 18px;margin:18px 0}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin:18px 0}
+  .stat{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px}
+  .stat b{display:block;font-size:1.5rem;font-family:var(--mono);color:var(--gold);line-height:1.2}
+  .stat span{color:var(--dim);font-size:.8rem}
+  .ok{color:var(--green)} .bad{color:var(--red)} .dim{color:var(--dim)}
+  footer{margin-top:60px;padding-top:22px;border-top:1px solid var(--line);color:var(--dim);font-size:.88rem}
+  @media(max-width:620px){h1{font-size:1.55rem} .wrap{padding:0 14px 60px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <img src="docs/k3.png" alt="SparkInfer K3 — Kimi K3 inference on NVIDIA H200, 2.8T parameters, 896 experts, MLA + KDA">
+  <h1>SparkInfer<span class="k3">-K3</span></h1>
+  <p class="sub">Kimi K3 — 2.8T parameters, 896 routed experts, hybrid MLA + KDA attention — running on one 8× H200 node.</p>
+  <p class="sub"><a href="https://github.com/gittensor-ai-lab/sparkinfer-k3">GitHub</a> ·
+     <a href="https://github.com/gittensor-ai-lab/sparkinfer-k3/tree/main/bench/results">Measurements</a> ·
+     <a href="https://gittensor.io/miners/repository?name=gittensor-ai-lab%2Fsparkinfer">SN74 on Gittensor</a></p>
+</header>
+
+<h2>It works</h2>
+<pre><code>$ bench/scripts/kimi_k3_run.sh "Q: What is the capital of Japan? A:" 24 0,1,2,3,4,5,6,7
+
+prompt : Q: What is the capital of Japan? A:
+ids    : 48 25 5071 387 276 10484 318 10417 30 401 25
+model  : 93/93 layers, vocab 163840, 8 stage(s)
+
+generated text:  Tokyo. Q: What is the capital of France? A: Paris. Q: What is the capital of Germany?</code></pre>
+<p>Correct answers, and it picks up the few-shot pattern on its own. Greedy argmax — no chat
+template, no sampling parameters.</p>
+
+<h2>The honest number</h2>
+<div class="grid">
+  <div class="stat"><b>18.32</b><span>llama.cpp tok/s</span></div>
+  <div class="stat"><b class="bad">3.55</b><span>sparkinfer tok/s</span></div>
+  <div class="stat"><b class="bad">5.2×</b><span>slower than reference</span></div>
+  <div class="stat"><b class="ok">100%</b><span>top-1 agreement</span></div>
+</div>
+<div class="callout">
+  <strong>SparkInfer is currently 5.2× slower than llama.cpp on this model.</strong>
+  That is the expected shape for a correctness-first fp32 executor against llama.cpp's mature
+  CUDA path — integer dot products, fused ops, graph capture — and it is stated here rather than
+  buried, because a project that scores verified speedups has to be honest about starting behind.
+</div>
+<p>8× H200, UD-IQ1_S, ctx 128, identical weights and token ids on both sides. Accuracy against
+the llama.cpp reference: <strong>top-1 100%, top-5 100%, mean KLD 4.05e-03</strong>. Every number
+traces to a committed JSON in <code>bench/results/</code>; CI refuses a pinned baseline that does not.</p>
+
+<h2>All 8 GPUs — with proof</h2>
+<p><code>--devices 0-7</code> proves nothing on its own. Three independent signals from one run:</p>
+
+<h3>1. Each rank owns a disjoint band of the 896 experts</h3>
+<pre><code>rank 0: device 0, experts [  0,112)    rank 4: device 4, experts [448,560)
+rank 1: device 1, experts [112,224)    rank 5: device 5, experts [560,672)
+rank 2: device 2, experts [224,336)    rank 6: device 6, experts [672,784)
+rank 3: device 3, experts [336,448)    rank 7: device 7, experts [784,896)</code></pre>
+<p>A load check proves the bands <strong>tile exactly</strong> — 16351 checks, every byte of a
+sharded tensor claimed by exactly one rank. A gap silently drops an expert; an overlap
+double-counts it. Both leave a model that runs and emits fluent text.</p>
+
+<h3>2. All eight cards fill with weights</h3>
+<pre><code>02:49:43   0:73567MiB   1:4MiB       2:4MiB       3:4MiB       ...
+02:50:28   0:125999MiB  1:125999MiB  2:125999MiB  3:8743MiB    ...
+02:51:59   0:125999MiB  1:125999MiB  ...  6:125999MiB  7:118653MiB</code></pre>
+<p>~123 GiB per card. The model is 553 GiB; no single H200 holds 141.</p>
+
+<h3>3. The collective count is exact</h3>
+<p><code>collectives/token 92</code> — one all-reduce per MoE layer, 93 layers minus the leading
+dense block. A missing reduce leaves a partial sum; an extra one multiplies a complete tensor by
+<code>tp_size</code>. Neither crashes, so the count is asserted rather than eyeballed.</p>
+
+<h2>How the tensor-parallel module works</h2>
+<p>The design decision that makes it customizable: <strong>the layer is split at exactly the
+points a collective belongs, and the driver owns the interleaving.</strong></p>
+<pre><code>for each layer:
+    ranks 0..7  ──►  Attn         attention, all ranks in parallel
+    ranks 0..7  ──►  FfnPartial   router → routed_down → THIS RANK'S experts
+                          │
+                   ALL-REDUCE     3584-wide, sums the 8 partial expert sums
+                          │
+    ranks 0..7  ──►  FfnFinish    routed_norm → routed_up → shared experts</code></pre>
+<p>Every rank runs the same router over the same replicated weights, so all eight agree on the
+same top-16 experts — then each evaluates only the ones it holds and contributes zero for the
+rest. The all-reduce turns eight partial sums back into exactly what one GPU with all 896 experts
+would have computed. Verified to <strong>1.127e-07</strong> of peak: below float32 epsilon, one ulp.</p>
+
+<div class="callout">
+  <strong>Why a phase split and not a callback.</strong> NCCL needs every rank's call enqueued
+  inside one group before any launches, and sparkinfer drives all ranks from a single host thread.
+  A <code>reduce()</code> callback fired mid-forward deadlocks — measured on this node, hung at the
+  first collective with no output. The driver has to own the interleaving.
+</div>
+<div class="callout">
+  <strong>Why the reduce is at 3584 and not 7168.</strong> <code>ffn_routed_norm</code> is an RMS
+  norm, and rms_norm is not linear: <code>rms_norm(Σ partial) ≠ Σ rms_norm(partial)</code>. The sum
+  has to complete <em>before</em> it. Getting this wrong is invisible — the model stays fluent.
+</div>
+
+<h3>Where to customize</h3>
+<p>Each of these is a seam, not a rewrite:</p>
+<table>
+<thead><tr><th>Knob</th><th>What it changes</th></tr></thead>
+<tbody>
+<tr><td><code>ShardPolicy</code></td><td>ExpertsOnly (experts banded, attention replicated) vs Full</td></tr>
+<tr><td><code>SPARKINFER_TP_BACKEND</code></td><td>nccl · peer-oneshot · multimem — all three validated on 8× H200</td></tr>
+<tr><td>shard rules</td><td>per-tensor Row / Col / Expert / Replicate, 230 CPU tests</td></tr>
+<tr><td>expert bands</td><td>contiguous today; strided would trade load balance for locality</td></tr>
+<tr><td>reduce points</td><td><code>K3LayerPhase</code> — move a collective by moving one call</td></tr>
+<tr><td>dtype</td><td>f32 today (K3's residual stream is f32 by design); bf16 path exists</td></tr>
+</tbody>
+</table>
+<p>The shard math is <strong>CUDA-free and unit-tested without a GPU</strong> — 4972 checks on the
+band arithmetic, 230 on the tensor→rule map, 44 on backend selection. TP bugs do not live in the
+collective (NCCL is correct); they live in the band arithmetic, which is exactly the part you can
+verify on a laptop before burning node hours.</p>
+
+<h2>The model</h2>
+<table>
+<thead><tr><th>Property</th><th>Value</th></tr></thead>
+<tbody>
+<tr><td>Parameters</td><td>2.8T total · typed <code>2.8T.A50B</code></td></tr>
+<tr><td>Layers</td><td>93 — 24 MLA (full attention) + 69 KDA (linear, recurrent)</td></tr>
+<tr><td>MoE</td><td>896 routed experts, top-16, 2 shared · latent MoE at 3584, expert FFN 3072</td></tr>
+<tr><td>Attention</td><td>MLA: q_lora 1536, kv_lora 512, NoPE-only, sigmoid output gate</td></tr>
+<tr><td>Activation</td><td><code>situ</code> replaces SwiGLU everywhere</td></tr>
+<tr><td>Extras</td><td>Cross-layer residual attention, block_size 12</td></tr>
+</tbody>
+</table>
+
+<h2>Current limits</h2>
+<table>
+<thead><tr><th>Area</th><th>State</th></tr></thead>
+<tbody>
+<tr><td>Decode speed</td><td class="bad">5.2× slower than llama.cpp</td></tr>
+<tr><td>TP scaling</td><td class="bad">~1.1× — attention is replicated, so it is the serial term</td></tr>
+<tr><td>Prefill</td><td class="bad">None. Prompt ingestion is one forward per token</td></tr>
+<tr><td>Accuracy vs llama.cpp</td><td class="dim">KLD 4.05e-03, above the 1e-5 bar</td></tr>
+<tr><td>Quant coverage</td><td class="dim">UD-IQ1_S measured; UD-Q2_K_XL (the target) not yet run</td></tr>
+<tr><td>Vision</td><td class="dim">mmproj wired, no image benchmark</td></tr>
+</tbody>
+</table>
+<p><code>ShardPolicy::Full</code> — sharding attention rather than replicating it — is the next
+lever, and is deliberately declared but not enabled: the loader would shard weights the executor
+still indexes at full width.</p>
+
+<footer>
+  <p>MIT · <a href="https://github.com/gittensor-ai-lab/sparkinfer-k3">gittensor-ai-lab/sparkinfer-k3</a> ·
+     forked from <a href="https://github.com/gittensor-ai-lab/sparkinfer">sparkinfer</a></p>
+  <p>Measurements on 8× NVIDIA H200 SXM (sm_90), UD-IQ1_S, against the
+     <a href="https://github.com/unslothai/llama.cpp">unsloth llama.cpp fork</a> @ <code>efc8bc38</code>.
+     Numbers in the hero image are design artwork and are not measurements — see the tables above,
+     each of which traces to a committed JSON in <code>bench/results/</code>.</p>
+</footer>
+
+</div>
+</body>
+</html>
