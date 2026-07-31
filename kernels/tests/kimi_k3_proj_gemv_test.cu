@@ -10,6 +10,7 @@
 
 #include "sparkinfer/kernels/kimi_k3.h"
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -77,6 +78,45 @@ int main() {
         const double rl2 = std::sqrt(num / (den + 1e-30));
         std::printf("[Q8_0] N=%d K=%d accepted=%s relL2=%.3e\n", N, K, ok ? "yes" : "NO", rl2);
         if (!ok || rl2 > 1e-5) ++fail;
+
+        // llama.cpp CPU compatibility path: it first quantizes x to block_q8_0,
+        // including the fp16 activation scale, then performs an integer dot.
+        std::vector<BlockQ8_0> Xq(K / 32);
+        for (int b = 0; b < K / 32; ++b) {
+            float amax = 0.0f;
+            for (int j = 0; j < 32; ++j) amax = std::fmax(amax, std::fabs(x[32*b+j]));
+            const float d = amax / 127.0f;
+            Xq[b].d = __half_as_ushort(__float2half_rn(d));
+            const float id = amax != 0.0f ? 127.0f / amax : 0.0f;
+            for (int j = 0; j < 32; ++j)
+                Xq[b].qs[j] = (int8_t)std::nearbyint(x[32*b+j] * id);
+        }
+        std::vector<double> qref(N, 0.0);
+        for (int n = 0; n < N; ++n) {
+            float sum = 0.0f;
+            for (int b = 0; b < K / 32; ++b) {
+                int sumi = 0;
+                const auto& wb = W[(size_t)n * (K / 32) + b];
+                for (int j = 0; j < 32; ++j) sumi += (int)wb.qs[j] * (int)Xq[b].qs[j];
+                sum += (float)sumi * (h2f(wb.d) * h2f(Xq[b].d));
+            }
+            qref[n] = sum;
+        }
+        void* dq = nullptr;
+        CU(cudaMalloc(&dq, k3_q8_0_bytes(K)));
+        const bool qok = k3_proj_ggml_f32((float*)dy, (const float*)dx, dW, 8, N, K, dq, 0);
+        CU(cudaDeviceSynchronize());
+        CU(cudaMemcpy(got.data(), dy, N * sizeof(float), cudaMemcpyDeviceToHost));
+        double qnum = 0, qden = 0;
+        for (int n = 0; n < N; ++n) {
+            const double d = got[n] - qref[n];
+            qnum += d*d; qden += qref[n]*qref[n];
+        }
+        const double qrl2 = std::sqrt(qnum / (qden + 1e-30));
+        std::printf("[Q8_0 x Q8_0] accepted=%s relL2=%.3e\n",
+                    qok ? "yes" : "NO", qrl2);
+        if (!qok || qrl2 > 1e-6) ++fail;
+        cudaFree(dq);
         cudaFree(dW); cudaFree(dx); cudaFree(dy);
     }
 

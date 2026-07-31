@@ -37,7 +37,10 @@ namespace k3 {
 // index arithmetic gets checked against real ggml without a GPU
 // (kernels/tests/kimi_k3_iq1s_ggml_cpu_test.cpp).
 #ifdef __CUDACC__
-__device__ __constant__ static uint64_t iq1s_grid_c[SPARKINFER_IQ1S_NGRID];
+// __device__, not __constant__ — block_dot() gathers this by codepoint, which is
+// divergent across the warp, and the constant unit serialises divergent addresses to
+// one per cycle. See the long note on c_iq2xs_grid in k3_kernels.cu.
+__device__ static uint64_t iq1s_grid_c[SPARKINFER_IQ1S_NGRID];
 #endif
 
 static const uint64_t iq1s_grid_host[SPARKINFER_IQ1S_NGRID] = {

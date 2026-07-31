@@ -51,13 +51,30 @@ void situ_f32(float* out, const float* gate, const float* up, int64_t n,
 // ---------------------------------------------------------------------------
 // 2. KDA decode step (gated delta rule, one token)
 // ---------------------------------------------------------------------------
-// Reference: src/models/delta-net-base.cpp build_delta_net_autoregressive()
+// Reference: ggml_compute_forward_gated_delta_net_one_chunk() in
+// ggml/src/ggml-cpu/ops.cpp — the path llama.cpp ACTUALLY EXECUTES.
+//
+// NOT build_delta_net_autoregressive(), which this contract used to cite. That
+// function is dead code: llama-context.cpp sets cparams.fused_gdn_ar = true, so
+// delta-net-base.cpp routes both prefill and decode to build_delta_net_fused, which
+// lowers to the ggml op above. The two disagree about the decay axis, and
+// transcribing the dead one cost a full-model KLD of 0.448 against the reference.
 //
 // Per head, with state S indexed [i][j] (i = ne0 = fastest), all dims = head_dim:
 //
-//   S[i][j] *= exp(g[j])              per-CHANNEL decay. GDA decays by a scalar;
-//                                     KDA has a full head_dim-wide g. Collapsing it
-//                                     to a scalar is a wrong model that still runs.
+//   S[i][j] *= exp(g[i])              per-CHANNEL decay, indexed by the CONTRACTION
+//                                     index i — NOT by j. The reference stores the
+//                                     state transposed (s_out[j*D+i] == S[i][j]) and
+//                                     multiplies each row j elementwise by exp(g), so
+//                                     the multiplier varies along i. Its own comment
+//                                     reads "S[i][:] *= exp(g[i])".
+//                                     Using exp(g[j]) is S*diag(exp g) instead of
+//                                     diag(exp g)*S — a different operator, and one
+//                                     that is bit-identical at token 0 (zero state),
+//                                     so a single-token test cannot see it.
+//                                     GDA decays by a scalar; KDA has a full
+//                                     head_dim-wide g. Collapsing it to a scalar is a
+//                                     wrong model that still runs.
 //   sk[j]    = sum_i S[i][j]*k[i]
 //   d[m]     = beta * (v[m] - sk[m])
 //   S[i][j] += k[i]*d[j]
@@ -296,7 +313,8 @@ bool moe_expert_ffn_f32_by_type(float* out, float* scratch,
                                 int latent, int ffn, int top_k,
                                 float situ_beta, float situ_linear_beta,
                                 int ggml_type, cudaStream_t stream,
-                                int expert_begin = 0, int n_local_experts = 0);
+                                int expert_begin = 0, int n_local_experts = 0,
+                                void* q8k_scratch = nullptr);
 
 // ---------------------------------------------------------------------------
 // 5. MLA output gate
@@ -418,6 +436,23 @@ void mla_decode_attn_f32(float* out, const float* q, const float* k_cache,
 bool k3_proj_f32(float* y, const float* x, const void* W, int wtype,
                  int N, int K, cudaStream_t stream);
 
+// llama.cpp's CPU mul_mat does not multiply quantised weights by the original f32
+// activation. It first converts the activation to the weight type's vec_dot_type:
+// Q8_0 weights use block_q8_0 activations, while IQ1_S/IQ2_XS use block_q8_K.
+// The pinned full-model reference was captured on that CPU path, so omitting this
+// conversion creates a stable ~1e-3 KLD floor even when every model operator is
+// otherwise correct.
+//
+// This entry point preserves F32 weights exactly and applies llama's Q8_0 activation
+// conversion only for Q8_0 weights. q8_scratch must hold (K/32)*34 bytes.
+bool k3_proj_ggml_f32(float* y, const float* x, const void* W, int wtype,
+                      int N, int K, void* q8_scratch, cudaStream_t stream);
+
+// Scratch sizing helpers for the two reference-compatible activation paths.
+// K must be divisible by the corresponding block size (32 or 256).
+size_t k3_q8_0_bytes(int K);
+size_t k3_moe_q8_k_bytes(int latent, int ffn, int top_k);
+
 // ---------------------------------------------------------------------------
 // 15. Plain RMS norm (full width, elementwise)
 // ---------------------------------------------------------------------------
@@ -437,6 +472,11 @@ void rms_norm_f32(float* out, const float* x, const float* w, int n, float eps,
 // needs no kernel at all — it is a plain device-to-device copy of the layer output.
 void k3_add_f32(float* out, const float* a, const float* b, int64_t n,
                 cudaStream_t stream);
+
+// out[i] = sigmoid(out[i]), in place. Used to apply the sigmoid the K3 KDA layer
+// puts on the beta (update-rate) projection before the delta-rule scan consumes it
+// — llama.cpp's build_kda_layer does `beta = ggml_sigmoid(ssm_beta @ x)`.
+void sigmoid_inplace_f32(float* x, int64_t n, cudaStream_t stream);
 
 }  // namespace k3
 }  // namespace kernels

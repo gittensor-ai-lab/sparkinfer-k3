@@ -1,6 +1,13 @@
 // What does tensor parallelism actually buy on Kimi K3 decode?
 //
 //   kimi_k3_tp_bench <first-shard.gguf> [tp_size] [n_layers] [n_tokens]
+//                    [--ids a,b,c] [--logits FILE]
+//
+// --ids feeds an exact prompt (ids, not text) instead of the synthetic sequence, and
+// --logits dumps the final step's logits in .spkl. Together they are what compares a
+// full 93-layer TP run against the captured llama.cpp reference in bench/refdata/ —
+// the only correctness check available at full depth, since no single GPU can hold
+// 553 GiB to serve as a tp=1 baseline.
 //
 // Reports ms/token and ms/layer, and extrapolates ms/layer to the full 93. The
 // extrapolation is the useful number: no single GPU can hold 93 layers of this model,
@@ -33,10 +40,41 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
 using namespace sparkinfer;
+
+namespace {
+
+// .spkl: magic | u32 version | u32 n_tokens | u32 n_vocab | f32[n_tokens][n_vocab].
+// Byte-identical to kimi_k3_generate's writer so compare_logits.py reads both.
+bool write_spkl(const char* path, const std::vector<float>& logits, int n_vocab) {
+    std::FILE* f = std::fopen(path, "wb");
+    if (!f) return false;
+    const uint32_t ver = 1, ntok = 1, nv = (uint32_t)n_vocab;
+    const bool ok = std::fwrite("SPKL", 1, 4, f) == 4 &&
+                    std::fwrite(&ver, 4, 1, f) == 1 &&
+                    std::fwrite(&ntok, 4, 1, f) == 1 &&
+                    std::fwrite(&nv, 4, 1, f) == 1 &&
+                    std::fwrite(logits.data(), sizeof(float), logits.size(), f) == logits.size();
+    std::fclose(f);
+    return ok;
+}
+
+std::vector<int> parse_ids(const char* s) {
+    std::vector<int> out;
+    const char* p = s;
+    while (*p) {
+        out.push_back(std::atoi(p));
+        while (*p && *p != ',') ++p;
+        if (*p == ',') ++p;
+    }
+    return out;
+}
+
+}  // namespace
 
 int main(int argc, char** argv) {
     if (argc < 2) {
@@ -47,7 +85,13 @@ int main(int argc, char** argv) {
     const std::string path = argv[1];
     const int tp_size  = argc > 2 ? std::atoi(argv[2]) : 8;
     const int want_lyr = argc > 3 ? std::atoi(argv[3]) : 16;
-    const int n_tokens = argc > 4 ? std::atoi(argv[4]) : 8;
+    int n_tokens = argc > 4 ? std::atoi(argv[4]) : 8;
+    const char* logits_path = nullptr;
+    std::vector<int> ids;
+    for (int i = 2; i < argc; ++i) {
+        if (!std::strcmp(argv[i], "--ids") && i + 1 < argc) ids = parse_ids(argv[++i]);
+        else if (!std::strcmp(argv[i], "--logits") && i + 1 < argc) logits_path = argv[++i];
+    }
 
     GGUF g; KimiK3Config cfg; KimiK3LayerCoverage cov;
     if (!kimi_k3_load_partial(path.c_str(), cfg, g, &cov)) { std::printf("load failed\n"); return 1; }
@@ -93,6 +137,30 @@ int main(int argc, char** argv) {
     const double load_s = std::chrono::duration<double>(t_load1 - t_load0).count();
 
     std::vector<float> logits((size_t)cfg.vocab);
+
+    // --ids: feed the exact prompt, no warm-up, no synthetic tokens. The recurrent
+    // state and KV cache must see the reference's ids in the reference's order, so a
+    // discarded warm-up token would advance position and corrupt the comparison.
+    if (!ids.empty()) {
+        std::printf("prompt: %zu ids from --ids\n", ids.size());
+        for (size_t i = 0; i < ids.size(); ++i) {
+            if (!kimi_k3_tp_forward_token(p, ids[i], logits.data())) {
+                std::printf("prompt token %zu (id %d) failed\n", i, ids[i]); return 1;
+            }
+        }
+        int best = 0;
+        for (int i = 1; i < cfg.vocab; ++i)
+            if (logits[(size_t)i] > logits[(size_t)best]) best = i;
+        std::printf("argmax next-token id: %d  logit: %.6f\n", best, logits[(size_t)best]);
+        if (logits_path) {
+            std::printf("%s %s\n",
+                        write_spkl(logits_path, logits, cfg.vocab) ? "wrote" : "FAILED to write",
+                        logits_path);
+        }
+        kimi_k3_tp_free(p);
+        return 0;
+    }
+
     // Warm-up token, discarded: one-time context/module/lattice-table costs.
     if (!kimi_k3_tp_forward_token(p, 1000, logits.data())) { std::printf("warmup failed\n"); return 1; }
 

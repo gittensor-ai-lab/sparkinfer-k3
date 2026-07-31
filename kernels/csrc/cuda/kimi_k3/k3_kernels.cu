@@ -98,17 +98,48 @@ __global__ void kda_decode_step_kernel(float* __restrict__ out, float* __restric
     float* s_k  = smem;                       // head_dim
     float* s_q  = s_k + head_dim;             // head_dim
     float* s_sk = s_q + head_dim;             // head_dim  (sk, then reused for d)
+    float* s_ge = s_sk + head_dim;            // head_dim  exp(g[i]), i = CONTRACTION index
 
     s_k[j] = kh[j];
     s_q[j] = qh[j];
+    // exp(g) is needed indexed by i inside the loop below, not by this thread's j, so
+    // it has to be staged in shared memory rather than read per-thread.
+    s_ge[j] = __expf(gh[j]);
     __syncthreads();
 
-    // Step 1: per-channel decay on column j, and Step 2: sk[j] = sum_i S[i][j]*k[i].
+    // Step 1: per-channel decay, and Step 2: sk[j] = sum_i S[i][j]*k[i].
     // Fused into one pass over the column — the decay is applied as we read.
-    const float decay = __expf(gh[j]);
+    //
+    // THE DECAY IS INDEXED BY i, THE CONTRACTION INDEX — NOT BY j.
+    //
+    // The reference (ggml_compute_forward_gated_delta_net_one_chunk, ggml/src/
+    // ggml-cpu/ops.cpp) stores the state transposed exactly as this kernel does
+    // (s_out[j*S_v + i] == S[i][j]) and then does:
+    //
+    //     for (i) delta[i] = expf(g_d[i]);
+    //     for (j) ggml_vec_mul_f32(S_v, &s_out[j*S_v], &s_out[j*S_v], delta);
+    //
+    // i.e. row j of the transposed state is multiplied ELEMENTWISE by exp(g) — the
+    // multiplier varies along i. Its own comment: "S[i][:] *= exp(g[i])".
+    //
+    // This kernel previously hoisted `exp(g[j])` out of the i-loop, which is
+    // diag(exp g)*S vs S*diag(exp g) — a different operator, not a relabeling. The
+    // roles of i and j are pinned by the surrounding math (k and q contract over i;
+    // v, d and out are indexed by j), so there is no transpose elsewhere that
+    // compensates.
+    //
+    // It survived every test for three separate reasons, all worth knowing:
+    //   - kimi_k3_numeric_test.cu's float64 "independent" reference was transcribed
+    //     from this same wrong contract, so it agreed with the bug.
+    //   - kimi_k3_layer0_ref_check.cpp is SINGLE-TOKEN, and at token 0 the state is
+    //     zero, so both axes give bit-identical results. It structurally cannot see it.
+    //   - the contract cited build_delta_net_autoregressive, which llama.cpp NEVER
+    //     EXECUTES: llama-context.cpp sets cparams.fused_gdn_ar = true, and
+    //     delta-net-base.cpp routes to build_delta_net_fused instead. sparkinfer
+    //     transcribed a dead path that disagrees with the live one.
     float sk = 0.0f;
     for (int i = 0; i < head_dim; ++i) {
-        const float sv = S[(size_t)j * head_dim + i] * decay;
+        const float sv = S[(size_t)j * head_dim + i] * s_ge[i];
         S[(size_t)j * head_dim + i] = sv;
         sk += sv * s_k[i];
     }
@@ -264,9 +295,25 @@ __global__ void kda_conv_step_kernel(float* __restrict__ out, float* __restrict_
 // ---------------------------------------------------------------------------
 // One thread per 8-value group (one qs entry). 32 groups per 256-value block.
 
-__constant__ uint64_t c_iq2xs_grid[512];
-__constant__ uint8_t  c_ksigns_iq2xs[128];
-__constant__ uint8_t  c_kmask_iq2xs[8];
+// THE LATTICE TABLES LIVE IN __device__, NOT __constant__.
+//
+// The constant unit services ONE distinct address per cycle per SM. block_dot()
+// indexes these tables by the quantised codepoint, which is different in every lane
+// — a fully 32-way-divergent gather. In __constant__ that serialises into 32 replays
+// per access, and the 16 KB grid does not fit the per-SM immediate constant cache, so
+// each replay also misses. Through __device__ the same divergent addresses go to L1,
+// which returns multiple sectors per cycle and holds 16 KB comfortably.
+//
+// __constant__ is the right home for a broadcast read (every lane, same address).
+// It is close to the worst possible home for this one. llama.cpp reached the same
+// conclusion: ggml/src/ggml-common.h declares its CUDA lattice tables
+// `static const __device__`, not __constant__.
+//
+// cudaMemcpyToSymbol works identically against a __device__ symbol, so the
+// per-device upload guard below is unchanged.
+__device__ uint64_t c_iq2xs_grid[512];
+__device__ uint8_t  c_ksigns_iq2xs[128];
+__device__ uint8_t  c_kmask_iq2xs[8];
 
 struct BlockIQ2XS {          // 74 bytes, matches ggml block_iq2_xs exactly
     uint16_t d;              // fp16 bits
@@ -288,6 +335,13 @@ struct BlockIQ1S {           // 50 bytes
     uint8_t  qs[32];         // grid index, low 8 bits
     uint16_t qh[8];          // 3 bits x4 of grid index, 3-bit scale, 1 sign bit
 };
+
+struct BlockQ8K {            // 292 bytes, matches ggml block_q8_K exactly
+    float   d;
+    int8_t  qs[256];
+    int16_t bsums[16];
+};
+static_assert(sizeof(BlockQ8K) == 292, "bad block_q8_K layout");
 
 __global__ void dequant_iq2_xs_kernel(float* __restrict__ out,
                                       const BlockIQ2XS* __restrict__ blocks,
@@ -479,6 +533,60 @@ __device__ __forceinline__ float block_dot(const BlockIQ1S& b,
     return acc;
 }
 
+// llama.cpp CPU vec_dot contracts for the pinned reference. The activation has
+// already been converted to block_q8_K. Keep the integer dot integer until the
+// whole 256-value block has been reduced, then apply the two block scales once;
+// dequantising both sides to f32 first is mathematically close but not the same
+// floating-point program.
+__device__ __forceinline__ float block_dot_q8k(const BlockIQ2XS& b,
+                                               const BlockQ8K& x, int lane) {
+    const int ib32 = lane >> 2, sub = lane & 3;
+    const uint8_t sc = b.scales[ib32];
+    const int ls = 2 * (sub < 2 ? (sc & 0xf) : (sc >> 4)) + 1;
+    const uint16_t q = b.qs[lane];
+    const uint8_t* grid = (const uint8_t*)&c_iq2xs_grid[q & 511];
+    const uint8_t signs = c_ksigns_iq2xs[q >> 9];
+    int sumi = 0;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int wq = (signs & c_kmask_iq2xs[j]) ? -(int)grid[j] : (int)grid[j];
+        sumi += wq * (int)x.qs[8 * lane + j];
+    }
+    sumi *= ls;
+    for (int off = 16; off > 0; off >>= 1)
+        sumi += __shfl_down_sync(0xffffffff, sumi, off);
+    if (lane != 0) return 0.0f;
+    const float dw = __half2float(__ushort_as_half(b.d));
+    return 0.125f * dw * x.d * (float)sumi;
+}
+
+__device__ __forceinline__ float block_dot_q8k(const BlockIQ1S& b,
+                                               const BlockQ8K& x, int lane) {
+    const int ib32 = lane >> 2, l = lane & 3;
+    const uint16_t h = b.qh[ib32];
+    const int ls = 2 * ((h >> 12) & 7) + 1;
+    const int delta = (h & 0x8000) ? -1 : 1;
+    const uint32_t idx =
+        (uint32_t)b.qs[4 * ib32 + l] | (((uint32_t)(h >> (3 * l)) & 7u) << 8);
+    const int8_t* grid = (const int8_t*)&iq1s_grid_c[idx];
+    int sumi = 0, sumq = 0;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int q8 = (int)x.qs[8 * lane + j];
+        sumi += (int)grid[j] * q8;
+        sumq += q8;
+    }
+    sumi *= ls;
+    sumq *= ls * delta;
+    for (int off = 16; off > 0; off >>= 1) {
+        sumi += __shfl_down_sync(0xffffffff, sumi, off);
+        sumq += __shfl_down_sync(0xffffffff, sumq, off);
+    }
+    if (lane != 0) return 0.0f;
+    const float dw = __half2float(__ushort_as_half(b.d));
+    return dw * x.d * ((float)sumi + SPARKINFER_IQ1S_DELTA * (float)sumq);
+}
+
 // gate/up GEMV + situ. One block per (selected expert k, output chunk).
 template <int BLOCK, typename Blk>
 __global__ void moe_gate_up_situ_kernel(float* __restrict__ scratch,
@@ -564,6 +672,64 @@ __global__ void moe_down_combine_kernel(float* __restrict__ out,
         __syncthreads();
         if (threadIdx.x == 0) total += w[k] * acc;
         __syncthreads();
+    }
+    if (threadIdx.x == 0) out[o] = total;
+}
+
+template <typename Blk>
+__global__ void moe_gate_up_situ_q8k_kernel(float* __restrict__ scratch,
+                                            const BlockQ8K* __restrict__ x,
+                                            const int* __restrict__ ids,
+                                            const Blk* __restrict__ gate_exps,
+                                            const Blk* __restrict__ up_exps,
+                                            int latent, int ffn,
+                                            float beta, float inv_beta,
+                                            float lb, float inv_lb, int lb_active,
+                                            int expert_begin, int n_local_experts) {
+    const int k = blockIdx.y;
+    const int j = blockIdx.x;
+    if (j >= ffn) return;
+    const int e = ids[k] - expert_begin;
+    if (e < 0 || e >= n_local_experts) {
+        if (threadIdx.x == 0) scratch[(size_t)k * ffn + j] = 0.0f;
+        return;
+    }
+    const int blocks_per_row = latent / 256;
+    const Blk* g_row = gate_exps + (size_t)(e * ffn + j) * blocks_per_row;
+    const Blk* u_row = up_exps   + (size_t)(e * ffn + j) * blocks_per_row;
+    float gacc = 0.0f, uacc = 0.0f;
+    for (int b = 0; b < blocks_per_row; ++b) {
+        gacc += block_dot_q8k(g_row[b], x[b], threadIdx.x);
+        uacc += block_dot_q8k(u_row[b], x[b], threadIdx.x);
+    }
+    if (threadIdx.x == 0) {
+        const float a = beta * tanhf(gacc * inv_beta) * sigmoidf_(gacc);
+        const float ub = lb_active ? (lb * tanhf(uacc * inv_lb)) : uacc;
+        scratch[(size_t)k * ffn + j] = a * ub;
+    }
+}
+
+template <typename Blk>
+__global__ void moe_down_combine_q8k_kernel(float* __restrict__ out,
+                                            const BlockQ8K* __restrict__ acts,
+                                            const int* __restrict__ ids,
+                                            const float* __restrict__ w,
+                                            const Blk* __restrict__ down_exps,
+                                            int latent, int ffn, int top_k,
+                                            int expert_begin, int n_local_experts) {
+    const int o = blockIdx.x;
+    if (o >= latent) return;
+    const int blocks_per_row = ffn / 256;
+    float total = 0.0f;
+    for (int k = 0; k < top_k; ++k) {
+        const int e = ids[k] - expert_begin;
+        if (e < 0 || e >= n_local_experts) continue;
+        const Blk* d_row = down_exps + (size_t)(e * latent + o) * blocks_per_row;
+        const BlockQ8K* act = acts + (size_t)k * blocks_per_row;
+        float acc = 0.0f;
+        for (int b = 0; b < blocks_per_row; ++b)
+            acc += block_dot_q8k(d_row[b], act[b], threadIdx.x);
+        if (threadIdx.x == 0) total += w[k] * acc;
     }
     if (threadIdx.x == 0) out[o] = total;
 }
@@ -754,6 +920,62 @@ struct BlockQ8_0 {   // 34 bytes, matches ggml block_q8_0 exactly
     int8_t   qs[32];
 };
 
+static_assert(sizeof(BlockQ8_0) == 34, "bad block_q8_0 layout");
+
+// CPU-reference-compatible activation conversion. One CUDA thread deliberately
+// owns one quant block: these vectors are tiny (at most 33,792 values in K3), and
+// the serial max scan preserves ggml's first-maximum sign rule exactly. Parallel
+// reduction here would make equal-magnitude +/- values pick a schedule-dependent
+// sign, changing every quant in the block while leaving the dequantised values
+// deceptively close.
+__global__ void quantize_q8_0_kernel(BlockQ8_0* __restrict__ out,
+                                     const float* __restrict__ x, int n_blocks) {
+    const int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= n_blocks) return;
+    const float* xb = x + (size_t)b * 32;
+    float amax = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 32; ++j) amax = fmaxf(amax, fabsf(xb[j]));
+    const float d = amax / 127.0f;
+    const float id = amax != 0.0f ? 127.0f / amax : 0.0f;
+    out[b].d = __half_as_ushort(__float2half_rn(d));
+#pragma unroll
+    for (int j = 0; j < 32; ++j)
+        out[b].qs[j] = (int8_t)__float2int_rn(xb[j] * id);
+}
+
+__global__ void quantize_q8_k_kernel(BlockQ8K* __restrict__ out,
+                                     const float* __restrict__ x,
+                                     int blocks_per_row, int n_rows) {
+    const int bi = blockIdx.x * blockDim.x + threadIdx.x;
+    const int n_blocks = blocks_per_row * n_rows;
+    if (bi >= n_blocks) return;
+    const float* xb = x + (size_t)bi * 256;
+    BlockQ8K& q = out[bi];
+    float maxv = 0.0f, amax = 0.0f;
+    for (int j = 0; j < 256; ++j) {
+        const float ax = fabsf(xb[j]);
+        if (ax > amax) { amax = ax; maxv = xb[j]; }
+    }
+    if (amax == 0.0f) {
+        q.d = 0.0f;
+        for (int j = 0; j < 256; ++j) q.qs[j] = 0;
+        for (int j = 0; j < 16; ++j) q.bsums[j] = 0;
+        return;
+    }
+    const float iscale = -127.0f / maxv;
+    for (int j = 0; j < 256; ++j) {
+        int v = __float2int_rn(iscale * xb[j]);
+        q.qs[j] = (int8_t)(v < 127 ? v : 127);
+    }
+    for (int j = 0; j < 16; ++j) {
+        int sum = 0;
+        for (int k = 0; k < 16; ++k) sum += q.qs[16 * j + k];
+        q.bsums[j] = (int16_t)sum;
+    }
+    q.d = 1.0f / iscale;
+}
+
 template <int BLOCK>
 __global__ void proj_q8_0_kernel(float* __restrict__ y, const float* __restrict__ x,
                                  const BlockQ8_0* __restrict__ W, int blocks_per_row) {
@@ -769,6 +991,27 @@ __global__ void proj_q8_0_kernel(float* __restrict__ y, const float* __restrict_
 #pragma unroll
         for (int j = 0; j < 32; ++j) s += (float)row[b].qs[j] * xb[j];
         acc += d * s;
+    }
+    acc = block_sum<BLOCK>(acc, shm);
+    if (threadIdx.x == 0) y[n] = acc;
+}
+
+template <int BLOCK>
+__global__ void proj_q8_0_q8_0_kernel(float* __restrict__ y,
+                                      const BlockQ8_0* __restrict__ x,
+                                      const BlockQ8_0* __restrict__ W,
+                                      int blocks_per_row) {
+    const int n = blockIdx.x;
+    const BlockQ8_0* row = W + (size_t)n * blocks_per_row;
+    __shared__ float shm[BLOCK / 32 + 1];
+    float acc = 0.0f;
+    for (int b = threadIdx.x; b < blocks_per_row; b += BLOCK) {
+        int sumi = 0;
+#pragma unroll
+        for (int j = 0; j < 32; ++j) sumi += (int)row[b].qs[j] * (int)x[b].qs[j];
+        const float dw = __half2float(__ushort_as_half(row[b].d));
+        const float dx = __half2float(__ushort_as_half(x[b].d));
+        acc += (float)sumi * (dw * dx);
     }
     acc = block_sum<BLOCK>(acc, shm);
     if (threadIdx.x == 0) y[n] = acc;
@@ -815,6 +1058,11 @@ __global__ void add_f32_kernel(float* __restrict__ out, const float* __restrict_
     if (i < n) out[i] = a[i] + b[i];
 }
 
+__global__ void sigmoid_inplace_f32_kernel(float* __restrict__ x, int64_t n) {
+    const int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
+    if (i < n) x[i] = 1.0f / (1.0f + __expf(-x[i]));
+}
+
 template <int BLOCK>
 __global__ void rms_norm_kernel(float* __restrict__ out, const float* __restrict__ x,
                                 const float* __restrict__ w, int n, float eps) {
@@ -848,7 +1096,8 @@ void kda_decode_step_f32(float* out, float* state,
     if (head_dim <= 0 || n_head <= 0) return;
     // One thread per state column. K3's head_dim is 128.
     const int T = head_dim;
-    const size_t shm = (size_t)3 * head_dim * sizeof(float);
+    // s_k, s_q, s_sk, s_ge
+    const size_t shm = (size_t)4 * head_dim * sizeof(float);
     kda_decode_step_kernel<128><<<(unsigned)n_head, T, shm, stream>>>(
         out, state, q, k, v, g, beta, head_dim);
 }
@@ -886,7 +1135,8 @@ void kda_conv_step_f32(float* out, float* state, const float* x, const float* w,
     kda_conv_step_kernel<<<(unsigned)blocks, T, 0, stream>>>(out, state, x, w, d_conv, d_inner);
 }
 
-// Upload the lattice/sign tables once. __constant__ is the right home: every
+// Upload the lattice/sign tables once. __device__ (NOT __constant__) is the right
+// home — see the note on the declarations above. Formerly:  every
 // thread in a warp reads the same grid entry for a given codepoint, so the
 // broadcast path is what we want rather than L1 thrash.
 // THE LATTICE TABLES ARE PER-DEVICE STATE, SO THE GUARD MUST BE TOO.
@@ -980,12 +1230,12 @@ void moe_expert_ffn_iq2xs_f32(float* out, float* scratch,
     // the band test must never reject. INT_MAX makes it a no-op rather than a branch.
     const int n_local = n_local_experts > 0 ? n_local_experts : INT_MAX;
     dim3 g1((unsigned)ffn, (unsigned)top_k);
-    moe_gate_up_situ_kernel<128, BlockIQ2XS><<<g1, 128, 0, stream>>>(
+    moe_gate_up_situ_kernel<32, BlockIQ2XS><<<g1, 32, 0, stream>>>(
         scratch, x, ids, (const BlockIQ2XS*)gate_exps, (const BlockIQ2XS*)up_exps,
         latent, ffn, situ_beta, 1.0f / situ_beta, situ_linear_beta,
         lb_active ? 1.0f / situ_linear_beta : 1.0f, lb_active,
         expert_begin, n_local);
-    moe_down_combine_kernel<128, BlockIQ2XS><<<(unsigned)latent, 128, 0, stream>>>(
+    moe_down_combine_kernel<32, BlockIQ2XS><<<(unsigned)latent, 32, 0, stream>>>(
         out, scratch, ids, w, (const BlockIQ2XS*)down_exps, latent, ffn, top_k,
         expert_begin, n_local);
 }
@@ -1011,12 +1261,12 @@ void moe_expert_ffn_iq1s_f32(float* out, float* scratch,
     const int lb_active = situ_linear_beta > 0.0f ? 1 : 0;
     const int n_local = n_local_experts > 0 ? n_local_experts : INT_MAX;
     dim3 g1((unsigned)ffn, (unsigned)top_k);
-    moe_gate_up_situ_kernel<128, BlockIQ1S><<<g1, 128, 0, stream>>>(
+    moe_gate_up_situ_kernel<32, BlockIQ1S><<<g1, 32, 0, stream>>>(
         scratch, x, ids, (const BlockIQ1S*)gate_exps, (const BlockIQ1S*)up_exps,
         latent, ffn, situ_beta, 1.0f / situ_beta, situ_linear_beta,
         lb_active ? 1.0f / situ_linear_beta : 1.0f, lb_active,
         expert_begin, n_local);
-    moe_down_combine_kernel<128, BlockIQ1S><<<(unsigned)latent, 128, 0, stream>>>(
+    moe_down_combine_kernel<32, BlockIQ1S><<<(unsigned)latent, 32, 0, stream>>>(
         out, scratch, ids, w, (const BlockIQ1S*)down_exps, latent, ffn, top_k,
         expert_begin, n_local);
 }
@@ -1059,7 +1309,56 @@ bool moe_expert_ffn_f32_by_type(float* out, float* scratch,
                                 int latent, int ffn, int top_k,
                                 float situ_beta, float situ_linear_beta,
                                 int ggml_type, cudaStream_t stream,
-                                int expert_begin, int n_local_experts) {
+                                int expert_begin, int n_local_experts,
+                                void* q8k_scratch) {
+    if (q8k_scratch) {
+        if (latent <= 0 || ffn <= 0 || top_k <= 0 ||
+            latent % 256 != 0 || ffn % 256 != 0)
+            return false;
+        BlockQ8K* qin = (BlockQ8K*)q8k_scratch;
+        BlockQ8K* qacts = qin + latent / 256;
+        const int T = 128;
+        quantize_q8_k_kernel<<<((latent / 256) + T - 1) / T, T, 0, stream>>>(
+            qin, x, latent / 256, 1);
+        const int lb_active = situ_linear_beta > 0.0f ? 1 : 0;
+        const int n_local = n_local_experts > 0 ? n_local_experts : INT_MAX;
+        dim3 g1((unsigned)ffn, (unsigned)top_k);
+        switch (ggml_type) {
+            case 17:
+                ensure_iq2xs_tables();
+                moe_gate_up_situ_q8k_kernel<BlockIQ2XS><<<g1, 32, 0, stream>>>(
+                    scratch, qin, ids, (const BlockIQ2XS*)gate_exps,
+                    (const BlockIQ2XS*)up_exps, latent, ffn,
+                    situ_beta, 1.0f / situ_beta, situ_linear_beta,
+                    lb_active ? 1.0f / situ_linear_beta : 1.0f, lb_active,
+                    expert_begin, n_local);
+                break;
+            case 19:
+                ensure_iq1s_tables();
+                moe_gate_up_situ_q8k_kernel<BlockIQ1S><<<g1, 32, 0, stream>>>(
+                    scratch, qin, ids, (const BlockIQ1S*)gate_exps,
+                    (const BlockIQ1S*)up_exps, latent, ffn,
+                    situ_beta, 1.0f / situ_beta, situ_linear_beta,
+                    lb_active ? 1.0f / situ_linear_beta : 1.0f, lb_active,
+                    expert_begin, n_local);
+                break;
+            default:
+                return false;
+        }
+        const int act_blocks = top_k * (ffn / 256);
+        quantize_q8_k_kernel<<<(act_blocks + T - 1) / T, T, 0, stream>>>(
+            qacts, scratch, ffn / 256, top_k);
+        if (ggml_type == 17) {
+            moe_down_combine_q8k_kernel<BlockIQ2XS><<<(unsigned)latent, 32, 0, stream>>>(
+                out, qacts, ids, w, (const BlockIQ2XS*)down_exps,
+                latent, ffn, top_k, expert_begin, n_local);
+        } else {
+            moe_down_combine_q8k_kernel<BlockIQ1S><<<(unsigned)latent, 32, 0, stream>>>(
+                out, qacts, ids, w, (const BlockIQ1S*)down_exps,
+                latent, ffn, top_k, expert_begin, n_local);
+        }
+        return true;
+    }
     switch (ggml_type) {
         case 17:
             moe_expert_ffn_iq2xs_f32(out, scratch, x, ids, w, gate_exps, up_exps,
@@ -1141,6 +1440,34 @@ bool k3_proj_f32(float* y, const float* x, const void* W, int wtype,
     }
 }
 
+bool k3_proj_ggml_f32(float* y, const float* x, const void* W, int wtype,
+                      int N, int K, void* q8_scratch, cudaStream_t stream) {
+    if (N <= 0 || K <= 0) return false;
+    if (wtype == 0)
+        return k3_proj_f32(y, x, W, wtype, N, K, stream);
+    if (wtype != 8 || !q8_scratch || K % 32 != 0) return false;
+    const int nb = K / 32;
+    constexpr int QT = 128;
+    quantize_q8_0_kernel<<<(nb + QT - 1) / QT, QT, 0, stream>>>(
+        (BlockQ8_0*)q8_scratch, x, nb);
+    constexpr int BLOCK = 128;
+    proj_q8_0_q8_0_kernel<BLOCK><<<(unsigned)N, BLOCK, 0, stream>>>(
+        y, (const BlockQ8_0*)q8_scratch, (const BlockQ8_0*)W, nb);
+    return true;
+}
+
+size_t k3_q8_0_bytes(int K) {
+    return K > 0 && K % 32 == 0 ? (size_t)(K / 32) * sizeof(BlockQ8_0) : 0;
+}
+
+size_t k3_moe_q8_k_bytes(int latent, int ffn, int top_k) {
+    if (latent <= 0 || ffn <= 0 || top_k <= 0 ||
+        latent % 256 != 0 || ffn % 256 != 0)
+        return 0;
+    return ((size_t)(latent / 256) + (size_t)top_k * (ffn / 256)) *
+           sizeof(BlockQ8K);
+}
+
 void rms_norm_f32(float* out, const float* x, const float* w, int n, float eps,
                   cudaStream_t stream) {
     if (n <= 0) return;
@@ -1154,6 +1481,13 @@ void k3_add_f32(float* out, const float* a, const float* b, int64_t n,
     const int T = 256;
     const int64_t blocks = (n + T - 1) / T;
     add_f32_kernel<<<(unsigned)blocks, T, 0, stream>>>(out, a, b, n);
+}
+
+void sigmoid_inplace_f32(float* x, int64_t n, cudaStream_t stream) {
+    if (n <= 0) return;
+    const int T = 256;
+    const int64_t blocks = (n + T - 1) / T;
+    sigmoid_inplace_f32_kernel<<<(unsigned)blocks, T, 0, stream>>>(x, n);
 }
 
 }  // namespace k3
