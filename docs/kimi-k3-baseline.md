@@ -1,7 +1,7 @@
 # Kimi K3 evaluation baseline — UD-Q2_K_XL at 1M context
 
 Kimi K3 (Moonshot AI) is 2.8T total / ~50B active, hybrid KDA + MLA, 896 routed experts,
-1M context, native vision. This document covers **the baseline half of the eval only**:
+1M context, native vision. This document covers **the llama.cpp reference half of the eval**. The sparkinfer half — measuring the runtime and emitting the scoring verdict — is `bench/scripts/kimi_k3_eval.sh`; this doc covers what it is measured *against*:
 producing a pinned, reproducible llama.cpp reference for **UD-Q2_K_XL at the full 1M
 context**, across the three milestone nodes.
 
@@ -17,11 +17,20 @@ context**, across the three milestone nodes.
 M1–M3 change **only the node**: same quant, same context, same flags, so each delta is
 attributable to hardware rather than a moving target. M4 is the one capability milestone.
 
-sparkinfer cannot run this model yet. `runtime/` loaders are Qwen-shaped
-(`runtime/src/models/qwen35.cpp`, `runtime/include/sparkinfer/models/qwen_config.h`) and
-there is no `kimi-k3` GGUF loader, no KDA decode path, and no tuned kernel path for any of
-the three milestone architectures. What this repo lands is the *measuring stick*, so that
-native work has a same-box number to beat instead of a claim.
+sparkinfer runs this model. `runtime/src/models/kimi_k3.cpp` carries a native K3 loader and
+forward (KDA + MLA decode, latent MoE, `situ`, cross-layer residual), and
+`runtime/src/models/kimi_k3_tp.cpp` runs it tensor-parallel across 8 GPUs. All 93 layers,
+text in and text out, via `bench/scripts/kimi_k3_run.sh`.
+
+**The reference still matters more than ever, because sparkinfer currently LOSES to it:**
+
+    llama.cpp    18.32 tok/s      8x H200, UD-IQ1_S, ctx 128
+    sparkinfer    3.55 tok/s      tensor-parallel, same box, same weights  -> 5.2x slower
+
+Accuracy on identical weights and ids: top-1 100%, top-5 100%, mean KLD 4.05e-03. So the
+measuring stick did its job — it gave the native work a same-box number to beat, and that
+number is not yet beaten. See `bench/results/kimi_k3_tp_scaling_h200x8_iq1s.md` and
+`bench/results/kimi_k3_e2e_h200x8_iq1s.md`.
 
 ## Why the baseline is a fork, not upstream llama.cpp
 
@@ -131,7 +140,7 @@ metric — see the config's `required_work` for what actually needs measuring.
 
 ```bash
 # 0. from the repo root, on the node
-export KIMI_K3_MODELS_DIR=/workspace/models_k3     # needs ~900 GiB free
+export KIMI_K3_MODELS_DIR=/workspace/models_k3     # needs ~560 GiB free (UD-IQ1_S default)
 
 # 1. sanity-check the plan without touching the network or the GPUs
 bench/scripts/kimi_k3_baseline.sh --node h200x8 --dry-run
@@ -285,7 +294,7 @@ node/quant/context combination, and the GGUF tokenizer backend.
 
 ## Not done yet
 
-- **No measured numbers, on any node.** Every `KIMI_K3_*_LLAMA_*` in `reference.lock` ships
+- **One measured number.** `KIMI_K3_H200X8_IQ1S_LLAMA_128 = 18.3210` is pinned and backed by a committed sweep JSON (8x H200, UD-IQ1_S, ctx 128, 1 rep, decode only). Every OTHER `KIMI_K3_*_LLAMA_*` in `reference.lock` still ships
   as `0` and every sparkinfer slot in every target YAML is `null`. No sweep has run.
 - **No sparkinfer `kimi-k3` loader** (M2) — see `runtime.required_work` in the model YAML.
 - **No tuned kernel path** for sm_90, sm_100 or sm_103.

@@ -7,7 +7,7 @@ how to make a contribution that counts.
 ## Built through Gittensor
 
 Gittensor helps power SPARKINFER through SN74: the project receives subnet emissions,
-contributors submit source PRs, the evaluator rebuilds those PRs on real RTX 5090 hardware,
+contributors submit source PRs, the evaluator rebuilds those PRs on a real 8x H200 node,
 and rewards are assigned from verified marginal speedups that keep correctness intact.
 You do not need to be in Discord or understand the subnet internals to contribute, but the
 source of the incentive loop is clear: SPARKINFER is built through **SN74 on Gittensor**.
@@ -21,7 +21,7 @@ source of the incentive loop is clear: SPARKINFER is built through **SN74 on Git
   Every change is gated against a frozen reference (see *Accuracy gate* below).
 - **General, not overfit.** Optimizations must hold across the basket — **Qwen3-MoE and
   Gemma 4** — and across shapes. A win on one model/shape but not the other is overfitting.
-- **Blackwell only, by design.** Targets `sm_120` (RTX 5090, RTX PRO 6000) and `sm_121`
+- **Hopper first, by design.** Targets `sm_90` (H200 — the default node) and `sm_100`
   (RTX Spark / Jetson Thor). CUDA 12.8+ (13 works). Not `sm_100`.
 
 ## Before you open a PR
@@ -50,7 +50,7 @@ must be clean (0 errors).
 
 **Speedup-only.** You're paid for the **verified marginal speedup** your PR adds over the
 current best ("frontier"), not your rank — so "copy the leader + ε" pays ≈ ε. Both **current
-`main` and your PR are built and benchmarked on the same RTX 5090** in one run and scored on the
+`main` and your PR are built and benchmarked on the same 8x H200 node** in one run and scored on the
 delta between them, so speed differences between eval machines can't inflate or hide your result.
 
 **Competing PRs (per-round merge workflow).** A run grades every queued PR against the *same*
@@ -77,19 +77,28 @@ and tooling are appreciated and we'll review and merge good ones, but SN74 emits
 verified speedups, so they earn no reward. (The eval/scoring harness is maintainer-owned — see
 *Maintainer-owned paths* below.)
 
-**Evaluation is opt-in and proof-gated.** The RTX 5090 eval runs only when **both** hold: you tick
-**`- [x] Tested on RTX 5090`** *and* fill the template's **decode tok/s** table with a real
+**Evaluation is opt-in and proof-gated.** The node eval runs only when **both** hold: you tick
+**`- [x] Tested on 8x H200`** *and* fill the template's **decode tok/s** table with a real
 end-to-end improvement (`after > before`, from `bench/scripts/bench.sh` — not an isolated-kernel
-microbenchmark). Then the bot greenlights it (**`test-on-5090`**) and evaluates on the next poll.
+microbenchmark). Then the bot greenlights it and evaluates on the next poll.
 - Box ticked but the decode table empty / placeholder / no gain → **`needs-benchmark`**, not evaluated
   (fill in real numbers and it greenlights automatically).
-- Box not ticked → **auto-closed** (same as `rtx5090-required` CI). Tick the box, fill tables, and reopen to submit.
-There is **no override** — every PR is evaluated on a real RTX 5090 only after it legitimately
+- Box not ticked → the `node-attestation` job labels `needs-node-run`. It **labels only — it never closes a PR**.
+There is **no override** — every PR is evaluated on a real node only after it legitimately
 passes the gate (box ticked + real before<after decode numbers).
 
-> ⚠️ Tick that box **only if you actually ran it on an RTX 5090** and pasted the benchmark log.
+> ⚠️ Tick that box **only if you actually ran it on the node you ticked** and pasted the benchmark log.
 > Checking it without testing is false attestation — it is treated as gaming and the account will
 > be **blocked** (added to the denylist), the same as sybil farming.
+
+### One open PR at a time
+
+**You may have exactly ONE open pull request.** Open a second while the first is still
+open and it is closed automatically, newest first, so the one under review survives.
+
+This is not only anti-spam. The eval scores a PR against the **merged** frontier, so two
+open PRs from one author are both measured against a baseline the other is about to move —
+the marginal-gain number only means something if they land one at a time.
 
 ### Anti-gaming (how submissions are kept honest)
 
@@ -97,9 +106,21 @@ The bot evaluates PRs **oldest-first** and fingerprints each diff, so gaming is 
 
 - **Copycatting.** Re-submitting an earlier PR's diff — *even with a few extra lines bolted on to
   look original or slip past the evaluator* — is flagged by diff-containment fingerprint. A first
-  copycat strike **freezes all your evaluations for 5 days** (`penalty` label, skipped; PRs already
-  scored keep their result); a **second strike blocks** the account. Logged in
-  [`.github/copycats.json`](.github/copycats.json) / [`COPYCATS.md`](.github/COPYCATS.md).
+  copycat is acted on IMMEDIATELY — there is no strike accumulation and no 5-day freeze.
+  Enforcement is tiered by how much of an earlier PR your diff contains:
+
+  | containment | what happens |
+  |---|---|
+  | **>= 90%** | account added to the denylist and the PR closed. Effectively permanent. |
+  | **80-90%** | explanatory comment + the PR is auto-closed. You can open a real one next. |
+  | **70-80%** | `llm-judge` label + a semantic review. **Never closes, never blocks** — a maintainer decides. |
+  | < 70% | ignored. |
+
+  The gap between the tiers is deliberate: a missed copycat costs one PR's emission, a
+  false block costs a real contributor their access permanently. The 70-80% band exists
+  because overlap alone cannot separate a renamed copycat from an independent contributor
+  who touched the same hot function, so that band is reviewed rather than punished.
+  Logged in [`.github/copycats.json`](.github/copycats.json) / [`COPYCATS.md`](.github/COPYCATS.md).
 - **Sybil / duplicate-account farming** (one operator pushing under multiple GitHub identities, or
   shadowing others' work) is blocked outright; evidence is recorded in [`.github/FLAGGED.md`](.github/FLAGGED.md).
 - **No override.** There is no way to force-evaluate around the gate — not even for a maintainer.
