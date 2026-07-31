@@ -3,9 +3,10 @@
 Kimi K3 at the target quant is **802 GiB**. No single GPU holds it, so multi-GPU is
 not an optimization here — it is the precondition for sparkinfer running K3 at all.
 
-This document covers **what has landed** (the shard math, the collective
-abstraction, the NCCL backend, the hardware validation tool) and **what has not**
-(the forward-path integration). Read the status table before trusting anything.
+This document covered "what has landed vs what has not" when nothing ran. **It all runs
+now**: sharded loading, a phase-split forward, and an end-to-end tensor-parallel decode of
+all 93 layers on 8x H200. What remains is not integration but SCOPE — only the experts are
+sharded. Read the status table, then the limit at the bottom.
 
 ## Status
 
@@ -19,8 +20,10 @@ abstraction, the NCCL backend, the hardware validation tool) and **what has not*
 | ✅ **Validation tool** | `tp_allreduce_check` — **run; numbers in `bench/results/`** |
 | ✅ **Reduce points** | corrected: the MoE collective is at `expert_latent`, not hidden — see below |
 | ⚠️ **f32 fast collectives** | peer-oneshot/multimem are bf16-only; K3 f32 falls back to NCCL |
-| ❌ **Forward integration** | no model forward issues a collective yet |
-| ❌ **Sharded weight loading** | the loader still slices by LAYER RANGE, never by row/col/expert |
+| ✅ **Forward integration** | `kimi_k3_tp.cpp` — phase-split forward, one collective per MoE layer |
+| ✅ **Sharded weight loading** | `upload_sliced()` consumes `plan_tensor_residency()`'s StridedCopy |
+| ✅ **End to end** | 93 layers on 8x H200, text in text out, matches the pipeline to 1.85e-09 |
+| ❌ **`ShardPolicy::Full`** | attention is REPLICATED. Declared, not enabled — see the limit below |
 
 ### Two corrections this table used to hide
 
@@ -158,14 +161,23 @@ shapes where experts don't divide but the width does) and is reported via
 K3, `tp_size 8`, 93 layers:
 
 ```
-2 collectives/layer x 93 layers   = 186 all-reduces per decoded token
-hidden 7168 x 2 bytes (bf16)      = 14 KiB per collective
+MEASURED, ShardPolicy::ExpertsOnly:
+  1 collective/MoE layer x 92 MoE layers = 92 all-reduces per decoded token
+  expert_latent 3584 x 4 bytes (f32)     = 14 KiB per collective
+  58.7 us/call on 8x H200 (NCCL)         = ~5.4 ms/token of pure collective
 ```
 
-14 KiB is nothing for NVLink. **186 round-trips per token is the entire decode
-budget.** So this is latency-bound, `tp_allreduce_check` reports microseconds per
-call rather than GB/s, and the per-call overhead of the collective mechanism —
-not its throughput — is what decides whether TP=8 scales.
+The 186 figure this section used to quote assumed a fully-sharded K3 — two collectives
+per layer over all 93. `ExpertsOnly` replicates attention, so the attention reduce does
+not exist and the leading dense layer has no expert dispatch: **92, not 186.**
+
+f32, not bf16: K3's residual stream is f32 by design, so the payload is 3584 x 4 B rather
+than 7168 x 2 B — the same 14 KiB, for a different reason.
+
+Still latency-bound — 512x the data costs 1.45x the time — so `tp_allreduce_check` reports
+microseconds per call rather than GB/s. But the measured 5.4 ms/token is **under 7% of the
+281.6 ms token**, so the collective is NOT the bottleneck. Launch overhead in the ~30
+unfused kernels per layer is.
 
 ## Validate before trusting
 
@@ -205,29 +217,40 @@ benchmark measure one card.
 
 ## Next, in order
 
-1. **Run `tp_allreduce_check` on the 8× H200 node.** Nothing below is worth
-   starting until the collective is proven correct and its latency is known.
-2. **Sharded weight loading.** `load_gguf()` currently loads to one device; it
-   needs to walk its tensors through `plan_for()` and place each rank's slice. The
-   decisions are done and tested — the slicing primitives (`row_shard`,
-   `col_shard`, `col_shard_row_offset`) and the per-tensor rules
-   (`weight_plan.h`) — so what remains is copy plumbing, not design.
+Steps 1-3 of the old list are done: the collective is validated on hardware, the loader
+shards, and the forward issues the reduce. What is left:
 
-   Two things the plan will tell the loader that it must handle rather than
-   ignore: a **fused `attn_qkv` with replicated kv is refused** (`Rule::Unknown`
-   with a note), because q shards while kv replicates and that is not one rule —
-   the loader has to split the fused tensor first. And any tensor with no rule is
-   a **hard load error**, so a K3 tensor sparkinfer has no loader for (`attn_kv_b`,
-   `attn_res_proj`) stops the load instead of being mis-sharded.
-3. **Forward integration.** Insert the two all-reduces per layer at the points
-   `ReducePoint` enumerates, and shard the lm_head with a cross-rank argmax
-   (each rank's local max + index is all that needs exchanging, so that
-   collective is tiny).
-4. **CUDA-graph capture across ranks.** The existing decode path captures a graph;
-   an 8-stream capture with collectives in it is where the host-event vs
-   in-kernel-barrier distinction starts to matter, and where `peer-oneshot`
-   would earn its keep — after step 1 has validated it.
+1. **`ShardPolicy::Full` — shard attention.** This is the whole ballgame now. See below.
+2. **Batched prefill.** There is none; prompt ingestion is one forward per prompt token.
+3. **CUDA-graph capture across ranks.** ~30 unfused launches per layer x 93 layers, and
+   the profile is launch/occupancy-bound at 13x off roofline. An 8-stream capture with
+   collectives inside is where the host-event vs in-kernel-barrier distinction starts to
+   matter, and where `peer-oneshot` would finally earn its keep.
+4. **f32 fast collectives.** peer-oneshot and multimem are bf16-only, so K3 falls back to
+   NCCL. peer-oneshot was 3.3x faster than NCCL in bf16, so an f32 variant is worth roughly
+   3.5 ms/token — real, but far behind item 1.
 
-Note that none of this makes sparkinfer run **K3**: there is still no `kimi-k3`
-GGUF loader (see `bench/configs/models/kimi_k3.yaml` → `runtime.required_work`).
-TP is exercisable against Qwen today, which is the right way to validate it.
+## The limit of ExpertsOnly, and why it is now the whole story
+
+`ShardPolicy::ExpertsOnly` bands the 896 routed experts (531 of UD-IQ1_S's 553 GiB) and
+**replicates everything else, including attention**. That was the right first cut: it
+captures essentially all of the memory win, needs one collective per layer instead of two,
+and — because no activation changes width — lets the forward run at full `cfg` dims on
+every rank with no per-rank shape threading.
+
+Then the MoE dispatch got ~3x faster, and the arithmetic inverted:
+
+| | before the MoE speedup | after |
+|---|---:|---:|
+| tp=1, 16 layers | 196.65 ms/token | **60.66** |
+| tp=8, 16 layers | 80.61 ms/token | **54.33** |
+| **tp=8 vs tp=1** | **2.44x** | **~1.1x** |
+
+The replicated attention did not get faster and did not get sharded, so it became the
+entire serial term. `ShardPolicy::Full` is declared and deliberately NOT enabled: the
+loader would shard weights the executor still indexes at full width, which reads past the
+end of the slice. Enabling it means threading per-rank head counts through the KDA and MLA
+kernels and sizing the recurrent state per rank.
+
+Absolute context: llama.cpp does **18.32 tok/s** on this box against sparkinfer's **3.55**.
+TP is not what closes that gap on its own.
