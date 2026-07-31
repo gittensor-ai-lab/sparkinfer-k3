@@ -766,13 +766,39 @@ class CiWorkflowTest(unittest.TestCase):
         self.assertIn("bench/results/", pattern)
         # ...and the blanket bench/scripts/ alternative must NOT be.
         self.assertNotIn("bench/scripts/|", pattern)
-        # Prove it behaves: the guard must fire on reference.lock and not on the runner.
+        # Prove it behaves. The rule is NOT "narrow" for its own sake -- it is "everything
+        # that determines a verdict, and nothing else". Anything kimi_k3_eval.sh invokes to
+        # produce a number is part of the verdict: guarding eval.sh while leaving
+        # baseline.sh (which emits the tok/s) or _kimi_k3.sh (which it sources) writable is
+        # a bypass, not a narrower guard. An earlier revision of this test asserted those
+        # two were open; that was wrong and is corrected here.
         import re as _re
         rx = _re.compile(pattern.split("'")[1])
-        self.assertTrue(rx.search("bench/scripts/reference.lock"))
-        self.assertTrue(rx.search("bench/results/kimi_k3_x.json"))
-        self.assertFalse(rx.search("bench/scripts/kimi_k3_baseline.sh"))
-        self.assertFalse(rx.search("bench/scripts/_kimi_k3.sh"))
+        for guarded in ("bench/scripts/reference.lock", "bench/results/kimi_k3_x.json",
+                        "bench/scripts/label.py", "bench/scripts/kimi_k3_eval.sh",
+                        "bench/scripts/kimi_k3_baseline.sh", "bench/scripts/_kimi_k3.sh",
+                        "bench/scripts/kimi_k3_attest.py"):
+            self.assertTrue(rx.search(guarded), f"trust anchor left writable: {guarded}")
+        # ...while the harness at large stays open to contributors.
+        for open_path in ("bench/scripts/kimi_k3_run.sh", "bench/scripts/bench.sh",
+                          "bench/scripts/probe_max_ctx.sh", "kernels/csrc/cuda/x.cu"):
+            self.assertFalse(rx.search(open_path), f"needlessly guarded: {open_path}")
+
+    def test_guard_covers_everything_the_eval_invokes(self):
+        """Closes the class, not the instance. The guard is a hand-maintained list while
+        the eval's call graph moves independently -- that is exactly how baseline.sh ended
+        up writable. This walks what kimi_k3_eval.sh actually invokes and fails if any of
+        it escapes the guard, so the next helper added to the chain cannot silently
+        reopen the hole."""
+        import re as _re
+        wf = (ROOT / ".github/workflows/sensitive-paths-guard.yml").read_text()
+        rx = _re.compile([l for l in wf.splitlines() if "SENSITIVE=" in l][0].split("'")[1])
+        src = (ROOT / "bench/scripts/kimi_k3_eval.sh").read_text()
+        invoked = set(_re.findall(r"bench/scripts/([A-Za-z0-9_.]+\.(?:sh|py))", src))
+        invoked |= {m for m in _re.findall(r"\b(_[a-z0-9_]+\.sh)", src)}
+        missing = [f for f in sorted(invoked)
+                   if f != "kimi_k3_run.sh" and not rx.search(f"bench/scripts/{f}")]
+        self.assertEqual(missing, [], f"kimi_k3_eval.sh invokes unguarded files: {missing}")
 
     def test_baseline_results_are_committable(self):
         """The `lock` job requires a committed bench/results JSON to back any pinned

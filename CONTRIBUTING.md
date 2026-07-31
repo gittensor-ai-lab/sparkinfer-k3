@@ -19,55 +19,72 @@ source of the incentive loop is clear: SPARKINFER is built through **SN74 on Git
   submission format.
 - **Correctness first.** A faster kernel that changes the model's output is worth zero.
   Every change is gated against a frozen reference (see *Accuracy gate* below).
-- **General, not overfit.** Optimizations must hold across the basket — **Qwen3-MoE and
-  Gemma 4** — and across shapes. A win on one model/shape but not the other is overfitting.
-- **Hopper first, by design.** Targets `sm_90` (H200 — the default node) and `sm_100`
-  (RTX Spark / Jetson Thor). CUDA 12.8+ (13 works). Not `sm_100`.
+- **General, not overfit.** This repo targets **one model: Kimi K3** (2.8T, 93 layers,
+  896 routed experts) at **UD-IQ1_S** on **8x H200**. "Not overfit" here means the win must
+  hold across *context lengths* (128 -> 128k) and survive the accuracy gate — not a
+  cherry-picked shape. A kernel that only helps ctx 128 has not moved the case anyone runs.
+- **Hopper only.** Targets `sm_90` (8x H200). CUDA 12.8+ (13 works). `sm_100`
+  (Blackwell / RTX Spark) is **not** a target here — that is the parent repo's track.
 
 ## Before you open a PR
 
 ```bash
-# 1. build + tests (must be 5/5)
-cmake -B build -DCMAKE_CUDA_ARCHITECTURES=120 && cmake --build build -j && ctest --test-dir build
+# 1. build + tests
+cmake -B build -DCMAKE_CUDA_ARCHITECTURES=90 && cmake --build build -j && ctest --test-dir build
+python3 bench/scripts/test_kimi_k3_baseline.py          # 78 tests, no GPU needed
 
-# 2. speed — does it actually go faster?
-bench/scripts/bench.sh --download            # and --compare for the llama.cpp gap
+# 2. does it still generate? (8x H200, all 93 layers, text in text out)
+export KIMI_K3_MODEL=$KIMI_K3_MODELS_DIR/UD-IQ1_S/Kimi-K3-UD-IQ1_S-00001-of-00014.gguf
+bench/scripts/kimi_k3_run.sh "The capital of France is" 32 0,1,2,3,4,5,6,7
 
-# 3. accuracy — did it stay correct?  (this is the gate that blocks regressions)
-bench/scripts/accuracy.sh --download
+# 3. speed AND accuracy in one command — this is what produces your verdict
+bench/scripts/kimi_k3_eval.sh --node h200x8 --seal
 ```
 
-**Accuracy gate.** Run `bench/scripts/accuracy.sh` (or `qwen3_gguf_score`) on the build
-*before* and *after* your change. A correct optimization must keep:
-- **top-1 token agreement within the current eval threshold** vs the previous build, and
-- **low mean KL** (the next-token distributions should barely move).
+`bench.sh` and `accuracy.sh` are the **inherited Qwen3-30B track** and do not apply here.
+K3's harness is `kimi_k3_*`.
 
-(`accuracy.sh` also compares against llama.cpp; the implementation bar there is ≥ 90%
-top-1, currently met at ~96–99%.) If `compute-sanitizer` is available, your kernels
+**Accuracy gate, and it runs FIRST.** `kimi_k3_eval.sh` compares your build's logits
+against the captured llama.cpp reference (`bench/refdata/`) on identical weights and
+identical token ids. `label.py` REJECTs below **top-1 0.90** or **mean KL 0.20** no matter
+how fast the run was — a speedup that erodes parity is not a speedup worth taking.
+
+Current measured parity on `main`: **top-1 100%, mean KLD 4.05e-03**. Note that KLD is
+~400x the 1e-5 same-implementation bar, from a known and accepted cause (K3 keeps f32
+activations where ggml quantizes them before a quantized mat-vec). Do not go hunting it
+as a bug; do not make it worse. If `compute-sanitizer` is available, your kernels
 must be clean (0 errors).
 
 ## How rewards work (SN74 on Gittensor)
 
 **Speedup-only.** You're paid for the **verified marginal speedup** your PR adds over the
-current best ("frontier"), not your rank — so "copy the leader + ε" pays ≈ ε. Both **current
-`main` and your PR are built and benchmarked on the same 8x H200 node** in one run and scored on the
-delta between them, so speed differences between eval machines can't inflate or hide your result.
+current best ("frontier"), not your rank — so "copy the leader + ε" pays ≈ ε. Your PR is built and benchmarked on the **same 8x H200 node** as the recorded frontier,
+against the pinned reference in `bench/scripts/reference.lock`, so speed differences between eval
+machines can't inflate or hide your result.
 
-**Competing PRs (per-round merge workflow).** A run grades every queued PR against the *same*
-`main`, so two independent optimizations each get their true gain. The bot then labels the round's
-biggest one [`merge-first`](../../labels/merge-first) and the rest
-[`needs-rebase`](../../labels/needs-rebase). The `merge-first` winner is **auto-merged** once it
-clears every guard — verified speedup, clean CI, no conflicts, author in good standing, and it
-touches only `kernels`/`runtime`/`moe` (never the maintainer-owned paths); a maintainer can stop
-that with a `hold` label. Once the `merge-first` PR is merged, the others **stay `needs-rebase`** —
-**rebase your branch onto the new `main`** and push; the bot then re-runs your eval against the new
-frontier (briefly tagging [`re-evaluate`](../../labels/re-evaluate) during the re-grade), so you're
-credited for the **marginal** gain on top of what merged (independent wins stack and keep scoring; a
-change the merge already captured drops to `none`). A `needs-rebase` PR can't win the next round
-until you actually rebase + it re-evals. Keep your branch rebased on `main`. The eval loop
-labels each PR **XL / L / M / S / XS** from the measured delta (or **BASELINE** for the first
-verified entry on a new model/target) — never by hand — and that tier is the payout. A speedup
-is scored the same wherever it lands (`kernels/`, `runtime/`, `moe/`); there is **no
+**There is no autonomous eval bot in this repo — yet.** The round workflow the parent
+repo runs (queue every PR against the same `main`, label the winner `merge-first`,
+auto-merge it, tag the rest `needs-rebase` and re-grade them) does **not** exist here.
+`eval/pr_eval_bot.py` is inherited and Qwen-shaped: it drives `bench.sh`/`accuracy.sh`,
+not the K3 harness.
+
+What actually happens today:
+
+1. A maintainer runs `bench/scripts/kimi_k3_eval.sh --node h200x8 --seal` on the node.
+   That measures, scores, seals the verdict into a Polaris receipt, and publishes the run
+   to [`sparkinfer-k3-log`](https://github.com/gittensor-ai-lab/sparkinfer-k3-log).
+2. They post `/eval RESULT_JSON {…}` on the PR.
+3. `.github/workflows/eval-label.yml` **re-derives** the tier from the reported
+   measurements rather than trusting the reported label, verifies the receipt against the
+   log, and applies exactly one `eval:*` label.
+
+So: **one open PR at a time, evaluated when a maintainer runs it.** No auto-merge, no
+`merge-first`/`needs-rebase`/`re-evaluate`, no oldest-first polling. Keep your branch
+rebased on `main`; the frontier moves when something merges, and your gain is measured
+against the merged frontier.
+
+The applied labels are **lowercase** — `eval:xs` … `eval:xl`, plus `eval:baseline` for the
+first verified entry on a node/quant. The tier is never set by hand. A speedup is scored the same wherever it lands (`kernels/`, `runtime/`, `moe/`); there is **no
 per-subsystem budget**. Tiers are bands of **% speedup over the frontier** — `XS` 2–3.5%, `S`
 3.5–6%, `M` 6–10%, `L` 10–18%, `XL` >18% (a gain under 2% is within measurement noise → `none`).
 Because they scale with the frontier, every tier stays reachable as decode speed grows.
@@ -77,15 +94,14 @@ and tooling are appreciated and we'll review and merge good ones, but SN74 emits
 verified speedups, so they earn no reward. (The eval/scoring harness is maintainer-owned — see
 *Maintainer-owned paths* below.)
 
-**Evaluation is opt-in and proof-gated.** The node eval runs only when **both** hold: you tick
+**Evaluation is opt-in and proof-gated.** A node eval happens only when you tick
 **`- [x] Tested on 8x H200`** *and* fill the template's **decode tok/s** table with a real
-end-to-end improvement (`after > before`, from `bench/scripts/bench.sh` — not an isolated-kernel
-microbenchmark). Then the bot greenlights it and evaluates on the next poll.
-- Box ticked but the decode table empty / placeholder / no gain → **`needs-benchmark`**, not evaluated
-  (fill in real numbers and it greenlights automatically).
-- Box not ticked → the `node-attestation` job labels `needs-node-run`. It **labels only — it never closes a PR**.
-There is **no override** — every PR is evaluated on a real node only after it legitimately
-passes the gate (box ticked + real before<after decode numbers).
+end-to-end improvement (`after > before`, from `bench/scripts/kimi_k3_baseline.sh` — not an
+isolated-kernel microbenchmark). Fill the **128k** row: that is the configuration this repo runs.
+- Box not ticked on a perf-bearing diff → the `node-attestation` job labels `needs-node-run`.
+  It **labels only — it never closes a PR.**
+- Box ticked with an empty or placeholder table → a maintainer will not queue the run.
+There is **no override** — a tier is only ever applied from a real measured run.
 
 > ⚠️ Tick that box **only if you actually ran it on the node you ticked** and pasted the benchmark log.
 > Checking it without testing is false attestation — it is treated as gaming and the account will
@@ -102,7 +118,8 @@ the marginal-gain number only means something if they land one at a time.
 
 ### Anti-gaming (how submissions are kept honest)
 
-The bot evaluates PRs **oldest-first** and fingerprints each diff, so gaming is caught automatically:
+`copycat-guard.yml` fingerprints every PR diff against merged history on open and on push,
+so gaming is caught automatically without anyone having to look:
 
 - **Copycatting.** Re-submitting an earlier PR's diff — *even with a few extra lines bolted on to
   look original or slip past the evaluator* — is flagged by diff-containment fingerprint. A first
@@ -135,11 +152,18 @@ score. These paths are protected:
 
 | Path | What |
 |---|---|
-| `eval/` | the PR-evaluation bot + GPU runner |
-| `bench/scripts/` | the on-box scoring harness (`evaluate.sh`, `label.py`, `accuracy*`, `_common.sh`, the eval prompt) |
+| `eval/` | inherited Qwen-era bot + GPU runner (dead in this repo, still guarded) |
+| `bench/scripts/label.py` | the scoring function — decides your tier |
+| `bench/scripts/kimi_k3_eval.sh`, `kimi_k3_baseline.sh`, `_kimi_k3.sh` | the measurement chain that produces tok/s |
+| `bench/scripts/kimi_k3_attest.py` | receipt sealing / Polaris attestation |
+| `bench/scripts/compare_logits.py`, `check_reference_lock.py` | the accuracy gate and pin verifier |
+| `bench/scripts/reference.lock`, `*.sha256` | the pinned frontier + weight manifests |
+| `bench/results/`, `dashboard/data.json` | recorded runs and the frontier ledger |
 | `.gittensor/` | intra-repo emission weights |
-| `sparkinfer-web` `public/dashboard/data.json` | the live frontier ledger (eval bot pushes here; in-repo `dashboard/` is legacy) |
 | `.github/` | CI, `CODEOWNERS`, and this guard |
+
+Everything else under `bench/scripts/` (including `kimi_k3_run.sh` and the Qwen-era
+`bench.sh`/`accuracy.sh`) is **not** guarded — those are convenience and legacy, not trust anchors.
 
 **Enforcement.** A required **`sensitive-paths-guard`** check automatically fails any PR from a
 non-maintainer that touches these paths, and `CODEOWNERS` requires maintainer review — so such
