@@ -36,12 +36,14 @@ jobs:
         id: key
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          YUNWEI_API_KEY: ${{ secrets.YUNWEI_API_KEY }}
+          COPYCAT_LLM_PROVIDER: ${{ vars.COPYCAT_LLM_PROVIDER }}
         run: |
-          if [ -n "${OPENAI_API_KEY:-}" ]; then
+          if [ -n "${OPENAI_API_KEY:-}" ] || [ -n "${YUNWEI_API_KEY:-}" ]; then
             echo "have_key=true" >> "$GITHUB_OUTPUT"
           else
             echo "have_key=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::OPENAI_API_KEY is not set — skipping the copycat guard. Set the secret to enable it, or remove this workflow."
+            echo "::notice::no LLM key (OPENAI_API_KEY / YUNWEI_API_KEY) — containment tiers still run; only the 50-70% judge band is skipped."
           fi
 
       - uses: actions/checkout@v4
@@ -55,6 +57,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          YUNWEI_API_KEY: ${{ secrets.YUNWEI_API_KEY }}
+          COPYCAT_LLM_PROVIDER: ${{ vars.COPYCAT_LLM_PROVIDER }}
           COPYCAT_LLM_PROVIDER: openai
           COPYCAT_LLM_MODEL: gpt-4o-mini
           PR_NUM: ${{ github.event.pull_request.number }}

@@ -1,6 +1,14 @@
 name: cap-open-prs
 
-# Anti-spam: cap the number of OPEN pull requests a single contributor may have.
+# STRICT: ONE open pull request per contributor. Merge one by one.
+#
+# A contributor who opens a second PR while the first is still open has it closed
+# automatically with an explanation. This is not only anti-spam: the eval loop scores a
+# PR against the MERGED frontier, so two open PRs from one author are measured against a
+# baseline that the other one is about to move. Serialising them is what makes the
+# marginal-gain number mean anything.
+#
+# Newest-first, so the PR under review is the one that survives.
 # When a contributor is over the cap, their excess PRs (newest first) are auto-closed
 # with an explanatory comment. Maintainers and bots are exempt.
 #
@@ -17,7 +25,7 @@ on:
     inputs:
       max:
         description: "Max open PRs allowed per contributor"
-        default: "5"
+        default: "1"
         required: false
 
 permissions:
@@ -35,10 +43,10 @@ jobs:
       - name: Enforce per-author open-PR cap
         uses: actions/github-script@v7
         env:
-          MAX_OPEN: ${{ github.event.inputs.max || '5' }}
+          MAX_OPEN: ${{ github.event.inputs.max || '1' }}
         with:
           script: |
-            const MAX = parseInt(process.env.MAX_OPEN, 10) || 5;
+            const MAX = parseInt(process.env.MAX_OPEN, 10) || 1;
             const { owner, repo } = context.repo;
             const isSweep = context.eventName === 'workflow_dispatch';
 

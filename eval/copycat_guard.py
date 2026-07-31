@@ -18,7 +18,7 @@ from datetime import date
 from pathlib import Path
 
 from copycat_policy import (
-    COPYCAT_BLOCK, COPYCAT_WARN, COPYCAT_CONTAINMENT, MAX_WARNINGS,
+    COPYCAT_BLOCK, COPYCAT_WARN, COPYCAT_JUDGE, COPYCAT_CONTAINMENT, MAX_WARNINGS,
     MIN_ADDED_LINES, LITERAL_BLOCK, FUNC_BLOCK_WARN,
     FUNC_MIN_BODY_TOKENS, FUNC_MIN_PR_LEVEL, FUNC_MAIN_SKIP,
     STRUCTURAL_ENABLED, LLM_ENABLED, skip_copycat_scoring,
@@ -56,7 +56,17 @@ PROVIDER_DEFAULTS = {
     "cursor":   {"model": "composer-2.5", "api": ""},
     "openai":   {"model": "gpt-4o-mini",  "api": "https://api.openai.com/v1/chat/completions"},
     "deepseek": {"model": "deepseek-chat", "api": "https://api.deepseek.com/v1/chat/completions"},
+    # DeepSeek V4 Pro via the yunwei gateway — the judge for the 50-70% band.
+    # Key comes from the COPYCAT_LLM_API_KEY secret; NEVER hardcode it here, this file
+    # is public and a leaked key is a billable incident, not an inconvenience.
+    "yunwei":   {"model": "deepseek-v4-pro",
+                 "api": "https://api.yunwei.ai/v1/chat/completions"},
 }
+
+# The 50-70% band: containment alone cannot separate a renamed copycat from an
+# independent contributor who touched the same hot function. Everything about this tier
+# is advisory — it labels for human review and never closes or blocks.
+LLM_JUDGE_LABEL = "llm-judge"
 
 
 def gh(args):
@@ -301,6 +311,10 @@ def _llm_provider():
         return "cursor"
     if os.environ.get("DEEPSEEK_API_KEY", "").strip():
         return "deepseek"
+    # yunwei last in autodetect but preferred when its key is the only one present —
+    # this is the configured judge for the 50-70% band.
+    if os.environ.get("YUNWEI_API_KEY", "").strip():
+        return "yunwei"
     return "openai"
 
 
@@ -309,6 +323,7 @@ def _llm_api_key(provider):
         "cursor": "CURSOR_API_KEY",
         "openai": "OPENAI_API_KEY",
         "deepseek": "DEEPSEEK_API_KEY",
+        "yunwei": "YUNWEI_API_KEY",
     }
     env = keys.get(provider, "")
     return os.environ.get(env, "").strip() if env else ""
@@ -601,6 +616,50 @@ def main():
                     if not original or func_c > (best_containment if original == e_num else 0):
                         original = e_num; orig_author = e_author
                     print(f"  LLM verdict: COPYCAT CONFIRMED -> bumping to WARN vs #{e_num}")
+
+    # ---- TIER 3: 50-70% -> llm-judge label + semantic review ----
+    #
+    # Advisory only. It cannot close and cannot block, because the evidence at this level
+    # is genuinely ambiguous and an automated verdict on ambiguous evidence is how a real
+    # contributor gets wrongly punished. The label routes it to a human; the judge's
+    # opinion is written into the comment so the human is not starting from scratch.
+    if (original is not None and COPYCAT_JUDGE <= best_containment < COPYCAT_WARN
+            and not structural_fired):
+        print(f"  TIER 3 (judge band): {best_containment:.0%} vs #{original}")
+        verdict_txt = ""
+        if _llm_enabled():
+            try:
+                cb = "\n".join(sorted(added)[:200])
+                _o_files, o_added = pr_fingerprint(REPO, original)
+                ob = "\n".join(sorted(o_added)[:200])
+                is_copy, conf, reason = llm_judge_copycat(cb, ob, f"PR#{pr_num}", f"PR#{original}")
+                print(f"  judge: copycat={is_copy} confidence={conf:.2f}")
+                if is_copy and conf >= LLM_CONFIDENCE_MIN:
+                    verdict_txt = (f"\n\n**Judge verdict: likely copycat** "
+                                   f"(confidence {conf:.0%}) — {reason[:400]}")
+                else:
+                    # Cleared. Remove the label if a previous run added it and stop:
+                    # leaving a stale llm-judge on a cleared PR is a standing accusation.
+                    if pr_has_label(REPO, pr_num, LLM_JUDGE_LABEL):
+                        gh(["pr", "edit", str(pr_num), "--repo", REPO,
+                            "--remove-label", LLM_JUDGE_LABEL])
+                        print(f"  judge CLEARED #{pr_num} -> removed {LLM_JUDGE_LABEL}")
+                    else:
+                        print(f"  judge CLEARED #{pr_num} -> no label")
+                    return
+            except Exception as e:
+                print(f"  judge unavailable ({e}) — labelling for human review anyway")
+        gh(["label", "create", LLM_JUDGE_LABEL, "--repo", REPO, "--color", "FBCA04",
+            "--description", "50-70% overlap — needs a human call", "--force"])
+        gh(["pr", "edit", str(pr_num), "--repo", REPO, "--add-label", LLM_JUDGE_LABEL])
+        gh(["pr", "comment", str(pr_num), "--repo", REPO, "--body",
+            f"### `llm-judge` — needs a human call\n\n"
+            f"This PR is **{best_containment:.0%}** contained in #{original}, which lands in the "
+            f"50-70% band where overlap alone cannot distinguish a copycat from an independent "
+            f"contributor touching the same code.\n\n"
+            f"**Not closed, not blocked.** A maintainer decides.{verdict_txt}"])
+        print(f"  TIER 3: labelled #{pr_num} for review (vs #{original})")
+        return
 
     if original is None or (best_containment < COPYCAT_WARN and not structural_fired):
         print("  no copycat detected — clean"); return
