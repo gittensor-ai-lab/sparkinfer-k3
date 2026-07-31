@@ -28,6 +28,7 @@ permissions:
 
 jobs:
   guard:
+    name: copycat-guard
     runs-on: ubuntu-latest
     # Skip maintainer PRs
     if: github.event.pull_request.author_association != 'OWNER' && github.event.pull_request.author_association != 'MEMBER' && github.event.pull_request.author_association != 'COLLABORATOR'

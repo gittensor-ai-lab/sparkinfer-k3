@@ -800,6 +800,49 @@ class CiWorkflowTest(unittest.TestCase):
                    if f != "kimi_k3_run.sh" and not rx.search(f"bench/scripts/{f}")]
         self.assertEqual(missing, [], f"kimi_k3_eval.sh invokes unguarded files: {missing}")
 
+    def test_check_run_names_are_unique_across_workflows(self):
+        """A branch-protection required context is matched by check-run NAME, and a check
+        run is named by the job's `name:` if set, else by the job id. Two jobs in different
+        workflows sharing a name make that context ambiguous: protection cannot tell which
+        one satisfied it, so requiring the trust-bearing guard could be signed off by an
+        unrelated advisory job. copycat-guard and sensitive-paths-guard both used the bare
+        job id `guard` and both trigger on pull_request_target, so they genuinely coexisted
+        on every PR commit."""
+        import yaml as _y
+        seen = {}
+        for wf in sorted((ROOT / ".github" / "workflows").glob("*.yml")):
+            for jid, job in (_y.safe_load(wf.read_text()).get("jobs") or {}).items():
+                seen.setdefault((job or {}).get("name") or jid, []).append(f"{wf.name}:{jid}")
+        dupes = {n: w for n, w in seen.items() if len(w) > 1}
+        self.assertEqual(dupes, {}, f"ambiguous required-context names: {dupes}")
+
+    def test_required_checks_always_run(self):
+        """The other half of the footgun. A required check that never produces a check run
+        blocks merge forever, and a job-level `if:` is the usual cause. Every job named
+        here is one we require in branch protection, so each must be unconditional: no
+        job-level `if:`, and a trigger that fires on pull requests from forks. Adding an
+        `if:` to one of these later would silently wedge the merge queue -- this fails
+        instead."""
+        import yaml as _y
+        required = {
+            "sensitive-paths-guard.yml": "guard",
+            "ci.yml": ["shell", "python", "configs", "plans", "lock"],
+        }
+        for fname, jids in required.items():
+            wf = ROOT / ".github" / "workflows" / fname
+            doc = _y.safe_load(wf.read_text())
+            on = doc.get(True) or doc.get("on")
+            triggers = set(on if isinstance(on, (list, dict)) else [on])
+            self.assertTrue(
+                triggers & {"pull_request", "pull_request_target"},
+                f"{fname} is required but does not run on pull requests: {triggers}")
+            for jid in ([jids] if isinstance(jids, str) else jids):
+                job = doc["jobs"][jid]
+                self.assertNotIn(
+                    "if", job,
+                    f"{fname}:{jid} is a REQUIRED check but is conditional -- a skipped "
+                    f"required check cannot be satisfied and blocks merge")
+
     def test_baseline_results_are_committable(self):
         """The `lock` job requires a committed bench/results JSON to back any pinned
         baseline. bench/.gitignore ignores results/ wholesale, so without an explicit
