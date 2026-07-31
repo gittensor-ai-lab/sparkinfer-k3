@@ -1,4 +1,4 @@
-![SparkInfer K3 — Kimi K3 inference, 2.8T parameters, 1M context, one node](docs/k3.png)
+![SparkInfer K3 — Kimi K3 inference on NVIDIA H200, 2.8T parameters, 896 experts, MLA + KDA](docs/k3.png)
 
 # SP⚡RKINFER-K3 · Powered by SN74
 
