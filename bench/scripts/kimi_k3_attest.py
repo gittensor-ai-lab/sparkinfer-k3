@@ -99,6 +99,12 @@ def main():
     ap.add_argument("--node", default=os.environ.get("KIMI_K3_NODE", "h200x8"))
     ap.add_argument("--out", default=str(ROOT / "bench" / "results" / "receipts"))
     ap.add_argument("--build-dir", default=str(ROOT / "build"))
+    ap.add_argument("--eval-log", default="", help="raw harness output to archive with the run")
+    ap.add_argument("--publish", action="store_true",
+                    help="commit the sealed run to sparkinfer-k3-log (append-only)")
+    ap.add_argument("--log-repo",
+                    default=os.environ.get("KIMI_K3_LOG_REPO",
+                                           "https://github.com/gittensor-ai-lab/sparkinfer-k3-log.git"))
     args = ap.parse_args()
 
     result = json.loads(Path(args.result).read_text())
@@ -210,7 +216,75 @@ def main():
     print(f"  model_sha  : {msha[:16]}...")
     print(f"  commit     : {commit[:12]}  scoring={scoring[:12] or 'n/a'}")
     print(f"  receipt    : {base.with_suffix('.receipt.json')}")
+
+    if args.publish:
+        rc = publish(rid, result, att, rec, args.eval_log, args.log_repo)
+        if rc:
+            return rc
+    else:
+        print("  NOT published. eval-label.yml reads the receipt from the LOG, not from a "
+              "comment, so an unpublished run cannot be scored. Re-run with --publish.")
     return 0
+
+
+def publish(rid, result, att, rec, eval_log, log_repo):
+    """Commit the sealed run to the append-only eval log.
+
+    APPEND-ONLY IS ENFORCED HERE, not just by convention: if runs/<rid>/ already exists
+    the publish is REFUSED rather than overwritten. A log whose entries can be replaced
+    is not evidence of anything, and the receipt_id is a hash of the attestation — so a
+    collision means either a genuine re-publish of the identical run (harmless to skip)
+    or an attempt to swap the contents under a receipt someone already verified.
+    """
+    import shutil, tempfile
+    tmp = tempfile.mkdtemp(prefix="k3log_")
+    try:
+        if subprocess.run(["git", "clone", "-q", "--depth", "1", log_repo, tmp]).returncode:
+            print(f"kimi_k3_attest: cannot clone {log_repo}", file=sys.stderr)
+            return 1
+        rundir = Path(tmp) / "runs" / rid
+        if rundir.exists():
+            print(f"  already published: runs/{rid} exists in the log — leaving it alone.")
+            return 0
+        rundir.mkdir(parents=True)
+        (rundir / "result.json").write_text(json.dumps(result, indent=2, sort_keys=True))
+        (rundir / "attestation.json").write_text(json.dumps(att, indent=2, sort_keys=True))
+        (rundir / "receipt.json").write_text(json.dumps(rec, indent=2, sort_keys=True))
+        if eval_log and Path(eval_log).is_file():
+            shutil.copy(eval_log, rundir / "eval.log")
+
+        # ledger + index: newest first, so the page needs no sort.
+        entry = {
+            "run_id": rid,
+            "timestamp_utc": att.get("timestamp_utc", ""),
+            "label": result.get("label"),
+            "tps": result.get("tps"),
+            "top1": result.get("top1"),
+            "kl": result.get("kl"),
+            "commit": att.get("code", {}).get("commit", ""),
+            "attestation_type": rec.get("attestation_type", ""),
+        }
+        with open(Path(tmp) / "ledger.jsonl", "a") as f:
+            f.write(json.dumps(entry, sort_keys=True) + "\n")
+        idx_p = Path(tmp) / "index.json"
+        idx = json.loads(idx_p.read_text()) if idx_p.is_file() and idx_p.read_text().strip() else []
+        idx.insert(0, entry)
+        idx_p.write_text(json.dumps(idx, indent=2))
+
+        g = ["git", "-C", tmp, "-c", "user.email=noreply@github.com",
+             "-c", "user.name=sparkinfer-k3-eval"]
+        subprocess.run(g[:3] + ["add", "-A"], check=True)
+        subprocess.run(g + ["commit", "-q", "-m",
+                            f"eval {rid}: {result.get('label')} tps={result.get('tps')} "
+                            f"({rec.get('attestation_type','unsealed')})"], check=True)
+        if subprocess.run(["git", "-C", tmp, "push", "-q", "origin", "HEAD:main"]).returncode:
+            print("kimi_k3_attest: push to the log failed (token lacks write access?)",
+                  file=sys.stderr)
+            return 1
+        print(f"  published   : {log_repo.rsplit('/',1)[-1].replace('.git','')}/runs/{rid}")
+        return 0
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":

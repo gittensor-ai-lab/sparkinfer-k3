@@ -3,6 +3,11 @@
 #
 #   bench/scripts/kimi_k3_eval.sh [--node h200x8] [--devices 0,1,..] [--frontier TOKS]
 #                                 [--llama-ref TOKS] [--layers N] [--json-out FILE]
+#                                 [--seal]
+#
+# --seal additionally seals the verdict into a Polaris receipt and publishes the run to
+# sparkinfer-k3-log. eval-label.yml reads the receipt FROM THAT LOG, so an unsealed run
+# cannot be scored. Needs POLARIS_API_KEY and push access to the log.
 #
 # Produces the same RESULT_JSON contract the eval loop already consumes for the Qwen
 # models (bench/scripts/label.py), so the K3 track needs no second scoring path.
@@ -41,6 +46,7 @@ LLAMA_REF=""         # empty => read the lock
 LAYERS=93
 TOKENS=8
 JSON_OUT=""
+SEAL=0
 
 while [[ $# -gt 0 ]]; do case "$1" in
   --node)      shift; NODE="$1" ;;
@@ -50,6 +56,7 @@ while [[ $# -gt 0 ]]; do case "$1" in
   --layers)    shift; LAYERS="$1" ;;
   --tokens)    shift; TOKENS="$1" ;;
   --json-out)  shift; JSON_OUT="$1" ;;
+  --seal)      SEAL=1 ;;
   -h|--help)   sed -n '2,31p' "$0"; exit 0 ;;
   *) echo "kimi_k3_eval: unknown arg $1" >&2; exit 2 ;;
 esac; shift; done
@@ -141,6 +148,28 @@ RESULT="$(SPARKINFER_DIFFICULTY_REF="$LLAMA_REF" \
     python3 "$HERE/label.py" "$TPS" "$FRONTIER" 0 "$TOP1" "$KL" "$COMMIT" "$PROV")"
 echo
 echo "$RESULT"
+
+# ---- 4. seal + publish --------------------------------------------------
+# eval-label.yml reads the receipt from sparkinfer-k3-log, NOT from the PR comment, so a
+# verdict that is not sealed and published cannot be scored. Doing it here rather than
+# leaving it to the operator is the difference between attestation being the default and
+# attestation being the thing everyone forgets.
+#
+# --seal is opt-in because sealing needs POLARIS_API_KEY and push access to the log, and a
+# developer running this locally to check a number should not be blocked by either.
+if [ "$SEAL" = 1 ]; then
+    RJ="$(mktemp -t k3result_XXXXXX.json)"
+    printf '%s\n' "${RESULT#RESULT_JSON }" > "$RJ"
+    echo
+    echo ">> sealing + publishing ..."
+    if ! python3 "$HERE/kimi_k3_attest.py" --result "$RJ" --model "$MODEL" \
+             --node "$NODE" --build-dir "$BUILD" --publish; then
+        echo ">> FAILED to seal/publish — this verdict is NOT scorable." >&2
+        echo ">>   eval-label.yml will refuse it when REQUIRE_EVAL_RECEIPT=1." >&2
+        rm -f "$RJ"; exit 1
+    fi
+    rm -f "$RJ"
+fi
 if [[ -n "$JSON_OUT" ]]; then
     printf '%s\n' "${RESULT#RESULT_JSON }" > "$JSON_OUT"
     echo ">> wrote $JSON_OUT"
