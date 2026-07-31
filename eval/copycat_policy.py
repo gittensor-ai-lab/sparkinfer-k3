@@ -9,12 +9,12 @@
 # remaining explanation.
 #
 #   >= 90%   BLOCK   denylist + close. Effectively permanent.
-#   70-90%   CLOSE   comment + auto-close. Recoverable: they can open a real PR next.
-#   50-70%   JUDGE   llm-judge label, semantic review, label removed if cleared.
-#            < 50%   ignore.
+#   80-90%   CLOSE   comment + auto-close. Recoverable: they can open a real PR next.
+#   70-80%   JUDGE   llm-judge label, semantic review, label removed if cleared.
+#            < 70%   ignore.
 COPYCAT_BLOCK = 0.90   # >=90% → denylist + close (permanent)
-COPYCAT_WARN = 0.70    # 70-90% → comment + auto-close
-COPYCAT_JUDGE = 0.50   # 50-70% → llm-judge label + semantic review
+COPYCAT_WARN = 0.80    # 80-90% → comment + auto-close
+COPYCAT_JUDGE = 0.70   # 70-80% → llm-judge label + semantic review
 MAX_WARNINGS = 1       # a 70-90% hit closes immediately; no strike accumulation
 
 # Small PR guard — avoids ratio explosions on tiny diffs
@@ -39,7 +39,7 @@ STRUCTURAL_ENABLED = False
 
 # LLM semantic judge: ON for the 50-70% band only.
 #
-# That band is exactly where containment stops being evidence. 50-70% overlap is the
+# That band is exactly where containment stops being evidence. 70-80% overlap is the
 # signature of BOTH a copycat that renamed things and an independent contributor who
 # touched the same hot function — the two are indistinguishable by token overlap, which
 # is why the structural layer below was disabled for false positives. A semantic judge
