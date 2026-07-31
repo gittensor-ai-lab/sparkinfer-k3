@@ -55,6 +55,114 @@ sparkinfer keeps f32 by design).
 
 Numbers: [`bench/results/`](bench/results). Detail: [`docs/kimi-k3-baseline.md`](docs/kimi-k3-baseline.md).
 
+## It works — a real run, on a real node
+
+```
+$ bench/scripts/kimi_k3_run.sh "Q: What is the capital of Japan? A:" 24 0,1,2,3,4,5,6,7
+
+prompt : Q: What is the capital of Japan? A:
+ids    : 48 25 5071 387 276 10484 318 10417 30 401 25
+devices: 0,1,2,3,4,5,6,7   predict: 24
+
+model: 93/93 layers, vocab 163840, 8 stage(s)
+decode: 23 forward passes in 7.459 s = 3.08 tok/s
+
+generated text:  Tokyo. Q: What is the capital of France? A: Paris. Q: What is the capital of Germany?
+```
+
+Correct answers, and it picks up the few-shot pattern on its own. No chat template, no
+sampling parameters — greedy argmax over raw completions.
+
+### Are all 8 GPUs actually working? Yes, and here is the proof
+
+Not "we launched with 8 devices" — three independent signals from one run:
+
+**1. Each rank owns a disjoint band of the 896 experts.** Printed at init:
+
+```
+[k3-tp] rank 0: device 0, experts [  0,112)     rank 4: device 4, experts [448,560)
+[k3-tp] rank 1: device 1, experts [112,224)     rank 5: device 5, experts [560,672)
+[k3-tp] rank 2: device 2, experts [224,336)     rank 6: device 6, experts [672,784)
+[k3-tp] rank 3: device 3, experts [336,448)     rank 7: device 7, experts [784,896)
+```
+
+`kimi_k3_tp_load_check` proves those bands **tile exactly**: 16351 checks, every byte of
+a sharded tensor claimed by exactly one rank. A gap would silently drop an expert; an
+overlap would double-count it. Both leave a model that runs and emits fluent text.
+
+**2. All eight cards fill with weights.** `nvidia-smi` sampled through a load, starting
+from 0 MiB on every card:
+
+```
+02:49:43   0:73567MiB   1:4MiB      2:4MiB      3:4MiB      ...     <- rank 0 loading
+02:50:28   0:125999MiB  1:125999MiB 2:125999MiB 3:8743MiB   ...     <- ranks 1-3 filling
+02:51:59   0:125999MiB  1:125999MiB ... 6:125999MiB 7:118653MiB     <- all 8 resident
+```
+
+~123 GiB per card. The model is 553 GiB and no single H200 holds 141.
+
+**3. The collective count is exact.** `collectives/token 92` — one all-reduce per MoE
+layer, 93 layers minus the leading dense block. A missing reduce leaves a partial expert
+sum; an extra one multiplies a complete tensor by `tp_size`. Neither crashes, so the
+count is asserted rather than eyeballed.
+
+## How the TP module works
+
+The design decision that makes it customizable: **the layer is split at exactly the
+points a collective belongs, and the driver owns the interleaving.**
+
+```
+  for each layer:
+      ranks 0..7  ──►  Attn         (attention, all ranks in parallel)
+      ranks 0..7  ──►  FfnPartial   (router → routed_down → THIS RANK'S experts)
+                              │
+                       ALL-REDUCE   ← 3584-wide, sums the 8 partial expert sums
+                              │
+      ranks 0..7  ──►  FfnFinish    (routed_norm → routed_up → shared experts)
+```
+
+Every rank runs the same router over the same replicated weights, so all eight agree on
+the same top-16 experts — then each evaluates only the ones it holds and contributes
+zero for the rest. The all-reduce turns eight partial sums back into exactly what one
+GPU with all 896 experts would have computed. Verified to **1.127e-07** of peak — below
+float32 epsilon, i.e. one ulp.
+
+**Why a phase split and not a callback.** NCCL needs every rank's call enqueued inside
+one group before any launches, and sparkinfer drives all ranks from a single host
+thread. A `reduce()` callback fired mid-forward deadlocks — measured on this node, hung
+at the first collective with no output. The driver has to own the interleaving.
+
+**Why the reduce is at 3584 and not 7168.** `ffn_routed_norm` is an RMS norm, and
+rms_norm is not linear: `rms_norm(Σ partial) ≠ Σ rms_norm(partial)`. The sum has to
+complete *before* it. Getting this wrong is invisible — the model stays fluent.
+
+### Where to customize
+
+Each of these is a seam, not a rewrite:
+
+| knob | what it changes | where |
+|---|---|---|
+| `ShardPolicy` | `ExpertsOnly` (experts banded, attention replicated) vs `Full` | [`kimi_k3.h`](runtime/include/sparkinfer/models/kimi_k3.h) |
+| `SPARKINFER_TP_BACKEND` | `nccl` \| `peer` \| `multimem` — all three validated on 8× H200 | [`collective.h`](runtime/include/sparkinfer/tp/collective.h) |
+| shard rules | per-tensor Row / Col / Expert / Replicate, 230 CPU tests | [`weight_plan.cpp`](runtime/src/tp/weight_plan.cpp) |
+| expert bands | contiguous today; strided would trade load balance for locality | [`shard.cpp`](runtime/src/tp/shard.cpp) |
+| reduce points | `K3LayerPhase` — move a collective by moving one call | [`kimi_k3_tp.cpp`](runtime/src/models/kimi_k3_tp.cpp) |
+| dtype | f32 today (K3's residual stream is f32 by design); bf16 path exists | [`collective.h`](runtime/include/sparkinfer/tp/collective.h) |
+
+The shard math is **CUDA-free and unit-tested without a GPU** — 4972 checks on
+`shard.cpp`, 230 on `weight_plan.cpp`, 44 on backend selection. TP bugs do not live in
+the collective (NCCL is correct); they live in the band arithmetic, which is exactly the
+part you can verify on a laptop before burning node hours.
+
+### The honest limit of the current policy
+
+`ExpertsOnly` shards the 896 experts (531 of 553 GiB) and **replicates attention**. So
+attention runs redundantly on all eight cards. After the MoE dispatch got 3× faster,
+that replicated attention became the entire serial term and TP scaling fell from 2.44×
+to ~1.1×. `ShardPolicy::Full` is declared and deliberately **not** enabled — the loader
+would shard weights the executor still indexes at full width. That is the next lever.
+
+
 ## The model
 
 | | |
