@@ -293,7 +293,7 @@ bench/scripts/kimi_k3_run.sh "The capital of France is" 32 0,1,2,3,4,5,6,7
 bench/scripts/kimi_k3_eval.sh --node h200x8
 
 # the llama.cpp reference sweep itself
-bench/scripts/kimi_k3_baseline.sh --node h200x8 --decode-only --reps 3
+bench/scripts/kimi_k3_baseline.sh --node h200x8 --decode-only --reps 3   # 128..128k
 
 # plan anything with no GPU, no network, no weights
 bench/scripts/kimi_k3_baseline.sh --node h200x8 --dry-run
