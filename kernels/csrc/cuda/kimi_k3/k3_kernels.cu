@@ -17,6 +17,7 @@
 #include <cuda_fp16.h>
 #include <math.h>
 #include <cstdio>
+#include <cstdint>   // uintptr_t — the float4-alignment test in k3_proj_f32
 
 namespace sparkinfer {
 namespace kernels {
@@ -976,21 +977,89 @@ __global__ void quantize_q8_k_kernel(BlockQ8K* __restrict__ out,
     q.d = 1.0f / iscale;
 }
 
-template <int BLOCK>
+// The ARITHMETIC here is unchanged from the scalar version this replaces: thread t
+// still owns blocks t, t+BLOCK, ... in that order, still multiplies j = 0..31 in
+// order, and still folds through the same block_sum tree. Only the LOADS differ, and
+// only because block_q8_0 is 34 bytes.
+//
+// One thread per block puts a warp's 32 lanes on a 34-byte stride, so every scalar
+// `row[b].qs[j]` is an address-divergent warp load: 32 lanes claim one byte each out
+// of an 1088-byte span, which the L1 has to service as ~34 sectors. Thirty-three such
+// loads move ~36 KB through L1 to deliver 1088 bytes of weights, and the 32 `xb[j]`
+// loads add another 32 KB to deliver 4 KB. On the 8x H200 target this is the whole
+// ballgame: ShardPolicy::ExpertsOnly replicates attention, so these projections are
+// ~97% of a rank's per-layer bytes and the serial term TP scaling stalls on.
+//
+// So stage instead. The same 1088 bytes are read as CONTIGUOUS halfwords -- 2 sectors
+// per warp instruction, no amplification -- and the inner loop reads them back out of
+// shared memory a word at a time. Staging de-interleaves the 34-byte record into a
+// 36-byte slot (d split off, qs word-aligned) because qs sits at byte offset 2 and is
+// otherwise unreadable as uint32; the 9th word is padding that makes the per-lane
+// stride odd, which is what keeps the shared reads bank-conflict-free.
+//
+// XVEC says x is 16-byte aligned so the activation can come in as float4. Every K3
+// buffer is a cudaMalloc base and therefore is, but a float4 load off an unaligned
+// pointer is a hard fault, so the caller proves it rather than the kernel assuming it.
+template <int BLOCK, bool XVEC>
 __global__ void proj_q8_0_kernel(float* __restrict__ y, const float* __restrict__ x,
                                  const BlockQ8_0* __restrict__ W, int blocks_per_row) {
     const int n = blockIdx.x;
     const BlockQ8_0* row = W + (size_t)n * blocks_per_row;
     __shared__ float shm[BLOCK / 32 + 1];
+    __shared__ uint16_t d_sm[BLOCK];
+    __shared__ uint32_t q_sm[BLOCK * 9];
 
     float acc = 0.0f;
-    for (int b = threadIdx.x; b < blocks_per_row; b += BLOCK) {
-        const float d = __half2float(__ushort_as_half(row[b].d));
-        const float* xb = x + (size_t)b * 32;
-        float s = 0.0f;
+    for (int base = 0; base < blocks_per_row; base += BLOCK) {
+        const int left = blocks_per_row - base;
+        const int tile = left < BLOCK ? left : BLOCK;
+
+        // Guards the PREVIOUS tile's shared reads against this tile's writes. Harmless
+        // on the first pass; wrong to omit on any later one.
+        __syncthreads();
+        {
+            const uint16_t* src = (const uint16_t*)(row + base);
+            uint16_t* q16 = (uint16_t*)q_sm;
+            const int n16 = tile * 17;      // 34 bytes = 17 halfwords per block
+            for (int i = threadIdx.x; i < n16; i += BLOCK) {
+                const int b = i / 17;
+                const int r = i - b * 17;
+                const uint16_t v = src[i];
+                if (r == 0) d_sm[b] = v;                 // the fp16 scale
+                else        q16[b * 18 + (r - 1)] = v;   // 18 halfwords = 9 words/slot
+            }
+        }
+        __syncthreads();
+
+        if (threadIdx.x < tile) {
+            const float d = __half2float(__ushort_as_half(d_sm[threadIdx.x]));
+            const uint32_t* q = q_sm + (size_t)threadIdx.x * 9;
+            const float* xb = x + (size_t)(base + threadIdx.x) * 32;
+            float s = 0.0f;
+            if (XVEC) {
+                const float4* x4 = (const float4*)xb;
 #pragma unroll
-        for (int j = 0; j < 32; ++j) s += (float)row[b].qs[j] * xb[j];
-        acc += d * s;
+                for (int w = 0; w < 8; ++w) {
+                    const uint32_t p = q[w];
+                    const float4 v = x4[w];
+                    s += (float)(int8_t)( p        & 0xffu) * v.x;
+                    s += (float)(int8_t)((p >>  8) & 0xffu) * v.y;
+                    s += (float)(int8_t)((p >> 16) & 0xffu) * v.z;
+                    s += (float)(int8_t)((p >> 24) & 0xffu) * v.w;
+                }
+            } else {
+#pragma unroll
+                for (int w = 0; w < 8; ++w) {
+                    const uint32_t p = q[w];
+                    const float* v = xb + 4 * w;
+                    s += (float)(int8_t)( p        & 0xffu) * v[0];
+                    s += (float)(int8_t)((p >>  8) & 0xffu) * v[1];
+                    s += (float)(int8_t)((p >> 16) & 0xffu) * v[2];
+                    s += (float)(int8_t)((p >> 24) & 0xffu) * v[3];
+                }
+            }
+            acc += d * s;
+        }
     }
     acc = block_sum<BLOCK>(acc, shm);
     if (threadIdx.x == 0) y[n] = acc;
@@ -1431,8 +1500,15 @@ bool k3_proj_f32(float* y, const float* x, const void* W, int wtype,
             return true;
         case 8: {  // Q8_0
             if (K % 32 != 0) return false;
-            proj_q8_0_kernel<BLOCK><<<(unsigned)N, BLOCK, 0, stream>>>(
-                y, x, (const BlockQ8_0*)W, K / 32);
+            // x + b*32 floats is 128 bytes past x, so only x's own alignment decides
+            // whether the float4 path is legal. Checked once here rather than branched
+            // on per thread.
+            if (((uintptr_t)x & 15u) == 0)
+                proj_q8_0_kernel<BLOCK, true><<<(unsigned)N, BLOCK, 0, stream>>>(
+                    y, x, (const BlockQ8_0*)W, K / 32);
+            else
+                proj_q8_0_kernel<BLOCK, false><<<(unsigned)N, BLOCK, 0, stream>>>(
+                    y, x, (const BlockQ8_0*)W, K / 32);
             return true;
         }
         default:

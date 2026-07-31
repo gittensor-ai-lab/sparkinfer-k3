@@ -120,6 +120,63 @@ int main() {
         cudaFree(dW); cudaFree(dx); cudaFree(dy);
     }
 
+    // ---- Q8_0, the shapes the KDA/MLA projections actually run at ----
+    //
+    // The case above is K=512, i.e. 16 blocks/row: ONE staging tile, and a partial one.
+    // Every real K3 projection is far wider than that (attn_q/k/v are K=7168 = 224
+    // blocks/row, attn_output is K=12288 = 384), so they run the multi-tile path where
+    // a tile's shared-memory writes have to be fenced against the previous tile's
+    // reads. A missing barrier there is invisible at K=512 and wrong at K=7168.
+    //
+    // The second sub-case feeds an x that is 4-byte but NOT 16-byte aligned, which is
+    // what selects the scalar-activation fallback instead of the float4 path. Both
+    // must produce the same answer; only one of them is exercised by an aligned buffer.
+    for (int variant = 0; variant < 2; ++variant) {
+        const bool misaligned = (variant == 1);
+        const int N = 260, K = 7168;          // 224 blocks/row = 1 full tile + 96
+        const int bpr = K / 32;
+        std::vector<BlockQ8_0> W((size_t)N * bpr);
+        for (auto& b : W) {
+            const uint16_t exp = (uint16_t)(9 + (rng() % 8));
+            b.d = (uint16_t)(((rng() & 1) << 15) | (exp << 10) | (rng() % 1024));
+            for (auto& q : b.qs) q = (int8_t)((int)(rng() % 256) - 128);
+        }
+        std::vector<float> x(K); for (auto& v : x) v = U(rng);
+
+        std::vector<double> ref(N, 0.0);
+        for (int n = 0; n < N; ++n) {
+            double acc = 0;
+            for (int b = 0; b < bpr; ++b) {
+                const auto& blk = W[(size_t)n * bpr + b];
+                const double d = h2f(blk.d);
+                for (int j = 0; j < 32; ++j) acc += d * (double)blk.qs[j] * (double)x[b * 32 + j];
+            }
+            ref[n] = acc;
+        }
+
+        void *dW, *dxbase, *dy;
+        CU(cudaMalloc(&dW, W.size() * sizeof(BlockQ8_0)));
+        // one float of slack so the misaligned variant can start x at a +4-byte offset
+        CU(cudaMalloc(&dxbase, (size_t)(K + 1) * sizeof(float)));
+        CU(cudaMalloc(&dy, N * sizeof(float)));
+        float* dx = (float*)dxbase + (misaligned ? 1 : 0);
+        CU(cudaMemcpy(dW, W.data(), W.size() * sizeof(BlockQ8_0), cudaMemcpyHostToDevice));
+        CU(cudaMemcpy(dx, x.data(), K * sizeof(float), cudaMemcpyHostToDevice));
+        const bool ok = k3_proj_f32((float*)dy, dx, dW, /*wtype=*/8, N, K, 0);
+        CU(cudaDeviceSynchronize());
+        std::vector<float> got(N);
+        CU(cudaMemcpy(got.data(), dy, N * sizeof(float), cudaMemcpyDeviceToHost));
+
+        double num = 0, den = 0;
+        for (int n = 0; n < N; ++n) { double d = got[n] - ref[n]; num += d*d; den += ref[n]*ref[n]; }
+        const double rl2 = std::sqrt(num / (den + 1e-30));
+        std::printf("[Q8_0] N=%d K=%d x=%s accepted=%s relL2=%.3e\n", N, K,
+                    misaligned ? "unaligned (scalar path)" : "aligned (float4 path)",
+                    ok ? "yes" : "NO", rl2);
+        if (!ok || rl2 > 1e-5) ++fail;
+        cudaFree(dW); cudaFree(dxbase); cudaFree(dy);
+    }
+
     // ---- F32 dense case ----
     {
         const int N = 200, K = 384;
