@@ -160,11 +160,23 @@ int main(int argc, char** argv) {
     auto Wup = read_matrix(T("ffn_up.weight"), cfg.dense_ffn, H);
     auto Wdown = read_matrix(T("ffn_down.weight"), H, cfg.dense_ffn);
 
-    // ---- random input, shared between CPU ref and GPU run ----
-    std::mt19937 rng(20260730);
-    std::normal_distribution<double> Nrm(0.0, 1.0);
+    // ---- input: from a file (llama.cpp's inp_embd, for a real cross-impl compare)
+    // if K3_INPUT is set, else a fixed random vector (self-consistency check) ----
     std::vector<double> x(H);
-    for (auto& v : x) v = Nrm(rng);
+    if (const char* inp = std::getenv("K3_INPUT")) {
+        std::vector<float> tmp(H);
+        FILE* f = std::fopen(inp, "rb");
+        if (!f || std::fread(tmp.data(), sizeof(float), H, f) != (size_t)H) {
+            std::printf("could not read K3_INPUT=%s\n", inp); return 1;
+        }
+        std::fclose(f);
+        for (int i = 0; i < H; ++i) x[i] = (double)tmp[i];
+        std::printf("[input] from %s\n", inp);
+    } else {
+        std::mt19937 rng(20260730);
+        std::normal_distribution<double> Nrm(0.0, 1.0);
+        for (auto& v : x) v = Nrm(rng);
+    }
 
     // ================= CPU float64 reference =================
     // Layer 0 is a checkpoint layer (0 % block_size == 0): attn_res_mix is identity
@@ -229,6 +241,8 @@ int main(int argc, char** argv) {
         }
 
     auto beta = matvec(Wbeta, normed, n_head, H);
+    // beta is sigmoid'd before the scan (llama build_kda_layer: beta = sigmoid(ssm_beta @ x)).
+    for (auto& b : beta) b = 1.0 / (1.0 + std::exp(-b));
 
     // gated delta rule, state=0 at position 0
     std::vector<double> delta_out(qkv);
@@ -357,13 +371,16 @@ int main(int argc, char** argv) {
     fwd.cfg = &cfg; fwd.w = &w; fwd.state = &state; fwd.opt = opt; fwd.stream = 0;
     if (!kimi_k3_forward_alloc_scratch(cfg, fwd)) { std::printf("scratch alloc failed\n"); return 1; }
     fwd.debug = [](const char* tag, int layer, const float* dev_ptr, int64_t n) {
-        std::vector<float> h(n < 8 ? n : 8);
-        cudaMemcpy(h.data(), dev_ptr, h.size() * sizeof(float), cudaMemcpyDeviceToHost);
-        double ss = 0; std::vector<float> full(n);
+        std::vector<float> full(n);
         cudaMemcpy(full.data(), dev_ptr, n * sizeof(float), cudaMemcpyDeviceToHost);
-        for (float v : full) ss += (double)v * v;
+        double ss = 0; for (float v : full) ss += (double)v * v;
         std::printf("[gpu %s L%d] rms=%.6g  first4=%.6g,%.6g,%.6g,%.6g\n",
-                    tag, layer, std::sqrt(ss / n), (double)h[0], (double)h[1], (double)h[2], (double)h[3]);
+                    tag, layer, std::sqrt(ss / n), (double)full[0], (double)full[1],
+                    n>2?(double)full[2]:0, n>3?(double)full[3]:0);
+        if (const char* dd = std::getenv("K3_L0_DUMP")) {
+            char p[512]; std::snprintf(p, sizeof(p), "%s/our_%s.bin", dd, tag);
+            if (FILE* f = std::fopen(p, "wb")) { std::fwrite(full.data(), sizeof(float), n, f); std::fclose(f); }
+        }
     };
 
     std::vector<float> hx(H); for (int i = 0; i < H; ++i) hx[i] = (float)x[i];
@@ -376,6 +393,10 @@ int main(int argc, char** argv) {
     cudaDeviceSynchronize();
     std::vector<float> gpu_out(H);
     cudaMemcpy(gpu_out.data(), d_out, H * sizeof(float), cudaMemcpyDeviceToHost);
+    if (const char* dd = std::getenv("K3_L0_DUMP")) {
+        char p[512]; std::snprintf(p, sizeof(p), "%s/our_l_out.bin", dd);
+        if (FILE* f = std::fopen(p, "wb")) { std::fwrite(gpu_out.data(), sizeof(float), H, f); std::fclose(f); }
+    }
 
     // ================= compare =================
     double num = 0, den = 0, worst = 0; int worst_i = -1;
