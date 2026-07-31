@@ -60,6 +60,78 @@ jobs:
                     "so only maintainers may post one."; exit 1 ;;
           esac
 
+      - name: Require a verified Polaris receipt
+        id: receipt
+        env:
+          BODY: ${{ github.event.comment.body }}
+          DISPATCH_JSON: ${{ github.event.inputs.result_json }}
+          REQUIRE_RECEIPT: ${{ vars.REQUIRE_EVAL_RECEIPT }}
+        run: |
+          set -euo pipefail
+          # THE HOLE THIS CLOSES. Re-deriving the tier proves the LABEL follows from the
+          # numbers. It proves nothing about where the numbers came from — a RESULT_JSON
+          # pasted into a comment is just text. bench/scripts/kimi_k3_attest.py seals a
+          # verdict into a Polaris receipt that binds it to the model sha256, the build
+          # hash, the code commit and the scoring-scripts commit; this step refuses to
+          # label a run that has no such receipt.
+          #
+          # Gated on the REQUIRE_EVAL_RECEIPT variable so the requirement can be turned on
+          # deliberately rather than silently breaking every open PR the moment it merges.
+          # Set it to "1" once the eval node is sealing runs.
+          if [ "${REQUIRE_RECEIPT:-0}" != "1" ]; then
+            echo "::notice::REQUIRE_EVAL_RECEIPT is not set — labelling WITHOUT attestation."
+            echo "  The verdict is unverified: nothing binds these numbers to a real run."
+            echo "required=0" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          RAW="${DISPATCH_JSON:-$BODY}"
+          RID="$(printf '%s' "$RAW" | sed -n 's/.*"receipt_id"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{8,\}\)".*/\1/p' | head -1)"
+          if [ -z "$RID" ]; then
+            echo "::error::no receipt_id in the payload. Seal the run first:"
+            echo "  bench/scripts/kimi_k3_attest.py --result RESULT.json --model <first-shard.gguf>"
+            echo "then post the RESULT_JSON together with its receipt_id."
+            exit 1
+          fi
+          echo "receipt_id=$RID" >> "$GITHUB_OUTPUT"
+          echo "required=1" >> "$GITHUB_OUTPUT"
+          echo "receipt $RID present — verifying against the log"
+
+      - name: Verify the receipt in sparkinfer-k3-log
+        if: steps.receipt.outputs.required == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RID: ${{ steps.receipt.outputs.receipt_id }}
+        run: |
+          set -euo pipefail
+          # The receipt must already be COMMITTED to the append-only log. Accepting one
+          # pasted inline would just move the forgeable surface from the numbers to the
+          # receipt; requiring it in a separate repo the scored repo cannot rewrite is the
+          # point of having a log at all.
+          if ! gh api "repos/gittensor-ai-lab/sparkinfer-k3-log/contents/runs/$RID/receipt.json" \
+                 --jq '.name' >/dev/null 2>&1; then
+            echo "::error::receipt $RID is not in gittensor-ai-lab/sparkinfer-k3-log."
+            echo "Commit runs/$RID/{result,attestation,receipt}.json to the log first."
+            exit 1
+          fi
+          gh api "repos/gittensor-ai-lab/sparkinfer-k3-log/contents/runs/$RID/receipt.json" \
+            --jq '.content' | base64 -d > /tmp/receipt.json
+          python3 - <<'PY'
+          import json, sys
+          sys.path.insert(0, "eval")
+          from polaris.verify import verify_strict
+          from polaris.receipt import ReceiptValidator
+          r = json.load(open("/tmp/receipt.json"))
+          problems = verify_strict(r, ReceiptValidator(r))
+          if problems:
+              # Under-provenanced is not the same as fraudulent, but it is not scorable
+              # either — an unpinned clock means the tok/s is not comparable to the
+              # frontier it is being scored against.
+              print("::error::receipt failed strict verification:")
+              for p in problems:
+                  print(f"  {p}")
+              sys.exit(1)
+          print(f"receipt verifies: {r.get('attestation_type')} / {r.get('receipt_id')}")
+          PY
+
       - name: Extract and re-derive the verdict
         id: verdict
         env:
