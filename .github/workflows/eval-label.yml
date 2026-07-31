@@ -1,0 +1,148 @@
+name: eval-label
+
+# Applies the eval:XS .. eval:XL tier to a PR from a node run's RESULT_JSON.
+#
+# WHY THE LABEL IS APPLIED HERE AND NOT COMPUTED HERE. The tier is a deterministic
+# function of measurements (bench/scripts/label.py) so independent validators converge
+# on the same verdict. But the measurements require an 8x H200 node holding 553 GiB —
+# no hosted runner can produce them. So the node runs the eval, and this workflow only
+# TRANSCRIBES the verdict onto the PR. It recomputes the label from the reported
+# numbers rather than trusting the reported label, so a hand-edited tier is caught.
+#
+# Trigger it by commenting on the PR with the harness output:
+#
+#     /eval RESULT_JSON {"commit":"abc1234","tps":3.55,...}
+#
+# produced by:
+#
+#     bench/scripts/kimi_k3_eval.sh --node h200x8 --frontier <merged best>
+#
+# AUTHORIZATION. Only OWNER / MEMBER / COLLABORATOR comments are honoured. Without
+# that gate any contributor could comment their own eval:XL onto their own PR, which
+# is the whole ballgame in a repo that pays per tier.
+
+on:
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: PR number
+        required: true
+      result_json:
+        description: RESULT_JSON payload from kimi_k3_eval.sh
+        required: true
+
+permissions:
+  issues: write
+  pull-requests: write
+  contents: read
+
+jobs:
+  label:
+    # issue_comment fires for issues too; PR-only, and only on an /eval command.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.issue.pull_request != null &&
+       startsWith(github.event.comment.body, '/eval'))
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authorize
+        if: github.event_name == 'issue_comment'
+        env:
+          ASSOC: ${{ github.event.comment.author_association }}
+        run: |
+          case "$ASSOC" in
+            OWNER|MEMBER|COLLABORATOR) echo "authorized ($ASSOC)" ;;
+            *) echo "::error::/eval from $ASSOC is not authorized — the tier decides payout, "\
+                    "so only maintainers may post one."; exit 1 ;;
+          esac
+
+      - name: Extract and re-derive the verdict
+        id: verdict
+        env:
+          BODY: ${{ github.event.comment.body }}
+          DISPATCH_JSON: ${{ github.event.inputs.result_json }}
+        run: |
+          set -euo pipefail
+          if [ -n "${DISPATCH_JSON:-}" ]; then RAW="$DISPATCH_JSON"; else RAW="$BODY"; fi
+          PAYLOAD="$(printf '%s' "$RAW" | sed -n 's/.*RESULT_JSON[[:space:]]*\({.*}\).*/\1/p' | head -1)"
+          if [ -z "$PAYLOAD" ]; then
+            echo "::error::no RESULT_JSON found. Post the output of bench/scripts/kimi_k3_eval.sh"
+            exit 1
+          fi
+          # RE-DERIVE rather than trust. label.py is deterministic, so recomputing from the
+          # reported measurements must reproduce the reported label; if it does not, the
+          # payload was edited between the node and the comment.
+          python3 - "$PAYLOAD" <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os, subprocess, sys
+          d = json.loads(sys.argv[1])
+          claimed = d.get("label", "")
+          need = ["tps", "frontier_tps", "top1", "kl", "commit"]
+          missing = [k for k in need if k not in d]
+          if missing:
+              print(f"::error::RESULT_JSON missing {missing}", file=sys.stderr); sys.exit(1)
+          env = dict(os.environ)
+          ref = (d.get("provenance") or {}).get("llama_ref") or d.get("llama_ref") or 0
+          if ref: env["SPARKINFER_DIFFICULTY_REF"] = str(ref)
+          out = subprocess.run(
+              [sys.executable, "bench/scripts/label.py", str(d["tps"]), str(d["frontier_tps"]),
+               "0", str(d["top1"]), str(d["kl"]), str(d["commit"])],
+              capture_output=True, text=True, env=env, check=True).stdout
+          re_d = json.loads(out.split("RESULT_JSON", 1)[1].strip())
+          derived = re_d.get("label", "")
+          if claimed and claimed != derived:
+              print(f"::error::reported label {claimed!r} != re-derived {derived!r} from the same "
+                    f"numbers — payload edited or harness version mismatch", file=sys.stderr)
+              sys.exit(1)
+          print(f"label={derived}")
+          print(f"tps={d['tps']}")
+          print(f"top1={d['top1']}")
+          print(f"kl={d['kl']}")
+          print(f"pct={re_d.get('pct_over_frontier', '')}")
+          print(f"reason={re_d.get('reason', '') or re_d.get('note', '')}")
+          PY
+
+      - name: Apply the tier
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.issue.number || github.event.inputs.pr }}
+          LABEL: ${{ steps.verdict.outputs.label }}
+          TPS: ${{ steps.verdict.outputs.tps }}
+          TOP1: ${{ steps.verdict.outputs.top1 }}
+          KL: ${{ steps.verdict.outputs.kl }}
+          PCT: ${{ steps.verdict.outputs.pct }}
+          REASON: ${{ steps.verdict.outputs.reason }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Clear any previous tier first: two eval:* labels on one PR is ambiguous, and
+          # a re-eval after a rebase must supersede rather than accumulate.
+          for l in $(gh pr view "$PR" --repo "$REPO" --json labels -q '.labels[].name' | grep '^eval:' || true); do
+            gh pr edit "$PR" --repo "$REPO" --remove-label "$l" || true
+          done
+
+          TIER="$(printf '%s' "$LABEL" | tr 'A-Z' 'a-z')"
+          NEW="eval:$TIER"
+          # Create on demand so a fresh repo does not need the label set seeded by hand.
+          gh label create "$NEW" --repo "$REPO" --color BFD4F2 \
+            --description "deterministic eval tier from bench/scripts/label.py" 2>/dev/null || true
+          gh pr edit "$PR" --repo "$REPO" --add-label "$NEW"
+
+          {
+            echo "### eval: \`$LABEL\`"
+            echo
+            echo "| metric | value |"
+            echo "|---|--:|"
+            echo "| decode tok/s | $TPS |"
+            echo "| % over frontier | $PCT |"
+            echo "| top-1 vs llama.cpp | $TOP1 |"
+            echo "| mean KLD vs llama.cpp | $KL |"
+            [ -n "$REASON" ] && echo "| note | $REASON |"
+            echo
+            echo "Re-derived from the posted measurements with \`bench/scripts/label.py\`;"
+            echo "the tier is a deterministic function of them, not of the reported label."
+          } > /tmp/body.md
+          gh pr comment "$PR" --repo "$REPO" --body-file /tmp/body.md

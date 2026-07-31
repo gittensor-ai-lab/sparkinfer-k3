@@ -75,6 +75,10 @@ def main():
     ap.add_argument("test")
     ap.add_argument("--top-k", type=int, default=5,
                     help="also report top-k set agreement")
+    ap.add_argument("--json", action="store_true",
+                    help="emit one machine-readable JSON line instead of the report. The eval "
+                         "harness consumes this: regex-parsing a formatted float is how a "
+                         "'4.045515e-03' silently becomes 4.045515 in someone's shell pipeline.")
     ap.add_argument("--per-token", type=int, default=0,
                     help="print the N worst-disagreeing token positions")
     args = ap.parse_args()
@@ -103,6 +107,22 @@ def main():
     tk_ref = np.argpartition(-ref, k, axis=1)[:, :k]
     tk_test = np.argpartition(-test, k, axis=1)[:, :k]
     topk_agree = np.mean([len(set(a) & set(b)) / k for a, b in zip(tk_ref, tk_test)])
+
+    if args.json:
+        import json as _json
+        print(_json.dumps({
+            "tokens": int(n_tok), "vocab": int(n_vocab),
+            "mean_kld": float(mean_kld),
+            "top1_agreement": float(top1_agree),      # 0..1, NOT a percentage
+            "topk_overlap": float(topk_agree),
+            "rms_dp": float(dp_rms),
+            "max_token_kld": float(kld_per_tok.max()),
+            "topk": int(k),
+        }, separators=(",", ":")))
+        # Same exit criteria as the report below, so --json changes the OUTPUT
+        # FORMAT and nothing else. A flag that also moved the pass bar would make
+        # two callers of the same script disagree about whether a run passed.
+        return 0 if (mean_kld < 1e-5 and top1_agree > 0.999 and dp_rms < 1e-3) else 1
 
     print(f"tokens {n_tok}  vocab {n_vocab}")
     print(f"  mean KLD        : {mean_kld:.6e}")

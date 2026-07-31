@@ -105,15 +105,30 @@ class ShardPathTest(unittest.TestCase):
     PUBLISHED = {"UD-IQ1_S": (14, 553), "UD-IQ1_M": (15, 604), "UD-IQ2_XXS": (16, 662),
                  "UD-Q2_K_XL": (19, 802), "UD-Q4_K_XL": (32, 1407), "UD-Q8_K_XL": (34, 1453)}
 
-    def test_target_quant_is_q2kxl(self):
-        # UD-Q2_K_XL is the accuracy knee (90.4% top-1). UD-IQ1_S is 249 GiB smaller but
-        # 78.9% top-1 — too lossy to judge an optimization frontier on.
-        self.assertEqual(bash("kimi_k3_quant"), "UD-Q2_K_XL")
+    def test_default_quant_is_iq1s(self):
+        # THE DEFAULT AND THE TARGET ARE DIFFERENT CLAIMS, and this pair asserts both.
+        # Default = UD-IQ1_S because it is what is resident, what the llama.cpp reference
+        # was measured on, and what bench/refdata's logits were captured against — so the
+        # harness works with no flags. Defaulting to an 802 GiB download nobody has means
+        # every fresh invocation dies at verify_model_split.
+        self.assertEqual(bash("kimi_k3_quant"), "UD-IQ1_S")
         self.assertEqual(bash("kimi_k3_first_shard"),
+                         "UD-IQ1_S/Kimi-K3-UD-IQ1_S-00001-of-00014.gguf")
+        self.assertEqual(bash("kimi_k3_n_shards"), "14")
+        self.assertEqual(bash("kimi_k3_size_gib"), "553")
+
+    def test_target_quant_is_q2kxl(self):
+        # UD-Q2_K_XL remains the accuracy knee (90.4% top-1) and what the project is
+        # judged on. UD-IQ1_S is 249 GiB smaller but 78.9% top-1 — fine for making the
+        # harness runnable, too lossy to be the frontier's yardstick. Reachable via
+        # PRIMARY_QUANT, and it must stay fully wired.
+        env = {"PRIMARY_QUANT": "UD-Q2_K_XL"}
+        self.assertEqual(bash("kimi_k3_quant", env), "UD-Q2_K_XL")
+        self.assertEqual(bash("kimi_k3_first_shard", env),
                          "UD-Q2_K_XL/Kimi-K3-UD-Q2_K_XL-00001-of-00019.gguf")
-        self.assertEqual(bash("kimi_k3_n_shards"), "19")
-        self.assertEqual(bash("kimi_k3_include_glob"), "*UD-Q2_K_XL*")
-        self.assertEqual(bash("kimi_k3_size_gib"), "802")
+        self.assertEqual(bash("kimi_k3_n_shards", env), "19")
+        self.assertEqual(bash("kimi_k3_include_glob", env), "*UD-Q2_K_XL*")
+        self.assertEqual(bash("kimi_k3_size_gib", env), "802")
 
     def test_every_published_quant_resolves(self):
         for q, (shards, gib) in self.PUBLISHED.items():
@@ -129,11 +144,13 @@ class ShardPathTest(unittest.TestCase):
         self.assertTrue(bash("kimi_k3_manifest", env).endswith("kimi_k3_ud_iq1_s.sha256"))
 
     def test_manifest_name_matches_quant(self):
-        self.assertTrue(bash("kimi_k3_manifest").endswith("kimi_k3_ud_q2_k_xl.sha256"))
+        self.assertTrue(bash("kimi_k3_manifest").endswith("kimi_k3_ud_iq1_s.sha256"))
+        self.assertTrue(bash("kimi_k3_manifest", {"PRIMARY_QUANT": "UD-Q2_K_XL"})
+                        .endswith("kimi_k3_ud_q2_k_xl.sha256"))
 
     def test_gguf_path_joins_models_dir(self):
         got = bash("kimi_k3_gguf", {"KIMI_K3_MODELS_DIR": "/mnt/w"})
-        self.assertEqual(got, "/mnt/w/UD-Q2_K_XL/Kimi-K3-UD-Q2_K_XL-00001-of-00019.gguf")
+        self.assertEqual(got, "/mnt/w/UD-IQ1_S/Kimi-K3-UD-IQ1_S-00001-of-00014.gguf")
 
 
 class NodeProfileTest(unittest.TestCase):
@@ -224,8 +241,15 @@ class ContextBudgetTest(unittest.TestCase):
 class LlamaFlagTest(unittest.TestCase):
     def test_required_flags_present(self):
         flags = bash("kimi_k3_llama_flags")
-        for needed in ("-ngl 99", "--split-mode layer", "--no-mmap", "-b 2048", "-ub 512"):
+        for needed in ("-ngl 99", "--split-mode layer", "-b 2048", "-ub 512"):
             self.assertIn(needed, flags)
+        # The no-mmap spelling is PROBED from llama-bench --help, not hardcoded:
+        # upstream replaced --no-mmap with -lm/--load-mode and deprecated -mmp. Asserting
+        # one literal spelling is what made this test pass while the real invocation was
+        # failing arg-parse on the node. Assert the INTENT instead.
+        self.assertTrue(
+            any(f in flags for f in ("--load-mode none", "--no-mmap", "-mmp 0")),
+            f"no recognised no-mmap flag in: {flags}")
 
     def test_server_flags_cover_the_hybrid_arch(self):
         # Without --no-context-shift a long eval dies mid-run on a recurrent arch;
@@ -309,10 +333,13 @@ class FitCheckTest(unittest.TestCase):
         self.assertEqual(bash_rc("kimi_k3_check_fits", self._with_fake_smi(self.B200, 8, at32k)), 0)
 
     def test_smaller_quant_rescues_an_undersized_node(self):
-        # 5x H200 (705 GiB) can't hold the 802 GiB target, but holds IQ1_S (553 + 26 = 579).
+        # 5x H200 (705 GiB) can't hold the 802 GiB TARGET, but holds IQ1_S (553 + 26 = 579).
+        # Both quants are named explicitly: the harness default moved to UD-IQ1_S, so
+        # relying on it to supply the "too big" side silently inverted this test's premise.
         small = {"PRIMARY_QUANT": "UD-IQ1_S", "KIMI_K3_MAX_CTX": "32768"}
+        big   = {"PRIMARY_QUANT": "UD-Q2_K_XL", "KIMI_K3_MAX_CTX": "32768"}
         self.assertEqual(bash_rc("kimi_k3_check_fits", self._with_fake_smi(self.H200, 5, small)), 0)
-        self.assertEqual(bash_rc("kimi_k3_check_fits", self._with_fake_smi(self.H200, 5)), 1)
+        self.assertEqual(bash_rc("kimi_k3_check_fits", self._with_fake_smi(self.H200, 5, big)), 1)
 
     def test_4x_h200_cannot_hold_even_iq1s(self):
         # 564 GiB vs 553 GiB weights leaves 11 GiB — less than the compute buffers alone.
@@ -342,9 +369,9 @@ class BaselineDryRunTest(unittest.TestCase):
 
     def test_dry_run_needs_no_gpu_or_weights(self):
         out = self._dry()
-        self.assertIn("Kimi-K3-UD-Q2_K_XL-00001-of-00019.gguf", out)
+        self.assertIn("Kimi-K3-UD-IQ1_S-00001-of-00014.gguf", out)
         self.assertIn("--split-mode layer", out)
-        self.assertIn("802 GiB + 29 GiB headroom", out)
+        self.assertIn("553 GiB + 29 GiB headroom", out)
         self.assertIn(PINNED_COMMIT, out)
 
     def test_longctx_probe_is_opt_in(self):
@@ -551,6 +578,14 @@ class ReferenceLockProvenanceTest(unittest.TestCase):
             else (SCRIPTS / "reference.lock").read_text())
         shutil.copy(self.CHECKER, scripts / self.CHECKER.name)
         rdir = tmp / "bench" / "results"
+        # Seed with the REAL committed baseline JSONs unless the caller supplies its own
+        # set. The shipped lock now pins a measured value (the first K3 reference), so a
+        # provenance run against an empty dir would fail for the right reason at the wrong
+        # time — it would be asserting "nothing is measured yet", which is no longer true.
+        real = ROOT / "bench" / "results"
+        if real.is_dir():
+            for f in real.glob("kimi_k3_*_baseline_*.json"):
+                shutil.copy(f, rdir / f.name)
         for name, payload in (results or {}).items():
             (rdir / name).write_text(json.dumps(payload))
         out = subprocess.run(
@@ -559,10 +594,15 @@ class ReferenceLockProvenanceTest(unittest.TestCase):
         return out.returncode, out.stdout + out.stderr
 
     def test_shipped_lock_is_clean(self):
+        """Every pinned slot in the shipped lock traces to a committed measurement.
+
+        This used to assert "0 pinned" — correct while no K3 baseline existed. The first
+        real reference (llama.cpp on 8x H200, UD-IQ1_S) is now pinned, so the invariant
+        that matters is PROVENANCE, not emptiness: rc == 0 means every pinned value is
+        backed by a results JSON in the tree."""
         rc, out = self._run()
         self.assertEqual(rc, 0, out)
-        self.assertIn("24 K3 baseline slots", out)
-        self.assertIn("0 pinned", out)
+        self.assertIn("K3 baseline slots", out)
 
     def test_hand_filled_baseline_is_rejected(self):
         lock = (SCRIPTS / "reference.lock").read_text().replace(
