@@ -145,7 +145,7 @@ export KIMI_K3_MODELS_DIR=/workspace/models_k3     # needs ~560 GiB free (UD-IQ1
 # 1. sanity-check the plan without touching the network or the GPUs
 bench/scripts/kimi_k3_baseline.sh --node h200x8 --dry-run
 
-# 2. fetch the 19 shards + build the pinned fork, then sweep the scored contexts
+# 2. fetch the 14 shards + build the pinned fork, then sweep the scored contexts (128..128k)
 bench/scripts/kimi_k3_baseline.sh --node h200x8 --download
 
 # 3. close the milestone: probe 128k / 256k / 1M
@@ -156,7 +156,7 @@ bench/scripts/kimi_k3_baseline.sh --node h200x8 --longctx
 
 M2 and M3 are the same command with `--node b200x8` / `--node b300x4`.
 
-The scored sweep runs `llama-bench` at contexts `128 512 4096 32768`, 3 reps, taking the
+The scored sweep runs `llama-bench` at contexts `128 512 4096 32768 131072`, 3 reps, taking the
 median `samples_ts` for the prefill (`pp`) and decode (`tg`) rows separately. Override with
 `--ctx "..."`, `--reps N`, `--decode-only`, `--prefill-only`.
 

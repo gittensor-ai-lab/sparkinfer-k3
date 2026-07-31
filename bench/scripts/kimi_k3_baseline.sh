@@ -33,8 +33,12 @@ source "$HERE/_common.sh"
 source "$HERE/_kimi_k3.sh"
 
 DOWNLOAD=0; DO_DECODE=1; DO_PREFILL=1; REPS=3; DRY=0; LONGCTX=0
-CTXS="${KIMI_K3_CTXS:-128 512 4096 32768}"
-LONGCTXS="${KIMI_K3_LONGCTXS:-131072 262144 1048576}"
+# 128k IS IN THE SCORED SWEEP, not deferred to --longctx. UD-IQ1_S at 128k is the
+# configuration this repo actually runs; a number that only covers 128-token decode has
+# not shown anything about the case anyone uses. 256k/1M stay in --longctx because a 1M
+# prefill is minutes per rep — those are capability probes, this is a median.
+CTXS="${KIMI_K3_CTXS:-128 512 4096 32768 131072}"
+LONGCTXS="${KIMI_K3_LONGCTXS:-262144 1048576}"
 DECODE_TOKENS="${KIMI_K3_DECODE_TOKENS:-64}"
 while [ $# -gt 0 ]; do case "$1" in
   --download)     DOWNLOAD=1 ;;

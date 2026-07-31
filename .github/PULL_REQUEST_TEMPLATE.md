@@ -23,11 +23,9 @@
 > Tick a box only if you actually ran it. A pinned baseline must be backed by the
 > `bench/results/*.json` the sweep emitted, and the `lock` CI job enforces that.
 
-- [ ] Tested on **8× H200** (`sm_90`) — M1
-- [ ] Tested on **8× B200** (`sm_100`) — M2
-- [ ] Tested on **4×+ B300** (`sm_103`) — M3
+- [ ] Tested on **8× H200** (`sm_90`)
 
-**Decode tok/s** — from `bench/scripts/kimi_k3_baseline.sh --node <node>`, UD-Q2_K_XL:
+**Decode tok/s** — from `bench/scripts/kimi_k3_baseline.sh --node h200x8`, **UD-IQ1_S**:
 
 | context | before (main) | after (this PR) |
 |---|--:|--:|
@@ -35,19 +33,12 @@
 | 512 | | |
 | 4k | | |
 | 32k | | |
+| 128k | | |
 
-**Prefill pp tok/s** — same command, same node:
-
-| context | before (main) | after (this PR) |
-|---|--:|--:|
-| 4k | | |
-| 32k | | |
-
-**1M context** (`--longctx`, 1 rep — capability probe, not a median):
-
-| | loads | decode tok/s | prefill pp |
-|---|:-:|--:|--:|
-| this PR at 1,048,576 | | | |
+<!-- 128k is in the scored sweep, not deferred to a capability probe. UD-IQ1_S at 128k is
+     the configuration this repo actually runs, so a PR that only moves 128-token decode
+     has not shown it moves the case anyone uses. Reference for context: llama.cpp does
+     18.32 tok/s at ctx 128 on this node; sparkinfer does 3.55. -->
 
 <!-- Paste the sweep output backing the numbers above. Isolated-kernel microbenchmarks are
      welcome as extra evidence but do NOT substitute for an end-to-end before/after. -->
