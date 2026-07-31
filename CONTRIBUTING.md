@@ -182,3 +182,5 @@ scoped to `kernels/`, `runtime/`, and `moe/` — that's the rewarded optimizatio
 - Keep changes focused; one optimization per PR makes the measured delta attributable.
 
 By contributing you agree your work is licensed under the repository's [MIT License](LICENSE).
+
+<!-- check-name verification probe; see PR #29 -->
