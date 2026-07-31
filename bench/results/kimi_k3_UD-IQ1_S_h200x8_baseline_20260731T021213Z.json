@@ -1,0 +1,33 @@
+{
+  "engine": "llama.cpp (unsloth fork)",
+  "engine_repo": "https://github.com/unslothai/llama.cpp",
+  "engine_ref": "refs/pull/48/head",
+  "engine_commit": "efc8bc38f0a9950cbb10ccef2cf48b951c39d3b2",
+  "model": "Kimi K3",
+  "quant": "UD-IQ1_S",
+  "gguf": "Kimi-K3-UD-IQ1_S-00001-of-00014.gguf",
+  "node_profile": "h200x8",
+  "node_label": "8x H200 SXM (sm_90, Hopper)",
+  "node_expects_arch": "sm_90",
+  "arch": "sm_90",
+  "gpus": 8,
+  "gpu_name": "NVIDIA H200",
+  "hbm_gib_total": 1123,
+  "pinned_graphics_clock_mhz": "",
+  "max_ctx_budgeted": 131072,
+  "kv_gib_at_max_ctx": 4,
+  "decode_tokens": 64,
+  "reps": 1,
+  "llama_flags": "-ngl 99 --split-mode layer --load-mode none -b 2048 -ub 512 ",
+  "reference_lock_prefix": "KIMI_K3_H200X8_LLAMA_",
+  "contexts": {
+    "128": {
+      "prefill_pp": 0.0,
+      "decode_tps": 18.321,
+      "kind": "scored",
+      "reps": 1
+    }
+  },
+  "sparkinfer": null,
+  "note": "Baseline only \u2014 sparkinfer has no kimi-k3 loader yet (see bench/configs/models/kimi_k3.yaml)."
+}

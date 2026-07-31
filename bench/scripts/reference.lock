@@ -113,6 +113,25 @@ KIMI_K3_LLAMACPP_BASE_COMMIT="${KIMI_K3_LLAMACPP_BASE_COMMIT:-cf67f0d24511864d2d
 # capability probes, not medians: a 1M-token prefill is minutes of wall-clock per rep.
 
 # --- M1: 8x H200 SXM (sm_90) ---
+# --- MEASURED 2026-07-31, 8x H200 SXM, UD-IQ1_S ---
+# The Q2_K_XL slots below stay 0: they are the TARGET quant and it has not been run.
+# An IQ1_S number pinned into a Q2_K_XL slot would be scored against the wrong
+# reference — IQ1_S is 249 GiB smaller and decodes faster, so it would understate every
+# future gain. Quant-qualified slots instead.
+#
+# llama-bench -p 0 -n 64 -r 1 -ngl 99 --split-mode layer --load-mode none -b 2048 -ub 512
+# engine: unslothai/llama.cpp @ efc8bc38 (refs/pull/48/head)
+# backing: bench/results/kimi_k3_UD-IQ1_S_h200x8_baseline_20260731T021213Z.json
+#
+# THE HEADLINE, RECORDED SO IT IS NOT LOST: llama.cpp does 18.32 tok/s here and
+# sparkinfer does 3.55. sparkinfer's K3 path is ~5.2x SLOWER than the reference. That
+# is the expected shape for a correctness-first fp32 executor against llama.cpp's
+# mature CUDA path (integer dot products, fused ops, graph capture) — but it means the
+# K3 frontier starts far behind, and every tier below is anchored to 18.32.
+KIMI_K3_H200X8_IQ1S_LLAMA_128="${KIMI_K3_H200X8_IQ1S_LLAMA_128:-18.3210}"
+# sparkinfer's own first verified entry on the same node/quant (tensor-parallel, tp=8).
+KIMI_K3_H200X8_IQ1S_SPARKINFER_128="${KIMI_K3_H200X8_IQ1S_SPARKINFER_128:-3.55}"
+
 KIMI_K3_H200X8_LLAMA_128="${KIMI_K3_H200X8_LLAMA_128:-0}"
 KIMI_K3_H200X8_LLAMA_512="${KIMI_K3_H200X8_LLAMA_512:-0}"
 KIMI_K3_H200X8_LLAMA_4K="${KIMI_K3_H200X8_LLAMA_4K:-0}"

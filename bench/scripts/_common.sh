@@ -66,13 +66,36 @@ unset _cuda
 CUDA_HOST_FLAG=""
 [ -x /usr/bin/g++-12 ] && CUDA_HOST_FLAG="-DCMAKE_CUDA_HOST_COMPILER=g++-12"
 
+# Build parallelism. WAS HARDCODED -j2/-j1 EVERYWHERE, which is a sensible guard on the
+# small RTX 5090 dev boxes this harness grew up on — nvcc peaks around 2 GB per TU, so an
+# unbounded -j on a 16 GB builder OOMs mid-link and looks like a flaky build.
+#
+# On a milestone node it is pathological: an 8x H200 box has 240 cores and 2 TB of RAM,
+# and a llama.cpp CUDA build at -j2 takes over an hour of pure wall-clock before the
+# benchmark can even start. MEASURED: the K3 baseline sat 25 minutes at -j2 with all
+# eight GPUs idle, having built only libggml-base and libggml-cpu.
+#
+# So: scale with the machine, but stay bounded by MEMORY as well as cores, because the
+# core count is not what OOMs a build. ~2 GB per job, and never more than nproc.
+# SPARKINFER_BUILD_JOBS overrides for a builder that needs a hard cap.
+build_jobs() {
+  if [ -n "${SPARKINFER_BUILD_JOBS:-}" ]; then echo "$SPARKINFER_BUILD_JOBS"; return; fi
+  local cores mem_gb by_mem
+  cores="$(nproc 2>/dev/null || echo 2)"
+  mem_gb="$(awk '/MemTotal/ {printf "%d", $2/1048576}' /proc/meminfo 2>/dev/null || echo 4)"
+  by_mem=$(( mem_gb / 2 ))
+  [ "$by_mem" -lt 1 ] && by_mem=1
+  if [ "$by_mem" -lt "$cores" ]; then echo "$by_mem"; else echo "$cores"; fi
+}
+
 ensure_sparkinfer() {  # $1 = arch
   [ -x "$ROOT/build/runtime/qwen3_gguf_bench" ] && [ -x "$ROOT/build/runtime/qwen3_gguf_score" ] \
     && [ -x "$ROOT/build/runtime/qwen3_gguf_prefill_check" ] && return 0
   echo ">> building sparkinfer (sm_$1) ..." >&2
   cmake -S "$ROOT" -B "$ROOT/build" -DCMAKE_CUDA_ARCHITECTURES="$1" -DCMAKE_BUILD_TYPE=Release $CUDA_HOST_FLAG >/dev/null
-  # Cap at 2 parallel jobs — cc1plus for sm_120 uses ~2-3 GB RAM each; -j4 OOMs on 64GB eval boxes.
-  if ! cmake --build "$ROOT/build" -j2 >/dev/null; then
+  # Parallelism is machine-scaled but memory-bounded — see build_jobs().
+
+  if ! cmake --build "$ROOT/build" -j"$(build_jobs)" >/dev/null; then
     echo ">> sparkinfer build FAILED (sm_$1)" >&2
     return 1
   fi
@@ -89,7 +112,7 @@ ensure_prefill_check() {  # $1 = arch
   if [ -n "${SI_BIN:-}" ] && [ -x "$SI_BIN/qwen3_gguf_prefill_check" ]; then return 0; fi
   echo ">> building qwen3_gguf_prefill_check (sm_$1) ..." >&2
   cmake -S "$ROOT" -B "$ROOT/build" -DCMAKE_CUDA_ARCHITECTURES="$1" -DCMAKE_BUILD_TYPE=Release $CUDA_HOST_FLAG >/dev/null
-  cmake --build "$ROOT/build" -j2 --target qwen3_gguf_prefill_check >/dev/null
+  cmake --build "$ROOT/build" -j"$(build_jobs)" --target qwen3_gguf_prefill_check >/dev/null
   [ -x "$ROOT/build/runtime/qwen3_gguf_prefill_check" ]
 }
 
@@ -99,7 +122,7 @@ ensure_cb_bench() {  # $1 = arch
   if [ -n "${SI_BIN:-}" ] && [ -x "$SI_BIN/qwen3_gguf_cb_bench" ]; then return 0; fi
   echo ">> building qwen3_gguf_cb_bench (sm_$1) ..." >&2
   cmake -S "$ROOT" -B "$ROOT/build" -DCMAKE_CUDA_ARCHITECTURES="$1" -DCMAKE_BUILD_TYPE=Release $CUDA_HOST_FLAG >/dev/null
-  cmake --build "$ROOT/build" -j2 --target qwen3_gguf_cb_bench >/dev/null
+  cmake --build "$ROOT/build" -j"$(build_jobs)" --target qwen3_gguf_cb_bench >/dev/null
   [ -x "$ROOT/build/runtime/qwen3_gguf_cb_bench" ]
 }
 
@@ -257,7 +280,7 @@ ensure_llamacpp() {  # $1 = arch ; builds llama-bench + llama-server, pinned + t
   # Build targets sequentially — parallel llama-bench + llama-server races on shared ggml objects.
   if [ ! -x "$bench" ]; then
     echo ">> building llama-bench ..." >&2
-    if ! cmake --build "$bdir" -j2 --target llama-bench 2>&1 \
+    if ! cmake --build "$bdir" -j"$(build_jobs)" --target llama-bench 2>&1 \
           | tee -a /tmp/llama_build.log | awk 'NR<=5 || NR%40==0 || /Built target|error:|FAILED|fatal error/' >&2; then
       echo ">> FATAL: llama-bench build failed" >&2
       grep -iE 'error:|fatal error:' /tmp/llama_build.log | tail -20 >&2 || tail -40 /tmp/llama_build.log >&2
@@ -266,7 +289,7 @@ ensure_llamacpp() {  # $1 = arch ; builds llama-bench + llama-server, pinned + t
   fi
   if [ ! -x "$srv" ]; then
     echo ">> building llama-server (single-threaded) ..." >&2
-    if ! cmake --build "$bdir" -j1 --target llama-server 2>&1 \
+    if ! cmake --build "$bdir" -j"$(build_jobs)" --target llama-server 2>&1 \
           | tee -a /tmp/llama_build.log | awk 'NR<=5 || NR%20==0 || /Built target|error:|FAILED|fatal error/' >&2; then
       echo ">> FATAL: llama-server build failed" >&2
       grep -iE 'error:|fatal error:' /tmp/llama_build.log | tail -20 >&2 || tail -40 /tmp/llama_build.log >&2
@@ -276,7 +299,7 @@ ensure_llamacpp() {  # $1 = arch ; builds llama-bench + llama-server, pinned + t
   for t in $LLAMACPP_EXTRA_TARGETS; do
     [ -x "$bdir/bin/$t" ] && continue
     echo ">> building $t ..." >&2
-    if ! cmake --build "$bdir" -j1 --target "$t" 2>&1 \
+    if ! cmake --build "$bdir" -j"$(build_jobs)" --target "$t" 2>&1 \
           | tee -a /tmp/llama_build.log | awk 'NR<=5 || NR%20==0 || /Built target|error:|FAILED|fatal error/' >&2; then
       echo ">> FATAL: $t build failed" >&2
       grep -iE 'error:|fatal error:' /tmp/llama_build.log | tail -20 >&2 || tail -40 /tmp/llama_build.log >&2

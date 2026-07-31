@@ -36,10 +36,23 @@ CTX_OF_SUFFIX = {
 }
 FLOAT_TOL = 0.01     # the lock stores 2dp of what the sweep measured
 
+# KIMI_K3_<NODE>[_<QUANT>]_LLAMA_<CTX>[_PP].
+#
+# The optional QUANT segment exists because the node alone does not identify a
+# reference: UD-IQ1_S is 249 GiB smaller than the UD-Q2_K_XL target and decodes
+# several times faster on the same box. Pinning an IQ1_S number into an unqualified
+# slot would silently score every future PR against the wrong denominator — the exact
+# class of undetectable-downstream error this checker exists to prevent. So a
+# quant-qualified slot must match a results file for THAT quant, not just that node.
 VAR_RE = re.compile(
-    r'^(KIMI_K3_(?P<node>[A-Z0-9]+)_LLAMA_(?P<suffix>[A-Z0-9_]+))='
+    r'^(KIMI_K3_(?P<node>[A-Z0-9]+)(?:_(?P<quant>[A-Z0-9]+))?_LLAMA_(?P<suffix>[0-9]+K?M?(?:_PP)?))='
     r'"\$\{\1:-(?P<value>[0-9.]+)\}"\s*$'
 )
+
+
+def _norm_quant(q):
+    """UD-IQ1_S -> IQ1S, so the lock's identifier charset matches the JSON's."""
+    return re.sub(r'[^A-Z0-9]', '', (q or '').upper()).replace('UD', '', 1) or None
 
 
 def parse_lock(path: Path):
@@ -56,13 +69,17 @@ def parse_lock(path: Path):
             suffix,
             suffix.endswith("_PP"),
             float(m.group("value")),
+            m.group("quant"),
         ))
     return out
 
 
 def load_results(results_dir: Path):
-    """-> {(node, ctx, is_prefill): [values]} from every baseline JSON on disk."""
-    measured: dict[tuple[str, int, bool], list[float]] = {}
+    """-> {(node, quant, ctx, is_prefill): [values]} from every baseline JSON on disk.
+
+    Keyed by quant as well as node; an entry is also recorded under quant=None so an
+    unqualified lock slot still resolves the way it always did."""
+    measured: dict[tuple, list[float]] = {}
     bad_nodes = []
     for f in sorted(results_dir.glob("kimi_k3_*_baseline_*.json")):
         try:
@@ -71,6 +88,7 @@ def load_results(results_dir: Path):
             print(f"  !! unreadable results file {f.name}: {e}")
             continue
         node = (d.get("node_profile") or "").lower()
+        quant = _norm_quant(d.get("quant"))
         if node and node not in KNOWN_NODES:
             bad_nodes.append((f.name, node))
         for ctx_s, row in (d.get("contexts") or {}).items():
@@ -81,7 +99,8 @@ def load_results(results_dir: Path):
             for is_pp, key in ((False, "decode_tps"), (True, "prefill_pp")):
                 v = row.get(key)
                 if isinstance(v, (int, float)) and v > 0:
-                    measured.setdefault((node, ctx, is_pp), []).append(float(v))
+                    measured.setdefault((node, quant, ctx, is_pp), []).append(float(v))
+                    measured.setdefault((node, None, ctx, is_pp), []).append(float(v))
     return measured, bad_nodes
 
 
@@ -109,7 +128,7 @@ def main() -> int:
         errors.append(f"{name}: claims unknown node profile {node!r} "
                       f"(known: {sorted(KNOWN_NODES)})")
 
-    for var, node, suffix, is_pp, value in pinned:
+    for var, node, suffix, is_pp, value, quant in pinned:
         if node not in KNOWN_NODES:
             errors.append(f"{var}: unknown node {node!r} — add a profile or drop the slot")
             continue
@@ -117,7 +136,7 @@ def main() -> int:
         if ctx is None:
             errors.append(f"{var}: suffix {suffix!r} maps to no context — extend CTX_OF_SUFFIX")
             continue
-        found = measured.get((node, ctx, is_pp), [])
+        found = measured.get((node, quant, ctx, is_pp), [])
         if not found:
             errors.append(
                 f"{var} = {value} is pinned but NO results file records "

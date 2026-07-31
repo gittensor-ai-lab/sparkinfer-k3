@@ -32,9 +32,28 @@ export LLAMACPP_COMMIT="${KIMI_K3_LLAMACPP_COMMIT:-efc8bc38f0a9950cbb10ccef2cf48
 export LLAMACPP_DIR="${KIMI_K3_LLAMACPP_DIR:-${ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}/.llamacpp-k3}"
 
 # ---- quant selection ----
-# PRIMARY_QUANT: UD-Q2_K_XL (default, target) | UD-IQ1_S | UD-IQ1_M | UD-IQ2_XXS | UD-Q8_K_XL
+# PRIMARY_QUANT: UD-IQ1_S (default, RUNNABLE) | UD-Q2_K_XL (target) | UD-IQ1_M
+#                | UD-IQ2_XXS | UD-Q8_K_XL
+#
+# THE DEFAULT IS UD-IQ1_S, THE TARGET IS STILL UD-Q2_K_XL. Those are different claims
+# and both are deliberate.
+#
+# UD-Q2_K_XL remains what this project is judged on: 90.4% top-1 against lossless is the
+# accuracy knee, and UD-IQ1_S's 78.9% is too lossy to be the thing an optimization
+# frontier is scored against. Nothing about that changed.
+#
+# But the default is what runs when nobody passes a flag, and defaulting to a 802 GiB
+# download that is not on any machine yet means every fresh invocation fails at
+# verify_model_split before it does anything useful. UD-IQ1_S (553 GiB) is what is
+# resident, what the reference baseline was measured on, and what bench/refdata's
+# llama.cpp logits were captured against — so it is the quant that makes the harness
+# work out of the box and the accuracy comparison meaningful.
+#
+# The reference.lock slots keep the quant in their NAME for exactly this reason
+# (KIMI_K3_H200X8_IQ1S_LLAMA_128), so a number measured under this default can never be
+# read as a Q2_K_XL result. Set PRIMARY_QUANT=UD-Q2_K_XL for the target sweep.
 # Sizes are unsloth's published GiB, used for the fits-in-HBM precheck only.
-kimi_k3_quant() { echo "${PRIMARY_QUANT:-UD-Q2_K_XL}"; }
+kimi_k3_quant() { echo "${PRIMARY_QUANT:-UD-IQ1_S}"; }
 
 # Shard counts as published in unsloth/Kimi-K3-GGUF. Pinned rather than discovered, so an
 # interrupted download fails loudly instead of looking complete. 0 = don't enforce a count
@@ -197,14 +216,37 @@ kimi_k3_headroom_gib() {
 #   -ngl 99            93 layers, all offloaded
 #   --split-mode layer llama.cpp sizes the per-GPU split from tensor bytes; the layers are
 #                      not uniform (24 MLA vs 69 KDA), so do NOT hand-force -ts
-#   --no-mmap          the weights must land in HBM, not the host page cache; on an 802 GiB
-#                      read, mmap turns load into a random-read storm
+#   no-mmap            the weights must land in HBM, not the host page cache; on an 802 GiB
+#                      read, mmap turns load into a random-read storm. THE SPELLING IS
+#                      VERSION-DEPENDENT: llama-bench replaced `--no-mmap` with
+#                      `-lm/--load-mode <none|mmap|mlock|mmap+mlock|dio>` (and deprecated
+#                      `-mmp <0|1>`). Passing the old spelling to a new binary does not
+#                      warn — llama-bench falls through to its numeric-range parser, fails
+#                      on the NEXT argument, and prints its whole usage. MEASURED: that is
+#                      exactly how the first K3 baseline attempt died, reporting
+#                      "'first-last' or 'first-last+step'..." with no mention of mmap.
+#                      So probe --help once and emit whichever the binary accepts.
 #   -b / -ub           compute buffers are per-GPU and scale with ubatch; the fork's
 #                      n_tokens*160 node budget is sized for large ubatch but VRAM is not
+# Which no-mmap spelling this llama-bench understands. Probed from --help, cached.
+kimi_k3_nommap_flag() {
+  if [ -z "${_KIMI_K3_NOMMAP_FLAG:-}" ]; then
+    local help="" bin="${LLAMA_BENCH:-}"
+    [ -x "$bin" ] && help="$("$bin" --help 2>&1 || true)"
+    if   printf '%s' "$help" | grep -q -- '--load-mode'; then _KIMI_K3_NOMMAP_FLAG="--load-mode none"
+    elif printf '%s' "$help" | grep -q -- '--no-mmap';   then _KIMI_K3_NOMMAP_FLAG="--no-mmap"
+    elif printf '%s' "$help" | grep -q -- '--mmap';      then _KIMI_K3_NOMMAP_FLAG="-mmp 0"
+    else _KIMI_K3_NOMMAP_FLAG="--load-mode none"   # current upstream spelling
+    fi
+    export _KIMI_K3_NOMMAP_FLAG
+  fi
+  printf '%s' "$_KIMI_K3_NOMMAP_FLAG"
+}
+
 kimi_k3_llama_flags() {
   echo "-ngl ${KIMI_K3_NGL:-99}" \
        "--split-mode ${KIMI_K3_SPLIT_MODE:-layer}" \
-       "--no-mmap" \
+       "$(kimi_k3_nommap_flag)" \
        "-b ${KIMI_K3_BATCH:-2048}" \
        "-ub ${KIMI_K3_UBATCH:-512}" \
        "${KIMI_K3_EXTRA_FLAGS:-}"
