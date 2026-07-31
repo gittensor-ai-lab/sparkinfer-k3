@@ -308,12 +308,12 @@ Tests need no GPU: `python3 bench/scripts/test_kimi_k3_baseline.py` (78).
 
 ## Powered by SN74 — moving at the speed of ⚡
 
-Contributors submit PRs; the bot verifies correctness and speed on real RTX 5090 hardware; SN74 rewards verified marginal speedups. **15 releases in 3 weeks** — from first llama.cpp beat to **+86% decode / +127% prefill @ 32k on Qwen3.6 SOTA**.
+Contributors submit PRs; the eval verifies correctness and speed **on an 8x H200 node**; SN74 rewards verified marginal speedups. The Qwen3.6 track this forks from reached **+86% decode / +127% prefill @ 32k** that way. K3 starts further back — sparkinfer is currently **5.2x slower than llama.cpp** here, which is the whole opportunity.
 
-1. Pick a narrow bottleneck in the Blackwell decode path.
+1. Pick a narrow bottleneck in the Hopper decode path.
 2. Submit a PR with source changes and benchmark evidence.
-3. The bot builds `main` and the PR on the same RTX 5090.
-4. Correctness vs llama.cpp; guards at 128 / 512 / 4k / 16k / 32k decode.
+3. The eval builds `main` and the PR on the same 8x H200 node.
+4. Correctness vs llama.cpp (top-1 >= 0.90, KL <= 0.20) gates before any speed tier.
 5. Strongest context improvement scores; regressions get `regression-*` labels.
 6. Frontier merges; the [dashboard](https://gittensor-ai-lab.github.io/sparkinfer/dashboard/) updates.
 

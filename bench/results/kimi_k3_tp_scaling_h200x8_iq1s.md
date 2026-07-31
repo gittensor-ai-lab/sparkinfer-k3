@@ -1,5 +1,23 @@
 # Kimi K3 UD-IQ1_S — tensor-parallel decode scaling, 8× H200
 
+> **SUPERSEDED IN PART — read this first.** These numbers predate the MoE dispatch
+> optimization (`BLOCK` 128→32 and the IQ lattice tables moved `__constant__`→`__device__`),
+> which made the sharded half ~3× faster and therefore **changed the scaling conclusion**:
+>
+> | | before | after |
+> |---|---:|---:|
+> | tp=1, 16 layers | 196.65 ms/token | **60.66** |
+> | tp=8, 16 layers | 80.61 ms/token | **54.33** |
+> | tp=8 vs tp=1 | **2.44×** | **~1.1×** |
+> | tp=8, 93 layers | 439.10 ms/token | **281.6** (3.55 tok/s) |
+>
+> The 2.44× below is still what was measured at the time, and the Amdahl analysis is still
+> the right way to read it. But the conclusion inverted: once the MoE got 3× faster, the
+> **replicated attention** that `ShardPolicy::ExpertsOnly` does not shard became the whole
+> serial term. Sharding attention (`ShardPolicy::Full`) is now the lever, not the MoE.
+>
+> Absolute context: llama.cpp does **18.32 tok/s** on this box. sparkinfer is still slower.
+
 First TP numbers for this model. Expert-parallel (`ShardPolicy::ExpertsOnly`): the 896
 routed experts are banded across ranks, everything else replicated. Produced by
 `runtime/examples/kimi_k3_tp_bench.cpp`; correctness is established separately by
