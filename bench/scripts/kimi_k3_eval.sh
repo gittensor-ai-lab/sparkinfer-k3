@@ -21,7 +21,8 @@
 #   DIFF_REF   the llama.cpp reference tok/s — the TIER BASIS. label.py sizes a gain
 #              against llama.cpp rather than against the frontier so the same tok/s of
 #              real work earns the same tier whether the frontier is fast or slow.
-#              Read from reference.lock (KIMI_K3_<NODE>_LLAMA_128) unless --llama-ref.
+#              Read from reference.lock (KIMI_K3_<NODE>_<QUANT>_LLAMA_128, falling back
+#              to the unqualified slot) unless --llama-ref.
 #
 # plus the correctness gate: top-1 agreement and mean KLD against llama.cpp on the
 # SAME weights and the SAME ids, from bench/refdata/. label.py REJECTs below
@@ -75,9 +76,28 @@ fi
 # frontier. Sourcing it (rather than hardcoding) is what makes M1/M2/M3 independent.
 # shellcheck source=/dev/null
 [[ -f "$HERE/reference.lock" ]] && source "$HERE/reference.lock"
+# SLOTS ARE QUANT-QUALIFIED. reference.lock stores the measured values as
+# KIMI_K3_<NODE>_<QUANT>_{LLAMA,SPARKINFER}_128 because the node alone does not identify
+# a reference — UD-IQ1_S is 249 GiB smaller than UD-Q2_K_XL and decodes faster on the
+# same box, so one number in the other's slot would misprice every future PR.
+#
+# This lookup used to read the UNQUALIFIED slots, which are all still 0. Both refs came
+# back 0, and the consequences were silent and total:
+#   frontier 0  -> label.py returns BASELINE for every run, so no PR could ever score.
+#   llama_ref 0 -> DIFF_REF <= 0, so label.py falls back to delta/frontier — the exact
+#                  un-anchored basis the llama-anchored tier exists to replace.
+# Try the qualified slot first, fall back to the unqualified one for a quant that has
+# not been split out yet.
 PFX="KIMI_K3_$(printf '%s' "$NODE" | tr 'a-z' 'A-Z')"
-[[ -n "$LLAMA_REF" ]] || LLAMA_REF="$(eval "printf '%s' \"\${${PFX}_LLAMA_128:-0}\"")"
-[[ -n "$FRONTIER"  ]] || FRONTIER="$(eval "printf '%s' \"\${${PFX}_SPARKINFER_128:-0}\"")"
+QUANT="$(printf '%s' "${PRIMARY_QUANT:-UD-IQ1_S}" | sed 's/^UD-//' | tr -cd 'A-Za-z0-9' | tr 'a-z' 'A-Z')"
+lookup() {  # $1 = LLAMA | SPARKINFER
+    local v
+    v="$(eval "printf '%s' \"\${${PFX}_${QUANT}_$1_128:-}\"")"
+    [[ -n "$v" && "$v" != "0" ]] && { printf '%s' "$v"; return; }
+    eval "printf '%s' \"\${${PFX}_$1_128:-0}\""
+}
+[[ -n "$LLAMA_REF" ]] || LLAMA_REF="$(lookup LLAMA)"
+[[ -n "$FRONTIER"  ]] || FRONTIER="$(lookup SPARKINFER)"
 
 echo ">> Kimi K3 eval — node=$NODE devices=$DEVICES layers=$LAYERS"
 echo ">> llama.cpp reference (tier basis): $LLAMA_REF tok/s"
