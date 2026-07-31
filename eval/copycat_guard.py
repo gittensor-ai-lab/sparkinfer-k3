@@ -41,7 +41,12 @@ STRUCT_MIN            = 0.40
 LLM_FUNC_MIN          = 0.60
 LLM_CONFIDENCE_MIN    = 0.85
 LLM_BODY_MAX_CHARS    = 2000
-LLM_MAX_TOKENS        = 150
+# deepseek-v4-pro is a REASONING model: it spends completion tokens on hidden reasoning
+# BEFORE emitting content. At the old 150 cap the reasoning consumed the whole budget and
+# `content` came back EMPTY — which parsed as "COPYCAT: NO, confidence 0.00", i.e. the
+# judge silently cleared everything instead of erroring. A cap that turns into a false
+# negative is worse than no judge at all.
+LLM_MAX_TOKENS        = 1500
 
 def _llm_enabled():
     if os.environ.get("COPYCAT_LLM_ENABLED", "").strip().lower() in ("1", "true", "yes"):
@@ -59,8 +64,10 @@ PROVIDER_DEFAULTS = {
     # DeepSeek V4 Pro via the yunwei gateway — the judge for the 50-70% band.
     # Key comes from the COPYCAT_LLM_API_KEY secret; NEVER hardcode it here, this file
     # is public and a leaked key is a billable incident, not an inconvenience.
+    # VERIFIED against the live gateway: host api.yunwu.ai, OpenAI-compatible /v1,
+    # and deepseek-v4-pro is present in its /v1/models listing.
     "yunwei":   {"model": "deepseek-v4-pro",
-                 "api": "https://api.yunwei.ai/v1/chat/completions"},
+                 "api": "https://api.yunwu.ai/v1/chat/completions"},
 }
 
 # The 50-70% band: containment alone cannot separate a renamed copycat from an
@@ -337,22 +344,80 @@ def _llm_model(provider):
 
 
 def _build_judge_prompt(copy_func_body, orig_func_body, copy_sig, orig_sig):
+    """The judge prompt.
+
+    THE HARD PART IS NOT SPOTTING SIMILARITY — containment already did that, and it is
+    70-80%, which is high. The hard part is that in a GPU-kernel optimization contest,
+    high similarity is the EXPECTED outcome of two competent people attacking the same
+    bottleneck: there are only so many ways to tile a GEMV or vectorize a load, and the
+    codebase's own conventions push everyone toward the same shape. This repo already
+    disabled its structural-similarity layer for exactly that false positive.
+
+    So the prompt asks a narrower, answerable question than "are these similar": does the
+    candidate share ARBITRARY choices that carry no functional justification? Two people
+    independently pick the same tile width because 128 is right. They do not
+    independently pick the same misspelled temporary, the same redundant statement, the
+    same idiosyncratic comment, or the same latent bug. Shared NECESSARY choices are
+    evidence of nothing; shared ARBITRARY ones are most of the signal.
+
+    It defaults to NO, because the asymmetry is real: this verdict lands as a public
+    label on a real person's PR.
+    """
     cap = LLM_BODY_MAX_CHARS
     return (
-        "You are a code-copycat detector for a GPU kernel optimization contest. "
-        "Reply with ONLY the three lines below — no tools, no extra text.\n\n"
-        "Determine if the COPY function is substantially derived from the ORIGINAL "
-        "(same computation, memory access pattern, numerical method) even if names differ.\n\n"
-        f"ORIGINAL signature: {orig_sig}\n"
-        f"```cpp\n{orig_func_body[:cap]}\n```\n\n"
-        f"COPY signature: {copy_sig}\n"
-        f"```cpp\n{copy_func_body[:cap]}\n```\n\n"
+        "You are judging a possible COPYCAT submission in a GPU kernel optimization "
+        "contest where contributors are paid for verified speedups. Two code blocks "
+        "already scored 70-80% token overlap. Your job is to decide whether that overlap "
+        "means COPYING or CONVERGENCE.\n\n"
+
+        "WHY THIS IS NOT OBVIOUS. High similarity is the EXPECTED result of two competent "
+        "people optimizing the same bottleneck in the same codebase. There are only so "
+        "many ways to tile a GEMV, vectorize a load, or unroll a reduction, and the "
+        "project's conventions push everyone toward the same shape. Similarity ALONE is "
+        "not evidence of copying.\n\n"
+
+        "WHAT IS EVIDENCE. Separate NECESSARY choices from ARBITRARY ones.\n"
+        "  NECESSARY (proves nothing): tile/block sizes dictated by warp size or the "
+        "shapes involved; the standard shape of a reduction; API calls the task requires; "
+        "loop bounds that follow from the data; idioms already used elsewhere in the repo.\n"
+        "  ARBITRARY (proves a lot when SHARED): identical unusual variable or temporary "
+        "names; the same redundant or dead statement; the same non-obvious ordering where "
+        "another would work equally well; identical comment wording or typos; the same "
+        "magic constant where another value would be equally valid; the same latent bug "
+        "or off-by-one; the same unusual formatting.\n\n"
+
+        "THE TEST: if two strong engineers solved this independently, how likely is it "
+        "they would land on THESE SPECIFIC ARBITRARY CHOICES? 'Quite likely - the problem "
+        "forces it' -> NO. 'No reason for both to choose that' -> YES.\n\n"
+
+        "BE SKEPTICAL OF SUPERFICIAL DIFFERENCE TOO. Renaming identifiers, reordering "
+        "independent statements, swapping a for-loop for a while, or reflowing whitespace "
+        "does not make derived code original. Judge the computation and its arbitrary "
+        "decisions, not the surface.\n\n"
+
+        "DEFAULT TO NO. This verdict becomes a public label on a real contributor's PR. A "
+        "false accusation costs them more than a missed copycat costs the project. If the "
+        "evidence is ambiguous, or the similarity is fully explained by the problem being "
+        "the same, answer NO and say what would have changed your mind.\n\n"
+
+        f"--- ORIGINAL (earlier submission) --- {orig_sig}\n"
+        f"```\n{orig_func_body[:cap]}\n```\n\n"
+        f"--- CANDIDATE (under review) --- {copy_sig}\n"
+        f"```\n{copy_func_body[:cap]}\n```\n\n"
+
+        "Reply with EXACTLY these three lines and nothing else:\n"
         "COPYCAT: YES|NO\n"
         "CONFIDENCE: 0.XX\n"
-        "REASON: one sentence")
+        "REASON: cite the SPECIFIC shared arbitrary choice that decided it, or name the "
+        "necessary constraint that explains the similarity")
 
 
 def _parse_judge_reply(reply):
+    # An empty/garbled reply is NOT a "not a copycat" verdict — it is a failed call.
+    # Returning confidence 0.0 keeps it below LLM_CONFIDENCE_MIN either way, but the
+    # note has to say "no verdict" so a human is not told the judge cleared the PR.
+    if not reply or not reply.strip():
+        return False, 0.0, "LLM judge returned no content (no verdict)"
     is_copy = "COPYCAT: YES" in reply.upper()
     conf = 0.0
     for line in reply.splitlines():
@@ -381,7 +446,11 @@ def _chat_complete_openai(api_url, api_key, model, prompt):
     )
     with urllib.request.urlopen(req, timeout=45) as resp:
         body = json.loads(resp.read())
-    return body["choices"][0]["message"]["content"].strip()
+    msg = body["choices"][0]["message"]
+    # Reasoning models put the answer in `content` and their scratchpad in
+    # `reasoning_content`. If a token cap truncated before `content` was emitted, fall
+    # back to the reasoning so the verdict is recoverable rather than silently empty.
+    return (msg.get("content") or msg.get("reasoning_content") or "").strip()
 
 
 def _chat_complete_cursor(api_key, model, prompt):
@@ -418,7 +487,7 @@ def llm_judge_copycat(copy_func_body, orig_func_body, copy_sig, orig_sig):
     try:
         if provider == "cursor":
             reply = _chat_complete_cursor(api_key, model, prompt)
-        elif provider in ("openai", "deepseek"):
+        elif provider in ("openai", "deepseek", "yunwei"):
             api_url = os.environ.get(
                 "COPYCAT_LLM_API",
                 PROVIDER_DEFAULTS[provider]["api"],
@@ -625,7 +694,7 @@ def main():
     # opinion is written into the comment so the human is not starting from scratch.
     if (original is not None and COPYCAT_JUDGE <= best_containment < COPYCAT_WARN
             and not structural_fired):
-        print(f"  TIER 3 (judge band): {best_containment:.0%} vs #{original}")
+        print(f"  TIER 3 (judge band 70-80%): {best_containment:.0%} vs #{original}")
         verdict_txt = ""
         if _llm_enabled():
             try:
@@ -650,12 +719,12 @@ def main():
             except Exception as e:
                 print(f"  judge unavailable ({e}) — labelling for human review anyway")
         gh(["label", "create", LLM_JUDGE_LABEL, "--repo", REPO, "--color", "FBCA04",
-            "--description", "50-70% overlap — needs a human call", "--force"])
+            "--description", "70-80% overlap — needs a human call", "--force"])
         gh(["pr", "edit", str(pr_num), "--repo", REPO, "--add-label", LLM_JUDGE_LABEL])
         gh(["pr", "comment", str(pr_num), "--repo", REPO, "--body",
             f"### `llm-judge` — needs a human call\n\n"
             f"This PR is **{best_containment:.0%}** contained in #{original}, which lands in the "
-            f"50-70% band where overlap alone cannot distinguish a copycat from an independent "
+            f"70-80% band where overlap alone cannot distinguish a copycat from an independent "
             f"contributor touching the same code.\n\n"
             f"**Not closed, not blocked.** A maintainer decides.{verdict_txt}"])
         print(f"  TIER 3: labelled #{pr_num} for review (vs #{original})")
