@@ -19,6 +19,7 @@ permissions:
 
 jobs:
   guard:
+    name: sensitive-paths-guard
     runs-on: ubuntu-latest
     steps:
       - name: Block non-maintainer edits to sensitive paths
