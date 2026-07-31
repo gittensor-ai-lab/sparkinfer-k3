@@ -47,7 +47,16 @@ jobs:
           # scored against; change a weight manifest and you change which bytes count as the
           # baseline; change bench/results/ and you change what `check_reference_lock.py`
           # will accept as provenance for a pinned number.
-          SENSITIVE='^(eval/|\.github/|\.gittensor/|bench/scripts/reference\.lock$|bench/scripts/kimi_k3_.*\.sha256$|bench/results/|dashboard/data\.json$)'
+          # THE SCORING FUNCTION ITSELF WAS NOT GUARDED. The inherited list covered the
+          # pins and the recorded measurements but not the code that turns a measurement
+          # into a payout tier — label.py IS the verdict (its BUCKETS decide XS..XL and its
+          # gates decide REJECT), compare_logits.py IS the accuracy gate label.py trusts,
+          # kimi_k3_eval.sh assembles the RESULT_JSON both feed, and
+          # check_reference_lock.py is what makes a hand-filled baseline impossible.
+          # A contributor able to edit any of those could mint their own tier without
+          # touching a single pin. Guarding results but not the scorer is guarding the
+          # ledger and leaving the pen on the desk.
+          SENSITIVE='^(eval/|\.github/|\.gittensor/|bench/results/|dashboard/data\.json$|bench/scripts/(reference\.lock|label\.py|compare_logits\.py|check_reference_lock\.py|kimi_k3_eval\.sh|kimi_k3_.*\.sha256)$)'
 
           # Read-only: the changed-file list from the API. Never runs PR code.
           FILES="$(gh pr diff "$NUM" -R "$REPO" --name-only)"
