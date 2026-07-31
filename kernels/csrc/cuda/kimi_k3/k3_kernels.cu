@@ -486,6 +486,15 @@ __global__ void moe_router_noaux_tc_kernel(float* __restrict__ out_w,
 // Decode one IQ2_XS block (256 values) into the caller's dot accumulator against
 // `x`. Same arithmetic as dequant_iq2_xs_kernel — kept in one place so the two
 // cannot drift, since that kernel is the one validated bit-exact against ggml.
+//
+// XVEC pulls the lane's 8 activations in as two float4 rather than eight scalars, and
+// the grid codepoint in as the one uint64 it is stored as rather than eight separate
+// byte loads. Neither changes a value or an order -- the multiply-accumulate below is
+// still j = 0..7 against the same operands -- but a lane's 8 values sit 32 bytes apart
+// across the warp, so the scalar form issues 8 loads that each span 1024 bytes to use
+// 128 of them. It is the same sector-amplification the projection GEMV had, one level
+// down.
+template <bool XVEC>
 __device__ __forceinline__ float block_dot(const BlockIQ2XS& b,
                                                  const float* __restrict__ x,
                                                  int lane, int nlanes) {
@@ -498,13 +507,26 @@ __device__ __forceinline__ float block_dot(const BlockIQ2XS& b,
         const float db = (sub < 2) ? d * (0.5f + (float)(sc & 0xf)) * 0.25f
                                    : d * (0.5f + (float)(sc >> 4))  * 0.25f;
         const uint16_t q = b.qs[l];
+        const uint64_t gw = c_iq2xs_grid[q & 511];
         const uint8_t* grid = (const uint8_t*)&c_iq2xs_grid[q & 511];
         const uint8_t signs = c_ksigns_iq2xs[q >> 9];
         const float* xv = x + l * 8;
+        if (XVEC) {
+            const float4* xv4 = (const float4*)xv;
+            const float4 xa = xv4[0], xb = xv4[1];
+            const float xs[8] = { xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w };
         #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            const float wv = db * (float)grid[j] * ((signs & c_kmask_iq2xs[j]) ? -1.0f : 1.0f);
-            acc += wv * xv[j];
+            for (int j = 0; j < 8; ++j) {
+                const uint8_t gj = (uint8_t)((gw >> (8 * j)) & 0xffu);
+                const float wv = db * (float)gj * ((signs & c_kmask_iq2xs[j]) ? -1.0f : 1.0f);
+                acc += wv * xs[j];
+            }
+        } else {
+        #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const float wv = db * (float)grid[j] * ((signs & c_kmask_iq2xs[j]) ? -1.0f : 1.0f);
+                acc += wv * xv[j];
+            }
         }
     }
     return acc;
@@ -514,6 +536,7 @@ __device__ __forceinline__ float block_dot(const BlockIQ2XS& b,
 // dequantised weights. Overloaded on the block type so the MoE kernels below are
 // written once and instantiated per quant type — the combine logic must not exist
 // twice, or the two copies will drift.
+template <bool XVEC>
 __device__ __forceinline__ float block_dot(const BlockIQ1S& b,
                                            const float* __restrict__ x,
                                            int lane, int nlanes) {
@@ -526,10 +549,25 @@ __device__ __forceinline__ float block_dot(const BlockIQ1S& b,
         const float delta = (h & 0x8000) ? -SPARKINFER_IQ1S_DELTA : SPARKINFER_IQ1S_DELTA;
         const uint32_t idx =
             (uint32_t)b.qs[4 * ib32 + l] | (((uint32_t)(h >> (3 * l)) & 7u) << 8);
-        const int8_t* grid = (const int8_t*)&iq1s_grid_c[idx];
         const float* xv = x + l32 * 8;
+        if (XVEC) {
+            // The table IS a uint64 per codepoint, so read it as one -- the byte
+            // pointer form makes the compiler emit eight dependent 1-byte loads off a
+            // divergent address.
+            const uint64_t gw = iq1s_grid_c[idx];
+            const float4* xv4 = (const float4*)xv;
+            const float4 xa = xv4[0], xb = xv4[1];
+            const float xs[8] = { xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w };
         #pragma unroll
-        for (int j = 0; j < 8; ++j) acc += dl * ((float)grid[j] + delta) * xv[j];
+            for (int j = 0; j < 8; ++j) {
+                const int8_t gj = (int8_t)((gw >> (8 * j)) & 0xffu);
+                acc += dl * ((float)gj + delta) * xs[j];
+            }
+        } else {
+            const int8_t* grid = (const int8_t*)&iq1s_grid_c[idx];
+        #pragma unroll
+            for (int j = 0; j < 8; ++j) acc += dl * ((float)grid[j] + delta) * xv[j];
+        }
     }
     return acc;
 }
@@ -588,8 +626,29 @@ __device__ __forceinline__ float block_dot_q8k(const BlockIQ1S& b,
     return dw * x.d * ((float)sumi + SPARKINFER_IQ1S_DELTA * (float)sumq);
 }
 
-// gate/up GEMV + situ. One block per (selected expert k, output chunk).
-template <int BLOCK, typename Blk>
+// gate/up GEMV + situ. One WARP per (selected expert k, output row j).
+//
+// It used to be one 32-thread BLOCK per row. sm_90 caps CTAs at 32 per SM, so a
+// one-warp CTA can occupy at most 32 of the SM's 64 warp slots however much work is
+// queued -- 50%, structurally. Eight warps per CTA lifts that to 62% here (48 registers
+// is what bounds it, not the CTA shape any more).
+//
+// The arithmetic is untouched. The reduction was ALREADY warp-wide: BLOCK was 32, so
+// block_sum's cross-warp stage summed exactly one partial and its shared round trip
+// bought nothing. Folding with a plain shuffle over the same 32 lanes in the same
+// butterfly order yields the identical float, and drops both __syncthreads() with it.
+//
+// The zero-fill for foreign experts is gone from here; the zeros are not. It moved to a
+// cudaMemsetAsync over scratch before this launch, and is kept rather than dropped
+// because it is what makes the combine's skip safe to rely on: moe_down_combine_kernel
+// re-tests the band and never reads a foreign slot, so the zeros are an invariant no
+// live path depends on today -- but scratch is reused across layers, so the day some
+// path stops re-testing, an untouched slot hands it the previous layer's activations.
+//
+// What changed is the cost. At tp=8, 14 of every 16 selections are foreign, so this was
+// 43,008 CTAs launched per MoE layer to store one scattered float each. One memset does
+// the same job coalesced.
+template <int WARPS_PER_CTA, bool XVEC, typename Blk>
 __global__ void moe_gate_up_situ_kernel(float* __restrict__ scratch,
                                         const float* __restrict__ x,
                                         const int* __restrict__ ids,
@@ -599,8 +658,10 @@ __global__ void moe_gate_up_situ_kernel(float* __restrict__ scratch,
                                         float beta, float inv_beta,
                                         float lb, float inv_lb, int lb_active,
                                         int expert_begin, int n_local_experts) {
-    const int k = blockIdx.y;                 // which selected expert
-    const int j = blockIdx.x;                 // which ffn output row
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int k = blockIdx.y;                                  // which selected expert
+    const int j = blockIdx.x * WARPS_PER_CTA + warp;           // which ffn output row
     if (j >= ffn) return;
 
     // EXPERT PARALLELISM. `ids` holds GLOBAL expert indices — every rank's router
@@ -608,15 +669,8 @@ __global__ void moe_gate_up_situ_kernel(float* __restrict__ scratch,
     // but this rank stores only experts [expert_begin, expert_begin+n_local).
     // Selections outside that band belong to another rank and contribute ZERO here;
     // the all-reduce that follows sums the bands back into the full top_k combine.
-    //
-    // The zero-fill is not optional. scratch is reused across layers, so leaving a
-    // foreign expert's slot untouched would feed the PREVIOUS layer's activations
-    // into this layer's down-projection — for a slot whose weight is nonzero.
     const int e = ids[k] - expert_begin;
-    if (e < 0 || e >= n_local_experts) {
-        if (threadIdx.x == 0) scratch[(size_t)k * ffn + j] = 0.0f;
-        return;
-    }
+    if (e < 0 || e >= n_local_experts) return;   // memset already left this slot at 0
     const int blocks_per_row = latent / 256;
 
     const Blk* g_row = gate_exps + (size_t)(e * ffn + j) * blocks_per_row;
@@ -625,15 +679,16 @@ __global__ void moe_gate_up_situ_kernel(float* __restrict__ scratch,
     float gacc = 0.0f, uacc = 0.0f;
     for (int b = 0; b < blocks_per_row; ++b) {
         const float* xb = x + b * 256;
-        gacc += block_dot(g_row[b], xb, threadIdx.x, BLOCK);
-        uacc += block_dot(u_row[b], xb, threadIdx.x, BLOCK);
+        gacc += block_dot<XVEC>(g_row[b], xb, lane, 32);
+        uacc += block_dot<XVEC>(u_row[b], xb, lane, 32);
     }
-    __shared__ float shm[BLOCK / 32 + 1];
-    gacc = block_sum<BLOCK>(gacc, shm);
-    __syncthreads();
-    uacc = block_sum<BLOCK>(uacc, shm);
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        gacc += __shfl_down_sync(0xffffffff, gacc, off);
+        uacc += __shfl_down_sync(0xffffffff, uacc, off);
+    }
 
-    if (threadIdx.x == 0) {
+    if (lane == 0) {
         // situ, identical to situ_kernel
         const float a  = beta * tanhf(gacc * inv_beta) * sigmoidf_(gacc);
         const float ub = lb_active ? (lb * tanhf(uacc * inv_lb)) : uacc;
@@ -643,7 +698,22 @@ __global__ void moe_gate_up_situ_kernel(float* __restrict__ scratch,
 
 // down GEMV + weighted combine. One block per output element; accumulates the
 // top_k experts so the combine needs no second pass and no atomics.
-template <int BLOCK, typename Blk>
+// The top_k experts used to be walked SERIALLY by a single warp, one full GEMV after
+// another, with a shared-memory reduction and two __syncthreads() between each.
+//
+// That is the starvation case, not merely an occupancy one. One warp per output element
+// is latent = 3584 warps of work for the WHOLE GPU — 27 per SM on a 132-SM H200, below
+// even the 32-warp ceiling a one-warp CTA imposes, so the machine cannot be filled no
+// matter how the CTAs are shaped. Spreading the experts across the CTA's warps makes it
+// 28,672 warps, which does fill it (100% occupancy at 32 registers), and takes the
+// barrier count per output element from 32 down to 1.
+//
+// The combine stays bit-identical, which is the reason for the two-stage shape. Each
+// warp writes its w[k]*acc into partial[k]; then ONE thread folds them in increasing k,
+// skipping exactly the k the serial version skipped. Summing all top_k slots with zeros
+// for the foreign ones would be equivalent for every real input and still wrong: it
+// turns a -0.0f running total into +0.0f. Reproducing the skip costs nothing.
+template <int WARPS_PER_CTA, bool XVEC, typename Blk>
 __global__ void moe_down_combine_kernel(float* __restrict__ out,
                                         const float* __restrict__ scratch,
                                         const int* __restrict__ ids,
@@ -653,11 +723,12 @@ __global__ void moe_down_combine_kernel(float* __restrict__ out,
                                         int expert_begin, int n_local_experts) {
     const int o = blockIdx.x;                 // output element in [0, latent)
     if (o >= latent) return;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
     const int blocks_per_row = ffn / 256;
-    __shared__ float shm[BLOCK / 32 + 1];
+    extern __shared__ float partial[];        // top_k floats
 
-    float total = 0.0f;
-    for (int k = 0; k < top_k; ++k) {
+    for (int k = warp; k < top_k; k += WARPS_PER_CTA) {
         // Same band test as the gate/up pass. Skipping here is what keeps the read
         // in bounds: down_exps holds n_local experts, so indexing it by a GLOBAL id
         // would run off the end of the allocation for every rank but rank 0 — and
@@ -668,13 +739,22 @@ __global__ void moe_down_combine_kernel(float* __restrict__ out,
         const float* act = scratch + (size_t)k * ffn;
         float acc = 0.0f;
         for (int b = 0; b < blocks_per_row; ++b)
-            acc += block_dot(d_row[b], act + b * 256, threadIdx.x, BLOCK);
-        acc = block_sum<BLOCK>(acc, shm);
-        __syncthreads();
-        if (threadIdx.x == 0) total += w[k] * acc;
-        __syncthreads();
+            acc += block_dot<XVEC>(d_row[b], act + b * 256, lane, 32);
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffff, acc, off);
+        if (lane == 0) partial[k] = w[k] * acc;
     }
-    if (threadIdx.x == 0) out[o] = total;
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        float total = 0.0f;
+        for (int k = 0; k < top_k; ++k) {
+            const int e = ids[k] - expert_begin;
+            if (e < 0 || e >= n_local_experts) continue;
+            total += partial[k];
+        }
+        out[o] = total;
+    }
 }
 
 template <typename Blk>
@@ -1279,6 +1359,60 @@ void moe_router_noaux_tc_f32(float* out_w, int* out_ids, const float* logits,
         out_w, out_ids, logits, bias, n_expert, top_k, norm_w, w_scale);
 }
 
+// One launch path for both quant types. The two front doors below differ only in the
+// table they prime and the block layout they name; duplicating the grid arithmetic
+// across them is the same drift the block_dot overloads exist to prevent.
+template <typename Blk>
+static void moe_expert_ffn_launch(float* out, float* scratch,
+                                  const float* x, const int* ids, const float* w,
+                                  const void* gate_exps, const void* up_exps,
+                                  const void* down_exps,
+                                  int latent, int ffn, int top_k,
+                                  float situ_beta, float situ_linear_beta,
+                                  cudaStream_t stream,
+                                  int expert_begin, int n_local_experts) {
+    constexpr int WARPS = 8;                       // 256-thread CTAs
+    const int lb_active = situ_linear_beta > 0.0f ? 1 : 0;
+    // n_local <= 0 means "this rank holds every expert" — the tp_size 1 case, where
+    // the band test must never reject. INT_MAX makes it a no-op rather than a branch.
+    const int n_local = n_local_experts > 0 ? n_local_experts : INT_MAX;
+
+    // Holds the "foreign slots read as zero" invariant the gate/up kernel used to
+    // maintain per-CTA. Only a banded rank can leave a slot untouched; at tp_size 1
+    // every slot is written, so memsetting there would be pure added work.
+    if (n_local_experts > 0 || expert_begin != 0)
+        cudaMemsetAsync(scratch, 0, (size_t)top_k * ffn * sizeof(float), stream);
+
+    // float4 activation reads need 16-byte alignment. Both pointers are cudaMalloc
+    // bases in every K3 caller and the per-block offsets are multiples of 1024 bytes,
+    // so the bases alone decide it.
+    const bool xvec = ((((uintptr_t)x) | ((uintptr_t)scratch)) & 15u) == 0;
+
+    const dim3 g1((unsigned)((ffn + WARPS - 1) / WARPS), (unsigned)top_k);
+    const size_t dshm = (size_t)top_k * sizeof(float);
+    const float inv_lb = lb_active ? 1.0f / situ_linear_beta : 1.0f;
+
+    if (xvec) {
+        moe_gate_up_situ_kernel<WARPS, true, Blk><<<g1, WARPS * 32, 0, stream>>>(
+            scratch, x, ids, (const Blk*)gate_exps, (const Blk*)up_exps, latent, ffn,
+            situ_beta, 1.0f / situ_beta, situ_linear_beta, inv_lb, lb_active,
+            expert_begin, n_local);
+        moe_down_combine_kernel<WARPS, true, Blk>
+            <<<(unsigned)latent, WARPS * 32, dshm, stream>>>(
+                out, scratch, ids, w, (const Blk*)down_exps, latent, ffn, top_k,
+                expert_begin, n_local);
+    } else {
+        moe_gate_up_situ_kernel<WARPS, false, Blk><<<g1, WARPS * 32, 0, stream>>>(
+            scratch, x, ids, (const Blk*)gate_exps, (const Blk*)up_exps, latent, ffn,
+            situ_beta, 1.0f / situ_beta, situ_linear_beta, inv_lb, lb_active,
+            expert_begin, n_local);
+        moe_down_combine_kernel<WARPS, false, Blk>
+            <<<(unsigned)latent, WARPS * 32, dshm, stream>>>(
+                out, scratch, ids, w, (const Blk*)down_exps, latent, ffn, top_k,
+                expert_begin, n_local);
+    }
+}
+
 void moe_expert_ffn_iq2xs_f32(float* out, float* scratch,
                               const float* x, const int* ids, const float* w,
                               const void* gate_exps, const void* up_exps,
@@ -1294,19 +1428,10 @@ void moe_expert_ffn_iq2xs_f32(float* out, float* scratch,
         return;
     }
     ensure_iq2xs_tables();
-    const int lb_active = situ_linear_beta > 0.0f ? 1 : 0;
-    // n_local <= 0 means "this rank holds every expert" — the tp_size 1 case, where
-    // the band test must never reject. INT_MAX makes it a no-op rather than a branch.
-    const int n_local = n_local_experts > 0 ? n_local_experts : INT_MAX;
-    dim3 g1((unsigned)ffn, (unsigned)top_k);
-    moe_gate_up_situ_kernel<32, BlockIQ2XS><<<g1, 32, 0, stream>>>(
-        scratch, x, ids, (const BlockIQ2XS*)gate_exps, (const BlockIQ2XS*)up_exps,
-        latent, ffn, situ_beta, 1.0f / situ_beta, situ_linear_beta,
-        lb_active ? 1.0f / situ_linear_beta : 1.0f, lb_active,
-        expert_begin, n_local);
-    moe_down_combine_kernel<32, BlockIQ2XS><<<(unsigned)latent, 32, 0, stream>>>(
-        out, scratch, ids, w, (const BlockIQ2XS*)down_exps, latent, ffn, top_k,
-        expert_begin, n_local);
+    moe_expert_ffn_launch<BlockIQ2XS>(out, scratch, x, ids, w, gate_exps, up_exps,
+                                      down_exps, latent, ffn, top_k, situ_beta,
+                                      situ_linear_beta, stream,
+                                      expert_begin, n_local_experts);
 }
 
 void dequant_iq1_s_f32(float* out, const void* src, int64_t n, cudaStream_t stream) {
@@ -1327,17 +1452,16 @@ void moe_expert_ffn_iq1s_f32(float* out, float* scratch,
                              cudaStream_t stream,
                              int expert_begin, int n_local_experts) {
     ensure_iq1s_tables();
-    const int lb_active = situ_linear_beta > 0.0f ? 1 : 0;
-    const int n_local = n_local_experts > 0 ? n_local_experts : INT_MAX;
-    dim3 g1((unsigned)ffn, (unsigned)top_k);
-    moe_gate_up_situ_kernel<32, BlockIQ1S><<<g1, 32, 0, stream>>>(
-        scratch, x, ids, (const BlockIQ1S*)gate_exps, (const BlockIQ1S*)up_exps,
-        latent, ffn, situ_beta, 1.0f / situ_beta, situ_linear_beta,
-        lb_active ? 1.0f / situ_linear_beta : 1.0f, lb_active,
-        expert_begin, n_local);
-    moe_down_combine_kernel<32, BlockIQ1S><<<(unsigned)latent, 32, 0, stream>>>(
-        out, scratch, ids, w, (const BlockIQ1S*)down_exps, latent, ffn, top_k,
-        expert_begin, n_local);
+    if (latent <= 0 || ffn <= 0 || top_k <= 0) return;
+    if (latent % 256 || ffn % 256) {
+        fprintf(stderr, "[k3] moe_expert_ffn: latent=%d ffn=%d must be multiples of 256\n",
+                latent, ffn);
+        return;
+    }
+    moe_expert_ffn_launch<BlockIQ1S>(out, scratch, x, ids, w, gate_exps, up_exps,
+                                     down_exps, latent, ffn, top_k, situ_beta,
+                                     situ_linear_beta, stream,
+                                     expert_begin, n_local_experts);
 }
 
 // Type-dispatched front doors. An unsloth dynamic quant MIXES types per tensor, so
