@@ -165,10 +165,28 @@ score. These paths are protected:
 Everything else under `bench/scripts/` (including `kimi_k3_run.sh` and the Qwen-era
 `bench.sh`/`accuracy.sh`) is **not** guarded — those are convenience and legacy, not trust anchors.
 
-**Enforcement.** A required **`sensitive-paths-guard`** check automatically fails any PR from a
-non-maintainer that touches these paths, and `CODEOWNERS` requires maintainer review — so such
-PRs **cannot merge**, regardless of content. The evaluator also grades with the harness pinned
-to the protected branch, so editing it in a PR never affects that PR's own score.
+**Enforcement.** `sensitive-paths-guard` is a **required status check on `main`**: it fails
+any PR from a non-maintainer touching these paths, and a failing required check means the PR
+**cannot merge**, regardless of content. It runs on `pull_request_target`, so it runs on fork
+PRs too and cannot be disabled by editing the workflow in your own branch. `CODEOWNERS`
+additionally **requests** maintainer review on those paths — that part is advisory; the status
+check is the hard gate. The evaluator also grades with the harness pinned to the protected
+branch, so editing it in a PR never affects that PR's own score.
+
+### What `main` requires
+
+Six checks must pass: `sensitive-paths-guard`, `shell syntax`, `python compile + unit tests`,
+`configs + docs`, `baseline --dry-run (all nodes)`, and `reference.lock provenance`. Branches
+must also be **up to date with `main`** before merging — your gain is scored as marginal over
+the current frontier, so it has to be measured against current `main`.
+
+Two things to expect if you contribute **from a fork**:
+
+- The five `ci.yml` checks show as pending until a maintainer clicks **Approve and run
+  workflows**. This is deliberate: `python compile + unit tests` executes test files from your
+  branch, and GitHub gates running outside code. `sensitive-paths-guard` runs immediately
+  without approval.
+- When `main` moves, rebase and push; the required checks re-run.
 
 **Improving the harness is welcome — just not via a direct PR.** Open an issue or discussion
 describing the change; if a maintainer agrees, they'll land it (with credit). Keep your own PRs

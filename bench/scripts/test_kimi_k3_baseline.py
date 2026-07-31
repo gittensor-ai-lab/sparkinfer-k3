@@ -843,6 +843,31 @@ class CiWorkflowTest(unittest.TestCase):
                     f"{fname}:{jid} is a REQUIRED check but is conditional -- a skipped "
                     f"required check cannot be satisfied and blocks merge")
 
+    def test_codeowners_matches_the_sensitive_guard(self):
+        """CODEOWNERS says in its own header to keep its list in sync with SENSITIVE in
+        sensitive-paths-guard.yml, and that instruction had already been violated: the
+        guard was widened to cover kimi_k3_baseline.sh / _kimi_k3.sh / kimi_k3_attest.py
+        and CODEOWNERS was not. Divergence is quietly bad in both directions -- a path in
+        the guard but not CODEOWNERS gets blocked with no reviewer auto-requested, and a
+        path in CODEOWNERS but not the guard looks protected while being freely editable.
+        A comment cannot enforce itself, so this does."""
+        import re as _re
+        wf = (ROOT / ".github/workflows/sensitive-paths-guard.yml").read_text()
+        pattern = [l for l in wf.splitlines() if "SENSITIVE=" in l][0].split("'")[1]
+        # the explicit bench/scripts/(a|b|c)$ alternation -- the named scoring-path files
+        group = _re.search(r"bench/scripts/\(([^)]*)\)", pattern)
+        self.assertIsNotNone(group, "guard no longer names bench/scripts files explicitly")
+        owners = (ROOT / ".github/CODEOWNERS").read_text()
+        for alt in group.group(1).split("|"):
+            name = alt.replace("\\", "").rstrip("$")
+            if ".*" in name:                       # a glob like kimi_k3_.*\.sha256
+                stem = name.split(".*")[0]
+                self.assertIn(f"/bench/scripts/{stem}", owners,
+                              f"guard covers {name} but CODEOWNERS has no matching entry")
+            else:
+                self.assertIn(f"/bench/scripts/{name}", owners,
+                              f"guard covers bench/scripts/{name} but CODEOWNERS does not")
+
     def test_baseline_results_are_committable(self):
         """The `lock` job requires a committed bench/results JSON to back any pinned
         baseline. bench/.gitignore ignores results/ wholesale, so without an explicit

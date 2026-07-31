@@ -24,12 +24,20 @@
 # The scoring path — keep in sync with SENSITIVE in sensitive-paths-guard.yml.
 # label.py turns a measurement into a payout tier; compare_logits.py is the accuracy
 # gate it trusts; kimi_k3_eval.sh assembles what both consume; check_reference_lock.py
-# is what makes a hand-filled baseline impossible.
+# is what makes a hand-filled baseline impossible. kimi_k3_baseline.sh and _kimi_k3.sh
+# are what eval.sh invokes to produce the tok/s itself, and kimi_k3_attest.py seals the
+# receipt -- guarding eval.sh while leaving those writable was a bypass, not a narrower
+# guard. The two test files are here because a weakened test passes CI silently.
 /bench/scripts/reference.lock        @ai-hpc
 /bench/scripts/label.py              @ai-hpc
 /bench/scripts/compare_logits.py     @ai-hpc
 /bench/scripts/check_reference_lock.py @ai-hpc
 /bench/scripts/kimi_k3_eval.sh       @ai-hpc
+/bench/scripts/kimi_k3_baseline.sh   @ai-hpc
+/bench/scripts/_kimi_k3.sh           @ai-hpc
+/bench/scripts/kimi_k3_attest.py     @ai-hpc
+/bench/scripts/test_kimi_k3_baseline.py @ai-hpc
+/bench/scripts/test_label.py         @ai-hpc
 /bench/scripts/kimi_k3_*.sha256      @ai-hpc
 /bench/results/                      @ai-hpc
 
