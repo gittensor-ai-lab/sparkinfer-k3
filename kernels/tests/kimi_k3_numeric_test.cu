@@ -197,10 +197,15 @@ static void test_kda_decode_step() {
         const float* qh = &q[h*D]; const float* kh = &k[h*D];
         const float* vh = &v[h*D]; const float* gh = &g[h*D];
         const double b = beta[h];
-        // 1. per-channel decay
+        // 1. per-channel decay, indexed by i (the CONTRACTION index), matching
+        // ggml_compute_forward_gated_delta_net_one_chunk: "S[i][:] *= exp(g[i])".
+        // This reference previously used exp(g[j]) — the same wrong axis as the
+        // kernel it was supposed to check independently, because both were
+        // transcribed from the same (dead) llama.cpp path. It therefore agreed with
+        // the bug. An "independent" reference derived from the same source as the
+        // implementation is not independent.
         for (int j = 0; j < D; ++j) {
-            const double dec = std::exp((double)gh[j]);
-            for (int i = 0; i < D; ++i) Sh[(size_t)j*D + i] *= dec;
+            for (int i = 0; i < D; ++i) Sh[(size_t)j*D + i] *= std::exp((double)gh[i]);
         }
         // 2. sk[j] = sum_i S[i][j]*k[i]
         std::vector<double> sk(D, 0.0);

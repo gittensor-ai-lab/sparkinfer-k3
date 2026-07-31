@@ -27,6 +27,12 @@ target_link_libraries(kimi_k3_proj_gemv_test PRIVATE si_k3)
 target_include_directories(kimi_k3_proj_gemv_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
 add_test(NAME kimi_k3_proj_gemv_test COMMAND kimi_k3_proj_gemv_test)
 
+# IQ1_S device path, including llama.cpp-compatible Q8_K activation conversion.
+add_executable(kimi_k3_iq1s_gpu_test kimi_k3_iq1s_gpu_test.cu)
+target_link_libraries(kimi_k3_iq1s_gpu_test PRIVATE si_k3)
+target_include_directories(kimi_k3_iq1s_gpu_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
+add_test(NAME kimi_k3_iq1s_gpu_test COMMAND kimi_k3_iq1s_gpu_test)
+
 # Row dequant (F32 passthrough + Q8_0), extending dequant_f32_by_type: what
 # token_embd.weight / output.weight lookups need (dequantise one contiguous row,
 # not a reduction). Bit-exact vs a float64 reference for both types.

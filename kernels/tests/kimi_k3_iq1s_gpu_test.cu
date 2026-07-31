@@ -77,6 +77,29 @@ static void fill_blocks(std::vector<BlockIQ1S>& v, std::mt19937& rng) {
     }
 }
 
+static std::vector<float> q8k_roundtrip(const std::vector<float>& x) {
+    std::vector<float> out(x.size());
+    for (size_t b = 0; b < x.size() / 256; ++b) {
+        const float* xb = x.data() + b*256;
+        float maxv=0, amax=0;
+        for (int j=0; j<256; ++j) {
+            const float ax=std::fabs(xb[j]);
+            if (ax > amax) { amax=ax; maxv=xb[j]; }
+        }
+        if (!amax) {
+            for (int j=0; j<256; ++j) out[b*256+j]=0;
+            continue;
+        }
+        const float iscale=-127.0f/maxv, d=1.0f/iscale;
+        for (int j=0; j<256; ++j) {
+            int q=(int)std::nearbyint(iscale*xb[j]);
+            q=std::min(127, q);
+            out[b*256+j]=d*(float)q;
+        }
+    }
+    return out;
+}
+
 int main() {
     std::printf("=== Kimi K3 IQ1_S on device ===\n\n");
     std::mt19937 rng(20260730);
@@ -114,7 +137,7 @@ int main() {
         std::printf("    %lld values, lattice coverage %d/%d\n", (long long)N, cov,
                     SPARKINFER_IQ1S_NGRID);
         std::printf("    bit mismatches: %lld%s\n", (long long)mism,
-                    mism ? "" : "  <- constant-memory upload verified");
+                    mism ? "" : "  <- device lookup tables verified");
         if (mism) { std::printf("    worst abs diff %.6g\n", worst); ++g_fail; }
         // A zeroed lattice would still produce finite plausible numbers, so assert the
         // output actually varies — the specific failure this guards.
@@ -197,6 +220,47 @@ int main() {
         std::printf("    relL2 = %.3e   worst_rel = %.3e   ref RMS = %.6g\n",
                     rl2, worst, std::sqrt(den/LAT));
         if (!ok || !(rl2 < 2e-5) || !(den > 0)) ++g_fail;
+
+        // Reference-compatible activation path: Q8_K before gate/up and again
+        // after situ, exactly as llama.cpp's IQ1_S vec_dot contract requires.
+        const std::vector<float> xq = q8k_roundtrip(x);
+        std::vector<double> qref(LAT, 0.0);
+        for (int k = 0; k < TOPK; ++k) {
+            std::vector<float> act(FFN);
+            for (int j = 0; j < FFN; ++j) {
+                double gv=0, uv=0;
+                for (int i=0; i<LAT; ++i) {
+                    gv += (double)G [((size_t)k*FFN+j)*LAT+i]*xq[i];
+                    uv += (double)Uw[((size_t)k*FFN+j)*LAT+i]*xq[i];
+                }
+                const double a=beta*std::tanh(gv/beta)/(1.0+std::exp(-gv));
+                act[j]=(float)(a*(lb*std::tanh(uv/lb)));
+            }
+            const std::vector<float> aq=q8k_roundtrip(act);
+            for (int o=0; o<LAT; ++o) {
+                double v=0;
+                for (int j=0; j<FFN; ++j)
+                    v += (double)Dw[((size_t)k*LAT+o)*FFN+j]*aq[j];
+                qref[o] += (double)w[k]*v;
+            }
+        }
+        void* dq8=nullptr;
+        CU(cudaMalloc(&dq8, k3_moe_q8_k_bytes(LAT, FFN, TOPK)));
+        const bool qok = moe_expert_ffn_f32_by_type(
+            dout, dscr, dx, did, dw, dg, du, dd, LAT, FFN, TOPK, beta, lb,
+            /*ggml_type=*/19, 0, 0, 0, dq8);
+        CU(cudaDeviceSynchronize());
+        CU(cudaMemcpy(got.data(), dout, LAT*4, cudaMemcpyDeviceToHost));
+        num=0; den=0;
+        for (int i=0; i<LAT; ++i) {
+            const double d=got[i]-qref[i];
+            num+=d*d; den+=qref[i]*qref[i];
+        }
+        const double qrl2=std::sqrt(num/(den+1e-30));
+        std::printf("    Q8_K activation relL2     : %.3e (%s)\n",
+                    qrl2, qok ? "accepted" : "REFUSED");
+        if (!qok || !(qrl2 < 5e-5)) ++g_fail;
+        cudaFree(dq8);
 
         // An unknown type must be REFUSED, not silently decoded with the wrong reader.
         const bool bad = moe_expert_ffn_f32_by_type(dout, dscr, dx, did, dw, dg, du, dd,

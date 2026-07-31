@@ -25,6 +25,19 @@ std::string blk(int i, const char* suffix) {
     return std::string(buf);
 }
 
+bool env_one(const char* name) {
+    const char* value = std::getenv(name);
+    return value && value[0] == '1';
+}
+
+// Diagnostic compatibility controls. The original all-in-one switch remains as a
+// convenient umbrella, while the component switches let the validation harness
+// distinguish projection, expert-dispatch, and LM-head quantization drift.
+bool qact_all()    { return env_one("SPARKINFER_K3_GGML_QACT"); }
+bool qact_proj()   { return qact_all() || env_one("SPARKINFER_K3_GGML_QACT_PROJ"); }
+bool qact_moe()    { return qact_all() || env_one("SPARKINFER_K3_GGML_QACT_MOE"); }
+bool qact_output() { return qact_all() || env_one("SPARKINFER_K3_GGML_QACT_OUTPUT"); }
+
 // Upload one GGUF tensor's raw bytes to the device, native quant format preserved.
 // This is the WHOLE loader primitive — every K3 weight is read natively at forward
 // time (k3_proj_f32 / the MoE dispatch kernels decode Q8_0 / IQ1_S / IQ2_XS / F32
@@ -584,6 +597,8 @@ struct KimiK3Forward::Scratch {
     float* moe_out = nullptr;         // [expert_latent]
     float* dense_gate = nullptr, *dense_up = nullptr, *dense_situ = nullptr; // [dense_ffn]
     float* shexp_out = nullptr;        // [H] — shared-expert output, H-wide
+    void* proj_q8 = nullptr;           // optional llama CPU-compat block_q8_0 scratch
+    void* moe_q8 = nullptr;            // optional llama CPU-compat block_q8_K scratch
 
     std::vector<void*> owned;
 };
@@ -608,6 +623,11 @@ bool kimi_k3_forward_alloc_scratch(const KimiK3Config& cfg, KimiK3Forward& fwd) 
         if (cudaMalloc(&p, n * sizeof(int)) != cudaSuccess) return false;
         s.owned.push_back(p);
         ptr = (int*)p;
+        return true;
+    };
+    auto alloc_bytes = [&](void*& ptr, size_t n) {
+        if (n == 0 || cudaMalloc(&ptr, n) != cudaSuccess) return false;
+        s.owned.push_back(ptr);
         return true;
     };
 
@@ -653,6 +673,9 @@ bool kimi_k3_forward_alloc_scratch(const KimiK3Config& cfg, KimiK3Forward& fwd) 
     ok &= alloc_f(s.dense_up, cfg.dense_ffn);
     ok &= alloc_f(s.dense_situ, cfg.dense_ffn);
     ok &= alloc_f(s.shexp_out, H);
+    ok &= alloc_bytes(s.proj_q8, k3k::k3_q8_0_bytes(cfg.dense_ffn));
+    ok &= alloc_bytes(s.moe_q8,
+                      k3k::k3_moe_q8_k_bytes(cfg.expert_latent, cfg.moe_ffn, cfg.top_k));
 
     if (!ok) { kimi_k3_forward_free_scratch(fwd); return false; }
     return true;
@@ -718,9 +741,14 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
     const int qk_nope = cfg.key_length_mla - cfg.rope_dim;
     const int res_bs = cfg.attn_res_block_size;
     const bool banked = res_bs > 0 && (layer % res_bs == 0);
+    const bool ggml_qact_proj = qact_proj();
+    const bool ggml_qact_moe = qact_moe();
 
     auto proj = [&](float* y, const float* x, const KimiK3Tensor& W, int N, int K) {
         if (!W.ok()) return false;
+        if (ggml_qact_proj)
+            return k3k::k3_proj_ggml_f32(y, x, W.data, W.type, N, K,
+                                         s.proj_q8, stream);
         return k3k::k3_proj_f32(y, x, W.data, W.type, N, K, stream);
     };
 
@@ -790,6 +818,11 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
                                     head_dim, n_head, cfg.kda_gate_lower_bound, stream);
 
             if (!proj(s.beta_out, s.normed, L.ssm_beta, n_head, H)) return false;
+            // beta is the delta-rule update rate: llama.cpp's build_kda_layer applies
+            // a sigmoid to the projection before the scan consumes it. Omitting this
+            // left beta unbounded (rms ~1.7 vs the correct ~0.75) and scaled the whole
+            // KDA output — the layer-0 divergence vs llama that this restores.
+            k3k::sigmoid_inplace_f32(s.beta_out, n_head, stream);
 
             if (fwd.debug) fwd.debug("dbg_decay_g", layer, s.decay_g, qkv);
             if (fwd.debug) fwd.debug("dbg_beta", layer, s.beta_out, n_head);
@@ -921,11 +954,13 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
         } else {
             if (!proj(s.router_logits, s.normed2, L.ffn_gate_inp, cfg.n_experts, H))
                 return false;
+            if (fwd.debug) fwd.debug("dbg_router_logits", layer, s.router_logits, cfg.n_experts);
             if (!L.exp_probs_b.ok()) return false;
             k3k::moe_router_noaux_tc_f32(s.router_w, s.router_ids, s.router_logits,
                                          (const float*)L.exp_probs_b.data, cfg.n_experts,
                                          cfg.top_k, /*n_tokens=*/1, /*norm_w=*/true,
                                          /*w_scale=*/1.0f, stream);
+            if (fwd.debug) fwd.debug("dbg_router_w", layer, s.router_w, cfg.top_k);
 
             // routed_down feeds the dispatch UNNORMALISED — routed_norm (if present)
             // normalises the dispatch's OUTPUT, not this. See build_latent_moe in the
@@ -951,7 +986,7 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
                 L.ffn_gate_exps.data, L.ffn_up_exps.data, L.ffn_down_exps.data,
                 cfg.expert_latent, cfg.moe_ffn, cfg.top_k, cfg.situ_beta,
                 cfg.situ_linear_beta, L.ffn_gate_exps.type, stream,
-                expert_begin, n_local_exp);
+                expert_begin, n_local_exp, ggml_qact_moe ? s.moe_q8 : nullptr);
             if (!moe_ok) return false;
             // This rank's PARTIAL expert sum: it legitimately differs per rank and
             // from the tp=1 value. dbg_moe_reduced below is the one that must match.
@@ -1098,8 +1133,11 @@ bool kimi_k3_forward_token(KimiK3Forward& fwd, int token_id, float* out_logits) 
     }
     if (ok && !w.output.ok()) ok = false;
     if (ok) {
-        ok = k3k::k3_proj_f32(logits_dev, x, w.output.data, w.output.type, cfg.vocab, H,
-                              stream);
+        ok = qact_output()
+            ? k3k::k3_proj_ggml_f32(logits_dev, x, w.output.data, w.output.type,
+                                    cfg.vocab, H, fwd.s->proj_q8, stream)
+            : k3k::k3_proj_f32(logits_dev, x, w.output.data, w.output.type,
+                               cfg.vocab, H, stream);
     }
     if (ok) {
         cudaStreamSynchronize(stream);
@@ -1248,10 +1286,44 @@ bool kimi_k3_pipeline_forward_token(KimiK3Pipeline& p, int token_id, float* out_
                           cudaMemcpyHostToDevice) != cudaSuccess) return false;
         }
 
+        // Debug localization: env-gated per-op sub-tap dump for one target layer.
+        st.fwd.debug = nullptr;
+        if (const char* sl = std::getenv("K3_SUBTAP_LAYER")) {
+            const int target = std::atoi(sl);
+            if (const char* dd = std::getenv("K3_DUMP_DIR")) {
+                st.fwd.debug = [target, dd](const char* tag, int layer, const float* dev, int64_t n) {
+                    if (layer != target) return;
+                    std::vector<float> hb((size_t)n);
+                    if (cudaMemcpy(hb.data(), dev, (size_t)n * sizeof(float),
+                                   cudaMemcpyDeviceToHost) == cudaSuccess) {
+                        char p[512];
+                        std::snprintf(p, sizeof(p), "%s/sub_%s_%d.bin", dd, tag, layer);
+                        if (FILE* f = std::fopen(p, "wb")) {
+                            std::fwrite(hb.data(), sizeof(float), (size_t)n, f); std::fclose(f);
+                        }
+                    }
+                };
+            }
+        }
         for (int L = st.first_layer; L <= st.last_layer; ++L) {
             if (!kimi_k3_forward_layer(st.fwd, L, st.hidden, st.hidden)) {
                 std::fprintf(stderr, "[k3] pipeline: layer %d failed on stage %zu\n", L, si);
                 return false;
+            }
+            // Debug localization: env-gated per-layer residual-stream dump. Writes
+            // st.hidden (== llama.cpp's l_out-<L>) so the two can be compared op-for-op.
+            if (const char* dd = std::getenv("K3_DUMP_DIR")) {
+                cudaStreamSynchronize(st.fwd.stream);
+                std::vector<float> hb((size_t)H);
+                if (cudaMemcpy(hb.data(), st.hidden, (size_t)H * sizeof(float),
+                               cudaMemcpyDeviceToHost) == cudaSuccess) {
+                    char pth[512];
+                    std::snprintf(pth, sizeof(pth), "%s/our_l_out-%d.bin", dd, L);
+                    if (FILE* f = std::fopen(pth, "wb")) {
+                        std::fwrite(hb.data(), sizeof(float), (size_t)H, f);
+                        std::fclose(f);
+                    }
+                }
             }
         }
         if (cudaDeviceSynchronize() != cudaSuccess) return false;
@@ -1284,8 +1356,13 @@ bool kimi_k3_pipeline_forward_token(KimiK3Pipeline& p, int token_id, float* out_
     k3k::rms_norm_f32(tmp, x, (const float*)sl.weights.output_norm.data, H,
                       cfg.rms_eps, nullptr);
     if (!sl.weights.output.ok()) return false;
-    if (!k3k::k3_proj_f32(sl.logits, tmp, sl.weights.output.data,
-                          sl.weights.output.type, cfg.vocab, H, nullptr))
+    const bool head_ok = qact_output()
+        ? k3k::k3_proj_ggml_f32(sl.logits, tmp, sl.weights.output.data,
+                                sl.weights.output.type, cfg.vocab, H,
+                                sl.fwd.s->proj_q8, nullptr)
+        : k3k::k3_proj_f32(sl.logits, tmp, sl.weights.output.data,
+                           sl.weights.output.type, cfg.vocab, H, nullptr);
+    if (!head_ok)
         return false;
     if (cudaDeviceSynchronize() != cudaSuccess) return false;
     if (cudaMemcpy(out_logits, sl.logits, (size_t)cfg.vocab * sizeof(float),
