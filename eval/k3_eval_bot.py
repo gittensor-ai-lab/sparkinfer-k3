@@ -792,6 +792,78 @@ def publish_round_log(repo_log, main_sha, results, text, dry_run):
                             f"round @ {main_sha[:8]}") else 0
 
 
+def _pr_state(repo, num):
+    r = gh(["pr", "view", str(num), "-R", repo, "--json",
+            "mergeStateStatus,labels,headRefOid,state"])
+    try:
+        return json.loads(r.stdout or "{}")
+    except json.JSONDecodeError:
+        return {}
+
+
+def wait_mergeable_state(repo, num, tries=20, delay=6):
+    """Poll until GitHub has actually COMPUTED mergeability, rather than reading UNKNOWN.
+
+    mergeStateStatus is UNKNOWN while GitHub recomputes in the background, and it returns to
+    UNKNOWN every time the base branch moves -- which this bot does to itself when it commits
+    the frontier. Reading it too early is not a stale answer, it is NO answer, and the code
+    treated it as one: #57 reported non-BEHIND before the recompute finished, so the branch
+    update was skipped, and minutes later the merge was refused for being BEHIND. One race
+    caused both halves of that.
+
+    Returns the settled info dict; on timeout returns the last reading and says so, because a
+    guess dressed as a fact is worse than a slow round.
+    """
+    for i in range(tries):
+        info = _pr_state(repo, num)
+        # No data at all is not "still recomputing" -- it is "cannot read this PR" (bad repo,
+        # no auth, deleted). Polling that for two minutes helps nobody and made the guard
+        # tests sleep; one retry covers a transient blip, then give up.
+        if not info:
+            if i >= 1:
+                print(f"!! #{num}: cannot read merge state from {repo}", file=sys.stderr)
+                return {}
+            time.sleep(min(delay, 2))   # a failed read is not a recompute; retry briefly
+            continue
+        if (info.get("mergeStateStatus") or "UNKNOWN") != "UNKNOWN":
+            return info
+        time.sleep(delay)
+    print(f"!! #{num}: mergeability still UNKNOWN after {tries * delay}s — proceeding on an "
+          f"uncomputed state, which the merge guards treat as not-clear", file=sys.stderr)
+    return _pr_state(repo, num)
+
+
+def wait_for_tier(repo, num, tries=30, delay=10):
+    """Poll until eval-label.yml has applied the eval:* label for the comment just posted.
+
+    THE TIER IS NOT THE BOT'S TO WRITE, AND THAT IS THE POINT. The bot posts /eval; the
+    workflow re-derives the tier from reference.lock on the protected branch and applies
+    exactly one label -- asynchronously, in CI. Asking for that label immediately after
+    posting therefore always found nothing, so --merge-admin could never merge a PR it had
+    just evaluated: it refused "no eval:* tier" on a PR whose tier landed seconds later.
+
+    Waiting is the fix. Merging without one is NOT: the label is the trusted side's verdict,
+    and the entire design is that the bot does not act on its own number.
+    """
+    for i in range(tries):
+        info = _pr_state(repo, num)
+        if not info:
+            if i >= 1:
+                print(f"!! #{num}: cannot read labels from {repo}", file=sys.stderr)
+                return []
+            time.sleep(min(delay, 2))   # a failed read is not a recompute; retry briefly
+            continue
+        labels = {l.get("name", "") for l in (info.get("labels") or [])}
+        hit = sorted(l for l in labels if l.startswith("eval:"))
+        if hit:
+            print(f">> #{num}: tier applied by eval-label.yml — {', '.join(hit)}")
+            return hit
+        time.sleep(delay)
+    print(f"!! #{num}: no eval:* tier after {tries * delay}s. eval-label.yml may have failed "
+          f"or is still queued; refusing to merge on the bot's own number", file=sys.stderr)
+    return []
+
+
 def merge_blockers(repo, num, pr, waiting_is_blocking=True, mode="strict"):
     """Every reason not to merge this without a human reading it. Empty list means clear.
 
@@ -814,11 +886,9 @@ def merge_blockers(repo, num, pr, waiting_is_blocking=True, mode="strict"):
     # mutates them -- merge-first goes on, needs-rebase comes off once a branch is updated --
     # so deciding from the opening snapshot refuses a merge over a label that no longer
     # exists. That is precisely what stopped #20: the snapshot still said needs-rebase.
-    st = gh(["pr", "view", str(num), "-R", repo, "--json", "mergeStateStatus,labels"])
-    try:
-        live = json.loads(st.stdout or "{}")
-    except json.JSONDecodeError:
-        live = {}
+    # Settled, not merely current: this runs right after the round moved main, so an
+    # uncomputed UNKNOWN here is what refused #57 for being BEHIND after skipping its update.
+    live = wait_mergeable_state(repo, num) if waiting_is_blocking else _pr_state(repo, num)
     labels = {l.get("name", "") for l in (live.get("labels") or pr.get("labels") or [])}
     hit = labels & NEVER_MERGE_LABELS
     if hit:
@@ -1188,11 +1258,10 @@ def main():
     # it is fixed, and the number has to be taken on the commit that will actually merge.
     for pr in list(eligible):
         num = pr["number"]
-        st = gh(["pr", "view", str(num), "-R", args.repo, "--json", "mergeStateStatus"])
-        try:
-            state = json.loads(st.stdout or "{}").get("mergeStateStatus")
-        except json.JSONDecodeError:
-            state = None
+        # The frontier commit above moved main, so GitHub is recomputing every open PR.
+        # Asking before it finishes returns UNKNOWN and the update gets skipped -- then the
+        # merge is refused for the BEHIND that the skipped update would have fixed.
+        state = wait_mergeable_state(args.repo, num).get("mergeStateStatus")
         if state != "BEHIND":
             continue
         head = update_pr_branch(args.repo, pr, args.dry_run)
@@ -1223,6 +1292,10 @@ def main():
         if res.get("receipt_id"):
             publish_receipt(LOG_REPO, num, res, BOX_RECEIPTS, args.dry_run)
         post(args.repo, num, res, args.dry_run)
+        # eval-label.yml applies the tier asynchronously. Wait for it here, once, rather
+        # than letting the merge decision below read a label that has not landed yet.
+        if not args.dry_run and (args.merge_admin or args.auto_merge):
+            wait_for_tier(args.repo, num)
         results.append((num, res))
         evaluated += 1
 

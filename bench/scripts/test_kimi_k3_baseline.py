@@ -1522,6 +1522,34 @@ class CiWorkflowTest(unittest.TestCase):
                       "a rewrite that matched zero or many lines must refuse, not guess")
         self.assertIn('"branch=main"', rec)
 
+    def test_merge_decisions_wait_for_asynchronous_github_state(self):
+        """Both merge-path failures were one bug: acting on GitHub state that is computed
+        asynchronously, without waiting for it to settle.
+
+        mergeStateStatus is UNKNOWN while GitHub recomputes, and returns to UNKNOWN whenever
+        the base branch moves -- which this bot does to itself when it commits the frontier.
+        #57 reported non-BEHIND before that finished, so its branch update was skipped, and
+        minutes later the merge was refused for the BEHIND the update would have fixed.
+
+        And the tier is applied by eval-label.yml in CI, after the comment is posted. Reading
+        the label immediately always found nothing, so --merge-admin could never merge a PR
+        it had just evaluated. Waiting is the fix; merging without a tier is not, because the
+        label is the trusted side's verdict and the bot must not act on its own number."""
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        self.assertIn("def wait_mergeable_state(", src)
+        self.assertIn("def wait_for_tier(", src)
+        self.assertIn('!= "UNKNOWN"', src, "UNKNOWN is no answer, not a stale one")
+        # the branch-update decision must read a settled state
+        main_fn = src[src.index("def main("):]
+        self.assertIn("wait_mergeable_state(args.repo, num).get(", main_fn,
+                      "the update decision reads mid-recompute state")
+        self.assertLess(main_fn.index("wait_for_tier("), main_fn.index("merge_winner("),
+                        "the tier must land before the merge decision reads it")
+        # ...and a timeout must NOT be treated as permission
+        tier = src[src.index("def wait_for_tier("):src.index("def merge_blockers(")]
+        self.assertIn("refusing to merge on the bot's own number", tier)
+        self.assertIn("return []", tier, "no tier means no merge, not merge anyway")
+
     def test_auto_merge_still_respects_the_substantive_guards(self):
         """Queueing is not merging, but it is arming: once the required review lands, GitHub
         merges with nobody looking again. So `hold` / `copycat` / a maintainer-owned path
