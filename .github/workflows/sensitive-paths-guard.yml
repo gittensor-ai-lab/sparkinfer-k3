@@ -57,7 +57,7 @@ jobs:
           # A contributor able to edit any of those could mint their own tier without
           # touching a single pin. Guarding results but not the scorer is guarding the
           # ledger and leaving the pen on the desk.
-          SENSITIVE='^(eval/|\.github/|\.gittensor/|bench/results/|dashboard/data\.json$|bench/scripts/(reference\.lock|label\.py|compare_logits\.py|check_reference_lock\.py|kimi_k3_eval\.sh|kimi_k3_baseline\.sh|kimi_k3_attest\.py|_kimi_k3\.sh|test_kimi_k3_baseline\.py|test_label\.py|kimi_k3_.*\.sha256)$)'
+          SENSITIVE='^(eval/|\.github/|\.gittensor/|bench/results/|bench/refdata/|dashboard/data\.json$|bench/scripts/(reference\.lock|_common\.sh|_eval_speed\.sh|label\.py|compare_logits\.py|check_reference_lock\.py|kimi_k3_eval\.sh|kimi_k3_baseline\.sh|kimi_k3_attest\.py|_kimi_k3\.sh|test_kimi_k3_baseline\.py|test_label\.py|kimi_k3_.*\.sha256)$)'
 
           # Read-only: the changed-file list from the API. Never runs PR code.
           FILES="$(gh pr diff "$NUM" -R "$REPO" --name-only)"
