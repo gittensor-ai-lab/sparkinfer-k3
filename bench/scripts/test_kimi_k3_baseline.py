@@ -1155,6 +1155,44 @@ class CiWorkflowTest(unittest.TestCase):
         self.assertIn("--query-compute-apps=pid", src,
                       "cleanup must target GPU memory holders, not a command-line pattern")
 
+    def test_strip_list_covers_everything_label_py_emits(self):
+        """DERIVED_BY_CI was hand-maintained and label.py grew pct_of_ceiling and
+        effective_pct after it was written, so the bot posted two derived numbers the
+        protected side is supposed to own. Derive the expectation from label.py's ACTUAL
+        output instead of trusting the list to have kept up."""
+        import subprocess as sp, json as _j
+        env = {**os.environ, "SPARKINFER_DIFFICULTY_REF": "18.3210"}
+        out = sp.run([sys.executable, str(ROOT / "bench/scripts/label.py"),
+                      "9.54", "3.55", "0", "1.0", "0.004", "abc1234"],
+                     capture_output=True, text=True, check=True, env=env).stdout
+        emitted = set(_j.loads(out.split("RESULT_JSON ", 1)[1]))
+        measurements = {"tps", "top1", "kl", "commit", "node", "devices", "layers",
+                        "quant", "ms_per_token", "engine", "llama_commit", "receipt_id"}
+        leaked = emitted - measurements - set(self._bot().DERIVED_BY_CI)
+        self.assertEqual(leaked, set(),
+                         f"label.py emits {leaked} and the bot would post them")
+
+    def test_sealing_is_only_claimed_when_the_log_says_so(self):
+        """A receipt id proves a receipt was minted, not that anyone can find it. One run
+        reported "2 sealed to the log" while sparkinfer-k3-log stayed at one entry: the
+        harness printed RESULT_JSON, THEN failed to publish and exited 1, and the bot
+        scraped the id off stdout without checking either the exit status or the log."""
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        self.assertIn("r.returncode != 0", src, "the harness's seal failure is ignored")
+        self.assertIn("contents/runs/", src, "sealing is claimed without asking the log")
+        self.assertIn('r.pop("receipt_id", None)', src,
+                      "an unfindable receipt must not stay in the payload")
+
+    def test_labels_avoid_the_deprecated_graphql_path(self):
+        """gh pr edit --add-label queries projectCards, which GitHub deprecated, so it exits
+        1 even on a repo with no projects. The bot printed ">> merge-first: #25" while the
+        label never landed, because nothing checked the return code."""
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        code = [l for l in src.split("\n") if not l.strip().startswith("#")]
+        self.assertFalse([l for l in code if '"pr", "edit"' in l and "label" in l],
+                         "gh pr edit --add-label exits 1 on the projectCards deprecation")
+        self.assertIn("issues/{num}/labels", src, "labels must go through the REST endpoint")
+
     def test_baseline_results_are_committable(self):
         """The `lock` job requires a committed bench/results JSON to back any pinned
         baseline. bench/.gitignore ignores results/ wholesale, so without an explicit
