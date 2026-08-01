@@ -989,22 +989,37 @@ constexpr int kMlaMaxSplits   = 32;
 // Scratch for the partials, grown on demand and reused. Sized n_head * splits *
 // (kv_lora + 2) floats — 6.3 MB at K3's dims with 32 splits, against ~140 GB of weights,
 // so a one-off allocation is cheaper than threading a buffer through every caller.
-static float* g_mla_part_acc = nullptr;
-static float* g_mla_part_ml  = nullptr;
-static size_t g_mla_part_cap = 0;
+//
+// PER DEVICE, not one global. K3 runs tensor-parallel across 8 ranks, each owning its
+// own device and its own thread. A single static pointer is allocated by whichever rank
+// arrives first and then dereferenced by the other seven on devices it does not belong
+// to — an illegal access that surfaces later and elsewhere, as a sticky error inside the
+// next NCCL all-reduce. A single-device numeric test cannot catch that by construction.
+//
+// Each slot is touched by exactly one rank thread (a rank owns its device for the whole
+// run), so the slots need no lock; the array itself is only ever read by index.
+static constexpr int kMlaMaxDevices = 16;
+static float* g_mla_part_acc[kMlaMaxDevices] = {nullptr};
+static float* g_mla_part_ml [kMlaMaxDevices] = {nullptr};
+static size_t g_mla_part_cap[kMlaMaxDevices] = {0};
 
-static bool k3_mla_split_scratch(int n_head, int kv_lora) {
+static bool k3_mla_split_scratch(int n_head, int kv_lora, int* dev_out) {
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return false;
+    if (dev < 0 || dev >= kMlaMaxDevices) return false;   // fall back to the un-split path
+    *dev_out = dev;
+
     const size_t need = (size_t)n_head * kMlaMaxSplits * (size_t)kv_lora;
-    if (need <= g_mla_part_cap) return true;
-    cudaFree(g_mla_part_acc);
-    cudaFree(g_mla_part_ml);
-    g_mla_part_acc = nullptr; g_mla_part_ml = nullptr; g_mla_part_cap = 0;
-    if (cudaMalloc((void**)&g_mla_part_acc, need * sizeof(float)) != cudaSuccess) return false;
-    if (cudaMalloc((void**)&g_mla_part_ml,
+    if (need <= g_mla_part_cap[dev]) return true;
+    cudaFree(g_mla_part_acc[dev]);
+    cudaFree(g_mla_part_ml [dev]);
+    g_mla_part_acc[dev] = nullptr; g_mla_part_ml[dev] = nullptr; g_mla_part_cap[dev] = 0;
+    if (cudaMalloc((void**)&g_mla_part_acc[dev], need * sizeof(float)) != cudaSuccess) return false;
+    if (cudaMalloc((void**)&g_mla_part_ml[dev],
                    (size_t)n_head * kMlaMaxSplits * 2 * sizeof(float)) != cudaSuccess) {
-        cudaFree(g_mla_part_acc); g_mla_part_acc = nullptr; return false;
+        cudaFree(g_mla_part_acc[dev]); g_mla_part_acc[dev] = nullptr; return false;
     }
-    g_mla_part_cap = need;
+    g_mla_part_cap[dev] = need;
     return true;
 }
 
@@ -2031,7 +2046,8 @@ void mla_decode_attn_f32(float* out, const float* q, const float* k_cache,
     // Only above kMlaSplitMinCtx: below it the slice is short enough that the combine
     // pass and the extra global round trip cost more than the parallelism buys, and the
     // un-split kernel is also the one the numeric test pins bit-for-bit.
-    const int splits = (n_ctx >= kMlaSplitMinCtx && k3_mla_split_scratch(n_head, kv_lora))
+    int dev = 0;
+    const int splits = (n_ctx >= kMlaSplitMinCtx && k3_mla_split_scratch(n_head, kv_lora, &dev))
                      ? std::min(kMlaMaxSplits, (n_ctx + kMlaSplitMinCtx - 1) / kMlaSplitMinCtx)
                      : 1;
     if (splits <= 1) {
@@ -2042,12 +2058,12 @@ void mla_decode_attn_f32(float* out, const float* q, const float* k_cache,
 
     dim3 grid((unsigned)n_head, (unsigned)splits);
     mla_decode_attn_split_kernel<BLOCK><<<grid, BLOCK, shm, stream>>>(
-        g_mla_part_acc, g_mla_part_ml, q, k_cache, key_length, kv_lora,
+        g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora,
         n_ctx, scale, splits);
     // s_acc + s_w, where s_w needs splits + 1 slots (the last holds 1/l).
     const size_t cshm = ((size_t)kv_lora + (size_t)splits + 1) * sizeof(float);
     mla_decode_combine_kernel<BLOCK><<<(unsigned)n_head, BLOCK, cshm, stream>>>(
-        out, g_mla_part_acc, g_mla_part_ml, wv_b, kv_lora, v_dim, splits);
+        out, g_mla_part_acc[dev], g_mla_part_ml[dev], wv_b, kv_lora, v_dim, splits);
 }
 
 // Threads that would run ZERO iterations of the block loop are not free.
