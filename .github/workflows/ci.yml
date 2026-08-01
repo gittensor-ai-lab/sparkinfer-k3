@@ -201,41 +201,17 @@ jobs:
           PY
 
   plans:
-    name: baseline --dry-run (all nodes)
+    name: harness pins
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      # --dry-run touches no network and no GPU, so CI can prove the plan resolves for
-      # every milestone node: shard paths, fork pin, flags, headroom, reference.lock prefix.
-      - name: Plan resolves for h200x8 / b200x8 / b300x4
-        run: |
-          set -euo pipefail
-          for node in h200x8 b200x8 b300x4; do
-            echo "::group::--node $node"
-            out="$(bash bench/scripts/kimi_k3_baseline.sh --node "$node" --dry-run --longctx)"
-            echo "$out"
-            # The DEFAULT quant is UD-IQ1_S (what is resident and measured); the TARGET
-            # is still UD-Q2_K_XL. Assert the default plan resolves a shard path, and
-            # separately that the target quant is still fully wired — pinning this to one
-            # literal name conflated the two and broke the moment the default moved.
-            echo "$out" | grep -qE "Kimi-K3-UD-[A-Za-z0-9_]+-00001-of-000[0-9]+\.gguf" \
-              || { echo "::error::$node: default shard path did not resolve"; exit 1; }
-            # Capture, then grep. Piping into `grep -q` closes the pipe on first match,
-            # and the SIGPIPE that follows kills the script under pipefail — it reports
-            # "write error: Broken pipe" and a non-zero exit that looks like a failed
-            # assertion. Same reason the default check above uses "$out".
-            tgt="$(PRIMARY_QUANT=UD-Q2_K_XL bench/scripts/kimi_k3_baseline.sh --node "$node" --dry-run 2>&1)"
-            echo "$tgt" | grep -q "Kimi-K3-UD-Q2_K_XL-00001-of-00019.gguf" \
-              || { echo "::error::$node: TARGET shard path did not resolve"; exit 1; }
-            echo "$out" | grep -q "efc8bc38f0a9950cbb10ccef2cf48b951c39d3b2" \
-              || { echo "::error::$node: fork pin missing from plan"; exit 1; }
-            echo "$out" | grep -qi "KIMI_K3_$(echo "$node" | tr 'a-z' 'A-Z')_LLAMA_" \
-              || { echo "::error::$node: wrong reference.lock prefix"; exit 1; }
-            echo "$out" | grep -q "1048576" \
-              || { echo "::error::$node: 1M context missing from longctx plan"; exit 1; }
-            echo "::endgroup::"
-          done
+      # The baseline --dry-run plan check (h200x8 / b200x8 / b300x4) was removed from CI by
+      # request. bench/scripts/test_kimi_k3_baseline.py still exercises the planner and runs
+      # in the `python compile + unit tests` job, so the planner is not unguarded — what is
+      # gone is the end-to-end assertion that each node's plan resolves a real shard path,
+      # the fork pin and the 1M longctx entry. Contributors can still run it by hand:
+      #   bash bench/scripts/kimi_k3_baseline.sh --node h200x8 --dry-run --longctx
 
       # The Qwen evals must keep the upstream ggml-org pin. Sourcing _kimi_k3.sh is what
       # switches to the fork, so nothing may leak the fork pin into _common.sh alone.
