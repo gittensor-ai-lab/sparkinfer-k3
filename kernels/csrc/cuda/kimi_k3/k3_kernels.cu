@@ -1111,10 +1111,42 @@ __device__ __forceinline__ float block_max(float v, float* shm) {
 constexpr int kMlaCtxTile = 128;
 
 // Context-split tunables. kMlaSplitMinCtx is the slice length below which splitting is
-// not worth the combine pass; kMlaMaxSplits caps the scratch and keeps the combine's
-// per-slice loop short.
+// not worth the combine pass.
 constexpr int kMlaSplitMinCtx = 4096;
 constexpr int kMlaMaxSplits   = 64;
+
+// THE SPLIT CAP IS A BUDGET ON n_head * splits, NOT A CONSTANT ON splits.
+//
+// The grid is (n_head/hpb, splits) and the partials scratch is
+// n_head * splits * kv_lora, so both the parallelism and the memory scale with
+// the PRODUCT. A flat cap on `splits` therefore does the wrong thing the moment
+// n_head stops being 96.
+//
+// It stopped being 96. Head-sharding MLA across 8 ranks gives each rank 12
+// heads, so hpb=12 collapses the head axis to ONE group and the grid becomes
+// 1 x 64 = 64 blocks on a 132-SM H200 — under half the machine idle, while the
+// heuristic three lines below was asking for 528. That is why sharding measured
+// 2.24x instead of the 8x the work reduction implied: the work went away and so
+// did the parallelism.
+//
+// Budgeting the product fixes both ends at once and is exactly memory-neutral:
+//
+//     n_head 96 (replicated)  ->  64 splits   6144 pairs   unchanged, bit-for-bit
+//     n_head 12 (sharded)     -> 512 splits   6144 pairs   same scratch, 8x grid
+//
+// The unsharded path keeps the cap it always had, so this cannot regress the
+// replicated build — it only spends, on parallelism, the scratch that sharding
+// already freed.
+constexpr int kMlaSplitBudget = 96 * kMlaMaxSplits;   // 6144 (head, slice) pairs
+
+static inline int k3_mla_max_splits(int n_head) {
+    if (n_head <= 0) return 1;
+    const int by_budget = kMlaSplitBudget / n_head;
+    // Never below the historical cap for a head count that already fit it, and
+    // never so high that the combine's per-slice loop (and its shared-memory
+    // slot per slice) becomes the new cost.
+    return std::min(1024, std::max(1, by_budget));
+}
 
 // ---------------------------------------------------------------------------
 // MLA IS MQA, AND ONE BLOCK PER HEAD READS THE KV CACHE n_head TIMES.
@@ -1198,14 +1230,18 @@ static bool k3_mla_split_scratch(int n_head, int kv_lora, int* dev_out) {
     if (dev < 0 || dev >= kMlaMaxDevices) return false;   // fall back to the un-split path
     *dev_out = dev;
 
-    const size_t need = (size_t)n_head * kMlaMaxSplits * (size_t)kv_lora;
+    // Sized with the same budget the launcher caps `splits` with. If these two
+    // ever disagreed the kernel would write partials past the allocation, so
+    // both go through k3_mla_max_splits() and neither hardcodes a cap.
+    const int    ms   = k3_mla_max_splits(n_head);
+    const size_t need = (size_t)n_head * ms * (size_t)kv_lora;
     if (need <= g_mla_part_cap[dev]) return true;
     cudaFree(g_mla_part_acc[dev]);
     cudaFree(g_mla_part_ml [dev]);
     g_mla_part_acc[dev] = nullptr; g_mla_part_ml[dev] = nullptr; g_mla_part_cap[dev] = 0;
     if (cudaMalloc((void**)&g_mla_part_acc[dev], need * sizeof(float)) != cudaSuccess) return false;
     if (cudaMalloc((void**)&g_mla_part_ml[dev],
-                   (size_t)n_head * kMlaMaxSplits * 2 * sizeof(float)) != cudaSuccess) {
+                   (size_t)n_head * ms * 2 * sizeof(float)) != cudaSuccess) {
         cudaFree(g_mla_part_acc[dev]); g_mla_part_acc[dev] = nullptr; return false;
     }
     g_mla_part_cap[dev] = need;
@@ -2581,7 +2617,7 @@ void mla_decode_attn_f32(float* out, const float* q, const float* k_cache,
     // un-split kernel is also the one the numeric test pins bit-for-bit.
     int dev = 0;
     int splits = (n_ctx >= kMlaSplitMinCtx && k3_mla_split_scratch(n_head, kv_lora, &dev))
-               ? std::min(kMlaMaxSplits, (n_ctx + kMlaSplitMinCtx - 1) / kMlaSplitMinCtx)
+               ? std::min(k3_mla_max_splits(n_head), (n_ctx + kMlaSplitMinCtx - 1) / kMlaSplitMinCtx)
                : 1;
     if (splits <= 1) {
         mla_decode_attn_kernel<BLOCK><<<(unsigned)n_head, BLOCK, shm, stream>>>(
@@ -2607,7 +2643,7 @@ void mla_decode_attn_f32(float* out, const float* q, const float* k_cache,
         if (sm > 0) {
             const int want = (kMlaBlocksPerSm * sm + groups - 1) / groups;
             splits = std::max(splits, std::min(want, n_ctx / kMlaMinSliceLen));
-            splits = std::min(std::max(splits, 1), kMlaMaxSplits);
+            splits = std::min(std::max(splits, 1), k3_mla_max_splits(n_head));
         }
         dim3 hgrid((unsigned)groups, (unsigned)splits);
         bool launched = true;
@@ -2644,7 +2680,7 @@ void mla_decode_attn_f32(float* out, const float* q, const float* k_cache,
                 out, g_mla_part_acc[dev], g_mla_part_ml[dev], wv_b, kv_lora, v_dim, splits);
             return;
         }
-        splits = std::min(splits, kMlaMaxSplits);
+        splits = std::min(splits, k3_mla_max_splits(n_head));
     }
 
     dim3 grid((unsigned)n_head, (unsigned)splits);
