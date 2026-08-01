@@ -5,6 +5,7 @@
 #include "sparkinfer/kernels/kimi_k3.h"
 #include "sparkinfer/tp/shard.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
@@ -17,6 +18,53 @@ namespace k3k = sparkinfer::kernels::k3;
 namespace sparkinfer {
 
 namespace {
+
+// ---------------------------------------------------------------------------
+// Host-issue accounting (SPARKINFER_K3_ISSUE_PROFILE=1)
+// ---------------------------------------------------------------------------
+// Why this exists, and why it is shaped this way:
+//
+// A single host thread issues every rank's kernels, rank 0 first and rank 7
+// last, and 92 all-reduces per token act as hard barriers. If issuing a layer
+// costs the host a meaningful fraction of what the layer costs the GPU, then
+// rank 7 arrives at every barrier structurally late and the collective's cost
+// is not the transfer at all — it is the host that has not finished asking yet.
+//
+// Everything measured below is ASYNCHRONOUS work-submission. That is the whole
+// point: no cudaEventRecord, no cudaEventSynchronize, no extra stream sync.
+// Instrumenting this path with CUDA events would sync the very thing being
+// measured (SPARKINFER_K3_PROFILE=1 does exactly that and eliminates the fast
+// mode on this box), so this uses steady_clock only — ~20 ns per sample against
+// microsecond-scale intervals, and it cannot change the GPU's schedule.
+//
+// t_issue  host time submitting the per-rank layer phases (async enqueue)
+// t_coll   host time inside the group all-reduce call (async enqueue)
+// t_sync   host time blocked in the ONE end-of-token sync -> GPU catch-up
+// t_total  wall time of the whole forward_token
+//
+// t_issue >> 0 and t_sync ~ 0 means the GPU is starved and the host is the
+// bottleneck. The reverse means the host stays ahead and the GPU is the wall.
+struct IssueProfile {
+    bool on = false;
+    long long n_tokens = 0;
+    double t_issue = 0, t_coll = 0, t_sync = 0, t_total = 0;
+    long long n_phase_calls = 0, n_setdev = 0;
+};
+
+IssueProfile& issue_profile() {
+    static IssueProfile p = [] {
+        IssueProfile q;
+        const char* e = std::getenv("SPARKINFER_K3_ISSUE_PROFILE");
+        q.on = e && e[0] == '1';
+        return q;
+    }();
+    return p;
+}
+
+using IClock = std::chrono::steady_clock;
+inline double secs_since(IClock::time_point t0) {
+    return std::chrono::duration<double>(IClock::now() - t0).count();
+}
 
 // Token row gather. Same contract as the single-GPU path: token_embd is replicated,
 // so every rank does this identically and no broadcast is needed.
@@ -220,14 +268,21 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
     const int H = cfg.hidden;
     const int tp_size = (int)p.ranks.size();
 
+    IssueProfile& ip = issue_profile();
+    const IClock::time_point t_tok0 = ip.on ? IClock::now() : IClock::time_point{};
+
     // The cross-layer residual bank is PER TOKEN on every rank — same lifetime rule
     // as the single-GPU path, and forgetting it here fails on token 2 rather than
     // token 1, because max_ckpt is exactly one token's worth of checkpoints.
     for (auto& R : p.ranks) R.state.n_ckpt = 0;
 
-    for (auto& R : p.ranks) {
-        if (cudaSetDevice(R.device) != cudaSuccess) return false;
-        if (!embed_token(R.weights, cfg, token_id, R.x, R.stream)) return false;
+    {
+        const IClock::time_point t0 = ip.on ? IClock::now() : IClock::time_point{};
+        for (auto& R : p.ranks) {
+            if (cudaSetDevice(R.device) != cudaSuccess) return false;
+            if (!embed_token(R.weights, cfg, token_id, R.x, R.stream)) return false;
+        }
+        if (ip.on) { ip.t_issue += secs_since(t0); ip.n_setdev += tp_size; }
     }
 
     for (int layer = 0; layer < cfg.n_layers; ++layer) {
@@ -239,12 +294,18 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
         // phase boundary is where a fully-sharded build WOULD reduce, and keeping
         // the call sites is what makes that a one-line change rather than a
         // re-split of the forward.
+        const IClock::time_point t_p12 = ip.on ? IClock::now() : IClock::time_point{};
         for (auto& R : p.ranks) {
             if (cudaSetDevice(R.device) != cudaSuccess) return false;
             if (!kimi_k3_forward_layer_phase(R.fwd, layer, K3LayerPhase::Attn,
                                              R.x, R.x_next)) return false;
             if (!kimi_k3_forward_layer_phase(R.fwd, layer, K3LayerPhase::FfnPartial,
                                              R.x, R.x_next)) return false;
+        }
+        if (ip.on) {
+            ip.t_issue += secs_since(t_p12);
+            ip.n_phase_calls += 2 * tp_size;
+            ip.n_setdev += tp_size;
         }
 
         // --- the collective -------------------------------------------------
@@ -288,19 +349,31 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
                     cudaMemcpy(p.reduce_bufs[(size_t)r], sum.data(),
                                (size_t)count * sizeof(float), cudaMemcpyHostToDevice);
                 }
-            } else if (!p.coll->allreduce_f32_group(p.reduce_bufs, (size_t)count, p.streams)) {
-                std::fprintf(stderr, "[k3-tp] all-reduce failed at layer %d\n", layer);
-                return false;
+            } else {
+                const IClock::time_point tc = ip.on ? IClock::now() : IClock::time_point{};
+                const bool okc = p.coll->allreduce_f32_group(p.reduce_bufs, (size_t)count,
+                                                             p.streams);
+                if (ip.on) ip.t_coll += secs_since(tc);
+                if (!okc) {
+                    std::fprintf(stderr, "[k3-tp] all-reduce failed at layer %d\n", layer);
+                    return false;
+                }
             }
             ++p.n_collectives;
         }
 
         // --- phase 3 on every rank ------------------------------------------
+        const IClock::time_point t_p3 = ip.on ? IClock::now() : IClock::time_point{};
         for (auto& R : p.ranks) {
             if (cudaSetDevice(R.device) != cudaSuccess) return false;
             if (!kimi_k3_forward_layer_phase(R.fwd, layer, K3LayerPhase::FfnFinish,
                                              R.x, R.x_next)) return false;
             std::swap(R.x, R.x_next);
+        }
+        if (ip.on) {
+            ip.t_issue += secs_since(t_p3);
+            ip.n_phase_calls += tp_size;
+            ip.n_setdev += tp_size;
         }
     }
 
@@ -324,9 +397,29 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
                           cfg.vocab, H, R0.stream))
         return false;
 
+    const IClock::time_point t_s0 = ip.on ? IClock::now() : IClock::time_point{};
     if (cudaStreamSynchronize(R0.stream) != cudaSuccess) return false;
+    if (ip.on) ip.t_sync += secs_since(t_s0);
     if (cudaMemcpy(out_logits, R0.logits, (size_t)cfg.vocab * sizeof(float),
                    cudaMemcpyDeviceToHost) != cudaSuccess) return false;
+
+    if (ip.on) {
+        ip.t_total += secs_since(t_tok0);
+        ++ip.n_tokens;
+        // Report every token: the run is 32 tokens and the per-token variation is
+        // itself the signal (a host-bound loop is steady, a GPU-bound one is not).
+        const double n = (double)ip.n_tokens;
+        std::fprintf(stderr,
+            "[k3-issue] tok=%lld  total=%.2f ms  issue=%.2f ms (%.1f%%)  "
+            "coll=%.2f ms (%.1f%%)  sync=%.2f ms (%.1f%%)  "
+            "| phase_calls/tok=%.0f setdev/tok=%.0f\n",
+            ip.n_tokens,
+            1e3 * ip.t_total / n,
+            1e3 * ip.t_issue / n, 100.0 * ip.t_issue / ip.t_total,
+            1e3 * ip.t_coll  / n, 100.0 * ip.t_coll  / ip.t_total,
+            1e3 * ip.t_sync  / n, 100.0 * ip.t_sync  / ip.t_total,
+            (double)ip.n_phase_calls / n, (double)ip.n_setdev / n);
+    }
 
     // Advance every rank's position together. They run the same attention, so a rank
     // whose position drifted would index a different KV row for the same token.
