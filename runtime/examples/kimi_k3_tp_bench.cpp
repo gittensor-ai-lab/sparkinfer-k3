@@ -1,6 +1,6 @@
 // What does tensor parallelism actually buy on Kimi K3 decode?
 //
-//   kimi_k3_tp_bench <first-shard.gguf> [tp_size] [n_layers] [n_tokens]
+//   kimi_k3_tp_bench <first-shard.gguf> [tp_size] [n_layers] [n_tokens] [--ctx N] [--seek]
 //                    [--ids a,b,c] [--logits FILE]
 //
 // --ids feeds an exact prompt (ids, not text) instead of the synthetic sequence, and
@@ -78,7 +78,8 @@ std::vector<int> parse_ids(const char* s) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: %s <first-shard.gguf> [tp_size] [n_layers] [n_tokens]\n",
+        std::fprintf(stderr, "usage: %s <first-shard.gguf> [tp_size] [n_layers] [n_tokens] "
+                     "[--ctx N] [--seek]\n",
                      argv[0]);
         return 2;
     }
@@ -87,10 +88,30 @@ int main(int argc, char** argv) {
     const int want_lyr = argc > 3 ? std::atoi(argv[3]) : 16;
     int n_tokens = argc > 4 ? std::atoi(argv[4]) : 8;
     const char* logits_path = nullptr;
+    // --ctx N allocates the KV cache for N positions; --seek jumps position to near the end
+    // of it so the MLA attention actually reduces over the whole thing.
+    //
+    // WHY SEEK RATHER THAN FILL. K3 has no prefill path, so genuinely reaching 128k means
+    // 131,072 sequential forward_token calls -- about 10 hours at main's speed, per
+    // measurement. The decode cost at a given context is DATA-INDEPENDENT: MLA attention
+    // runs the same dense reduction over the KV cache whether the entries are real
+    // activations or zeros, the KDA recurrent state is fixed-size, and the projections do
+    // not depend on context at all. Allocating the cache at the target size, leaving it
+    // zeroed, and seeking position therefore measures the same per-token cost the real fill
+    // would, in minutes.
+    //
+    // WHAT IT CANNOT DO: establish correctness at that context. It attends over zeros, so
+    // the logits are meaningless. Correctness is established separately at short context
+    // against the llama.cpp capture in bench/refdata/ -- which is why kimi_k3_eval.sh runs
+    // the accuracy pass WITHOUT these flags.
+    int  max_ctx = 64;
+    bool do_seek = false;
     std::vector<int> ids;
     for (int i = 2; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--ids") && i + 1 < argc) ids = parse_ids(argv[++i]);
         else if (!std::strcmp(argv[i], "--logits") && i + 1 < argc) logits_path = argv[++i];
+        else if (!std::strcmp(argv[i], "--ctx") && i + 1 < argc) max_ctx = std::atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "--seek")) do_seek = true;
     }
 
     GGUF g; KimiK3Config cfg; KimiK3LayerCoverage cov;
@@ -129,12 +150,25 @@ int main(int argc, char** argv) {
 
     const auto t_load0 = std::chrono::steady_clock::now();
     KimiK3TP p;
-    if (!kimi_k3_tp_init(g, cfg, opt, devs, /*max_ctx=*/64, p)) {
+    if (!kimi_k3_tp_init(g, cfg, opt, devs, max_ctx, p)) {
         std::printf("init failed at tp=%d, %d layers\n", tp_size, cfg.n_layers);
         return 1;
     }
     const auto t_load1 = std::chrono::steady_clock::now();
     const double load_s = std::chrono::duration<double>(t_load1 - t_load0).count();
+
+    // --seek: place every rank near the END of the allocated KV cache so the MLA attention
+    // reduces over the full context. Leaves room for the warm-up token plus n_tokens more,
+    // so no step runs past max_ctx.
+    if (do_seek) {
+        const int target = max_ctx - n_tokens - 2;
+        if (target <= 0) {
+            std::printf("--seek: ctx %d too small for %d tokens\n", max_ctx, n_tokens);
+            return 1;
+        }
+        for (auto& r : p.ranks) r.state.position = target;
+        std::printf("seek: position -> %d (ctx alloc %d)\n", target, max_ctx);
+    }
 
     std::vector<float> logits((size_t)cfg.vocab);
 

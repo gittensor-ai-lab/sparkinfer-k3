@@ -129,9 +129,48 @@ KIMI_K3_LLAMACPP_BASE_COMMIT="${KIMI_K3_LLAMACPP_BASE_COMMIT:-cf67f0d24511864d2d
 # mature CUDA path (integer dot products, fused ops, graph capture) — but it means the
 # K3 frontier starts far behind, and every tier below is anchored to 18.32.
 KIMI_K3_H200X8_IQ1S_LLAMA_128="${KIMI_K3_H200X8_IQ1S_LLAMA_128:-18.3210}"
-# sparkinfer's own first verified entry on the same node/quant (tensor-parallel, tp=8).
-# frontier: measured by eval/k3_eval_bot.py on main @ ddb3f04b8cad (h200x8, UD-IQ1_S). Do not hand-edit — the bot rewrites this each round.
-KIMI_K3_H200X8_IQ1S_SPARKINFER_128="${KIMI_K3_H200X8_IQ1S_SPARKINFER_128:-9.63}"
+# sparkinfer at ctx 64. HISTORICAL — NOT THE SCORED CONTEXT, AND NO LONGER MAINTAINED.
+# The bot writes only the _128K slot now, so nothing will ever update this one again; it is
+# frozen deliberately rather than left to rot at a value that quietly goes wrong. 10.34 was
+# measured on main @ 37d4219 (post-#20, post-#33) on 2026-08-01, same box and quant as the
+# 128k number below. Kept because the pair is the point: 10.34 -> 1.00 is what scoring at
+# 64 was hiding.
+KIMI_K3_H200X8_IQ1S_SPARKINFER_128="${KIMI_K3_H200X8_IQ1S_SPARKINFER_128:-10.34}"
+
+# --- THE SCORED CONTEXT: 128k (131,072) ---
+#
+# Everything above at _128 is decode from an effectively empty cache, and it is NOT what
+# this repo scores on any more. CONTRIBUTING has always said 128k is "the configuration
+# this repo runs"; until now nothing measured it — kimi_k3_tp_bench hardcoded max_ctx=64,
+# so the slot said 128, the doc said 128k, and the hardware saw 64.
+#
+# WHY IT MATTERS, in one comparison. 8x H200, UD-IQ1_S, same weights, measured 2026-08-01:
+#
+#              depth 0/64   depth 131,072   lost
+#   llama.cpp     18.20         16.70        -8%
+#   sparkinfer    10.34          1.01       -90%
+#
+# llama.cpp keeps a compressed MLA cache (kv_lora 512, f16); sparkinfer reduces over 576
+# f32 per token in a kernel with one block per head. Scoring at 64 hid a 16.5x gap behind
+# a 1.8x one, and pointed the incentive at a context nobody runs.
+#
+# THE TWO SIDES ARE NOT MEASURED THE SAME WAY, and that belongs here rather than in a commit
+# message. llama.cpp prefills 131,072 REAL tokens (llama-bench -d). sparkinfer has no
+# prefill path — a genuine fill is ~10 h of sequential forward_token calls — so it allocates
+# the cache at 131,072, leaves it ZEROED, and seeks position (--ctx/--seek in
+# kimi_k3_tp_bench). For decode TIMING these are equivalent: the MLA reduction is dense and
+# value-independent. For CORRECTNESS they are not, which is why the accuracy gate still runs
+# at short context against bench/refdata/ and never at 128k.
+#
+# Tier basis. Backed by bench/results/kimi_k3_UD-IQ1_S_h200x8_baseline_20260801T103818Z.json,
+# whose depth-0 sample reproduces the 18.3210 pinned above to within 0.67% — which is what
+# makes the two contexts comparable rather than two unrelated runs.
+KIMI_K3_H200X8_IQ1S_LLAMA_128K="${KIMI_K3_H200X8_IQ1S_LLAMA_128K:-16.7026}"
+# frontier at the scored context. eval/k3_eval_bot.py rewrites this each round; it is
+# raise-only, so a slow box cannot deflate it and mint tiers for everyone behind it.
+# 1.00 tok/s (995.65 ms/token) measured on main @ 37d4219 via the committed --ctx/--seek
+# path, which reproduces the throwaway seek_patch.py measurement (1.01 / 991.75) to 0.4%.
+KIMI_K3_H200X8_IQ1S_SPARKINFER_128K="${KIMI_K3_H200X8_IQ1S_SPARKINFER_128K:-1.00}"
 
 KIMI_K3_H200X8_LLAMA_128="${KIMI_K3_H200X8_LLAMA_128:-0}"
 KIMI_K3_H200X8_LLAMA_512="${KIMI_K3_H200X8_LLAMA_512:-0}"

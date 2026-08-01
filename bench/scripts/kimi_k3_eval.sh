@@ -90,24 +90,53 @@ fi
 # not been split out yet.
 PFX="KIMI_K3_$(printf '%s' "$NODE" | tr 'a-z' 'A-Z')"
 QUANT="$(printf '%s' "${PRIMARY_QUANT:-UD-IQ1_S}" | sed 's/^UD-//' | tr -cd 'A-Za-z0-9' | tr 'a-z' 'A-Z')"
+# THE SCORED CONTEXT IS 128k, AND THE SLOT SUFFIX FOLLOWS IT. Both references have to come
+# from the same context as the measurement or the tier is arithmetic on unrelated numbers.
+# Scoring used to read the _128 slots while the bench ran with max_ctx hardcoded to 64 --
+# so the recorded context, the slot name and the measured context were three different
+# things, and 128k, the configuration this repo actually targets, was never scored at all.
+#
+# 128k is where the two engines diverge. Measured on 8x H200 / UD-IQ1_S: llama.cpp gives up
+# 8% from depth 0 to 131,072 (18.20 -> 16.70 tok/s) while sparkinfer gives up 90%
+# (10.34 -> 1.01). Scoring at 64 hid that entirely.
+SCORED_CTX="${KIMI_K3_SCORED_CTX:-131072}"
+CTX_SUFFIX="${KIMI_K3_CTX_SUFFIX:-128K}"
 lookup() {  # $1 = LLAMA | SPARKINFER
     local v
-    v="$(eval "printf '%s' \"\${${PFX}_${QUANT}_$1_128:-}\"")"
+    v="$(eval "printf '%s' \"\${${PFX}_${QUANT}_$1_${CTX_SUFFIX}:-}\"")"
     [[ -n "$v" && "$v" != "0" ]] && { printf '%s' "$v"; return; }
-    eval "printf '%s' \"\${${PFX}_$1_128:-0}\""
+    eval "printf '%s' \"\${${PFX}_$1_${CTX_SUFFIX}:-0}\""
 }
 [[ -n "$LLAMA_REF" ]] || LLAMA_REF="$(lookup LLAMA)"
 [[ -n "$FRONTIER"  ]] || FRONTIER="$(lookup SPARKINFER)"
 
-echo ">> Kimi K3 eval — node=$NODE devices=$DEVICES layers=$LAYERS"
-echo ">> llama.cpp reference (tier basis): $LLAMA_REF tok/s"
+echo ">> Kimi K3 eval — node=$NODE devices=$DEVICES layers=$LAYERS ctx=$SCORED_CTX"
+echo ">> llama.cpp reference (tier basis): $LLAMA_REF tok/s  @ ctx $SCORED_CTX"
 echo ">> sparkinfer frontier             : $FRONTIER tok/s$([[ "$FRONTIER" == "0" ]] && echo '  (none yet -> BASELINE)')"
 
 # ---- 1. speed -------------------------------------------------------------
+# --seek attends over a ZEROED cache at the scored context. That is a faithful TIMING
+# measurement (the MLA reduction is dense and value-independent) and a meaningless
+# CORRECTNESS one, which is why step 2 below re-runs without these flags.
 NDEV="$(printf '%s' "$DEVICES" | tr ',' '\n' | grep -c .)"
-echo ">> measuring sparkinfer decode ..."
-SPEED_OUT="$("$BENCH" "$MODEL" "$NDEV" "$LAYERS" "$TOKENS" 2>&1)" || {
+echo ">> measuring sparkinfer decode at ctx $SCORED_CTX ..."
+SPEED_OUT="$("$BENCH" "$MODEL" "$NDEV" "$LAYERS" "$TOKENS" --ctx "$SCORED_CTX" --seek 2>&1)" || {
     echo "$SPEED_OUT" | tail -20 >&2; echo "kimi_k3_eval: bench failed" >&2; exit 1; }
+# THE BENCH MUST PROVE IT SEEKED. bench/scripts and bench/refdata are restored from the
+# protected branch before grading, but kimi_k3_tp_bench is built from the PR's OWN runtime/,
+# so the flags that select the scored context live in code the PR controls. A --seek that
+# silently does nothing measures decode at ctx 64 and reports it as 128k -- roughly 10x the
+# tok/s (10.34 vs 1.00 measured), which is the single highest-value edit a dishonest PR
+# could make. Unknown flags are ignored by the arg loop rather than rejected, so a stub is
+# also the EASIEST edit. Require the announcement, and require it to name the context we
+# asked for: a bench that seeked somewhere else is not measuring what the tier claims.
+if ! printf '%s' "$SPEED_OUT" | grep -q "seek: position -> .*(ctx alloc $SCORED_CTX)"; then
+    printf '%s' "$SPEED_OUT" | tail -20 >&2
+    echo "kimi_k3_eval: the bench did not report seeking to ctx $SCORED_CTX." >&2
+    echo "  refusing to score: --ctx/--seek are implemented in runtime/, which a PR can" >&2
+    echo "  edit, and a stub would score short-context decode as if it were 128k." >&2
+    exit 1
+fi
 TPS="$(printf '%s' "$SPEED_OUT" | sed -n 's/.*ms\/token[^(]*(\([0-9.]*\) tok\/s).*/\1/p' | head -1)"
 MSTOK="$(printf '%s' "$SPEED_OUT" | sed -n 's/.*ms\/token *\([0-9.]*\).*/\1/p' | head -1)"
 [[ -n "$TPS" ]] || { echo "$SPEED_OUT" | tail -20 >&2; echo "kimi_k3_eval: could not parse tok/s" >&2; exit 1; }
@@ -164,7 +193,7 @@ if [[ "${LLAMA_REF%%.*}" == "0" ]]; then
     echo ">>       Run: bench/scripts/kimi_k3_baseline.sh --node $NODE --decode-only" >&2
 fi
 
-RESULT="$(SPARKINFER_DIFFICULTY_REF="$LLAMA_REF" \
+RESULT="$(SPARKINFER_DIFFICULTY_REF="$LLAMA_REF" SPARKINFER_SCORED_CONTEXT="$SCORED_CTX" \
     python3 "$HERE/label.py" "$TPS" "$FRONTIER" 0 "$TOP1" "$KL" "$COMMIT" "$PROV")"
 echo
 echo "$RESULT"

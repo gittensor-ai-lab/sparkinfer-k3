@@ -274,10 +274,16 @@ FRONTIER_TOL = 0.02
 FRONTIER_ALARM = 0.90
 
 
+# The scored context is 131,072, so the frontier lives in the _128K slot. Keep this in step
+# with kimi_k3_eval.sh's CTX_SUFFIX and eval-label.yml's slot(): all three read the same
+# pin, and a mismatch means the bot writes one slot while CI scores from another.
+CTX_SUFFIX = "128K"
+
+
 def _frontier_slot(node, quant):
     pfx = "KIMI_K3_" + re.sub(r"[^A-Za-z0-9]", "", node).upper()
     q = re.sub(r"[^A-Za-z0-9]", "", re.sub(r"^UD-", "", quant or "")).upper()
-    return f"{pfx}_{q}_SPARKINFER_128"
+    return f"{pfx}_{q}_SPARKINFER_{CTX_SUFFIX}"
 
 
 def reconcile_lock(repo, node, quant, measured, main_sha, dry_run):
