@@ -120,6 +120,65 @@ int main() {
         cudaFree(dW); cudaFree(dx); cudaFree(dy);
     }
 
+    // ---- Q8_0 through the MULTIROW path ----
+    //
+    // k3_proj_f32 switches to proj_q8_0_multirow_kernel at N >= MULTIROW_MIN_N (1024).
+    // Every case above is N = 300 or 200, so the multirow kernel — which is the one that
+    // actually runs for K3's real projections (attn_q/k/v/output are N = 12288) — had no
+    // coverage here at all; its correctness rested on the node run alone.
+    //
+    // N = 1026 is deliberately not a multiple of ROWS (4). The kernel walks ROWS rows per
+    // block and guards each with `if (n0 + r >= n_rows) continue;`, so the last block runs
+    // partly out of range. An off-by-one there reads a row that does not exist, which is
+    // in-bounds of the allocation for a wrong row and therefore produces a plausible
+    // number rather than a fault — exactly the failure mode a shape test is for.
+    {
+        const int N = 1026, K = 2048;
+        const int bpr = K / 32;
+        std::vector<BlockQ8_0> W((size_t)N * bpr);
+        for (auto& b : W) {
+            const uint16_t exp = (uint16_t)(9 + (rng() % 8));
+            b.d = (uint16_t)(((rng() & 1) << 15) | (exp << 10) | (rng() % 1024));
+            for (auto& q : b.qs) q = (int8_t)((int)(rng() % 256) - 128);
+        }
+        std::vector<float> x(K); for (auto& v : x) v = U(rng);
+
+        std::vector<double> ref(N, 0.0);
+        for (int n = 0; n < N; ++n) {
+            double acc = 0;
+            for (int b = 0; b < bpr; ++b) {
+                const auto& blk = W[(size_t)n * bpr + b];
+                const double d = h2f(blk.d);
+                for (int j = 0; j < 32; ++j) acc += d * (double)blk.qs[j] * (double)x[b * 32 + j];
+            }
+            ref[n] = acc;
+        }
+
+        void *dW, *dx, *dy;
+        CU(cudaMalloc(&dW, W.size() * sizeof(BlockQ8_0)));
+        CU(cudaMalloc(&dx, K * sizeof(float)));
+        CU(cudaMalloc(&dy, N * sizeof(float)));
+        CU(cudaMemcpy(dW, W.data(), W.size() * sizeof(BlockQ8_0), cudaMemcpyHostToDevice));
+        CU(cudaMemcpy(dx, x.data(), K * sizeof(float), cudaMemcpyHostToDevice));
+        const bool ok = k3_proj_f32((float*)dy, (const float*)dx, dW, /*wtype=*/8, N, K, 0);
+        CU(cudaDeviceSynchronize());
+        std::vector<float> got(N);
+        CU(cudaMemcpy(got.data(), dy, N * sizeof(float), cudaMemcpyDeviceToHost));
+
+        double num = 0, den = 0; int worst_n = -1; double worst = 0;
+        for (int n = 0; n < N; ++n) {
+            const double d = got[n] - ref[n];
+            num += d*d; den += ref[n]*ref[n];
+            const double rel = std::fabs(d) / (std::fabs(ref[n]) + 1e-12);
+            if (rel > worst) { worst = rel; worst_n = n; }
+        }
+        const double rl2 = std::sqrt(num / (den + 1e-30));
+        std::printf("[Q8_0] N=%d K=%d multirow (N%%ROWS=%d) accepted=%s relL2=%.3e worst_row=%d\n",
+                    N, K, N % 4, ok ? "yes" : "NO", rl2, worst_n);
+        if (!ok || rl2 > 1e-5 || !(den > 0)) ++fail;
+        cudaFree(dW); cudaFree(dx); cudaFree(dy);
+    }
+
     // ---- F32 dense case ----
     {
         const int N = 200, K = 384;

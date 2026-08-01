@@ -1123,12 +1123,31 @@ class CiWorkflowTest(unittest.TestCase):
 
         UNKNOWN is not "fine" either, it is "GitHub has not finished computing
         mergeability". #20 reported UNKNOWN seconds after #25 merged while actually being
-        DIRTY, and an earlier denylist treated that as clear."""
+        DIRTY, and an earlier denylist treated that as clear.
+
+        BLOCKED is the one that is different in kind. It is a PERMISSION gate -- the required
+        approving review has not happened -- and bypassing that is exactly what --admin is
+        for. Refusing on it made --merge-admin unable to merge anything at all, because a
+        repo that requires review leaves every PR sitting at BLOCKED forever. So admin may
+        pass BLOCKED and must still refuse BEHIND, DIRTY and UNKNOWN: admin rights bypass
+        permission, not content."""
+        bot = self._bot()
         src = (ROOT / "eval/k3_eval_bot.py").read_text()
-        self.assertIn('if state not in ("CLEAN", "UNSTABLE")', src,
+        self.assertIn("MERGE_STATES", src,
                       "merge states must be allowlisted, not denylisted")
+        self.assertEqual(bot.MERGE_STATES["strict"], ("CLEAN", "UNSTABLE"))
         for st in ("BEHIND", "UNKNOWN", "DIRTY", "BLOCKED"):
             self.assertIn(f'"{st}"', src, f"{st} must be handled explicitly")
+            self.assertNotIn(st, bot.MERGE_STATES["strict"],
+                             f"{st} must not be mergeable without a human")
+        # admin bypasses the permission gate only
+        self.assertIn("BLOCKED", bot.MERGE_STATES["admin"],
+                      "--merge-admin exists to bypass the review requirement; refusing on "
+                      "BLOCKED makes it a no-op on every repo that requires review")
+        for st in ("BEHIND", "DIRTY", "UNKNOWN"):
+            self.assertNotIn(st, bot.MERGE_STATES["admin"],
+                             f"admin rights do not make {st} safe — that is content, not "
+                             f"permission")
 
     def test_bot_grades_with_the_protected_harness(self):
         """CONTRIBUTING states the evaluator "grades with the harness pinned to the
@@ -1253,17 +1272,160 @@ class CiWorkflowTest(unittest.TestCase):
             self.assertIn(p, bot.NEVER_MERGE_PATHS,
                           f"{p} decides payouts and must block an unreviewed merge")
 
+    def test_frontier_is_measured_not_pinned(self):
+        """main is benchmarked every round and THAT is what PRs are scored against.
+
+        The pinned constant failed exactly the way constants do. #25 merged and took main
+        from 3.55 to 9.54 tok/s; nothing in the merge path updated reference.lock; the next
+        PR's 8% gain was priced against a frontier main had already beaten by 2.7x and came
+        out XL when the honest tier was S. A measured frontier cannot drift from main because
+        it IS main, measured minutes earlier on the same box."""
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        self.assertIn("def measure_frontier(", src, "the round must measure main")
+        # the measurement has to reach the harness, or it is decoration: left to itself
+        # kimi_k3_eval.sh reads the frontier back out of reference.lock.
+        self.assertIn('front_flag = "" if frontier is None else f" --frontier {frontier}"',
+                      src, "the measured frontier must be passed to the harness")
+        main_fn = src[src.index("def main("):]
+        self.assertLess(main_fn.index("measure_frontier("), main_fn.index("evaluate("),
+                        "main must be measured before any PR is scored against it")
+        # ...and before anything is posted: eval-label.yml reads reference.lock at comment
+        # time, so a comment posted first gets a tier derived from the stale frontier.
+        self.assertLess(main_fn.index("reconcile_lock("), main_fn.index("post("),
+                        "the lock must be reconciled before a result is posted")
+
+    def test_frontier_write_is_narrow_and_raise_only(self):
+        """Writing reference.lock gives the bot the file that sets payout tiers, on a path
+        CODEOWNERS and sensitive-paths-guard exist to protect. Three things keep it narrow.
+
+        RAISE-ONLY is the load-bearing one. Lowering the frontier makes every subsequent PR's
+        gain look bigger, so a thermally-throttled box or a bad main could mint tiers for
+        everyone measured behind it. That direction has to stop the round, not re-baseline
+        it."""
+        bot = self._bot()
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        self.assertIn("FRONTIER_ALARM", src, "a slower main must stop the round")
+        self.assertLess(bot.FRONTIER_ALARM, 1.0)
+        self.assertGreater(bot.FRONTIER_TOL, 0,
+                           "without a tolerance the lock is rewritten on pure noise, and "
+                           "every commit to main costs every open PR a rebase")
+        # only the one node+quant frontier slot is ever addressed
+        self.assertEqual(bot._frontier_slot("h200x8", "UD-IQ1_S"),
+                         "KIMI_K3_H200X8_IQ1S_SPARKINFER_128")
+        self.assertNotIn("LLAMA", bot._frontier_slot("h200x8", "UD-IQ1_S"),
+                         "the llama reference is a real external constant — never rewritten")
+        rec = src[src.index("def reconcile_lock("):src.index("def evaluate(")]
+        self.assertIn("if seen != 1:", rec,
+                      "a rewrite that matched zero or many lines must refuse, not guess")
+        self.assertIn('"branch=main"', rec)
+
+    def test_auto_merge_still_respects_the_substantive_guards(self):
+        """Queueing is not merging, but it is arming: once the required review lands, GitHub
+        merges with nobody looking again. So `hold` / `copycat` / a maintainer-owned path
+        must stop a queue too.
+
+        The merge-STATE guards must NOT apply, though -- waiting for the review is the entire
+        point of the flag, and refusing to queue because the review has not happened yet
+        would make --auto-merge a no-op."""
+        bot = self._bot()
+        held = {"labels": [{"name": "hold"}, {"name": "eval:xl"}]}
+        self.assertTrue(bot.merge_blockers("x", 1, held, waiting_is_blocking=False),
+                        "a held PR must not be armed for auto-merge")
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        mmf = src[src.index("def mark_merge_first("):src.index("def main(")]
+        self.assertIn("waiting_is_blocking=False", mmf,
+                      "auto-merge must consult the substantive guards")
+        self.assertLess(mmf.index("merge_blockers("), mmf.index('"--auto"'),
+                        "the guards must be checked before the queue is armed")
+
+    def test_bot_clears_the_staleness_it_caused(self):
+        """Committing the measured frontier moves main, and under
+        required_status_checks.strict that puts every open PR BEHIND immediately.
+
+        Labelling them needs-rebase and waiting asks contributors to hand-fix bookkeeping the
+        bot did to them -- and it does not merely inconvenience them, it DEADLOCKS the round:
+        needs-rebase is in NEVER_MERGE_LABELS, so the frontier commit blocks the very PR it
+        was measured for. #20 was labelled merge-first and refused in the same round.
+
+        The update has to happen BEFORE the measurement, because merging main into the branch
+        changes the head sha and eval-label.yml refuses a payload measured on another
+        commit."""
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        self.assertIn("def update_pr_branch(", src)
+        self.assertIn("update-branch", src)
+        self.assertIn("expected_head_sha=", src,
+                      "updating without pinning the expected head races the author's push")
+        main_fn = src[src.index("def main("):]
+        self.assertLess(main_fn.index("update_pr_branch("), main_fn.index("evaluate("),
+                        "the branch must be current before the number is taken, or the "
+                        "measured sha is not the sha that merges")
+        # and the stale-tier labels must be reconciled before any merge decision reads them
+        self.assertLess(main_fn.index("sync_rebase_labels("), main_fn.index("merge_winner("),
+                        "a leftover needs-rebase blocks the merge it never meant to block")
+
+    def test_round_log_is_published_with_the_receipt(self):
+        """A receipt proves a number was signed. It says nothing about what the round did to
+        get there -- what the frontier moved to, which build failed, why a merge was refused.
+
+        That context lived only in the operator's terminal, which is the one place someone
+        checking the number afterwards cannot look. Both streams are captured: the
+        interesting parts of a bad round are on stderr, and a log that drops them reads like
+        a clean run."""
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        self.assertIn("def publish_log(", src)
+        self.assertIn("runs/{rid}/eval.log", src)
+        main_fn = src[src.index("def main("):]
+        self.assertIn("sys.stdout, sys.stderr = _Tee(", main_fn,
+                      "stderr must be captured too, or a failed round publishes a clean log")
+        # Published last, so the artefact covers the whole round rather than its opening.
+        # rindex, not index: --publish-log backfills an existing receipt and returns early,
+        # so it calls publish_log() near the top of main(). The AUTOMATIC publish is the last
+        # call site, and that is the one that has to follow the merge decision.
+        self.assertLess(main_fn.index("merge_winner("), main_fn.rindex("publish_log("),
+                        "the log must include the merge decision it explains")
+
+    def test_backfilled_log_needs_a_real_receipt(self):
+        """--publish-log files a log somebody hands it rather than one the round produced,
+        so it must refuse an id with no sealed run behind it.
+
+        A log filed against a receipt that does not exist is worse than no log: it looks like
+        evidence, and a reader has no measurement to check it against."""
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        self.assertIn('"--publish-log"', src)
+        block = src[src.index("    if args.publish_log:"):src.index("    prs = list_prs(")]
+        self.assertIn(f'contents/runs/{{rid}}', block,
+                      "the receipt must be confirmed to exist before a log is filed on it")
+        self.assertLess(block.index("contents/runs/"), block.index("publish_log("),
+                        "existence has to be checked BEFORE the log is written")
+        self.assertIn("--log-file", block)
+
     def test_rebase_label_clears_itself(self):
         """The frontier moves when something merges, so every other PR's tier goes stale by
         definition rather than by suspicion -- the denominator changed. The label says so.
 
         It must also clear itself once the branch is current: a label only a maintainer can
         remove turns a mechanical state into a queue someone has to babysit, and by then the
-        miner has already done the work it was asking for."""
+        miner has already done the work it was asking for.
+
+        BLOCKED IS NOT STALE. GitHub reports BLOCKED for "waiting on the required approving
+        review", which is an open PR's normal resting state here -- it says nothing about
+        whether the branch trails main. Counting it as stale deadlocked #20: the label could
+        never clear, and because needs-rebase is in NEVER_MERGE_LABELS it also blocked the
+        merge, so the label survived on the strength of the review it was helping to prevent
+        while the author had already rebased."""
         src = (ROOT / "eval/k3_eval_bot.py").read_text()
         self.assertIn('"-X", "DELETE", f"repos/{repo}/issues/{num}/labels/{REBASE_LABEL}"',
                       src, "needs-rebase is never removed once the branch is current")
-        self.assertIn("elif has and not behind:", src)
+        self.assertIn("elif has and current:", src)
+        sync = src[src.index("def sync_rebase_labels("):src.index("def mark_merge_first(")]
+        self.assertIn('stale = state in ("BEHIND", "DIRTY")', sync,
+                      "only a branch that trails main has a stale tier")
+        self.assertIn('current = state in ("CLEAN", "UNSTABLE", "BLOCKED")', sync,
+                      "BLOCKED means waiting on review, not behind — the label must clear")
+        # UNKNOWN is 'GitHub has not finished computing mergeability': not evidence either
+        # way, so it must neither set nor clear the label.
+        self.assertNotIn('"UNKNOWN"', sync,
+                         "acting on UNKNOWN labels people over an API race")
         # and the sweep must not run when the merge was blocked
         self.assertIn("if merge_winner(", src,
                       "rebase labelling must be conditional on something actually merging")
@@ -1285,7 +1447,7 @@ class CiWorkflowTest(unittest.TestCase):
         self.assertIn('if rid:\n', seal,
                       "receipt id is only kept when the box-side publish succeeded")
         self.assertLess(seal.index('res["receipt_id"] = rid.group(1)'),
-                        seal.index("r.returncode != 0"),
+                        seal.index("rc != 0"),
                         "the receipt must be kept before the exit code is considered")
         # and sealed is still only claimed once the log confirms it
         self.assertIn("contents/runs/", src)
