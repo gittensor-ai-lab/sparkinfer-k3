@@ -132,16 +132,31 @@ struct KimiK3Weights {
     //                width, so the forward runs at full cfg dims on every rank and
     //                needs no per-rank shape threading.
     //
-    //   Full         Also row/col-shard the attention and dense-FFN projections, per
-    //                weight_plan. Saves the remaining ~22 GiB and splits the attention
-    //                FLOPs, but every kernel then has to be handed per-rank widths and
-    //                the KDA/MLA state has to be sized per rank. NOT YET SUPPORTED by
-    //                the forward — the loader would shard weights the executor still
-    //                indexes at full width, which reads past the end of the slice.
+    //   ExpertsAndKda  ExpertsOnly, plus a head-parallel shard of the 69 KDA
+    //                attention layers: attn_q/k/v/ssm_g/ssm_f_b row-shard by qkv,
+    //                attn_output col-shards, and the recurrent state divides with
+    //                them. Costs ONE extra all-reduce per KDA layer, at hidden,
+    //                after attn_output.
     //
-    // Kept explicit rather than inferred from tp_size so that turning on Full is a
+    //                MEASURED, nsys at ctx 131072 on main + #57: the two Q8_0
+    //                projection kernels are 35.7% of GPU kernel time and the KDA
+    //                share of them is head-parallel, so ExpertsOnly has all eight
+    //                ranks streaming the same ~468 MB of KDA weights per layer
+    //                every token — 32.3 GB per rank per token, 8x redundant.
+    //
+    //                MLA IS DELIBERATELY LEFT REPLICATED. It is MQA: all 96 query
+    //                heads attend over ONE latent cache, so sharding query heads
+    //                divides the FLOPs but not the cache read. It buys a fraction
+    //                and pays a full collective.
+    //
+    //   Full         Also row/col-shard the MLA and dense-FFN projections, per
+    //                weight_plan. NOT YET SUPPORTED by the forward — the loader
+    //                would shard weights the executor still indexes at full width,
+    //                which reads past the end of the slice.
+    //
+    // Kept explicit rather than inferred from tp_size so that turning one on is a
     // deliberate act with a matching forward, not a silent consequence of tp>1.
-    enum class ShardPolicy { ExpertsOnly, Full };
+    enum class ShardPolicy { ExpertsOnly, ExpertsAndKda, Full };
     ShardPolicy policy = ShardPolicy::ExpertsOnly;
 
     // WHICH SLICE OF EACH TENSOR THIS RANK HOLDS. Set BEFORE calling the loader;
@@ -154,6 +169,12 @@ struct KimiK3Weights {
     // forward needs it too: an all-reduce whose tp_size disagrees with the tp_size
     // the weights were sharded under is a partial sum presented as an answer.
     tp::ShardDims shard;
+
+    // This rank's KDA slice, under ShardPolicy::ExpertsAndKda. Left at the tp=1
+    // identity (full width, zero offsets) under every other policy, so the forward
+    // reads it unconditionally and the unsharded path is the same code with the
+    // same values it always had — not a branch that can drift.
+    tp::KdaShardDims kda;
 
     // Every device buffer this struct owns, for bulk free in the destructor.
     std::vector<void*> owned;
@@ -232,8 +253,14 @@ struct KimiK3RuntimeState {
 // and are never touched. This is what lets the layer-split pipeline fit: the MLA KV
 // cache is per-MLA-layer and grows with context (~58 GB total at 1M), so an
 // every-stage-allocates-everything sizing would need that PER STAGE.
+// `kda` sizes the KDA recurrent state to THIS RANK's heads under
+// ShardPolicy::ExpertsAndKda. Null (the default) means full width, which is what
+// every unsharded caller wants and what tp=1 must keep getting. Passing a sharded
+// KdaShardDims while the forward still indexes at full width would read past the
+// end of the allocation, so the two are changed together or not at all.
 bool kimi_k3_alloc_state(const KimiK3Config& cfg, int max_ctx, KimiK3RuntimeState& out,
-                        int first_layer = -1, int last_layer = -1);
+                        int first_layer = -1, int last_layer = -1,
+                        const tp::KdaShardDims* kda = nullptr);
 void kimi_k3_reset_state(KimiK3RuntimeState& s);   // zero everything, position=0, n_ckpt=0
 void kimi_k3_free_state(KimiK3RuntimeState& s);
 

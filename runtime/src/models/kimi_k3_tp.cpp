@@ -215,7 +215,16 @@ bool kimi_k3_tp_init(const GGUF& g, const KimiK3Config& cfg, const K3PlanOptions
         }
         out.streams[(size_t)r] = R.stream;
 
-        R.weights.policy = KimiK3Weights::ShardPolicy::ExpertsOnly;
+        // SPARKINFER_K3_SHARD_KDA=1 additionally head-shards the 69 KDA attention
+        // layers. Off by default: this is a measured optimisation, not a semantic
+        // fix, so the default path must stay byte-identical until it is scored.
+        static const bool shard_kda = [] {
+            const char* e = std::getenv("SPARKINFER_K3_SHARD_KDA");
+            return e && e[0] == '1';
+        }();
+        R.weights.policy = (shard_kda && tp_size > 1)
+            ? KimiK3Weights::ShardPolicy::ExpertsAndKda
+            : KimiK3Weights::ShardPolicy::ExpertsOnly;
         R.weights.shard.tp_size = tp_size;
         R.weights.shard.rank = r;
         R.weights.shard.hidden = cfg.hidden;
@@ -230,7 +239,11 @@ bool kimi_k3_tp_init(const GGUF& g, const KimiK3Config& cfg, const K3PlanOptions
             rank_err[(size_t)r] = "weight load failed";
             return false;
         }
-        if (!kimi_k3_alloc_state(cfg, max_ctx, R.state)) {
+        // Sized to the slice the weights were just cut with. Passing the weights'
+        // own KdaShardDims rather than re-deriving it is what makes it impossible
+        // for the state and the projections to disagree about which heads this rank
+        // owns -- the failure that runs at full speed and emits wrong tokens.
+        if (!kimi_k3_alloc_state(cfg, max_ctx, R.state, -1, -1, &R.weights.kda)) {
             rank_err[(size_t)r] = "alloc_state failed";
             return false;
         }
@@ -312,7 +325,11 @@ bool kimi_k3_tp_init(const GGUF& g, const KimiK3Config& cfg, const K3PlanOptions
 
     std::string err;
     out.coll = tp::make_collective(devices, requested, &err,
-                                   /*max_count=*/(size_t)cfg.expert_latent,
+                                   // hidden (7168) > expert_latent (3584): the KDA
+                                   // reduce is the wider payload, and a collective
+                                   // sized to the narrower one would truncate it.
+                                   /*max_count=*/(size_t)(cfg.hidden > cfg.expert_latent
+                                                          ? cfg.hidden : cfg.expert_latent),
                                    /*need_f32=*/true);
     if (!out.coll) {
         std::fprintf(stderr, "[k3-tp] no collective: %s\n", err.c_str());
@@ -407,18 +424,70 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
         // phase boundary is where a fully-sharded build WOULD reduce, and keeping
         // the call sites is what makes that a one-line change rather than a
         // re-split of the forward.
+        // Under ExpertsAndKda a KDA layer's attn_output is COL-sharded, so every rank
+        // holds a full-width partial sum of the attention output and the two phases
+        // are no longer separable -- the reduce has to land between them. This is the
+        // boundary the forward already exposes; kimi_k3_partial_buffer(Attn) returns
+        // s.attn_out at cfg.hidden, which is exactly the partial.
+        //
+        // When the KDA attention is NOT sharded the two phases are still issued as
+        // one job, so the replicated path keeps its single barrier per layer and
+        // pays nothing for a split it does not need.
+        const bool kda_reduce = tp_size > 1 && cfg.is_kda_layer(layer) &&
+            p.ranks[0].weights.policy == KimiK3Weights::ShardPolicy::ExpertsAndKda;
+
         const IClock::time_point t_p12 = ip.on ? IClock::now() : IClock::time_point{};
         if (!issue_all([&](int r) {
                 KimiK3TPRank& R = p.ranks[(size_t)r];
                 if (!kimi_k3_forward_layer_phase(R.fwd, layer, K3LayerPhase::Attn,
                                                  R.x, R.x_next)) return false;
+                if (kda_reduce) return true;   // FfnPartial waits for the reduce
                 return kimi_k3_forward_layer_phase(R.fwd, layer, K3LayerPhase::FfnPartial,
                                                    R.x, R.x_next);
             })) return false;
+        // Closed HERE so t_issue never spans the reduce below; the second issue
+        // adds its own span. Letting one bracket cover both would book collective
+        // time as submission time and quietly inflate exactly the number this
+        // instrumentation exists to keep honest.
         if (ip.on) {
             ip.t_issue += secs_since(t_p12);
-            ip.n_phase_calls += 2 * tp_size;
+            ip.n_phase_calls += (kda_reduce ? 1 : 2) * tp_size;
             if (!parallel_issue) ip.n_setdev += tp_size;
+        }
+
+        if (kda_reduce) {
+            int count = 0;
+            for (int r = 0; r < tp_size; ++r) {
+                int n = 0;
+                float* buf = kimi_k3_partial_buffer(p.ranks[(size_t)r].fwd, layer,
+                                                    K3LayerPhase::Attn, &n);
+                if (!buf || n <= 0) return false;
+                if (r == 0) count = n;
+                else if (n != count) return false;
+                p.reduce_bufs[(size_t)r] = buf;
+            }
+            const IClock::time_point tk = ip.on ? IClock::now() : IClock::time_point{};
+            const bool okk = p.coll->allreduce_f32_group(p.reduce_bufs, (size_t)count,
+                                                         p.streams);
+            if (ip.on) ip.t_coll += secs_since(tk);
+            if (!okk) {
+                std::fprintf(stderr, "[k3-tp] KDA all-reduce failed at layer %d\n", layer);
+                return false;
+            }
+            ++p.n_collectives;
+
+            const IClock::time_point t_fp = ip.on ? IClock::now() : IClock::time_point{};
+            if (!issue_all([&](int r) {
+                    KimiK3TPRank& R = p.ranks[(size_t)r];
+                    return kimi_k3_forward_layer_phase(R.fwd, layer,
+                                                       K3LayerPhase::FfnPartial,
+                                                       R.x, R.x_next);
+                })) return false;
+            if (ip.on) {
+                ip.t_issue += secs_since(t_fp);
+                ip.n_phase_calls += tp_size;
+                if (!parallel_issue) ip.n_setdev += tp_size;
+            }
         }
 
         // --- the collective -------------------------------------------------

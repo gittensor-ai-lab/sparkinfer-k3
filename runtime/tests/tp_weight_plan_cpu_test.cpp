@@ -442,6 +442,41 @@ static void test_kda_plan_extents_match_kda_shard_dims() {
     }
 }
 
+static void test_kda_attn_k_v_are_not_a_kv_group() {
+    std::printf("kda_attn_k_v_are_not_a_kv_group\n");
+    // THE TRAP. attn_k.weight / attn_v.weight are written by BOTH branches: on an
+    // MLA layer they are absent (MLA uses attn_k_b/attn_v_b), on a KDA layer they
+    // are per-head input projections at [hidden, qkv] with no kv group involved.
+    //
+    // weight_plan downgrades them to Replicate whenever kv_replicated is set, and
+    // shard_dims() DOES set it for K3 (MLA stored as MQA, 1 kv head < 8 ranks). If
+    // the KDA loader ever inherits that flag, every rank holds a full-width attn_k
+    // beside a banded attn_q and the layer runs at full speed over mismatched
+    // slices. The loader states the exemption explicitly; this pins both halves.
+    ShardDims d;
+    CHECK(shard_dims(kimi_k3(), cfg_of(8), 0, &d).ok(), "shard");
+    CHECK(d.kv_replicated, "K3 at tp=8 must report kv_replicated — 1 kv head < 8 ranks");
+
+    TensorPlan mla = plan_for("blk.3.attn_k.weight", 12288, 7168, d);
+    CHECK(mla.rule == Rule::Replicate, "with kv_replicated set, the table downgrades");
+    CHECK(mla.replicated_fallback, "and says so");
+
+    // The exemption the KDA loader applies: same tensor, kv_replicated cleared.
+    ShardDims kda = d;
+    kda.kv_replicated = false;
+    for (const char* t : {"blk.3.attn_k.weight", "blk.3.attn_v.weight",
+                          "blk.3.attn_q.weight"}) {
+        TensorPlan p = plan_for(t, 12288, 7168, kda);
+        CHECK(p.rule == Rule::RowShard, "%s must row-shard on a KDA layer", t);
+        CHECK(p.rows == 1536, "%s rows %d, want 1536", t, p.rows);
+        CHECK(!p.replicated_fallback, "%s must not report a fallback", t);
+    }
+    // And all three must land on the SAME band, or q/k/v cover different heads.
+    CHECK(plan_for("blk.3.attn_q.weight", 12288, 7168, kda).band.offset ==
+          plan_for("blk.3.attn_k.weight", 12288, 7168, kda).band.offset,
+          "attn_q and attn_k must band identically");
+}
+
 static void test_kda_table_has_no_shadowed_duplicates() {
     std::printf("kda_table_has_no_shadowed_duplicates\n");
     // The table is one std::unordered_map built from an initializer list, so a
@@ -482,6 +517,7 @@ int main() {
     test_kda_every_loader_tensor_has_a_rule();
     test_kda_plan_is_internally_consistent();
     test_kda_plan_extents_match_kda_shard_dims();
+    test_kda_attn_k_v_are_not_a_kv_group();
     test_kda_table_has_no_shadowed_duplicates();
 
     std::printf("\n%d checks, %d failure(s)\n", g_checks, g_failures);
