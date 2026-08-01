@@ -1052,6 +1052,63 @@ class CiWorkflowTest(unittest.TestCase):
         self.assertNotIn("frontier_tps", payload)
         self.assertEqual(payload["tps"], 9.56, "the measurement itself must survive")
 
+    def _bot(self):
+        import importlib.util as _u
+        spec = _u.spec_from_file_location("k3bot", ROOT / "eval/k3_eval_bot.py")
+        m = _u.module_from_spec(spec)
+        saved, sys.argv = sys.argv, ["k3bot"]
+        try:
+            spec.loader.exec_module(m)
+        finally:
+            sys.argv = saved
+        return m
+
+    def test_bot_comment_stays_machine_readable(self):
+        """The comment got a human-readable table, which is exactly the change that can
+        silently break the pipeline: eval-label.yml gates on
+        startsWith(comment.body, '/eval') and then sed-scrapes the JSON off ONE line. Format
+        it wrong and the workflow simply never fires -- no error, no label, no clue."""
+        import io, contextlib, re as _re, json as _j
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self._bot().post("r", 1, {"commit": "abc1234", "tps": 9.55, "top1": 1.0,
+                                      "kl": 0.004, "label": "XL"}, True)
+        body = buf.getvalue().split("---\n", 1)[1]
+        self.assertTrue(body.startswith("/eval"), "workflow trigger requires /eval first")
+        m = _re.match(r".*RESULT_JSON\s*(\{.*\}).*", body.split("\n")[0])
+        self.assertIsNotNone(m, "the payload is no longer on one scrapeable line")
+        self.assertNotIn("label", _j.loads(m.group(1)), "bot posted a CI-derived field")
+
+    def test_merge_first_picks_the_largest_measured_gain(self):
+        """Two PRs in one round share a frontier, so faster genuinely is the larger gain.
+        Whichever merges moves the frontier, and the rest must be re-measured against it --
+        which is why exactly one carries the label."""
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self._bot().mark_merge_first(
+                "r", [(20, {"tps": 8.17}), (25, {"tps": 9.55})], True)
+        out = buf.getvalue()
+        self.assertIn("--add-label merge-first on #25", out)
+        self.assertIn("--remove-label merge-first on #20", out)
+
+    def test_bot_never_bypasses_branch_protection(self):
+        """main requires an approving review, and a bot approving the PR it merges is not a
+        review. --auto-merge queues GitHub's native auto-merge so the merge fires once every
+        requirement is met, including that human approval. It must never reach for --admin,
+        which is the bypass disarmed in #36."""
+        import ast as _ast
+        tree = _ast.parse((ROOT / "eval/k3_eval_bot.py").read_text())
+        # Check the ARGUMENTS of gh() calls, not the file text: the docstring explains why
+        # --admin is never used, and a substring search matches that explanation.
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.Call) and getattr(node.func, "id", "") == "gh":
+                args = [a.value for a in _ast.walk(node)
+                        if isinstance(a, _ast.Constant) and isinstance(a.value, str)]
+                self.assertNotIn("--admin", args, "a gh() call bypasses branch protection")
+                if "merge" in args:
+                    self.assertIn("--auto", args, "merge should queue, not merge directly")
+
     def test_baseline_results_are_committable(self):
         """The `lock` job requires a committed bench/results JSON to back any pinned
         baseline. bench/.gitignore ignores results/ wholesale, so without an explicit
