@@ -756,12 +756,20 @@ class ReceiptValidator:
 # ---- Utility functions for the eval box ----
 
 def compute_build_hash(build_dir: str) -> str:
-    """Compute SHA256 of the main sparkinfer binary.
+    """Compute SHA256 of the binary that produced the measurement.
 
-    Tries qwen3_gguf_bench first, falls back to qwen3_gguf_score.
+    kimi_k3_tp_bench FIRST, because on the K3 track it is the only binary that runs. The
+    candidate list held only the inherited Qwen names, so `Path(build_dir).is_dir()` passed,
+    no exception was raised, and this returned "" on every K3 receipt -- silently. Every run
+    in sparkinfer-k3-log carries build_hash="", so a receipt attests a COMMIT and not the
+    artifact, and verify_strict (which rejects an empty build_hash) could never be switched
+    on. That matters most here: the binary is built from the PR's own runtime/, so binding
+    the receipt to it is the difference between attesting what ran and attesting what was
+    claimed to run.
+
     Returns hex string, or empty string if no binary found.
     """
-    candidates = ["qwen3_gguf_bench", "qwen3_gguf_score"]
+    candidates = ["kimi_k3_tp_bench", "qwen3_gguf_bench", "qwen3_gguf_score"]
     for name in candidates:
         path = os.path.join(build_dir, name)
         if os.path.isfile(path):
