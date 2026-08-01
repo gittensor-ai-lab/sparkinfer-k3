@@ -973,6 +973,40 @@ class CiWorkflowTest(unittest.TestCase):
             self.assertNotIn("::", line, f"annotation leaked into GITHUB_OUTPUT: {line}")
             self.assertIn("=", line)
 
+    def test_cap_rechecks_when_a_draft_becomes_ready(self):
+        """Drafts do not count toward the open-PR cap, which is right -- parking an idea is
+        not something to auto-close. But it makes the cap trivially evadable unless becoming
+        ready re-checks: open the first PR as a DRAFT, open a second normally (the cap sees
+        one non-draft and passes), then mark the draft ready. That fires ready_for_review,
+        not opened, so nothing re-ran and the author holds two.
+
+        widecloud did exactly this with #52 and #57. copycat-guard already listened for
+        ready_for_review for the same reason -- the pattern was known and this workflow
+        simply never got it."""
+        import yaml as _y
+        cap_yaml = _y.safe_load((ROOT / ".github/workflows/cap-open-prs.yml").read_text())
+        types = cap_yaml[True]["pull_request_target"]["types"]
+        self.assertIn("ready_for_review", types,
+                      "a draft marked ready never re-checks the cap")
+        for t in ("opened", "reopened"):
+            self.assertIn(t, types)
+
+    def test_cap_keeps_the_measured_pr_not_merely_the_oldest(self):
+        """Node time is the scarce resource. A PR carrying an eval:* tier has had ~40 minutes
+        of 8x H200 spent on it and holds a live number against the CURRENT frontier, so
+        closing it in favour of an unmeasured sibling discards that and forces a re-run.
+
+        The old rule kept the oldest unconditionally -- and its header comment claimed the
+        opposite of what its code did, so neither reading was reliable. Age now decides only
+        among equals. eval:none does not count as measured: it means the gain was inside the
+        significance gate, so there is no tier to protect."""
+        cap = (ROOT / ".github/workflows/cap-open-prs.yml").read_text()
+        self.assertIn("scored(b) - scored(a)", cap, "measured PRs must sort first")
+        self.assertIn("l.name !== 'eval:none'", cap,
+                      "eval:none is not a tier worth protecting")
+        self.assertNotIn("Keep the MAX oldest", cap,
+                         "the stale comment contradicted the code")
+
     def test_destructive_workflows_skip_drafts(self):
         """A draft is work someone has explicitly marked unfinished. CI running on it is
         useful; closing it, denylisting its author, or attaching a payout tier to it is not.
@@ -1487,6 +1521,34 @@ class CiWorkflowTest(unittest.TestCase):
         self.assertIn("if seen != 1:", rec,
                       "a rewrite that matched zero or many lines must refuse, not guess")
         self.assertIn('"branch=main"', rec)
+
+    def test_merge_decisions_wait_for_asynchronous_github_state(self):
+        """Both merge-path failures were one bug: acting on GitHub state that is computed
+        asynchronously, without waiting for it to settle.
+
+        mergeStateStatus is UNKNOWN while GitHub recomputes, and returns to UNKNOWN whenever
+        the base branch moves -- which this bot does to itself when it commits the frontier.
+        #57 reported non-BEHIND before that finished, so its branch update was skipped, and
+        minutes later the merge was refused for the BEHIND the update would have fixed.
+
+        And the tier is applied by eval-label.yml in CI, after the comment is posted. Reading
+        the label immediately always found nothing, so --merge-admin could never merge a PR
+        it had just evaluated. Waiting is the fix; merging without a tier is not, because the
+        label is the trusted side's verdict and the bot must not act on its own number."""
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        self.assertIn("def wait_mergeable_state(", src)
+        self.assertIn("def wait_for_tier(", src)
+        self.assertIn('!= "UNKNOWN"', src, "UNKNOWN is no answer, not a stale one")
+        # the branch-update decision must read a settled state
+        main_fn = src[src.index("def main("):]
+        self.assertIn("wait_mergeable_state(args.repo, num).get(", main_fn,
+                      "the update decision reads mid-recompute state")
+        self.assertLess(main_fn.index("wait_for_tier("), main_fn.index("merge_winner("),
+                        "the tier must land before the merge decision reads it")
+        # ...and a timeout must NOT be treated as permission
+        tier = src[src.index("def wait_for_tier("):src.index("def merge_blockers(")]
+        self.assertIn("refusing to merge on the bot's own number", tier)
+        self.assertIn("return []", tier, "no tier means no merge, not merge anyway")
 
     def test_auto_merge_still_respects_the_substantive_guards(self):
         """Queueing is not merging, but it is arming: once the required review lands, GitHub
