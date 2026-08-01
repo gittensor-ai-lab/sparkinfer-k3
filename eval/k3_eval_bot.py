@@ -101,6 +101,21 @@ def evaluate(pr, repo, seal=False):
     num = pr["number"]
     steps = " && ".join([
         f"cd {BOX_REPO_DIR}",
+        # Start from a clean box every time. Two ways the previous PR poisons this one:
+        #
+        #   An orphaned bench still holding GPU memory. Killing the controller does not kill
+        #   what it started over ssh, so an interrupted run leaves 8-125 GiB resident per
+        #   device and the next load dies in cudaMalloc partway through layer 92 -- which
+        #   reads like an OOM bug in the PR under test rather than leftover state.
+        #   Matched on the built path so the build's own "--target kimi_k3_tp_bench" is not
+        #   caught by its own cleanup.
+        #
+        #   A dirty tree. Restoring the protected harness stages bench/scripts, so the next
+        #   git checkout --detach aborts with "local changes would be overwritten" and the
+        #   PR is reported as a build failure it had nothing to do with.
+        f"pkill -f '{BOX_REPO_DIR}/build/runtime/kimi_k3_tp_bench' 2>/dev/null || true",
+        "git reset -q --hard",
+        "git clean -qfd",
         "git fetch -q origin +refs/pull/*/head:refs/remotes/origin/pr/* --force",
         f"git fetch -q origin {sha} || true",
         f"git checkout -q --detach {sha}",
