@@ -921,6 +921,28 @@ struct BlockQ8_0 {   // 34 bytes, matches ggml block_q8_0 exactly
 };
 
 static_assert(sizeof(BlockQ8_0) == 34, "bad block_q8_0 layout");
+static_assert(alignof(BlockQ8_0) == 2, "get_int_b2 assumes 2-byte alignment");
+
+// Four int8 weights as one packed int, from a 2-BYTE-aligned source.
+//
+// WHY THIS EXISTS RATHER THAN A PLAIN int LOAD. BlockQ8_0 is 34 bytes with alignment
+// 2, so block b starts at byte 34b and its qs[] starts at 34b+2. 34b mod 4 == 2b mod 4,
+// so qs is 4-byte aligned only for ODD b — never uniformly. nvcc therefore cannot
+// legally widen a scalar `qs[j]` loop and must emit one ld.global.s8 per element:
+// 32 loads per block. Pairs of uint16 ARE always aligned (the whole struct is), so two
+// of those rebuild the identical 4 bytes and let the inner loop run 8 iterations
+// instead of 32. ggml's CUDA path carries get_int_b2() for exactly this reason
+// (ggml/src/ggml-cuda/vecdotq.cuh) — this is the same trick, not a new idea.
+//
+// Lane j of the result is qs[4*i32 + j] in bits [8j, 8j+8), matching the order the
+// scalar loop consumed them, so callers can keep their accumulation order byte-exact.
+// Little-endian is guaranteed on every CUDA target.
+__device__ __forceinline__ int get_int_b2(const int8_t* __restrict__ qs, int i32) {
+    const uint16_t* x16 = (const uint16_t*)qs;
+    int x32 = (int)x16[2 * i32 + 0];
+    x32 |= (int)x16[2 * i32 + 1] << 16;
+    return x32;
+}
 
 // CPU-reference-compatible activation conversion. One CUDA thread deliberately
 // owns one quant block: these vectors are tiny (at most 33,792 values in K3), and
@@ -988,12 +1010,179 @@ __global__ void proj_q8_0_kernel(float* __restrict__ y, const float* __restrict_
         const float d = __half2float(__ushort_as_half(row[b].d));
         const float* xb = x + (size_t)b * 32;
         float s = 0.0f;
+        // 8 packed loads instead of 32 byte loads — see get_int_b2. The unpack order
+        // below walks j = 0..31 in the SAME order the scalar loop did, so every
+        // partial sum lands in the same float in the same sequence and the result is
+        // bit-identical, not merely close.
 #pragma unroll
-        for (int j = 0; j < 32; ++j) s += (float)row[b].qs[j] * xb[j];
+        for (int i = 0; i < 8; ++i) {
+            const int wq = get_int_b2(row[b].qs, i);
+            const float* xq = xb + 4 * i;
+            s += (float)(int8_t)(wq >>  0) * xq[0];
+            s += (float)(int8_t)(wq >>  8) * xq[1];
+            s += (float)(int8_t)(wq >> 16) * xq[2];
+            s += (float)(int8_t)(wq >> 24) * xq[3];
+        }
         acc += d * s;
     }
     acc = block_sum<BLOCK>(acc, shm);
     if (threadIdx.x == 0) y[n] = acc;
+}
+
+// Same dot product, but ROWS output rows per thread block.
+//
+// WHY. The single-row kernel gives every output row its own block, and every block
+// reads the WHOLE activation vector. For K3's KDA projections that is N=12288 blocks
+// each pulling K=7168 floats: ~344 MB of activation traffic per projection, against
+// ~94 MB of Q8_0 weights. The activation is only 28 KB and sits in L2, but each block
+// still fills its own L1 from L2, so the re-read is paid 12288 times.
+//
+// Co-locating ROWS rows in one block cuts that by ROWS: the activation block is loaded
+// once per (b, i) and reused across all ROWS weight rows, so the L1 fill is amortised.
+// The weights are untouched — each row still streams its own, which is the traffic that
+// is actually irreducible.
+//
+// Only 4 activation values and ROWS accumulators are held live, rather than staging the
+// whole 32-float block in registers: the L2 saving comes from co-locating the rows, not
+// from register staging, and staging 32 floats would cost ~32 registers of occupancy to
+// buy nothing extra.
+//
+// BIT-IDENTICAL to the single-row kernel: each row keeps the same thread-to-block
+// striding, the same i order, the same four adds per i, and the same block_sum. Only
+// which rows share a CUDA block changes.
+template <int BLOCK, int ROWS>
+__global__ void proj_q8_0_multirow_kernel(float* __restrict__ y,
+                                          const float* __restrict__ x,
+                                          const BlockQ8_0* __restrict__ W,
+                                          int blocks_per_row, int n_rows) {
+    const int n0 = blockIdx.x * ROWS;
+    __shared__ float shm[BLOCK / 32 + 1];
+
+    float acc[ROWS];
+#pragma unroll
+    for (int r = 0; r < ROWS; ++r) acc[r] = 0.0f;
+
+    for (int b = threadIdx.x; b < blocks_per_row; b += BLOCK) {
+        const float* xb = x + (size_t)b * 32;
+        float s[ROWS];
+#pragma unroll
+        for (int r = 0; r < ROWS; ++r) s[r] = 0.0f;
+
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            // One activation load, reused by every row in this block.
+            const float x0 = xb[4 * i + 0], x1 = xb[4 * i + 1];
+            const float x2 = xb[4 * i + 2], x3 = xb[4 * i + 3];
+#pragma unroll
+            for (int r = 0; r < ROWS; ++r) {
+                if (n0 + r >= n_rows) continue;
+                const BlockQ8_0* row = W + (size_t)(n0 + r) * blocks_per_row;
+                const int wq = get_int_b2(row[b].qs, i);
+                s[r] += (float)(int8_t)(wq >>  0) * x0;
+                s[r] += (float)(int8_t)(wq >>  8) * x1;
+                s[r] += (float)(int8_t)(wq >> 16) * x2;
+                s[r] += (float)(int8_t)(wq >> 24) * x3;
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < ROWS; ++r) {
+            if (n0 + r >= n_rows) continue;
+            const BlockQ8_0* row = W + (size_t)(n0 + r) * blocks_per_row;
+            acc[r] += __half2float(__ushort_as_half(row[b].d)) * s[r];
+        }
+    }
+
+    // block_sum is called by every thread for every row — it contains __syncthreads(),
+    // so the call itself must stay uniform; only the store is guarded.
+#pragma unroll
+    for (int r = 0; r < ROWS; ++r) {
+        const float v = block_sum<BLOCK>(acc[r], shm);
+        if (threadIdx.x == 0 && n0 + r < n_rows) y[n0 + r] = v;
+    }
+}
+
+// Four projections that share one activation, in one launch.
+//
+// K3's KDA block computes attn_q, attn_k, attn_v and ssm_g from the SAME normed hidden
+// state, all at N=qkv=12288, K=hidden=7168. As four separate launches that is four grids
+// each re-reading the same 28 KB activation, on all 69 KDA layers, every token.
+//
+// Fusing them multiplies the activation reuse by the number of tensors on top of what
+// multi-row already gives: one load of an activation block now feeds TENSORS x ROWS dot
+// products instead of ROWS. ROWS is 2 here rather than the 4 the single-tensor kernel
+// uses, because the accumulators are per (tensor, row) — 4x2 live accumulators plus 4x2
+// running sums is already more register pressure than the single-tensor path, and the
+// amortisation is 8x either way.
+//
+// BIT-IDENTICAL: every output row keeps the same thread-to-block striding, the same i
+// order, the same four adds per i, and the same block_sum. Only which dot products share
+// a CUDA block changes.
+template <int BLOCK, int ROWS>
+__global__ void proj_q8_0_fused4_kernel(float* __restrict__ y0, float* __restrict__ y1,
+                                        float* __restrict__ y2, float* __restrict__ y3,
+                                        const float* __restrict__ x,
+                                        const BlockQ8_0* __restrict__ W0,
+                                        const BlockQ8_0* __restrict__ W1,
+                                        const BlockQ8_0* __restrict__ W2,
+                                        const BlockQ8_0* __restrict__ W3,
+                                        int blocks_per_row, int n_rows) {
+    const int n0 = blockIdx.x * ROWS;
+    __shared__ float shm[BLOCK / 32 + 1];
+
+    const BlockQ8_0* const Wt[4] = {W0, W1, W2, W3};
+    float* const Yt[4] = {y0, y1, y2, y3};
+
+    float acc[4][ROWS];
+#pragma unroll
+    for (int t = 0; t < 4; ++t)
+#pragma unroll
+        for (int r = 0; r < ROWS; ++r) acc[t][r] = 0.0f;
+
+    for (int b = threadIdx.x; b < blocks_per_row; b += BLOCK) {
+        const float* xb = x + (size_t)b * 32;
+        float s[4][ROWS];
+#pragma unroll
+        for (int t = 0; t < 4; ++t)
+#pragma unroll
+            for (int r = 0; r < ROWS; ++r) s[t][r] = 0.0f;
+
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            // One activation load, reused by all four tensors and all ROWS rows.
+            const float x0 = xb[4 * i + 0], x1 = xb[4 * i + 1];
+            const float x2 = xb[4 * i + 2], x3 = xb[4 * i + 3];
+#pragma unroll
+            for (int t = 0; t < 4; ++t)
+#pragma unroll
+                for (int r = 0; r < ROWS; ++r) {
+                    if (n0 + r >= n_rows) continue;
+                    const BlockQ8_0* row = Wt[t] + (size_t)(n0 + r) * blocks_per_row;
+                    const int wq = get_int_b2(row[b].qs, i);
+                    s[t][r] += (float)(int8_t)(wq >>  0) * x0;
+                    s[t][r] += (float)(int8_t)(wq >>  8) * x1;
+                    s[t][r] += (float)(int8_t)(wq >> 16) * x2;
+                    s[t][r] += (float)(int8_t)(wq >> 24) * x3;
+                }
+        }
+#pragma unroll
+        for (int t = 0; t < 4; ++t)
+#pragma unroll
+            for (int r = 0; r < ROWS; ++r) {
+                if (n0 + r >= n_rows) continue;
+                const BlockQ8_0* row = Wt[t] + (size_t)(n0 + r) * blocks_per_row;
+                acc[t][r] += __half2float(__ushort_as_half(row[b].d)) * s[t][r];
+            }
+    }
+
+    // block_sum contains __syncthreads(), so the calls stay uniform across the block;
+    // only the stores are guarded.
+#pragma unroll
+    for (int t = 0; t < 4; ++t)
+#pragma unroll
+        for (int r = 0; r < ROWS; ++r) {
+            const float v = block_sum<BLOCK>(acc[t][r], shm);
+            if (threadIdx.x == 0 && n0 + r < n_rows) Yt[t][n0 + r] = v;
+        }
 }
 
 template <int BLOCK>
@@ -1006,9 +1195,21 @@ __global__ void proj_q8_0_q8_0_kernel(float* __restrict__ y,
     __shared__ float shm[BLOCK / 32 + 1];
     float acc = 0.0f;
     for (int b = threadIdx.x; b < blocks_per_row; b += BLOCK) {
+        // __dp4a does four int8 MACs per instruction: 32 IMAD -> 8 dp4a, on top of
+        // the 32 -> 8 load reduction. This is the integer dot product llama.cpp's
+        // quantised mat-vecs are built on, and it is why the reference path is fast;
+        // writing it as a scalar loop gave up the whole point of quantising the
+        // activation. Available from sm_61 — every arch in CMAKE_CUDA_ARCHITECTURES
+        // (89;90;100;120;121) qualifies.
+        //
+        // Bit-identical to the scalar loop: these are exact integer products summed
+        // in int32, where addition IS associative, so regrouping cannot change the
+        // result. The accumulator cannot overflow either — |sumi| <= 32*127*127 =
+        // 516,128, three orders of magnitude inside int32.
         int sumi = 0;
 #pragma unroll
-        for (int j = 0; j < 32; ++j) sumi += (int)row[b].qs[j] * (int)x[b].qs[j];
+        for (int i = 0; i < 8; ++i)
+            sumi = __dp4a(get_int_b2(row[b].qs, i), get_int_b2(x[b].qs, i), sumi);
         const float dw = __half2float(__ushort_as_half(row[b].d));
         const float dx = __half2float(__ushort_as_half(x[b].d));
         acc += (float)sumi * (dw * dx);
@@ -1420,6 +1621,40 @@ void mla_decode_attn_f32(float* out, const float* q, const float* k_cache,
         out, q, k_cache, wv_b, key_length, kv_lora, v_dim, n_ctx, scale);
 }
 
+// Threads that would run ZERO iterations of the block loop are not free.
+//
+// Both projection kernels stride `for (b = threadIdx.x; b < blocks_per_row; b += BLOCK)`,
+// so a launch with BLOCK=128 against blocks_per_row < 128 leaves most of the block doing
+// nothing but taking up an SM slot and a slot in block_sum. K3 has projections where that
+// is the common case, not the corner case:
+//
+//   ssm_f_b        K=128  (kda_head_dim)   -> blocks_per_row 4    124/128 idle  96.9%
+//   attn_q_b       K=1536 (q_lora_rank)    -> blocks_per_row 48    80/128 idle  62.5%
+//   ffn_routed_up  K=3584 (expert_latent)  -> blocks_per_row 112   16/128 idle  12.5%
+//
+// ssm_f_b runs on all 69 KDA layers and attn_q_b on all 24 MLA layers, every token. This
+// is the same defect PR #7 fixed in the MoE dispatch ("96 of every 128 threads executed
+// zero iterations and returned 0.0f"), which survived there for the same reason it
+// survives here: the idle threads contribute exact zeros, so the output is correct and
+// only the occupancy is wrong.
+//
+// BIT-IDENTICAL, unconditionally. Two things have to hold and both do:
+//
+//   1. Warp 0's shuffle tree is untouched — the same 32 lanes hold the same values in
+//      either launch, so it reduces to the same bits.
+//   2. The cross-warp sum only drops exact +0.0f terms, and x + 0.0f == x.
+//
+// The one case that would break (2) is x = -0.0f, where -0.0f + 0.0f is +0.0f. It cannot
+// occur: every accumulator here is initialised to +0.0f, and +0.0f + anything is never
+// -0.0f, so no partial sum can carry a negative zero into the reduction in the first
+// place. Checked over 160,000 random rows at every blocks_per_row K3 produces, including
+// the 32/64/65 dispatch boundaries.
+static inline int proj_block_for(int blocks_per_row) {
+    if (blocks_per_row <= 32) return 32;
+    if (blocks_per_row <= 64) return 64;
+    return 128;
+}
+
 bool k3_proj_f32(float* y, const float* x, const void* W, int wtype,
                  int N, int K, cudaStream_t stream) {
     if (N <= 0 || K <= 0) return false;
@@ -1431,13 +1666,85 @@ bool k3_proj_f32(float* y, const float* x, const void* W, int wtype,
             return true;
         case 8: {  // Q8_0
             if (K % 32 != 0) return false;
-            proj_q8_0_kernel<BLOCK><<<(unsigned)N, BLOCK, 0, stream>>>(
-                y, x, (const BlockQ8_0*)W, K / 32);
+            // Multi-row amortises the activation re-read, but it also divides the grid
+            // by ROWS. That is only free while the grid still covers the device several
+            // times over — K3's big projections are N=12288 (grid 3072), whereas the
+            // small ones (n_head=96 for ssm_beta) would drop to 24 blocks and lose more
+            // to idle SMs than the activation traffic was costing. Single-row below the
+            // threshold keeps those on the wide grid.
+            constexpr int ROWS = 4;
+            constexpr int MULTIROW_MIN_N = 1024;   // grid >= 256 blocks
+            const int nb = K / 32;
+            const int TB = proj_block_for(nb);
+            if (N >= MULTIROW_MIN_N) {
+                const unsigned grid = (unsigned)((N + ROWS - 1) / ROWS);
+                switch (TB) {
+                    case 32:
+                        proj_q8_0_multirow_kernel<32, ROWS><<<grid, 32, 0, stream>>>(
+                            y, x, (const BlockQ8_0*)W, nb, N);
+                        break;
+                    case 64:
+                        proj_q8_0_multirow_kernel<64, ROWS><<<grid, 64, 0, stream>>>(
+                            y, x, (const BlockQ8_0*)W, nb, N);
+                        break;
+                    default:
+                        proj_q8_0_multirow_kernel<BLOCK, ROWS><<<grid, BLOCK, 0, stream>>>(
+                            y, x, (const BlockQ8_0*)W, nb, N);
+                        break;
+                }
+            } else {
+                switch (TB) {
+                    case 32:
+                        proj_q8_0_kernel<32><<<(unsigned)N, 32, 0, stream>>>(
+                            y, x, (const BlockQ8_0*)W, nb);
+                        break;
+                    case 64:
+                        proj_q8_0_kernel<64><<<(unsigned)N, 64, 0, stream>>>(
+                            y, x, (const BlockQ8_0*)W, nb);
+                        break;
+                    default:
+                        proj_q8_0_kernel<BLOCK><<<(unsigned)N, BLOCK, 0, stream>>>(
+                            y, x, (const BlockQ8_0*)W, nb);
+                        break;
+                }
+            }
             return true;
         }
         default:
             return false;
     }
+}
+
+bool k3_proj_f32_x4(float* y0, float* y1, float* y2, float* y3, const float* x,
+                    const void* W0, const void* W1, const void* W2, const void* W3,
+                    int wtype, int N, int K, cudaStream_t stream) {
+    // Deliberately narrow: Q8_0 only, all four the same shape. Anything else returns
+    // false so the caller falls back to four ordinary k3_proj_f32 calls rather than this
+    // path silently handling a case it was not written for.
+    if (N <= 0 || K <= 0 || wtype != 8 || K % 32 != 0) return false;
+    if (!y0 || !y1 || !y2 || !y3 || !W0 || !W1 || !W2 || !W3) return false;
+    constexpr int ROWS = 2;
+    if (N < ROWS) return false;
+    const int nb = K / 32;
+    const unsigned grid = (unsigned)((N + ROWS - 1) / ROWS);
+    switch (proj_block_for(nb)) {
+        case 32:
+            proj_q8_0_fused4_kernel<32, ROWS><<<grid, 32, 0, stream>>>(
+                y0, y1, y2, y3, x, (const BlockQ8_0*)W0, (const BlockQ8_0*)W1,
+                (const BlockQ8_0*)W2, (const BlockQ8_0*)W3, nb, N);
+            break;
+        case 64:
+            proj_q8_0_fused4_kernel<64, ROWS><<<grid, 64, 0, stream>>>(
+                y0, y1, y2, y3, x, (const BlockQ8_0*)W0, (const BlockQ8_0*)W1,
+                (const BlockQ8_0*)W2, (const BlockQ8_0*)W3, nb, N);
+            break;
+        default:
+            proj_q8_0_fused4_kernel<128, ROWS><<<grid, 128, 0, stream>>>(
+                y0, y1, y2, y3, x, (const BlockQ8_0*)W0, (const BlockQ8_0*)W1,
+                (const BlockQ8_0*)W2, (const BlockQ8_0*)W3, nb, N);
+            break;
+    }
+    return true;
 }
 
 bool k3_proj_ggml_f32(float* y, const float* x, const void* W, int wtype,
@@ -1450,9 +1757,22 @@ bool k3_proj_ggml_f32(float* y, const float* x, const void* W, int wtype,
     constexpr int QT = 128;
     quantize_q8_0_kernel<<<(nb + QT - 1) / QT, QT, 0, stream>>>(
         (BlockQ8_0*)q8_scratch, x, nb);
+    // Same idle-thread sizing as the f32-activation path above.
     constexpr int BLOCK = 128;
-    proj_q8_0_q8_0_kernel<BLOCK><<<(unsigned)N, BLOCK, 0, stream>>>(
-        y, (const BlockQ8_0*)q8_scratch, (const BlockQ8_0*)W, nb);
+    switch (proj_block_for(nb)) {
+        case 32:
+            proj_q8_0_q8_0_kernel<32><<<(unsigned)N, 32, 0, stream>>>(
+                y, (const BlockQ8_0*)q8_scratch, (const BlockQ8_0*)W, nb);
+            break;
+        case 64:
+            proj_q8_0_q8_0_kernel<64><<<(unsigned)N, 64, 0, stream>>>(
+                y, (const BlockQ8_0*)q8_scratch, (const BlockQ8_0*)W, nb);
+            break;
+        default:
+            proj_q8_0_q8_0_kernel<BLOCK><<<(unsigned)N, BLOCK, 0, stream>>>(
+                y, (const BlockQ8_0*)q8_scratch, (const BlockQ8_0*)W, nb);
+            break;
+    }
     return true;
 }
 

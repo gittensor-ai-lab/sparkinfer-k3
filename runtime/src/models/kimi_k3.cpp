@@ -783,9 +783,30 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             if (kda_ord < 0) return false;
             const int head_dim = cfg.kda_head_dim, n_head = cfg.n_q_heads;
 
-            if (!proj(s.qkv_q, s.normed, L.attn_q, qkv, H)) return false;
-            if (!proj(s.qkv_k, s.normed, L.attn_k, qkv, H)) return false;
-            if (!proj(s.qkv_v, s.normed, L.attn_v, qkv, H)) return false;
+            // attn_q / attn_k / attn_v / ssm_g all read the SAME s.normed at the same
+            // [qkv, H] shape, so they go out as one launch instead of four, and one
+            // activation load feeds all four. ssm_g is hoisted up here from below to
+            // join them: s.normed is written once at attn_norm above and is not touched
+            // again anywhere in this block, so computing g early is the same value at a
+            // different point in the stream order. Its consumer (kda_gate_out_f32) still
+            // runs after, on the same stream.
+            //
+            // k3_proj_f32_x4 returns false for anything outside its narrow contract
+            // (non-Q8_0, mismatched shape, missing tensor) — that is "use the slow path",
+            // not an error, so the fallback below is the general case, not dead code.
+            const bool fused_qkvg =
+                !ggml_qact_proj &&
+                L.attn_q.ok() && L.attn_k.ok() && L.attn_v.ok() && L.ssm_g.ok() &&
+                L.attn_q.type == 8 && L.attn_k.type == 8 &&
+                L.attn_v.type == 8 && L.ssm_g.type == 8 &&
+                k3k::k3_proj_f32_x4(s.qkv_q, s.qkv_k, s.qkv_v, s.g_proj_out, s.normed,
+                                    L.attn_q.data, L.attn_k.data, L.attn_v.data,
+                                    L.ssm_g.data, L.attn_q.type, qkv, H, stream);
+            if (!fused_qkvg) {
+                if (!proj(s.qkv_q, s.normed, L.attn_q, qkv, H)) return false;
+                if (!proj(s.qkv_k, s.normed, L.attn_k, qkv, H)) return false;
+                if (!proj(s.qkv_v, s.normed, L.attn_v, qkv, H)) return false;
+            }
 
             if (!L.ssm_conv1d_q.ok() || !L.ssm_conv1d_k.ok() || !L.ssm_conv1d_v.ok())
                 return false;
@@ -831,7 +852,8 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
                                      head_dim, n_head, stream);
             if (fwd.debug) fwd.debug("dbg_delta_out", layer, s.delta_out, qkv);
 
-            if (!proj(s.g_proj_out, s.normed, L.ssm_g, qkv, H)) return false;
+            // Already computed above when the q/k/v/g fusion took the fast path.
+            if (!fused_qkvg && !proj(s.g_proj_out, s.normed, L.ssm_g, qkv, H)) return false;
             if (!L.ssm_norm.ok()) return false;
             k3k::kda_gate_out_f32(s.gate_out, s.delta_out, (const float*)L.ssm_norm.data,
                                   s.g_proj_out, head_dim, n_head, eps, stream);
