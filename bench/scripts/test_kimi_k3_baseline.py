@@ -1141,12 +1141,19 @@ class CiWorkflowTest(unittest.TestCase):
         src = (ROOT / "eval/k3_eval_bot.py").read_text()
         self.assertIn("git reset -q --hard", src, "a dirty tree blocks the next checkout")
         self.assertIn("git clean -qfd", src)
-        self.assertIn("build/runtime/kimi_k3_tp_bench'", src,
-                      "pkill must match the built path, not the target name")
-        # every cleanup step must tolerate failure, or the && chain aborts the whole setup
-        for line in src.split("\n"):
-            if "pkill -f" in line:
-                self.assertIn("|| true", line, "pkill breaks the && chain when nothing matches")
+        # NOT pkill -f. Any pattern precise enough to match the bench also appears in the
+        # command line doing the matching, so pkill kills the remote shell running it. The
+        # chain then dies before cmake and the PR is reported as "build failed" with no
+        # output whatsoever -- verified on the box: the shell does not survive its own
+        # cleanup. Killing what holds GPU memory cannot match a shell.
+        # Check EXECUTABLE lines only. Asserting against the whole file matches the comment
+        # above explaining why pkill -f is wrong -- which is the third time in this work
+        # that an assertion has matched its own rationale.
+        code = [l for l in src.split("\n") if not l.strip().startswith("#")]
+        self.assertFalse([l for l in code if "pkill -f" in l],
+                         "pkill -f matches the shell running it")
+        self.assertIn("--query-compute-apps=pid", src,
+                      "cleanup must target GPU memory holders, not a command-line pattern")
 
     def test_baseline_results_are_committable(self):
         """The `lock` job requires a committed bench/results JSON to back any pinned
