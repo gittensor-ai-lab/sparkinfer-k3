@@ -1524,6 +1524,44 @@ class CiWorkflowTest(unittest.TestCase):
         self.assertLess(main_fn.index("merge_winner("), main_fn.rindex("publish_round_log("),
                         "the log must include the merge decision it explains")
 
+    def test_compare_logits_exit_code_is_a_verdict_not_an_error(self):
+        """compare_logits returns 0 only for mean_kld < 1e-5 -- a SAME-IMPLEMENTATION bar,
+        "two implementations of one arithmetic". K3's accepted parity is 4.05e-03, ~400x
+        that, from a documented cause (f32 activations where ggml quantizes before a
+        quantized mat-vec). So it reports FAIL on every healthy K3 run.
+
+        The shell this replaced ran it with `|| true` and read the JSON. Porting it to
+        Python without that turned every round into "compare_logits failed" with an empty
+        stderr -- which is exactly how the first hardened round died. The gate that decides
+        anything is label.py's (top1 >= 0.90, kl <= 0.20), applied downstream."""
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        acc = src[src.index("def measure_accuracy("):src.index("def _box_eval(")]
+        self.assertNotIn("if p.returncode != 0 or not", acc,
+                         "a non-zero exit here is the normal, healthy K3 result")
+        self.assertIn("if not out:", acc,
+                      "only a MISSING payload is a real failure — the tool did not run")
+        # and the real bars still live in label.py, unchanged
+        lbl = (ROOT / "bench/scripts/label.py").read_text()
+        self.assertIn('SPARKINFER_TOP1_BAR",  "0.90"', lbl)
+        self.assertIn('SPARKINFER_KL_BAR",    "0.20"', lbl)
+
+    def test_a_failed_round_still_has_a_log_path(self):
+        """rounds/<main_sha>/ exists for the round that seals nothing -- and the first one
+        that needed it published nothing anyway.
+
+        _bail read main_sha out of locals(), which is unbound when the FRONTIER measurement
+        is what failed, so the fallback reported "main is unknown" and dropped the log. That
+        is precisely the round worth reading. main is therefore resolved before anything can
+        fail, so the path exists before it is needed."""
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        main_fn = src[src.index("def main("):]
+        self.assertNotIn('locals().get("main_sha"', main_fn,
+                         "an unbound local is not a log path")
+        self.assertLess(main_fn.index("main_sha = (_r.stdout"), main_fn.index("def _bail("),
+                        "main must be resolved BEFORE the thing that can fail")
+        self.assertIn("sha or main_sha", main_fn,
+                      "_bail must fall back to the up-front sha")
+
     def test_every_round_publishes_a_log_even_when_nothing_seals(self):
         """The rule is ALWAYS, and receipt-indexing alone cannot satisfy it.
 
