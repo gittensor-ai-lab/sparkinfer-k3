@@ -43,6 +43,19 @@ POLARIS_ENV = os.environ.get("K3_POLARIS_ENV", "/root/.polaris_env")
 LOG_REPO = os.environ.get("K3_LOG_REPO", "gittensor-ai-lab/sparkinfer-k3-log")
 BOX_RECEIPTS = os.environ.get("K3_BOX_RECEIPTS", f"{BOX_REPO_DIR}/bench/results/receipts")
 
+# Guards for --merge-admin. That flag bypasses the approving-review requirement on main, so
+# these are the only thing left between a measurement and an unreviewed merge of a change
+# that carries a payout tier. Every one of them is a reason a human would have wanted to
+# look, and none can be satisfied by the PR simply being fast.
+NEVER_MERGE_LABELS = {"hold", "copycat", "copycat-warn", "flagged:gaming", "penalty",
+                      "needs-benchmark", "needs-node-run", "llm-judge", "needs-rebase"}
+# Paths that decide payouts. sensitive-paths-guard already fails a non-maintainer PR that
+# touches these, but a bot that merges without anyone reading should not depend on another
+# check having run correctly.
+NEVER_MERGE_PATHS = ("eval/", ".github/", ".gittensor/", "bench/scripts/", "bench/results/",
+                     "bench/refdata/", "dashboard/", "CODEOWNERS")
+REBASE_LABEL = "needs-rebase"
+
 # The PR template's hardware attestation. Matched loosely on purpose -- the template uses a
 # multiplication sign (8x H200) that is easy to retype as an ASCII x, and failing a real
 # submission over a homoglyph is worse than accepting a near-miss. What must be exact is
@@ -315,6 +328,124 @@ def publish_receipt(repo_log, num, res, box_out, dry_run):
     return True
 
 
+def merge_blockers(repo, num, pr):
+    """Every reason not to merge this without a human reading it. Empty list means clear."""
+    bad = []
+    labels = {l.get("name", "") for l in pr.get("labels") or []}
+    hit = labels & NEVER_MERGE_LABELS
+    if hit:
+        bad.append(f"labels {sorted(hit)}")
+    if not any(l.startswith("eval:") for l in labels):
+        bad.append("no eval:* tier — it has not passed the gate")
+    r = gh(["pr", "diff", str(num), "-R", repo, "--name-only"])
+    files = [f for f in (r.stdout or "").split() if f]
+    if r.returncode != 0 or not files:
+        bad.append("could not read the diff")
+    touched = sorted({f for f in files if f.startswith(NEVER_MERGE_PATHS)})
+    if touched:
+        bad.append(f"touches maintainer-owned paths: {touched[:4]}")
+    # Allowlist the states that are safe, rather than denylisting the bad ones.
+    #
+    # BEHIND is the important one and is easy to read as harmless: the branch merely trails
+    # main. But it trails main because something merged, which is exactly when the frontier
+    # moved, so the tier on it was computed against a baseline that no longer exists. That
+    # PR needs re-measuring, not merging.
+    #
+    # UNKNOWN is not "fine", it is "GitHub has not finished computing mergeability" --
+    # asynchronous, and it is what #20 reported seconds after #25 merged while actually
+    # being DIRTY. Treating unknown as clear is how a conflicted branch gets merged.
+    st = gh(["pr", "view", str(num), "-R", repo, "--json", "mergeStateStatus"])
+    try:
+        state = json.loads(st.stdout or "{}").get("mergeStateStatus", "UNKNOWN")
+    except json.JSONDecodeError:
+        state = "UNKNOWN"
+    if state not in ("CLEAN", "UNSTABLE"):
+        bad.append({
+            "BEHIND": "behind main — its tier predates the current frontier",
+            "DIRTY": "merge conflicts",
+            "BLOCKED": "blocked by a required check or review",
+            "UNKNOWN": "mergeability not yet computed by GitHub",
+        }.get(state, f"merge state {state}"))
+    return bad
+
+
+def merge_winner(repo, num, pr, dry_run):
+    """Merge the round's winner with admin rights, or say exactly why it was not.
+
+    Admin merging bypasses the approving-review requirement on `main`. That is an explicit
+    operator choice, not a default -- it trades human review for throughput on a change
+    carrying a payout tier -- so a blocked merge is reported loudly rather than skipped
+    quietly. A silent no-op here would be indistinguishable from a successful merge in the
+    run log, and that is exactly how an unreviewed merge goes unnoticed.
+    """
+    blockers = merge_blockers(repo, num, pr)
+    if blockers:
+        print(f"!! #{num}: NOT merged — {'; '.join(blockers)}", file=sys.stderr)
+        return False
+    if dry_run:
+        print(f"--- dry-run: would admin-merge #{num}")
+        return True
+    r = gh(["pr", "merge", str(num), "-R", repo, "--squash", "--admin"], timeout=180)
+    if r.returncode != 0:
+        print(f"!! #{num}: admin merge failed: {r.stderr.strip()[:200]}", file=sys.stderr)
+        return False
+    print(f">> #{num}: merged (admin) — round's largest verified gain")
+    return True
+
+
+def sync_rebase_labels(repo, prs, merged_num, dry_run):
+    """After a merge, every other open PR is scored against a frontier that just moved.
+
+    Their tier is stale by definition rather than by suspicion: the denominator changed.
+    So they get the label and an explanation. It clears automatically once the branch is no
+    longer behind -- a label only a maintainer can remove turns a mechanical state into a
+    queue somebody has to babysit, and the miner has already done the work by rebasing.
+    """
+    for pr in prs:
+        num = pr["number"]
+        if num == merged_num:
+            continue
+        st = gh(["pr", "view", str(num), "-R", repo, "--json", "mergeStateStatus,state,labels"])
+        try:
+            info = json.loads(st.stdout or "{}")
+        except json.JSONDecodeError:
+            continue
+        if info.get("state") != "OPEN":
+            continue
+        labels = {l.get("name", "") for l in info.get("labels") or []}
+        behind = info.get("mergeStateStatus") in ("BEHIND", "DIRTY", "BLOCKED", "UNKNOWN")
+        has = REBASE_LABEL in labels
+        if behind and not has:
+            if dry_run:
+                print(f"--- dry-run: would label #{num} {REBASE_LABEL}")
+                continue
+            gh(["label", "create", REBASE_LABEL, "-R", repo, "--color", "FBCA04",
+                "--description", "frontier moved — rebase and it is re-evaluated"])
+            q = gh(["api", "-X", "POST", f"repos/{repo}/issues/{num}/labels",
+                    "-f", f"labels[]={REBASE_LABEL}"])
+            if q.returncode != 0:
+                print(f"!! #{num}: could not label {REBASE_LABEL}: {q.stderr.strip()[:120]}",
+                      file=sys.stderr)
+                continue
+            gh(["pr", "comment", str(num), "-R", repo, "--body",
+                f"### Rebase needed\n\n#{merged_num} merged, so the frontier this PR is "
+                f"scored against has moved. The tier currently on it was measured against "
+                f"the old baseline and no longer means anything: you are paid for the gain "
+                f"**on top of what merged**, not the gain over where `main` used to be. If "
+                f"the merged work already covers this change, the honest re-measurement is "
+                f"a small number, and that is the mechanism working rather than a "
+                f"penalty.\n\nRebase onto `main` and push. The `{REBASE_LABEL}` label "
+                f"clears by itself once the branch is current, and the next round "
+                f"re-measures against the new frontier."])
+            print(f">> #{num}: {REBASE_LABEL} (frontier moved)")
+        elif has and not behind:
+            if dry_run:
+                print(f"--- dry-run: would clear {REBASE_LABEL} from #{num}")
+                continue
+            gh(["api", "-X", "DELETE", f"repos/{repo}/issues/{num}/labels/{REBASE_LABEL}"])
+            print(f">> #{num}: {REBASE_LABEL} cleared — branch is current again")
+
+
 def mark_merge_first(repo, results, dry_run, queue_auto_merge=False):
     """Label the round's biggest verified gain `merge-first`, and clear it from the rest.
 
@@ -376,6 +507,12 @@ def main():
                          "can corroborate the number that set someone's tier.")
     ap.add_argument("--merge-first", action="store_true",
                     help="label the round's largest gain merge-first")
+    ap.add_argument("--merge-admin", action="store_true",
+                    help="MERGE the merge-first winner with admin rights, bypassing the "
+                         "approving-review requirement on main, then label the other open "
+                         "PRs needs-rebase. This lands an emissions-bearing change with no "
+                         "human reading it; the guards in NEVER_MERGE_LABELS and "
+                         "NEVER_MERGE_PATHS are what remain.")
     ap.add_argument("--auto-merge", action="store_true",
                     help="queue GitHub native auto-merge on the merge-first winner. Waits "
                          "for the required review and checks; never bypasses them.")
@@ -425,9 +562,26 @@ def main():
         results.append((num, res))
         evaluated += 1
 
-    if args.merge_first or args.auto_merge:
+    if args.merge_first or args.auto_merge or args.merge_admin:
         mark_merge_first(args.repo, results, args.dry_run,
                          queue_auto_merge=args.auto_merge)
+
+    if args.merge_admin and results:
+        winner = max(results, key=lambda r: r[1].get("tps") or 0)[0]
+        by_num = {p["number"]: p for p in prs}
+        if merge_winner(args.repo, winner, by_num.get(winner, {}), args.dry_run):
+            # Only after something actually merged does the frontier move, so the rebase
+            # sweep is conditional on the merge -- labelling everything needs-rebase after a
+            # merge that was blocked would tell every contributor to redo work for nothing.
+            sync_rebase_labels(args.repo, prs, winner, args.dry_run)
+    elif args.merge_admin:
+        print("no results to merge", file=sys.stderr)
+
+    # A PR that has already been rebased should not keep the label just because no merge
+    # happened this round. Cheap to check, and it is the half of the contract the miner has
+    # already done their part of.
+    if args.merge_first or args.merge_admin:
+        sync_rebase_labels(args.repo, prs, merged_num=-1, dry_run=args.dry_run)
 
     # A receipt id proves a receipt was minted, not that anyone can find it. The log is the
     # only thing that makes a number checkable by someone who was not at this terminal, so

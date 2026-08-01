@@ -1092,22 +1092,43 @@ class CiWorkflowTest(unittest.TestCase):
         self.assertIn("--add-label merge-first on #25", out)
         self.assertIn("--remove-label merge-first on #20", out)
 
-    def test_bot_never_bypasses_branch_protection(self):
-        """main requires an approving review, and a bot approving the PR it merges is not a
-        review. --auto-merge queues GitHub's native auto-merge so the merge fires once every
-        requirement is met, including that human approval. It must never reach for --admin,
-        which is the bypass disarmed in #36."""
+    def test_admin_merge_is_reachable_only_through_the_guards(self):
+        """The bot may now bypass branch protection, by explicit operator choice. What must
+        stay true is that the bypass is reachable from exactly ONE place -- merge_winner,
+        which runs merge_blockers first -- so a future caller cannot acquire it by adding a
+        gh merge call somewhere else."""
         import ast as _ast
-        tree = _ast.parse((ROOT / "eval/k3_eval_bot.py").read_text())
-        # Check the ARGUMENTS of gh() calls, not the file text: the docstring explains why
-        # --admin is never used, and a substring search matches that explanation.
-        for node in _ast.walk(tree):
-            if isinstance(node, _ast.Call) and getattr(node.func, "id", "") == "gh":
-                args = [a.value for a in _ast.walk(node)
-                        if isinstance(a, _ast.Constant) and isinstance(a.value, str)]
-                self.assertNotIn("--admin", args, "a gh() call bypasses branch protection")
-                if "merge" in args:
-                    self.assertIn("--auto", args, "merge should queue, not merge directly")
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        tree = _ast.parse(src)
+        admin_calls = []
+        for fn in _ast.walk(tree):
+            if not isinstance(fn, _ast.FunctionDef):
+                continue
+            for node in _ast.walk(fn):
+                if isinstance(node, _ast.Call) and getattr(node.func, "id", "") == "gh":
+                    args = [a.value for a in _ast.walk(node)
+                            if isinstance(a, _ast.Constant) and isinstance(a.value, str)]
+                    if "--admin" in args:
+                        admin_calls.append(fn.name)
+        self.assertEqual(admin_calls, ["merge_winner"],
+                         f"--admin reachable from {admin_calls}, not just merge_winner")
+        body = src[src.index("def merge_winner"):src.index("def sync_rebase_labels")]
+        self.assertLess(body.index("merge_blockers"), body.index("--admin"),
+                        "merge_winner must check the guards before merging")
+
+    def test_stale_and_unknown_merge_states_block(self):
+        """BEHIND reads as harmless -- the branch merely trails main -- but it trails main
+        because something merged, which is exactly when the frontier moved, so its tier was
+        computed against a baseline that no longer exists.
+
+        UNKNOWN is not "fine" either, it is "GitHub has not finished computing
+        mergeability". #20 reported UNKNOWN seconds after #25 merged while actually being
+        DIRTY, and an earlier denylist treated that as clear."""
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        self.assertIn('if state not in ("CLEAN", "UNSTABLE")', src,
+                      "merge states must be allowlisted, not denylisted")
+        for st in ("BEHIND", "UNKNOWN", "DIRTY", "BLOCKED"):
+            self.assertIn(f'"{st}"', src, f"{st} must be handled explicitly")
 
     def test_bot_grades_with_the_protected_harness(self):
         """CONTRIBUTING states the evaluator "grades with the harness pinned to the
@@ -1204,6 +1225,48 @@ class CiWorkflowTest(unittest.TestCase):
                          "receipt selected by modification time")
         self.assertTrue([l for l in code if "grep -l" in l and "rid" in l],
                         "receipt must be matched by the id inside the file")
+
+    def test_admin_merge_is_opt_in_and_guarded(self):
+        """--merge-admin bypasses the approving-review requirement on main, so it lands an
+        emissions-bearing change with nobody reading it. Two properties matter.
+
+        It must be OPT-IN: nothing should acquire that power by default, least of all by
+        someone copying an old command line.
+
+        And the guards are all that remain in its place. Each one is a reason a human would
+        have wanted to look, and none can be satisfied by the PR merely being fast: a hold
+        or copycat label, no eval tier at all, a diff touching the paths that decide
+        payouts, or a conflicted branch."""
+        bot = self._bot()
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        self.assertIn('"--merge-admin", action="store_true"', src,
+                      "admin merging must be an explicit flag, never a default")
+        self.assertNotIn("--merge-admin\", action=\"store_true\", default=True", src)
+        # the guards themselves
+        self.assertTrue(bot.merge_blockers("x", 1, {"labels": []}),
+                        "a PR with no eval tier must not merge")
+        for blocking in ("hold", "copycat", "needs-rebase", "flagged:gaming"):
+            b = bot.merge_blockers("x", 1, {"labels": [{"name": blocking},
+                                                       {"name": "eval:xl"}]})
+            self.assertTrue(b, f"{blocking} must block an unreviewed merge")
+        for p in ("eval/", ".github/", "bench/scripts/", "bench/refdata/"):
+            self.assertIn(p, bot.NEVER_MERGE_PATHS,
+                          f"{p} decides payouts and must block an unreviewed merge")
+
+    def test_rebase_label_clears_itself(self):
+        """The frontier moves when something merges, so every other PR's tier goes stale by
+        definition rather than by suspicion -- the denominator changed. The label says so.
+
+        It must also clear itself once the branch is current: a label only a maintainer can
+        remove turns a mechanical state into a queue someone has to babysit, and by then the
+        miner has already done the work it was asking for."""
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        self.assertIn('"-X", "DELETE", f"repos/{repo}/issues/{num}/labels/{REBASE_LABEL}"',
+                      src, "needs-rebase is never removed once the branch is current")
+        self.assertIn("elif has and not behind:", src)
+        # and the sweep must not run when the merge was blocked
+        self.assertIn("if merge_winner(", src,
+                      "rebase labelling must be conditional on something actually merging")
 
     def test_baseline_results_are_committable(self):
         """The `lock` job requires a committed bench/results JSON to back any pinned
