@@ -884,6 +884,60 @@ class CiWorkflowTest(unittest.TestCase):
         calls = {_ast.unparse(c.func) for c in _ast.walk(fn) if isinstance(c, _ast.Call)}
         self.assertIn("validator.verify", calls, "validator.verify() is never invoked")
 
+    def _verdict_script(self):
+        """Extract the verdict heredoc out of eval-label.yml so the test exercises the code
+        that actually runs in CI, not a copy of it that can drift."""
+        import re as _re, tempfile
+        txt = (ROOT / ".github/workflows/eval-label.yml").read_text().split("\n")
+        i = [k for k, l in enumerate(txt) if 'python3 - "$PAYLOAD" "$PR_HEAD_SHA"' in l][0]
+        j = [k for k in range(i + 1, len(txt)) if txt[k].strip() == "PY"][0]
+        f = tempfile.NamedTemporaryFile("w", suffix=".py", delete=False)
+        f.write("\n".join(l[10:] for l in txt[i + 1:j])); f.close()
+        return f.name
+
+    def _run_verdict(self, payload, head):
+        import subprocess as sp, json as _j
+        r = sp.run([sys.executable, self._verdict_script(), _j.dumps(payload), head],
+                   capture_output=True, text=True, cwd=str(ROOT))
+        out = dict(l.split("=", 1) for l in r.stdout.strip().split("\n") if "=" in l)
+        return r.returncode, out, r.stderr
+
+    def test_tier_basis_comes_from_the_lock_not_the_payload(self):
+        """frontier_tps and llama_ref are the denominator and the significance basis, so a
+        payload that supplies them sets its own tier: understate the frontier and any speed
+        looks like a large win. They must come from reference.lock in the trusted base
+        checkout. Asserted by running the attack, not by reading the code."""
+        head = "8757caf10683484582b346663ee8944ac66e2e06"
+        base = {"tps": 4.2, "top1": 1.0, "kl": 0.001, "commit": head[:7]}
+        rc_h, honest, _ = self._run_verdict(base, head)
+        rc_a, attack, err = self._run_verdict({**base, "frontier_tps": 0.5}, head)
+        self.assertEqual((rc_h, rc_a), (0, 0))
+        self.assertEqual(honest["label"], attack["label"],
+                         "understating frontier_tps changed the tier")
+        self.assertEqual(honest["pct"], attack["pct"])
+        self.assertIn("using the pinned value", err)
+
+    def test_result_must_belong_to_this_pr(self):
+        """Without binding, a RESULT_JSON and its receipt measured on any branch label any
+        PR -- a valid receipt becomes a reusable token."""
+        head = "8757caf10683484582b346663ee8944ac66e2e06"
+        rc, _, err = self._run_verdict(
+            {"tps": 4.2, "top1": 1.0, "kl": 0.001, "commit": "deadbeef"}, head)
+        self.assertEqual(rc, 1, "a result from another commit was accepted")
+        self.assertIn("is not this PR's head", err)
+
+    def test_verdict_step_emits_only_key_value_pairs(self):
+        """stdout of that heredoc IS $GITHUB_OUTPUT. A stray ::notice:: line corrupts the
+        step outputs, which is how the annotations were first written."""
+        head = "8757caf10683484582b346663ee8944ac66e2e06"
+        import subprocess as sp, json as _j
+        r = sp.run([sys.executable, self._verdict_script(),
+                    _j.dumps({"tps": 4.2, "top1": 1.0, "kl": 0.001, "commit": head[:7]}), head],
+                   capture_output=True, text=True, cwd=str(ROOT))
+        for line in [l for l in r.stdout.strip().split("\n") if l]:
+            self.assertNotIn("::", line, f"annotation leaked into GITHUB_OUTPUT: {line}")
+            self.assertIn("=", line)
+
     def test_baseline_results_are_committable(self):
         """The `lock` job requires a committed bench/results JSON to back any pinned
         baseline. bench/.gitignore ignores results/ wholesale, so without an explicit
