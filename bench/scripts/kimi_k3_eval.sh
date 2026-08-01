@@ -157,9 +157,24 @@ echo ">> sparkinfer frontier             : $FRONTIER tok/s$([[ "$FRONTIER" == "0
 # announcement this used to require was defeated the same way: by printing it.
 #
 # So the cost per token is derived from WALL CLOCK across two runs at different token counts.
-# The model load (~150 s) and every other fixed cost cancel in the difference, leaving the
-# marginal cost of TOKENS_HI - TOKENS_LO decode steps. A binary cannot print its way out of
-# elapsed time.
+# The model load and every other fixed cost cancel in the difference, leaving the marginal
+# cost of TOKENS_HI - TOKENS_LO decode steps. A binary cannot print its way out of elapsed
+# time.
+#
+# TWO NUMBERS, TWO JOBS, AND CONFLATING THEM WAS A MISTAKE.
+#
+#   The SELF-REPORT is the measurement. It is timed inside the process around decode only,
+#   so it is precise, and precision is what a tier needs: a noisy number moves PRs across
+#   band boundaries for no reason.
+#
+#   The DIFFERENTIAL is the guard. It is external and therefore unforgeable, but it carries
+#   the run-to-run variance of the model load, so it is a BOUND, not a reading.
+#
+# Using the differential as the authoritative number failed on trusted main: at 8 and 24
+# tokens the marginal signal was ~3.5 s while the ~29 s load varies by 1-2 s, so 1.1 s of
+# jitter landed in it -- 4.55 tok/s self-reported against 3.45 measured, a 32% error, and
+# the run refused itself. The signal has to dominate the jitter, hence a fixed and much
+# larger token margin rather than a multiple of TOKENS.
 #
 # What this still cannot prove is that the work was real: a bench that returns immediately is
 # indistinguishable from an infinitely fast one. That residual is bounded by the accuracy
@@ -167,7 +182,10 @@ echo ">> sparkinfer frontier             : $FRONTIER tok/s$([[ "$FRONTIER" == "0
 # reference exists to check the seeked run against.
 NDEV="$(printf '%s' "$DEVICES" | tr ',' '\n' | grep -c .)"
 TOKENS_LO="$TOKENS"
-TOKENS_HI="$(( TOKENS * 3 ))"
+# ~128 marginal tokens is ~28 s at main's current 128k speed, against 1-2 s of load jitter:
+# a 5% bound rather than a 32% one. Env-tunable because the right value tracks ms/token.
+MARGIN_TOKENS="${KIMI_K3_MARGIN_TOKENS:-128}"
+TOKENS_HI="$(( TOKENS_LO + MARGIN_TOKENS ))"
 
 # POLARIS_API_KEY signs the attestation ledger, and `. .polaris_env` put it in the
 # environment of every child -- including this binary, which the PR wrote. env -u strips it
@@ -189,39 +207,47 @@ trap 'rm -f "$SPEED_OUT"' EXIT
 NS_LO="$(run_bench "$TOKENS_LO" 3>"$SPEED_OUT")" || { echo "kimi_k3_eval: bench failed" >&2; exit 1; }
 NS_HI="$(run_bench "$TOKENS_HI" 3>>"$SPEED_OUT")" || { echo "kimi_k3_eval: bench failed" >&2; exit 1; }
 
-read -r TPS MSTOK <<<"$(python3 - "$NS_LO" "$NS_HI" "$TOKENS_LO" "$TOKENS_HI" <<'PY'
+# The self-report is the reading; the differential is the bound it has to survive. A missing
+# self-report is fatal on its own -- there is no number to score, and a binary that prints
+# nothing has not been measured by anything.
+SELF_TPS="$(sed -n 's/.*ms\/token[^(]*(\([0-9.]*\) tok\/s).*/\1/p' "$SPEED_OUT" | head -1)"
+SELF_MS="$(sed -n 's/.*ms\/token *\([0-9.]*\).*/\1/p' "$SPEED_OUT" | head -1)"
+if [[ -z "$SELF_TPS" ]]; then
+    tail -20 "$SPEED_OUT" >&2
+    echo "kimi_k3_eval: the bench reported no ms/token line — nothing to score" >&2
+    exit 1
+fi
+
+read -r TPS MSTOK <<<"$(python3 - "$NS_LO" "$NS_HI" "$TOKENS_LO" "$TOKENS_HI" \
+                                 "$SELF_TPS" "$SELF_MS" "${KIMI_K3_SPEED_TOL:-1.5}" <<'PY'
 import sys
 ns_lo, ns_hi, n_lo, n_hi = (int(x) for x in sys.argv[1:5])
+self_tps, self_ms, tol = float(sys.argv[5]), float(sys.argv[6] or 0), float(sys.argv[7])
 d_ns, d_n = ns_hi - ns_lo, n_hi - n_lo
 if d_n <= 0 or d_ns <= 0:
     sys.stderr.write(f"kimi_k3_eval: non-positive time delta ({d_ns} ns over {d_n} tokens) — "
                      "the longer run was not slower, so nothing was measured\n")
     raise SystemExit(1)
-ms = d_ns / d_n / 1e6
-print(f"{1000.0 / ms:.2f} {ms:.2f}")
-PY
-)" || exit 1
-echo ">> sparkinfer: $TPS tok/s ($MSTOK ms/token)  [wall-clock differential]"
-
-# Cross-check against what the binary claimed. They measure the same thing by different
-# means, so a large gap is either a lying binary or a broken measurement, and both are
-# reasons to stop rather than to pick one.
-SELF="$(sed -n 's/.*ms\/token[^(]*(\([0-9.]*\) tok\/s).*/\1/p' "$SPEED_OUT" | head -1)"
-if [[ -n "$SELF" ]]; then
-    python3 - "$SELF" "$TPS" <<'PY' || exit 1
-import sys
-self_tps, ext_tps = float(sys.argv[1]), float(sys.argv[2])
-print(f">> self-reported {self_tps} tok/s vs wall-clock {ext_tps} tok/s", end="")
-if ext_tps <= 0 or self_tps / ext_tps > 1.25:
-    print()
+ext_ms = d_ns / d_n / 1e6
+ext_tps = 1000.0 / ext_ms
+sys.stderr.write(f">> wall-clock bound: {ext_tps:.2f} tok/s ({ext_ms:.2f} ms/token) "
+                 f"over {d_n} marginal tokens\n")
+# The bound is one-sided ON PURPOSE. Load jitter inflates the differential's ms/token, so
+# the external number reads SLOWER than truth; a self-report slower than the bound is
+# therefore never suspicious. Only a claim FASTER than elapsed time allows is evidence of
+# fabrication, and tol carries the jitter.
+if self_tps > ext_tps * tol:
     sys.stderr.write(
-        f"kimi_k3_eval: the bench claims {self_tps} tok/s but wall clock allows {ext_tps}.\n"
+        f"kimi_k3_eval: the bench claims {self_tps} tok/s but wall clock allows at most "
+        f"{ext_tps * tol:.2f} ({ext_tps:.2f} x {tol}).\n"
         "  refusing to score: the binary is built from the PR's runtime/, and a self-report\n"
         "  faster than elapsed time is the signature of a fabricated number.\n")
     raise SystemExit(1)
-print("  (agree)")
+# Scored on the self-report: precise, and the tier must not wobble with load jitter.
+print(f"{self_tps:.2f} {self_ms:.2f}")
 PY
-fi
+)" || exit 1
+echo ">> sparkinfer: $TPS tok/s ($MSTOK ms/token)  [self-timed, within the wall-clock bound]"
 
 # ---- 2. correctness -------------------------------------------------------
 # THE ANSWER KEY MUST NOT BE ON THE SAME MACHINE AS THE BINARY BEING GRADED.

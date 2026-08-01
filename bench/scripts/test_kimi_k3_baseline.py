@@ -1377,11 +1377,39 @@ class CiWorkflowTest(unittest.TestCase):
         self.assertIn("TOKENS_HI=", ev, "the second run is what makes the difference a rate")
         self.assertIn("date +%s%N", ev, "the timing must come from the controller's clock")
         speed = ev[ev.index("# ---- 1. speed"):ev.index("# ---- 2. correctness")]
-        self.assertIn("ns_hi - ns_lo", speed, "ms/token must be a wall-clock differential")
-        # the self-report is kept only as a cross-check, and disagreement must REFUSE
+        self.assertIn("ns_hi - ns_lo", speed, "the bound must be a wall-clock differential")
+        # a claim faster than elapsed time allows must REFUSE, not warn. The exact
+        # comparison lives in test_wall_clock_is_a_bound_not_the_reading.
         self.assertIn("refusing to score", speed)
-        self.assertIn("self_tps / ext_tps > 1.25", speed,
+        self.assertIn("self_tps > ext_tps * tol", speed,
                       "a binary claiming to be faster than elapsed time must be rejected")
+
+    def test_wall_clock_is_a_bound_not_the_reading(self):
+        """Two numbers, two jobs, and conflating them broke a round on TRUSTED main.
+
+        The self-report is timed inside the process around decode only, so it is precise --
+        and precision is what a tier needs, since a noisy number moves PRs across band
+        boundaries for nothing. The differential is external and therefore unforgeable, but
+        it carries the run-to-run variance of the model load, so it is a BOUND.
+
+        Using it as the reading failed: at 8 and 24 tokens the marginal signal was ~3.5 s
+        against a ~29 s load that varies by 1-2 s, so jitter became a 32% error -- 4.55
+        tok/s self-reported against 3.45 measured, and the harness refused itself. The
+        margin is a fixed, much larger token count now so the signal dominates the jitter.
+
+        The bound is ONE-SIDED on purpose: jitter only ever makes the differential read
+        slower than truth, so a self-report below it is never suspicious. Only a claim
+        FASTER than elapsed time allows is evidence."""
+        ev = (ROOT / "bench/scripts/kimi_k3_eval.sh").read_text()
+        speed = ev[ev.index("# ---- 1. speed"):ev.index("# ---- 2. correctness")]
+        self.assertIn("MARGIN_TOKENS=", speed,
+                      "a multiple of TOKENS gives a signal smaller than the load jitter")
+        self.assertNotIn("TOKENS * 3", speed)
+        self.assertIn("self_tps > ext_tps * tol", speed, "the bound must be one-sided")
+        self.assertIn('print(f"{self_tps:.2f} {self_ms:.2f}")', speed,
+                      "the SELF-REPORT is what gets scored; the differential only bounds it")
+        # a missing self-report is fatal -- there is nothing to score
+        self.assertIn("reported no ms/token line", speed)
 
     def test_polaris_key_is_kept_out_of_the_benchs_environment(self):
         """`. /root/.polaris_env` exports POLARIS_API_KEY, and every child inherits it --
