@@ -206,13 +206,23 @@ def evaluate(pr, repo, seal=False):
         # while the log stayed empty: the harness said "FAILED to seal/publish" and nothing
         # listened.
         rid = re.search(r"receipt[_ ]?id[\"'\s:=]+([0-9a-f]{8,})", out, re.I)
-        if r.returncode != 0:
-            why = next((l for l in reversed((r.stderr or "").splitlines())
-                        if "seal" in l.lower() or "publish" in l.lower()), "")
-            print(f"#{num}: NOT sealed — the harness failed to publish"
-                  + (f": {why.strip()}" if why else "") , file=sys.stderr)
-        elif rid:
+        if rid:
+            # SIGNING AND PUBLISHING ARE SEPARATE, and only signing has to happen on the
+            # box. kimi_k3_attest.py --publish git-pushes to the log, which needs write
+            # credentials wherever it runs; the box has none and should not be given any,
+            # since a rented shared machine that can rewrite the ledger it is judged
+            # against is a worse trade than one that can only sign.
+            #
+            # So a failed box-side publish is expected, not fatal: the receipt is minted
+            # and signed on the box either way, and publish_receipt() copies it here and
+            # commits it with credentials that never left this machine. Treating the
+            # harness's exit code as "not sealed" threw away a perfectly good receipt and
+            # made the controller path unreachable -- every run reported 0 sealed while a
+            # signed receipt sat on the box.
             res["receipt_id"] = rid.group(1)
+            if r.returncode != 0:
+                print(f"#{num}: box-side publish failed (expected — no git credentials "
+                      f"there); publishing {rid.group(1)[:12]} from here instead")
         else:
             print(f"#{num}: warning — --seal was requested but no receipt id appeared in "
                   f"the harness output; the run is NOT in the log", file=sys.stderr)

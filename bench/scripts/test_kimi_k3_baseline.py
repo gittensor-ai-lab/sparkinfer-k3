@@ -1268,6 +1268,28 @@ class CiWorkflowTest(unittest.TestCase):
         self.assertIn("if merge_winner(", src,
                       "rebase labelling must be conditional on something actually merging")
 
+    def test_box_publish_failure_does_not_discard_the_receipt(self):
+        """Signing and publishing are separate, and only signing has to happen on the box.
+
+        kimi_k3_attest.py --publish git-pushes to the log, which needs write credentials
+        wherever it runs. The box has none and should not be given any: a rented shared
+        machine that can rewrite the ledger it is judged against is a worse trade than one
+        that can only sign. So a failed box-side publish is expected, not fatal.
+
+        Treating the harness's exit code as "not sealed" threw the receipt away and made
+        the controller-side publish unreachable -- every run reported 0 sealed while three
+        signed receipts sat on the box unpublished."""
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        seal = src[src.index("    if seal:"):src.index("    # Bind the measurement")]
+        # the id must be taken whenever one was minted, not only on a clean exit
+        self.assertIn('if rid:\n', seal,
+                      "receipt id is only kept when the box-side publish succeeded")
+        self.assertLess(seal.index('res["receipt_id"] = rid.group(1)'),
+                        seal.index("r.returncode != 0"),
+                        "the receipt must be kept before the exit code is considered")
+        # and sealed is still only claimed once the log confirms it
+        self.assertIn("contents/runs/", src)
+
     def test_baseline_results_are_committable(self):
         """The `lock` job requires a committed bench/results JSON to back any pinned
         baseline. bench/.gitignore ignores results/ wholesale, so without an explicit
