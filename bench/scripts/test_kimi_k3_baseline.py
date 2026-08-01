@@ -1109,6 +1109,23 @@ class CiWorkflowTest(unittest.TestCase):
                 if "merge" in args:
                     self.assertIn("--auto", args, "merge should queue, not merge directly")
 
+    def test_bot_grades_with_the_protected_harness(self):
+        """CONTRIBUTING states the evaluator "grades with the harness pinned to the
+        protected branch, so editing it in a PR never affects that PR's own score." That was
+        not true of this bot -- it ran whatever bench/scripts the PR happened to carry.
+
+        The trust argument is the obvious one, but version skew is what actually broke it:
+        #25's head predates --seal, so sealing died with "unknown arg --seal" on a PR that
+        was otherwise fine, and the same skew made its reference.lock resolve frontier=0 and
+        label a real speedup BASELINE. refdata/ is pinned too because it IS the accuracy
+        answer key."""
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        self.assertIn("git checkout -q origin/main -- bench/scripts bench/refdata", src,
+                      "the bot grades with the PR's own harness")
+        self.assertLess(src.index("origin/main -- bench/scripts"),
+                        src.index("kimi_k3_eval.sh --node"),
+                        "the harness must be restored BEFORE the eval runs")
+
     def test_baseline_results_are_committable(self):
         """The `lock` job requires a committed bench/results JSON to back any pinned
         baseline. bench/.gitignore ignores results/ wholesale, so without an explicit
