@@ -982,33 +982,30 @@ class CiWorkflowTest(unittest.TestCase):
         self.assertIn("IS_DRAFT", (wf / "eval-label.yml").read_text(),
                       "/eval would attach a payout tier to a draft")
 
-    def test_qwen_bot_refuses_to_run_against_k3(self):
-        """eval/pr_eval_bot.py is the inherited Qwen evaluator and contains zero K3 code. Its
-        greenlight matches the literal substring "5090", which the K3 template cannot
-        contain, and the unchecked-box gate then CLOSES the PR -- so pointing it at this repo
-        auto-closes every K3 pull request. A commented-out crontab line is not a safe place
-        to keep that. Asserted by running it, including the exit code, because main() was
-        called bare and swallowed its own return value."""
-        import subprocess as sp
-        for bot in ("eval/pr_eval_bot.py", "eval/pr_dflash_bot.py"):
-            path = ROOT / bot
-            if not path.exists():
-                continue
-            r = sp.run([sys.executable, str(path), "--repo", "gittensor-ai-lab/sparkinfer-k3",
-                        "--dry-run"], capture_output=True, text=True, cwd=str(ROOT))
-            self.assertEqual(r.returncode, 2, f"{bot} did not refuse a -k3 repo (exit "
-                                              f"{r.returncode}); output: {r.stdout[-300:]}")
-            self.assertIn("refusing to run", r.stderr)
+    def test_qwen_track_is_gone(self):
+        """The inherited Qwen evaluator was not merely unused, it was dangerous: it
+        greenlit on the literal substring "5090" and CLOSED any PR whose box was unticked,
+        so pointing it at this repo would have auto-closed every K3 pull request. It was
+        fenced off with a runtime guard first and removed once the K3 bot replaced it. This
+        asserts it stays removed -- reintroducing it would reintroduce that behaviour."""
+        gone = ["eval/pr_eval_bot.py", "eval/pr_dflash_bot.py", "eval/vast_eval.py",
+                "bench/scripts/bench.sh", "bench/scripts/accuracy.sh",
+                "bench/scripts/evaluate.sh", "bench/scripts/evaluate_bidir.sh"]
+        for rel in gone:
+            self.assertFalse((ROOT / rel).exists(), f"the Qwen track is back: {rel}")
+        self.assertTrue((ROOT / "eval/k3_eval_bot.py").exists(),
+                        "the K3 bot that replaced it is missing")
 
-    def test_automerge_does_not_silently_bypass_protection(self):
-        """Enabling auto-merge must not also mean 'and bypass branch protection'. The admin
-        escalation defaulted to on, so a bot run under an admin token would have walked
-        through the required-review rule."""
-        for bot in ("eval/pr_eval_bot.py", "eval/pr_dflash_bot.py"):
-            path = ROOT / bot
-            if path.exists():
-                self.assertNotIn('SPARKINFER_AUTOMERGE_ADMIN", "1"', path.read_text(),
-                                 f"{bot} defaults to bypassing branch protection")
+    def test_k3_bot_configures_tensor_parallelism(self):
+        """kimi_k3_tp_bench refuses to run sharded without a real collective, so a build
+        configured without -DSPARKINFER_TP=ON fails at eval time with nothing pointing back
+        at configure as the cause. Found by running the bot against the node, not by
+        reading it. Same for the binary path: CMake emits to build/runtime/, and pointing
+        SPARKINFER_BUILD at build/ makes the harness report "not built" immediately after a
+        build that succeeded."""
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        self.assertIn("-DSPARKINFER_TP=ON", src, "bot builds without NCCL collectives")
+        self.assertIn("build/runtime", src, "bot points SPARKINFER_BUILD at the wrong dir")
 
     def test_baseline_results_are_committable(self):
         """The `lock` job requires a committed bench/results JSON to back any pinned

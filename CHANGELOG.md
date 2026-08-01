@@ -829,7 +829,7 @@ scores like the effort it took relative to a mature baseline. Safeguards: the bo
 stays on the **raw** delta (noise is never boosted), and the cold-start era (frontier ≤ ref) is
 untouched (D=1, no retroactive inflation). Applied from new evals onward. On the real history #83/#89/#86
 move S→M/L; everything below llama is unchanged. Governance-tunable (`SPARKINFER_DIFFICULTY_{BOOST,K,REF,MAX}`);
-replay with [`eval/sim_difficulty.py`](eval/sim_difficulty.py).
+replay with ``eval/sim_difficulty.py``.
 
 ### Added — long-context decode: the deficit found, and a first fix (#115) — proof of concept for miners
 Our headline "+24% past llama.cpp" is measured at 128-tok; at real KV **depth** the story reverses.
