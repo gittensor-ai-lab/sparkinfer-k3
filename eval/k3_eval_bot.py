@@ -251,11 +251,32 @@ def measure_accuracy(what):
         cmp_py = os.path.join(os.path.dirname(REFDATA), "scripts", "compare_logits.py")
         p = subprocess.run([sys.executable, cmp_py, ref_spkl, ours, "--json"],
                            capture_output=True, text=True, timeout=600)
-        if p.returncode != 0 or not (p.stdout or "").strip():
-            raise RuntimeError(f"compare_logits failed for {what}: "
-                               f"{(p.stderr or '').strip()[:300]}")
-        d = json.loads(p.stdout)
-        top1, kl = float(d["top1_agreement"]), float(d["mean_kld"])
+        # ITS EXIT CODE IS A VERDICT, NOT AN ERROR, AND IT IS ALWAYS 1 FOR K3.
+        #
+        # compare_logits returns 0 only for mean_kld < 1e-5 -- a SAME-IMPLEMENTATION bar,
+        # "two implementations of one arithmetic". K3's accepted parity is 4.05e-03, about
+        # 400x that, from a known cause: K3 keeps f32 activations where ggml quantizes them
+        # before a quantized mat-vec. CONTRIBUTING documents it. So the tool says FAIL on a
+        # perfectly good run, every time.
+        #
+        # The shell this replaced ran it with `|| true` and read the JSON; porting it to
+        # Python without that turned every round into "compare_logits failed" with an empty
+        # stderr, which is how the first hardened round died. The gate that matters is
+        # label.py's (top1 >= 0.90, kl <= 0.20), applied downstream.
+        #
+        # So parse the output and let the numbers speak. Only a MISSING or unparseable
+        # payload is a real failure -- that means the tool did not run, which is different
+        # from it disagreeing.
+        out = (p.stdout or "").strip()
+        if not out:
+            raise RuntimeError(f"compare_logits produced no output for {what} (rc="
+                               f"{p.returncode}): {(p.stderr or '').strip()[:300]}")
+        try:
+            d = json.loads(out)
+            top1, kl = float(d["top1_agreement"]), float(d["mean_kld"])
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(f"compare_logits output for {what} is not the expected JSON "
+                               f"({exc}): {out[:200]}") from exc
     finally:
         try:
             os.unlink(ours)
@@ -1115,9 +1136,23 @@ def main():
     # The early returns below are the FAILED rounds -- a frontier that would not measure, a
     # lock that would not reconcile -- and those are the logs most worth reading, so they must
     # not be the ones that silently never land.
+    # Resolve main UP FRONT so every exit below has a log path.
+    #
+    # _bail used to read main_sha out of locals(), which is unbound if the frontier
+    # measurement is what failed -- so the fallback printed "main is unknown, no log path"
+    # and published nothing. That is the exact round the rule exists for: the first hardened
+    # run died in measure_frontier and left no record, which is the failure mode
+    # rounds/<main_sha>/ was added to cover. A path cannot be invented after the fact, so it
+    # is established before anything can go wrong.
+    _r = gh(["api", f"repos/{args.repo}/commits/main", "--jq", ".sha"])
+    main_sha = (_r.stdout or "").strip()
+    if not main_sha:
+        print(f"!! could not resolve main on {args.repo} — a failed round will have nowhere "
+              f"to publish its log", file=sys.stderr)
+
     def _bail(code, sha=""):
         sys.stdout, sys.stderr = _real_out, _real_err
-        publish_round_log(LOG_REPO, sha, [], log_buf.getvalue(), args.dry_run)
+        publish_round_log(LOG_REPO, sha or main_sha, [], log_buf.getvalue(), args.dry_run)
         return code
 
     # THE FRONTIER IS MEASURED, NOT PINNED. Do this before anything is posted: eval-label.yml
@@ -1125,7 +1160,7 @@ def main():
     # gets a tier derived from the old frontier -- which is the whole failure being fixed.
     try:
         if args.frontier is not None:
-            main_sha, main_tps = "", float(args.frontier)
+            main_tps = float(args.frontier)
             quant = "UD-IQ1_S"
             print(f">> frontier: {main_tps} tok/s (--frontier, main not re-measured)")
             r = gh(["api", f"repos/{args.repo}/commits/main", "--jq", ".sha"])
@@ -1134,9 +1169,9 @@ def main():
             main_sha, main_tps, quant = measure_frontier(args.repo)
     except RuntimeError as exc:
         print(f"frontier measurement failed — {exc}", file=sys.stderr)
-        # main_sha may be blank here (the resolve itself can fail); publish_round_log says
-        # so loudly rather than inventing a path.
-        return _bail(1, locals().get("main_sha", ""))
+        # _bail falls back to the main_sha resolved before the try block, so this round is
+        # published under rounds/<sha>/ even though it sealed nothing.
+        return _bail(1)
 
     if args.no_lock_update:
         print(">> --no-lock-update: reference.lock untouched; the applied tier will come "
