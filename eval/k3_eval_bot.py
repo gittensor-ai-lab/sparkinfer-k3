@@ -4,14 +4,27 @@
 Replaces the inherited Qwen evaluator (pr_eval_bot.py), which had zero K3 support and
 would have auto-closed every K3 pull request. This one does exactly one job:
 
-    find an eligible PR -> measure it on the 8x H200 node -> post the result
+    measure main -> find eligible PRs -> measure each on the 8x H200 node -> post the result
 
-It never decides a tier and it never merges. Tiers come from
-.github/workflows/eval-label.yml, which re-derives them from reference.lock on the
-protected branch rather than trusting anything posted here. With --merge-first it marks
-the round's largest measured gain, and with --auto-merge it QUEUES GitHub native
-auto-merge on that winner -- which still waits for the required approving review and every
-required check. It never passes the admin flag, so it cannot bypass branch protection.
+THE FRONTIER IS MEASURED EVERY ROUND, NOT PINNED. main is benchmarked on the same box,
+minutes before the PRs it is compared against, and that number is what each PR is scored
+over. A pinned constant was tried and it failed the way constants do: #25 merged and took
+main from 3.55 to 9.54 tok/s, nothing updated reference.lock, and the next PR's 8% gain was
+priced against a frontier main had already beaten by 2.7x -- an XL for an S. Measuring also
+cancels the box: thermal state and neighbours on a rented machine move tok/s a few percent,
+and main and the PR share all of it.
+
+It does not decide a tier. Tiers come from .github/workflows/eval-label.yml, which
+re-derives them with label.py from reference.lock on the protected branch rather than
+trusting anything posted here -- so a PR cannot understate the frontier to inflate itself.
+That is also why this bot WRITES the measured frontier back into reference.lock (one slot,
+this node and quant, raise-only): the pinned value is the real tier basis, so leaving it
+stale means the posted number and the applied tier disagree.
+
+MERGING. --merge-first only labels. --auto-merge QUEUES GitHub native auto-merge, which
+still waits for the required approving review and every required check. --merge-admin does
+pass the admin flag and does bypass the review requirement; it is an explicit operator
+choice, guarded by NEVER_MERGE_LABELS and NEVER_MERGE_PATHS.
 
 WHY THE SPLIT. The scoring path pays SN74 emissions, so every autonomous mutation is a way
 to pay the wrong person or block the right one. Measuring is mechanical and slow, so it is
@@ -27,11 +40,14 @@ Qwen track cannot break it.
 """
 
 import argparse
+import base64
+import io
 import json
 import os
 import re
 import subprocess
 import sys
+import time
 
 REPO_DEFAULT = "gittensor-ai-lab/sparkinfer-k3"
 BOX_REPO_DIR = os.environ.get("K3_BOX_REPO_DIR", "/workspace/k3-botrun")
@@ -106,14 +122,13 @@ def eligibility(pr):
     return True, "eligible"
 
 
-def evaluate(pr, repo, seal=False):
-    """Check the PR head out on the box, build it, and run the K3 harness there.
+def _box_build(sha, what):
+    """Check `sha` out on the box and build the K3 bench there.
 
-    Returns the parsed RESULT_JSON, or raises RuntimeError with the box's own output. The
-    build and the eval both happen on the node; nothing is measured locally.
+    `what` names the thing being built ("#20", "main") so a failure says which one died.
+    Shared by the PR path and the frontier measurement on purpose: a frontier measured with
+    a different build than the PR it scores is not a comparison, it is two numbers.
     """
-    sha = pr["headRefOid"]
-    num = pr["number"]
     steps = " && ".join([
         f"cd {BOX_REPO_DIR}",
         # Start from a clean box every time. Two ways the previous PR poisons this one:
@@ -171,11 +186,24 @@ def evaluate(pr, repo, seal=False):
         tail = ((r.stderr or "") + (r.stdout or "")).strip()
         tail = "\n".join(l for l in tail.splitlines() if "setlocale" not in l)[-1500:]
         raise RuntimeError(
-            f"build failed for #{num} @ {sha[:8]} (ssh exit {r.returncode})"
+            f"build failed for {what} @ {sha[:8]} (ssh exit {r.returncode})"
             + (f"\n{tail}" if tail else " — no output at all, so a setup step aborted the "
                                         "chain before cmake ran"))
 
+
+def _box_eval(what, frontier=None, seal=False):
+    """Run the K3 harness on the box against the build already checked out there.
+
+    `frontier` is passed through to the harness as --frontier. Passing it EXPLICITLY is the
+    point: left to itself the harness reads the frontier out of reference.lock, and a pinned
+    constant only stays true until the next perf PR merges. It did not -- #25 took main from
+    3.55 to 9.54 tok/s and the lock kept saying 3.55, so #20's 8% gain was priced against a
+    frontier main had already beaten by 2.7x and came out XL instead of S.
+
+    Returns (RESULT_JSON dict, combined output, ssh exit status).
+    """
     seal_flag = " --seal" if seal else ""
+    front_flag = "" if frontier is None else f" --frontier {frontier}"
     # POLARIS_API_KEY lives in a 0600 file on the box, not in this command line and not in
     # the repo: anything passed as an ssh argument shows up in ps on a shared machine.
     evalcmd = (
@@ -185,7 +213,8 @@ def evaluate(pr, repo, seal=False):
         # $SPARKINFER_BUILD/kimi_k3_tp_bench, so pointing this at build/ makes it exit 2 with
         # "not built" immediately after a build that in fact succeeded.
         f"KIMI_K3_MODELS_DIR={BOX_MODELS_DIR} SPARKINFER_BUILD={BOX_REPO_DIR}/build/runtime "
-        f"bash bench/scripts/kimi_k3_eval.sh --node {NODE} --devices {DEVICES}{seal_flag}"
+        f"bash bench/scripts/kimi_k3_eval.sh --node {NODE} --devices {DEVICES}"
+        f"{front_flag}{seal_flag}"
     )
     r = sh(evalcmd, timeout=7200)
     out = (r.stdout or "") + "\n" + (r.stderr or "")
@@ -194,9 +223,216 @@ def evaluate(pr, repo, seal=False):
         detail = (r.stderr or "").strip().splitlines()
         why = next((l for l in reversed(detail) if l.strip() and "setlocale" not in l), "")
         raise RuntimeError(
-            f"no RESULT_JSON from the harness for #{num}"
+            f"no RESULT_JSON from the harness for {what}"
             + (f" — {why}" if why else "") + f"\n{out[-1200:]}")
-    res = json.loads(line.split("RESULT_JSON", 1)[1].strip())
+    return json.loads(line.split("RESULT_JSON", 1)[1].strip()), out, r.returncode
+
+
+def measure_frontier(repo):
+    """Benchmark main ON THE SAME BOX, THIS ROUND, and return (sha, tok/s).
+
+    This is the frontier every PR in the round is scored against. Measuring it beats pinning
+    it for two independent reasons:
+
+      It cannot go stale. A pinned number is only correct until the next perf PR merges, and
+      nothing in the merge path was updating it -- which is exactly how #20 got an XL.
+
+      It cancels the box. Thermal state, driver version and neighbours on a rented machine
+      all move tok/s a few percent. main and the PR measured minutes apart on the same node
+      share all of that; a constant measured on some other day shares none of it.
+
+    The cost is one extra build+eval per round, amortised across every PR in it.
+    """
+    r = gh(["api", f"repos/{repo}/commits/main", "--jq", ".sha"])
+    sha = (r.stdout or "").strip()
+    if r.returncode != 0 or len(sha) < 7:
+        raise RuntimeError(f"could not resolve main on {repo}: {r.stderr.strip()[:200]}")
+    print(f"main: measuring the frontier at {sha[:8]} on {NODE} …")
+    _box_build(sha, "main")
+    # frontier=0 makes label.py return BASELINE, which is what we want: this run is not a
+    # submission and must not be sealed or scored. Only its tps is used.
+    res, _, _ = _box_eval("main", frontier=0, seal=False)
+    tps = float(res.get("tps") or 0)
+    if tps <= 0:
+        raise RuntimeError(f"main measured {tps} tok/s — refusing to score a round against it")
+    got = str(res.get("commit", "")).lower()
+    if not sha.lower().startswith(got) or len(got) < 7:
+        raise RuntimeError(f"harness measured commit {got!r} but main is {sha[:12]!r}")
+    print(f"main: frontier = {tps} tok/s @ {sha[:8]}")
+    return sha, tps, str(res.get("quant") or "UD-IQ1_S")
+
+
+LOCK_PATH = "bench/scripts/reference.lock"
+# Agreement band. Below this the measurement and the pin are the same number with noise on
+# it, and rewriting the lock would be churn -- which is NOT free here: `main` has
+# required_status_checks.strict, so every commit to it puts every open PR BEHIND and costs
+# each author a rebase. A frontier commit has to be worth that.
+FRONTIER_TOL = 0.02
+# Below this fraction of the pin, "main got slower" stops being noise and becomes a fact
+# that needs a human: either something regressed on main or the box is degraded. Both are
+# reasons to stop, not to quietly re-baseline the thing that decides payouts.
+FRONTIER_ALARM = 0.90
+
+
+def _frontier_slot(node, quant):
+    pfx = "KIMI_K3_" + re.sub(r"[^A-Za-z0-9]", "", node).upper()
+    q = re.sub(r"[^A-Za-z0-9]", "", re.sub(r"^UD-", "", quant or "")).upper()
+    return f"{pfx}_{q}_SPARKINFER_128"
+
+
+def reconcile_lock(repo, node, quant, measured, main_sha, dry_run):
+    """Make reference.lock's frontier agree with what main actually does.
+
+    WHY THIS EXISTS. eval-label.yml deliberately does not trust the bot: it re-derives the
+    tier from reference.lock on the protected branch and discards the payload's
+    frontier_tps, so a PR cannot understate the frontier to inflate its own tier. That is
+    the right design, and it means a measured frontier in this bot changes nothing on its
+    own -- the pinned number IS the tier basis. #25 merged, main went 3.55 -> 9.54, the pin
+    stayed 3.55, and CI stamped #20 eval:xl for a gain that is really S.
+
+    WHAT IT COSTS. Writing here gives the bot commit access to the file that sets payout
+    tiers, on a path CODEOWNERS and sensitive-paths-guard exist to protect. Three things
+    keep that narrow: only the one SPARKINFER slot for this node+quant is ever rewritten,
+    the value is always something just measured on the box (never computed or carried over),
+    and the frontier is only ever raised automatically. Lowering it makes every subsequent
+    PR's gain look bigger, so a throttled box could mint tiers for everyone behind it --
+    that direction stops the round instead.
+
+    Returns the frontier the round should score against, or None to abort.
+    """
+    slot = _frontier_slot(node, quant)
+    r = gh(["api", f"repos/{repo}/contents/{LOCK_PATH}?ref=main"])
+    if r.returncode != 0:
+        print(f"!! could not read {LOCK_PATH} from main: {r.stderr.strip()[:200]}",
+              file=sys.stderr)
+        return None
+    meta = json.loads(r.stdout or "{}")
+    text = base64.b64decode(meta.get("content", "")).decode()
+    pat = re.compile(rf'^({re.escape(slot)})="\$\{{\1:-([0-9.]+)\}}"\s*$', re.M)
+    m = pat.search(text)
+    if not m:
+        print(f"!! {slot} is not in {LOCK_PATH} — refusing to guess where the frontier lives",
+              file=sys.stderr)
+        return None
+    pinned = float(m.group(2))
+
+    if pinned > 0 and measured < pinned * FRONTIER_ALARM:
+        print(f"!! main measured {measured} tok/s but {slot} pins {pinned} — main is "
+              f"{100 * (1 - measured / pinned):.1f}% slower than its own frontier.\n"
+              f"   That is a regression on main or a degraded box, and lowering the frontier "
+              f"would inflate every tier scored after it. Stopping.", file=sys.stderr)
+        return None
+    if pinned > 0 and abs(measured - pinned) <= max(0.01, FRONTIER_TOL * pinned):
+        print(f">> frontier: {slot} pins {pinned}, main measures {measured} — agrees within "
+              f"{FRONTIER_TOL:.0%}, leaving the lock alone")
+        return pinned
+    if pinned > 0 and measured < pinned:
+        print(f">> frontier: main measures {measured}, below the pinned {pinned} but within "
+              f"the alarm band — scoring against the pin (the conservative direction)")
+        return pinned
+
+    # Rewrite BY LINE, not by splicing the regex match out of the whole text. Splicing looked
+    # fine and quietly ate the blank line after the slot, because the trailing-whitespace part
+    # of the match ran into it. This file is sourced by bash and parsed by two other tools;
+    # the only safe edit is one that provably touches one line and copies every other
+    # verbatim.
+    new = f'{slot}="${{{slot}:-{measured}}}"'
+    stamp = (f"# frontier: measured by eval/k3_eval_bot.py on main @ {main_sha[:12]} "
+             f"({node}, {quant}). Do not hand-edit — the bot rewrites this each round.")
+    line_re = re.compile(rf'^{re.escape(slot)}="\$\{{{re.escape(slot)}:-[0-9.]+\}}"\s*$')
+    out, seen = [], 0
+    for ln in text.split("\n"):
+        if ln.startswith("# frontier: measured by eval/k3_eval_bot.py"):
+            continue                      # drop the old stamp; a fresh one goes back below
+        if line_re.match(ln):
+            out.extend((stamp, new))
+            seen += 1
+            continue
+        out.append(ln)
+    if seen != 1:
+        print(f"!! {slot} matched {seen} lines in {LOCK_PATH} — refusing to rewrite",
+              file=sys.stderr)
+        return None
+    updated = "\n".join(out)
+
+    print(f">> frontier: {slot} {pinned} -> {measured} (main @ {main_sha[:8]})")
+    if dry_run:
+        print(f"--- dry-run: would commit {LOCK_PATH} to main")
+        return measured
+    q = gh(["api", "-X", "PUT", f"repos/{repo}/contents/{LOCK_PATH}",
+            "-f", f"message=eval: frontier {pinned} -> {measured} tok/s "
+                  f"(main @ {main_sha[:8]}, {node}/{quant})",
+            "-f", f"content={base64.b64encode(updated.encode()).decode()}",
+            "-f", f"sha={meta['sha']}", "-f", "branch=main"], timeout=180)
+    if q.returncode != 0:
+        print(f"!! could not commit the frontier to main: {q.stderr.strip()[:300]}\n"
+              f"   Refusing to score against a frontier CI will not agree with.",
+              file=sys.stderr)
+        return None
+    print(f">> {LOCK_PATH} updated on main — eval-label.yml will re-derive against {measured}")
+    print(f"   note: main moved, so every open PR is now BEHIND (branch protection is "
+          f"strict) and needs a rebase before it can merge")
+    return measured
+
+
+def update_pr_branch(repo, pr, dry_run, tries=12, delay=5):
+    """Bring a PR branch up to date with main, and return its NEW head sha.
+
+    THE BOT CAUSED THIS. Committing the measured frontier moves main, and with
+    required_status_checks.strict every open PR is BEHIND the moment that lands. Labelling
+    them needs-rebase and waiting is asking contributors to hand-fix bookkeeping the bot
+    did to them -- and it is the reason nothing merged: needs-rebase is in
+    NEVER_MERGE_LABELS, so the frontier commit blocked the very PR it was measured for.
+
+    The update is a merge of main into the branch, which changes the head sha. That is why
+    this runs BEFORE the PR is measured: the payload's commit has to be the head that
+    eval-label.yml sees, or it refuses the result as measured on another commit. Measure the
+    thing that will actually merge.
+
+    Fork PRs need maintainer_can_modify (GitHub's "allow edits by maintainers"); without it
+    the API refuses and the author genuinely does have to rebase.
+    """
+    num = pr["number"]
+    if dry_run:
+        print(f"--- dry-run: would update #{num} onto main")
+        return pr["headRefOid"]
+    before = pr["headRefOid"]
+    r = gh(["api", "-X", "PUT", f"repos/{repo}/pulls/{num}/update-branch",
+            "-f", "expected_head_sha=" + before], timeout=120)
+    if r.returncode != 0:
+        err = (r.stderr or "").strip()[:200]
+        print(f"!! #{num}: could not update the branch onto main — {err}\n"
+              f"   (a fork PR needs 'allow edits by maintainers'); leaving it to the author",
+              file=sys.stderr)
+        return None
+    # The new head appears asynchronously. Poll for it rather than assuming: measuring the
+    # old sha would produce a result eval-label.yml rejects, after a 40-minute node run.
+    for _ in range(tries):
+        time.sleep(delay)
+        q = gh(["pr", "view", str(num), "-R", repo, "--json", "headRefOid,mergeStateStatus"])
+        try:
+            info = json.loads(q.stdout or "{}")
+        except json.JSONDecodeError:
+            continue
+        head, state = info.get("headRefOid", ""), info.get("mergeStateStatus")
+        if head and head != before and state != "BEHIND":
+            print(f">> #{num}: branch updated onto main, {before[:8]} -> {head[:8]}")
+            return head
+    print(f"!! #{num}: branch update did not settle in {tries * delay}s — not measuring a "
+          f"head that may still move", file=sys.stderr)
+    return None
+
+
+def evaluate(pr, repo, frontier, seal=False):
+    """Check the PR head out on the box, build it, and run the K3 harness there.
+
+    Returns the parsed RESULT_JSON, or raises RuntimeError with the box's own output. The
+    build and the eval both happen on the node; nothing is measured locally.
+    """
+    sha = pr["headRefOid"]
+    num = pr["number"]
+    _box_build(sha, f"#{num}")
+    res, out, rc = _box_eval(f"#{num}", frontier=frontier, seal=seal)
     # --seal publishes to sparkinfer-k3-log and prints the receipt id. Carry it in the
     # payload: eval-label.yml looks it up there when REQUIRE_EVAL_RECEIPT is on, and
     # without it a sealed run is indistinguishable from an unsealed one.
@@ -220,7 +456,7 @@ def evaluate(pr, repo, seal=False):
             # made the controller path unreachable -- every run reported 0 sealed while a
             # signed receipt sat on the box.
             res["receipt_id"] = rid.group(1)
-            if r.returncode != 0:
+            if rc != 0:
                 print(f"#{num}: box-side publish failed (expected — no git credentials "
                       f"there); publishing {rid.group(1)[:12]} from here instead")
         else:
@@ -322,7 +558,6 @@ def publish_receipt(repo_log, num, res, box_out, dry_run):
     if dry_run:
         print(f"--- dry-run: would publish runs/{rid} to {repo_log}")
         return True
-    import base64
     for name, payload in (("receipt.json", body),
                           ("result.json", json.dumps(res, indent=2, sort_keys=True))):
         enc = base64.b64encode(payload.encode()).decode()
@@ -338,10 +573,106 @@ def publish_receipt(repo_log, num, res, box_out, dry_run):
     return True
 
 
-def merge_blockers(repo, num, pr):
-    """Every reason not to merge this without a human reading it. Empty list means clear."""
+# Which merge states each path may proceed through.
+#
+# The distinction that matters is PERMISSION gates versus CONTENT gates.
+#
+#   BLOCKED is a permission gate: the required approving review has not happened yet (or a
+#   required check is still pending). Bypassing precisely that is what --admin IS for. The
+#   strict list refused it, and since `main` always requires a review, BLOCKED is where every
+#   PR here permanently sits -- so --merge-admin could never merge anything at all. It failed
+#   on #20 twice for this reason, reported as "blocked by a required check or review", which
+#   reads like a real objection rather than the flag refusing its own purpose.
+#
+#   BEHIND is a content gate: the branch does not contain main, so the tier measured on it
+#   was scored against a frontier that has since moved. Admin rights do not make that number
+#   true. The bot fixes this by updating the branch and RE-MEASURING, never by merging
+#   through it.
+#
+#   DIRTY is conflicts -- there is nothing to bypass, the merge would be a guess.
+#   UNKNOWN is "GitHub has not finished computing mergeability": not evidence, and it is what
+#   #20 reported seconds after #25 merged while actually being DIRTY.
+MERGE_STATES = {
+    "strict": ("CLEAN", "UNSTABLE"),
+    "admin": ("CLEAN", "UNSTABLE", "BLOCKED"),
+}
+
+
+class _Tee:
+    """Mirror everything the round prints into a buffer so it can be published.
+
+    A receipt proves a number was signed. It says nothing about what the round DID to get
+    there -- whether the frontier moved and to what, which build failed first, why a merge
+    was refused. That context existed only in the operator's terminal, which is exactly
+    where someone checking the number afterwards cannot look.
+    """
+
+    def __init__(self, stream, buf):
+        self._s, self._b = stream, buf
+
+    def write(self, s):
+        self._s.write(s)
+        self._b.write(s)
+        return len(s)
+
+    def flush(self):
+        self._s.flush()
+
+    def isatty(self):
+        return self._s.isatty()
+
+
+def publish_log(repo_log, rid, text, dry_run):
+    """Put the round's own output next to the receipt it produced.
+
+    Append-only, like the receipt itself: an existing path is a refusal, not something to
+    force. Publishing the log under the receipt id keeps a run self-describing -- the
+    measurement, the verdict and the session that produced them arrive together.
+    """
+    if not rid or not text.strip():
+        return False
+    if dry_run:
+        print(f"--- dry-run: would publish runs/{rid}/eval.log to {repo_log}")
+        return True
+    q = gh(["api", "-X", "PUT", f"repos/{repo_log}/contents/runs/{rid}/eval.log",
+            "-f", f"message=eval {rid}: round log",
+            "-f", f"content={base64.b64encode(text.encode()).decode()}"], timeout=180)
+    if q.returncode != 0:
+        print(f"!! could not publish runs/{rid}/eval.log: {q.stderr.strip()[:160]}",
+              file=sys.stderr)
+        return False
+    print(f">> published runs/{rid}/eval.log to {repo_log}")
+    return True
+
+
+def merge_blockers(repo, num, pr, waiting_is_blocking=True, mode="strict"):
+    """Every reason not to merge this without a human reading it. Empty list means clear.
+
+    Two kinds of reason, and they are not the same kind of thing:
+
+      SUBSTANTIVE -- a label, a maintainer-owned path, a missing tier. These say a human has
+      to look at this PR. No amount of waiting resolves them.
+
+      WAITING -- the merge state: behind, conflicted, or blocked on the required review.
+      These resolve by themselves when someone approves or the author rebases.
+
+    --merge-admin must respect both, because it merges NOW. Queued auto-merge only respects
+    the substantive ones (waiting_is_blocking=False): waiting for the review is precisely
+    what it is for, and refusing to queue because the review has not happened yet would make
+    the flag do nothing. The substantive guards still apply -- queueing auto-merge on a PR
+    labelled `hold` or `copycat` would hand it a merge the moment someone clicked approve.
+    """
     bad = []
-    labels = {l.get("name", "") for l in pr.get("labels") or []}
+    # Read labels FRESH rather than from the snapshot taken when the round started. The round
+    # mutates them -- merge-first goes on, needs-rebase comes off once a branch is updated --
+    # so deciding from the opening snapshot refuses a merge over a label that no longer
+    # exists. That is precisely what stopped #20: the snapshot still said needs-rebase.
+    st = gh(["pr", "view", str(num), "-R", repo, "--json", "mergeStateStatus,labels"])
+    try:
+        live = json.loads(st.stdout or "{}")
+    except json.JSONDecodeError:
+        live = {}
+    labels = {l.get("name", "") for l in (live.get("labels") or pr.get("labels") or [])}
     hit = labels & NEVER_MERGE_LABELS
     if hit:
         bad.append(f"labels {sorted(hit)}")
@@ -354,6 +685,8 @@ def merge_blockers(repo, num, pr):
     touched = sorted({f for f in files if f.startswith(NEVER_MERGE_PATHS)})
     if touched:
         bad.append(f"touches maintainer-owned paths: {touched[:4]}")
+    if not waiting_is_blocking:
+        return bad
     # Allowlist the states that are safe, rather than denylisting the bad ones.
     #
     # BEHIND is the important one and is easy to read as harmless: the branch merely trails
@@ -364,12 +697,8 @@ def merge_blockers(repo, num, pr):
     # UNKNOWN is not "fine", it is "GitHub has not finished computing mergeability" --
     # asynchronous, and it is what #20 reported seconds after #25 merged while actually
     # being DIRTY. Treating unknown as clear is how a conflicted branch gets merged.
-    st = gh(["pr", "view", str(num), "-R", repo, "--json", "mergeStateStatus"])
-    try:
-        state = json.loads(st.stdout or "{}").get("mergeStateStatus", "UNKNOWN")
-    except json.JSONDecodeError:
-        state = "UNKNOWN"
-    if state not in ("CLEAN", "UNSTABLE"):
+    state = live.get("mergeStateStatus") or "UNKNOWN"
+    if state not in MERGE_STATES.get(mode, MERGE_STATES["strict"]):
         bad.append({
             "BEHIND": "behind main — its tier predates the current frontier",
             "DIRTY": "merge conflicts",
@@ -388,7 +717,7 @@ def merge_winner(repo, num, pr, dry_run):
     quietly. A silent no-op here would be indistinguishable from a successful merge in the
     run log, and that is exactly how an unreviewed merge goes unnoticed.
     """
-    blockers = merge_blockers(repo, num, pr)
+    blockers = merge_blockers(repo, num, pr, mode="admin")
     if blockers:
         print(f"!! #{num}: NOT merged — {'; '.join(blockers)}", file=sys.stderr)
         return False
@@ -423,7 +752,22 @@ def sync_rebase_labels(repo, prs, merged_num, dry_run):
         if info.get("state") != "OPEN":
             continue
         labels = {l.get("name", "") for l in info.get("labels") or []}
-        behind = info.get("mergeStateStatus") in ("BEHIND", "DIRTY", "BLOCKED", "UNKNOWN")
+        # The label means ONE thing: "your branch trails main, so the tier on it was measured
+        # against a frontier that has moved". Only BEHIND and DIRTY say that about the branch.
+        #
+        # BLOCKED does not, and treating it as stale deadlocked #20: BLOCKED is what GitHub
+        # reports for "waiting on the required approving review", which is the branch's normal
+        # resting state here. So the label could never clear, and because needs-rebase is in
+        # NEVER_MERGE_LABELS it also blocked the merge -- the label survived on the strength of
+        # the review it was helping to prevent, while the author had already rebased.
+        #
+        # UNKNOWN means GitHub has not finished computing mergeability. That is not evidence
+        # either way, so it neither sets nor clears: acting on it would label people over an
+        # API race.
+        state = info.get("mergeStateStatus")
+        stale = state in ("BEHIND", "DIRTY")
+        current = state in ("CLEAN", "UNSTABLE", "BLOCKED")
+        behind = stale
         has = REBASE_LABEL in labels
         # The label means "your measured tier is stale because the frontier moved". A PR
         # with no eval:* tier has no stale tier -- telling its author to rebase because of
@@ -461,7 +805,7 @@ def sync_rebase_labels(repo, prs, merged_num, dry_run):
                 f"clears by itself once the branch is current, and the next round "
                 f"re-measures against the new frontier."])
             print(f">> #{num}: {REBASE_LABEL} (frontier moved)")
-        elif has and not behind:
+        elif has and current:
             if dry_run:
                 print(f"--- dry-run: would clear {REBASE_LABEL} from #{num}")
                 continue
@@ -469,7 +813,7 @@ def sync_rebase_labels(repo, prs, merged_num, dry_run):
             print(f">> #{num}: {REBASE_LABEL} cleared — branch is current again")
 
 
-def mark_merge_first(repo, results, dry_run, queue_auto_merge=False):
+def mark_merge_first(repo, results, dry_run, queue_auto_merge=False, prs=()):
     """Label the round's biggest verified gain `merge-first`, and clear it from the rest.
 
     The winner is by measured tok/s against the SAME frontier, which is the only comparison
@@ -510,16 +854,36 @@ def mark_merge_first(repo, results, dry_run, queue_auto_merge=False):
             print(f"!! #{num}: failed to set merge-first: {q.stderr.strip()[:200]}",
                   file=sys.stderr)
     print(f">> merge-first: #{winner} ({ranked[0][1].get('tps')} tok/s)")
-    if queue_auto_merge and not dry_run:
-        r = gh(["pr", "merge", str(winner), "-R", repo, "--squash", "--auto"])
-        if r.returncode == 0:
-            print(f">> #{winner}: auto-merge queued — fires when review + checks pass")
-        else:
-            print(f"!! #{winner}: could not queue auto-merge: {r.stderr.strip()}",
-                  file=sys.stderr)
+    if not queue_auto_merge:
+        return
+    # Queueing is not merging, but it is arming: once the required review lands, GitHub
+    # merges with nobody looking again. So the substantive guards apply here too -- the
+    # merge-state ones do not, because waiting for them IS the feature.
+    blockers = merge_blockers(repo, winner, {p["number"]: p for p in prs}.get(winner, {}),
+                              waiting_is_blocking=False)
+    if blockers:
+        print(f"!! #{winner}: NOT queued for auto-merge — {'; '.join(blockers)}",
+              file=sys.stderr)
+        return
+    if dry_run:
+        print(f"--- dry-run: would queue auto-merge on #{winner}")
+        return
+    r = gh(["pr", "merge", str(winner), "-R", repo, "--squash", "--auto"])
+    if r.returncode == 0:
+        print(f">> #{winner}: auto-merge queued — fires when review + checks pass")
+    else:
+        print(f"!! #{winner}: could not queue auto-merge: {r.stderr.strip()}",
+              file=sys.stderr)
 
 
 def main():
+    # Mirror the round into a buffer from the first line, so what gets published is the whole
+    # session and not the tail of it. Both streams share one buffer: the interesting parts of
+    # a bad round are on stderr, and a log that drops them reads like a clean run.
+    log_buf = io.StringIO()
+    _real_out, _real_err = sys.stdout, sys.stderr
+    sys.stdout, sys.stderr = _Tee(_real_out, log_buf), _Tee(_real_err, log_buf)
+
     ap = argparse.ArgumentParser(description="Measure eligible K3 PRs on the H200 node and post the result.")
     ap.add_argument("--repo", default=REPO_DEFAULT)
     ap.add_argument("--only-pr", type=int, default=0, help="evaluate just this PR number")
@@ -543,6 +907,19 @@ def main():
                     help="only reconcile needs-rebase labels against each PR's merge state "
                          "and exit — no node run. Cheap enough to poll, which is what makes "
                          "the label clear itself once a miner has rebased.")
+    ap.add_argument("--frontier", type=float, default=None,
+                    help="skip the main benchmark and score against this tok/s. For re-runs "
+                         "within a round; the lock is still reconciled against it.")
+    ap.add_argument("--no-lock-update", action="store_true",
+                    help="measure main but never write reference.lock. The posted number "
+                         "will then disagree with the tier eval-label.yml re-derives from "
+                         "the pinned frontier, so this is for inspection, not for a round "
+                         "that is meant to set tiers.")
+    ap.add_argument("--publish-log", metavar="RECEIPT_ID",
+                    help="publish a round log against an EXISTING receipt and exit. For "
+                         "backfilling a run that was sealed before the log was captured, or "
+                         "whose PR has since merged and can no longer be re-evaluated.")
+    ap.add_argument("--log-file", help="log to publish with --publish-log ('-' for stdin)")
     ap.add_argument("--list", action="store_true", help="show eligibility for every open PR and exit")
     args = ap.parse_args()
 
@@ -553,6 +930,28 @@ def main():
         sys.stderr.write(f"k3_eval_bot: refusing to run against {args.repo!r} — this bot only "
                          f"evaluates Kimi K3 repositories.\n")
         return 2
+
+    if args.publish_log:
+        # Backfill. Kept separate from a round on purpose: it publishes a log somebody hands
+        # it rather than one it produced, so it must never be confused with the automatic
+        # path. It refuses unless the receipt already exists -- the log is an annotation on a
+        # sealed run, and one filed against an id with nothing behind it is worse than
+        # absent, since a reader has no measurement to check it against.
+        if not args.log_file:
+            sys.stderr.write("k3_eval_bot: --publish-log needs --log-file\n")
+            return 2
+        rid = args.publish_log
+        q = gh(["api", f"repos/{LOG_REPO}/contents/runs/{rid}", "--silent"])
+        if q.returncode != 0:
+            sys.stderr.write(f"k3_eval_bot: no receipt {rid} in {LOG_REPO} — refusing to file "
+                             f"a log against a run that was never sealed\n")
+            return 1
+        try:
+            text = sys.stdin.read() if args.log_file == "-" else open(args.log_file).read()
+        except OSError as exc:
+            sys.stderr.write(f"k3_eval_bot: cannot read {args.log_file}: {exc}\n")
+            return 1
+        return 0 if publish_log(LOG_REPO, rid, text, args.dry_run) else 1
 
     prs = list_prs(args.repo)
     if args.only_pr:
@@ -576,17 +975,73 @@ def main():
         sync_rebase_labels(args.repo, prs, merged_num=-1, dry_run=args.dry_run)
         return 0
 
-    evaluated = 0
-    results = []
+    eligible = [p for p in prs if eligibility(p)[0]]
     for pr in prs:
-        num = pr["number"]
         ok, why = eligibility(pr)
         if not ok:
-            print(f"#{num}: skip — {why}")
-            continue
-        print(f"#{num}: evaluating {pr['headRefOid'][:8]} on {NODE} …")
+            print(f"#{pr['number']}: skip — {why}")
+    if not eligible:
+        print("nothing eligible — not booking the node for a frontier measurement")
+        return 0
+
+    # THE FRONTIER IS MEASURED, NOT PINNED. Do this before anything is posted: eval-label.yml
+    # reads reference.lock at comment time, so a comment posted before the lock is reconciled
+    # gets a tier derived from the old frontier -- which is the whole failure being fixed.
+    try:
+        if args.frontier is not None:
+            main_sha, main_tps = "", float(args.frontier)
+            quant = "UD-IQ1_S"
+            print(f">> frontier: {main_tps} tok/s (--frontier, main not re-measured)")
+            r = gh(["api", f"repos/{args.repo}/commits/main", "--jq", ".sha"])
+            main_sha = (r.stdout or "").strip()
+        else:
+            main_sha, main_tps, quant = measure_frontier(args.repo)
+    except RuntimeError as exc:
+        print(f"frontier measurement failed — {exc}", file=sys.stderr)
+        return 1
+
+    if args.no_lock_update:
+        print(">> --no-lock-update: reference.lock untouched; the applied tier will come "
+              "from the pinned frontier, not this one", file=sys.stderr)
+        frontier = main_tps
+    else:
+        frontier = reconcile_lock(args.repo, NODE, quant, main_tps, main_sha, args.dry_run)
+        if frontier is None:
+            return 3
+
+    # main may have just moved under these branches -- and if reconcile_lock committed, it
+    # moved BECAUSE of this round. Bring them onto it before measuring rather than labelling
+    # them needs-rebase and waiting: the bot caused the staleness, the head sha changes when
+    # it is fixed, and the number has to be taken on the commit that will actually merge.
+    for pr in list(eligible):
+        num = pr["number"]
+        st = gh(["pr", "view", str(num), "-R", args.repo, "--json", "mergeStateStatus"])
         try:
-            res = evaluate(pr, args.repo, seal=not args.no_seal)
+            state = json.loads(st.stdout or "{}").get("mergeStateStatus")
+        except json.JSONDecodeError:
+            state = None
+        if state != "BEHIND":
+            continue
+        head = update_pr_branch(args.repo, pr, args.dry_run)
+        if head is None:
+            print(f"#{num}: skip — behind main and the branch could not be brought current, "
+                  f"so any number measured here would be scored against the wrong frontier")
+            eligible.remove(pr)
+            continue
+        pr["headRefOid"] = head
+
+    if not eligible:
+        print("nothing left to evaluate after reconciling branches")
+        return 0
+
+    evaluated = 0
+    results = []
+    for pr in eligible:
+        num = pr["number"]
+        print(f"#{num}: evaluating {pr['headRefOid'][:8]} on {NODE} "
+              f"against frontier {frontier} …")
+        try:
+            res = evaluate(pr, args.repo, frontier, seal=not args.no_seal)
         except RuntimeError as exc:
             print(f"#{num}: eval failed — {exc}", file=sys.stderr)
             continue
@@ -598,9 +1053,16 @@ def main():
         results.append((num, res))
         evaluated += 1
 
+    # Reconcile the stale-tier labels BEFORE any merge decision, not after. needs-rebase is
+    # in NEVER_MERGE_LABELS, so one left over from before the branches were brought current
+    # blocks the merge it was never meant to block. That is exactly how #20 ended up labelled
+    # merge-first and then refused in the same round.
+    if args.merge_first or args.auto_merge or args.merge_admin:
+        sync_rebase_labels(args.repo, prs, merged_num=-1, dry_run=args.dry_run)
+
     if args.merge_first or args.auto_merge or args.merge_admin:
         mark_merge_first(args.repo, results, args.dry_run,
-                         queue_auto_merge=args.auto_merge)
+                         queue_auto_merge=args.auto_merge, prs=prs)
 
     if args.merge_admin and results:
         winner = max(results, key=lambda r: r[1].get("tps") or 0)[0]
@@ -612,12 +1074,6 @@ def main():
             sync_rebase_labels(args.repo, prs, winner, args.dry_run)
     elif args.merge_admin:
         print("no results to merge", file=sys.stderr)
-
-    # A PR that has already been rebased should not keep the label just because no merge
-    # happened this round. Cheap to check, and it is the half of the contract the miner has
-    # already done their part of.
-    if args.merge_first or args.merge_admin:
-        sync_rebase_labels(args.repo, prs, merged_num=-1, dry_run=args.dry_run)
 
     # A receipt id proves a receipt was minted, not that anyone can find it. The log is the
     # only thing that makes a number checkable by someone who was not at this terminal, so
@@ -635,7 +1091,17 @@ def main():
             print(f"#{num}: receipt {rid[:12]} is NOT in {LOG_REPO} — the run is unattested",
                   file=sys.stderr)
     print(f"done — {evaluated} evaluated, {sealed} sealed to the log; "
-          f"tiers are eval-label.yml's, merges wait on review")
+          f"tiers are eval-label.yml's")
+
+    # Publish the round's own output alongside each receipt. Last, so the log contains the
+    # whole round: the frontier measurement, the branch updates, the merge decision and the
+    # reason for it. Restore the real streams first -- the publish output describes the
+    # publish and belongs on the terminal, not recursively inside the artefact.
+    sys.stdout, sys.stderr = _real_out, _real_err
+    body = log_buf.getvalue()
+    for num, r in results:
+        if r.get("receipt_id"):
+            publish_log(LOG_REPO, r["receipt_id"], body, args.dry_run)
     return 0
 
 
