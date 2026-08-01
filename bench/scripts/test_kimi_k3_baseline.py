@@ -1126,6 +1126,28 @@ class CiWorkflowTest(unittest.TestCase):
                         src.index("kimi_k3_eval.sh --node"),
                         "the harness must be restored BEFORE the eval runs")
 
+    def test_bot_resets_box_state_between_prs(self):
+        """Each PR must start from a clean box, and both ways it fails blame the wrong PR.
+
+        An orphaned bench holds GPU memory: killing the controller does not kill what it
+        started over ssh, so the next weight load dies in cudaMalloc partway through layer
+        92 -- indistinguishable from an OOM bug in the PR under test. And restoring the
+        protected harness stages bench/scripts, so the NEXT checkout aborts with "local
+        changes would be overwritten" and that PR is reported as a build failure it had
+        nothing to do with. Both were observed in one run.
+
+        The pkill must match the built path, not the bare target name, or the build's own
+        `--target kimi_k3_tp_bench` command line is caught by its own cleanup."""
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        self.assertIn("git reset -q --hard", src, "a dirty tree blocks the next checkout")
+        self.assertIn("git clean -qfd", src)
+        self.assertIn("build/runtime/kimi_k3_tp_bench'", src,
+                      "pkill must match the built path, not the target name")
+        # every cleanup step must tolerate failure, or the && chain aborts the whole setup
+        for line in src.split("\n"):
+            if "pkill -f" in line:
+                self.assertIn("|| true", line, "pkill breaks the && chain when nothing matches")
+
     def test_baseline_results_are_committable(self):
         """The `lock` job requires a committed bench/results JSON to back any pinned
         baseline. bench/.gitignore ignores results/ wholesale, so without an explicit
