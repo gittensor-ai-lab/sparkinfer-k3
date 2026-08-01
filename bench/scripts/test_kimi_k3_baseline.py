@@ -1377,11 +1377,39 @@ class CiWorkflowTest(unittest.TestCase):
         self.assertIn("TOKENS_HI=", ev, "the second run is what makes the difference a rate")
         self.assertIn("date +%s%N", ev, "the timing must come from the controller's clock")
         speed = ev[ev.index("# ---- 1. speed"):ev.index("# ---- 2. correctness")]
-        self.assertIn("ns_hi - ns_lo", speed, "ms/token must be a wall-clock differential")
-        # the self-report is kept only as a cross-check, and disagreement must REFUSE
+        self.assertIn("ns_hi - ns_lo", speed, "the bound must be a wall-clock differential")
+        # a claim faster than elapsed time allows must REFUSE, not warn. The exact
+        # comparison lives in test_wall_clock_is_a_bound_not_the_reading.
         self.assertIn("refusing to score", speed)
-        self.assertIn("self_tps / ext_tps > 1.25", speed,
+        self.assertIn("self_tps > ext_tps * tol", speed,
                       "a binary claiming to be faster than elapsed time must be rejected")
+
+    def test_wall_clock_is_a_bound_not_the_reading(self):
+        """Two numbers, two jobs, and conflating them broke a round on TRUSTED main.
+
+        The self-report is timed inside the process around decode only, so it is precise --
+        and precision is what a tier needs, since a noisy number moves PRs across band
+        boundaries for nothing. The differential is external and therefore unforgeable, but
+        it carries the run-to-run variance of the model load, so it is a BOUND.
+
+        Using it as the reading failed: at 8 and 24 tokens the marginal signal was ~3.5 s
+        against a ~29 s load that varies by 1-2 s, so jitter became a 32% error -- 4.55
+        tok/s self-reported against 3.45 measured, and the harness refused itself. The
+        margin is a fixed, much larger token count now so the signal dominates the jitter.
+
+        The bound is ONE-SIDED on purpose: jitter only ever makes the differential read
+        slower than truth, so a self-report below it is never suspicious. Only a claim
+        FASTER than elapsed time allows is evidence."""
+        ev = (ROOT / "bench/scripts/kimi_k3_eval.sh").read_text()
+        speed = ev[ev.index("# ---- 1. speed"):ev.index("# ---- 2. correctness")]
+        self.assertIn("MARGIN_TOKENS=", speed,
+                      "a multiple of TOKENS gives a signal smaller than the load jitter")
+        self.assertNotIn("TOKENS * 3", speed)
+        self.assertIn("self_tps > ext_tps * tol", speed, "the bound must be one-sided")
+        self.assertIn('print(f"{self_tps:.2f} {self_ms:.2f}")', speed,
+                      "the SELF-REPORT is what gets scored; the differential only bounds it")
+        # a missing self-report is fatal -- there is nothing to score
+        self.assertIn("reported no ms/token line", speed)
 
     def test_polaris_key_is_kept_out_of_the_benchs_environment(self):
         """`. /root/.polaris_env` exports POLARIS_API_KEY, and every child inherits it --
@@ -1523,6 +1551,44 @@ class CiWorkflowTest(unittest.TestCase):
         # main() for the --publish-log backfill, which returns before any round runs.
         self.assertLess(main_fn.index("merge_winner("), main_fn.rindex("publish_round_log("),
                         "the log must include the merge decision it explains")
+
+    def test_compare_logits_exit_code_is_a_verdict_not_an_error(self):
+        """compare_logits returns 0 only for mean_kld < 1e-5 -- a SAME-IMPLEMENTATION bar,
+        "two implementations of one arithmetic". K3's accepted parity is 4.05e-03, ~400x
+        that, from a documented cause (f32 activations where ggml quantizes before a
+        quantized mat-vec). So it reports FAIL on every healthy K3 run.
+
+        The shell this replaced ran it with `|| true` and read the JSON. Porting it to
+        Python without that turned every round into "compare_logits failed" with an empty
+        stderr -- which is exactly how the first hardened round died. The gate that decides
+        anything is label.py's (top1 >= 0.90, kl <= 0.20), applied downstream."""
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        acc = src[src.index("def measure_accuracy("):src.index("def _box_eval(")]
+        self.assertNotIn("if p.returncode != 0 or not", acc,
+                         "a non-zero exit here is the normal, healthy K3 result")
+        self.assertIn("if not out:", acc,
+                      "only a MISSING payload is a real failure — the tool did not run")
+        # and the real bars still live in label.py, unchanged
+        lbl = (ROOT / "bench/scripts/label.py").read_text()
+        self.assertIn('SPARKINFER_TOP1_BAR",  "0.90"', lbl)
+        self.assertIn('SPARKINFER_KL_BAR",    "0.20"', lbl)
+
+    def test_a_failed_round_still_has_a_log_path(self):
+        """rounds/<main_sha>/ exists for the round that seals nothing -- and the first one
+        that needed it published nothing anyway.
+
+        _bail read main_sha out of locals(), which is unbound when the FRONTIER measurement
+        is what failed, so the fallback reported "main is unknown" and dropped the log. That
+        is precisely the round worth reading. main is therefore resolved before anything can
+        fail, so the path exists before it is needed."""
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        main_fn = src[src.index("def main("):]
+        self.assertNotIn('locals().get("main_sha"', main_fn,
+                         "an unbound local is not a log path")
+        self.assertLess(main_fn.index("main_sha = (_r.stdout"), main_fn.index("def _bail("),
+                        "main must be resolved BEFORE the thing that can fail")
+        self.assertIn("sha or main_sha", main_fn,
+                      "_bail must fall back to the up-front sha")
 
     def test_every_round_publishes_a_log_even_when_nothing_seals(self):
         """The rule is ALWAYS, and receipt-indexing alone cannot satisfy it.
