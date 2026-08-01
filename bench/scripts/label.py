@@ -160,5 +160,14 @@ if res.get("label") != "REJECT" and kl > KL_PREFER:
 
 # JSON keys can't be "pass" via kwarg; normalize
 res["pass"] = res.pop("pass_", True)
-res.update(prov)                                       # M1/H1/C2 provenance (non-scoring)
+# M1/H1/C2 provenance. This runs AFTER the verdict is set, so it must never be able to
+# reach a scoring key: an unfiltered res.update(prov) lets a provenance blob carrying
+# {"label": "XL"} overwrite the computed tier, which is the opposite of what the comment
+# here used to claim. Allowlist, and record any attempt rather than silently dropping it.
+_VERDICT_KEYS = {"label", "pass", "pass_", "delta_tps", "pct_over_frontier", "pct_of_llama",
+                 "speed_label", "note", "accuracy_warn", "top1", "kl"}
+_rejected = sorted(k for k in prov if k in _VERDICT_KEYS)
+res.update({k: v for k, v in prov.items() if k not in _VERDICT_KEYS})
+if _rejected:
+    res["provenance_rejected"] = _rejected
 print("RESULT_JSON " + json.dumps(res))

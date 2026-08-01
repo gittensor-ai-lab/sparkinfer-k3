@@ -867,6 +867,46 @@ class CiWorkflowTest(unittest.TestCase):
             else:
                 self.assertIn(f"/bench/scripts/{name}", owners,
                               f"guard covers bench/scripts/{name} but CODEOWNERS does not")
+    def test_guard_covers_the_accuracy_answer_key(self):
+        """bench/refdata/hello.spkl IS the accuracy gate. kimi_k3_eval.sh scores the build's
+        logits against it, so a PR able to rewrite it can hand itself top1=1.0 / kl=0.0 and
+        walk through the correctness gate that is supposed to make a speedup honest. It was
+        unguarded. _common.sh (build flags) and _eval_speed.sh (parses the tok/s) are the
+        same shape of hole on the speed side."""
+        import re as _re
+        wf = (ROOT / ".github/workflows/sensitive-paths-guard.yml").read_text()
+        rx = _re.compile([l for l in wf.splitlines() if "SENSITIVE=" in l][0].split("'")[1])
+        for p in ("bench/refdata/hello.spkl", "bench/refdata/hello.ids",
+                  "bench/scripts/_common.sh", "bench/scripts/_eval_speed.sh"):
+            self.assertTrue(rx.search(p), f"scoring input left writable by contributors: {p}")
+
+    def test_provenance_cannot_overwrite_the_verdict(self):
+        """label.py merges its optional 7th provenance arg into the result AFTER computing
+        the verdict. Unfiltered, a provenance blob carrying {"label": "XL"} silently becomes
+        the tier. The inline comment called it non-scoring; it was not."""
+        import subprocess as sp, json as _j
+        out = sp.run([sys.executable, str(ROOT / "bench/scripts/label.py"),
+                      "4.0", "3.55", "0", "1.0", "0.001", "abc123",
+                      _j.dumps({"label": "XL", "pass": True, "clock_mhz": 1980})],
+                     capture_output=True, text=True, check=True).stdout
+        res = _j.loads(out.split("RESULT_JSON ", 1)[1])
+        self.assertNotEqual(res["label"], "XL", "provenance overwrote the computed tier")
+        self.assertIn("label", res.get("provenance_rejected", []))
+        self.assertEqual(res.get("clock_mhz"), 1980, "legitimate provenance was dropped")
+
+    def test_verify_strict_actually_uses_its_validator(self):
+        """verify_strict(receipt, validator) accepted a validator and never referenced it,
+        so callers passing ReceiptValidator(r) got nothing: 'the receipt verifies' meant
+        five fields were non-empty. Asserted structurally via AST so a future refactor that
+        drops the call fails here rather than silently restoring a decorative parameter."""
+        import ast as _ast
+        src = (ROOT / "eval/polaris/verify.py").read_text()
+        fn = [n for n in _ast.walk(_ast.parse(src))
+              if isinstance(n, _ast.FunctionDef) and n.name == "verify_strict"][0]
+        names = {x.id for x in _ast.walk(fn) if isinstance(x, _ast.Name)}
+        self.assertIn("validator", names, "verify_strict ignores its validator parameter")
+        calls = {_ast.unparse(c.func) for c in _ast.walk(fn) if isinstance(c, _ast.Call)}
+        self.assertIn("validator.verify", calls, "validator.verify() is never invoked")
 
     def test_baseline_results_are_committable(self):
         """The `lock` job requires a committed bench/results JSON to back any pinned

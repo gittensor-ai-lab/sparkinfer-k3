@@ -70,7 +70,17 @@ def load_trusted_keys(filepath: str) -> list:
 
 def verify_strict(receipt: dict, validator: ReceiptValidator) -> list:
     """Additional strict-mode checks beyond the basic verification."""
-    issues = []
+    # The validator parameter was accepted and never used, so every caller passing
+    # ReceiptValidator(r) was buying nothing: "verifies" meant five fields were non-empty.
+    # Run it first and treat a signature failure as fatal.
+    problems = []
+    try:
+        ok = validator.verify()
+    except Exception as exc:                       # noqa: BLE001 - any failure is a failure
+        return ["signature check raised %s: %s" % (type(exc).__name__, exc)]
+    if not ok:
+        problems.append("✗ strict: signature does not verify against the receipt public key")
+    issues = problems        # carry the signature verdict into the returned list
     a = receipt.get("attestation", {})
     e = a.get("environment", {})
     r = a.get("references", {})
