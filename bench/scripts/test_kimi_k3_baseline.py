@@ -1010,6 +1010,48 @@ class CiWorkflowTest(unittest.TestCase):
                 self.assertNotIn('SPARKINFER_AUTOMERGE_ADMIN", "1"', path.read_text(),
                                  f"{bot} defaults to bypassing branch protection")
 
+    def test_k3_bot_build_configuration(self):
+        """Two bugs found by running the bot against the node, not by reading it.
+
+        kimi_k3_tp_bench refuses to run sharded without a real collective, so a build
+        configured without -DSPARKINFER_TP=ON fails at eval time with nothing pointing back
+        at configure as the cause. And CMake emits to build/runtime/, so pointing
+        SPARKINFER_BUILD at build/ makes the harness report "not built" immediately after a
+        build that in fact succeeded."""
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        self.assertIn("-DSPARKINFER_TP=ON", src, "bot builds without NCCL collectives")
+        self.assertIn("build/runtime", src, "bot points SPARKINFER_BUILD at the wrong dir")
+
+    def test_k3_bot_does_not_post_a_verdict(self):
+        """The bot runs the harness from the PR's OWN checkout, so any verdict field it
+        reports was computed against whatever reference.lock that branch carries. On a
+        branch predating the quant-qualified lookup that resolves to frontier=0 and labels
+        everything BASELINE -- which then makes eval-label.yml hard-error 'reported label
+        != re-derived' on a genuinely good run. Observed on PR #25: measured 9.56 tok/s,
+        payload said BASELINE, main's lock derives XL.
+
+        Measurements come from the node; the verdict is derived on the protected side.
+        Posting a frontier at all would also reopen the substitution #35 closed."""
+        import importlib.util as _u
+        spec = _u.spec_from_file_location("k3bot", ROOT / "eval/k3_eval_bot.py")
+        bot = _u.module_from_spec(spec)
+        saved, sys.argv = sys.argv, ["k3bot"]
+        try:
+            spec.loader.exec_module(bot)
+        finally:
+            sys.argv = saved
+        for field in ("label", "frontier_tps", "speed_label", "pass"):
+            self.assertIn(field, bot.DERIVED_BY_CI, f"bot would post CI-derived {field}")
+        import io, contextlib, json as _j
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            bot.post("r", 1, {"commit": "abc1234", "tps": 9.56, "top1": 1.0, "kl": 0.004,
+                              "label": "BASELINE", "frontier_tps": 0.0}, True)
+        payload = _j.loads(buf.getvalue().split("RESULT_JSON ", 1)[1].split("\n")[0])
+        self.assertNotIn("label", payload)
+        self.assertNotIn("frontier_tps", payload)
+        self.assertEqual(payload["tps"], 9.56, "the measurement itself must survive")
+
     def test_baseline_results_are_committable(self):
         """The `lock` job requires a committed bench/results JSON to back any pinned
         baseline. bench/.gitignore ignores results/ wholesale, so without an explicit
