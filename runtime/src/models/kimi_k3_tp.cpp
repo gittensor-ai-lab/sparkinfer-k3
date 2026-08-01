@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <vector>
 #include <string>
+#include <thread>
 #include <utility>
 
 namespace k3k = sparkinfer::kernels::k3;
@@ -51,12 +52,38 @@ bool kimi_k3_tp_init(const GGUF& g, const KimiK3Config& cfg, const K3PlanOptions
     out.reduce_bufs.assign((size_t)tp_size, nullptr);
     out.n_collectives = 0;
 
-    for (int r = 0; r < tp_size; ++r) {
+    // LOAD THE RANKS IN PARALLEL.
+    //
+    // This loop used to be strictly serial, and the load is the dominant cost of every run:
+    // ~150 s of a decode benchmark that then measures 8 tokens. Under ExpertsOnly each rank
+    // takes all the replicated tensors plus its own 1/8 expert band -- about 124 GiB on this
+    // model -- so eight ranks push ~992 GiB host-to-device, one after another, through
+    // synchronous cudaMemcpy from the pageable mmap. That stages through the driver at a
+    // few GB/s, which is exactly the 125-150 s observed.
+    //
+    // The ranks are independent: GGUF is a const mmap read by everyone, each rank writes its
+    // own pre-sized slot, and every device has its own PCIe path. cudaSetDevice is per-THREAD
+    // state in CUDA, so a thread per rank needs no other coordination -- which is also the
+    // trap: the device must be set INSIDE the worker, never inherited from the caller.
+    //
+    // Deliberately not touched here: the copies are still synchronous and still from pageable
+    // memory. Pinned staging would buy another 2-4x on top, and is a separate change with its
+    // own failure mode (pinning tens of GiB can starve the host).
+    std::vector<std::string> rank_err((size_t)tp_size);
+    std::vector<std::string> rank_log((size_t)tp_size);
+
+    auto load_rank = [&](int r) -> bool {
         KimiK3TPRank& R = out.ranks[(size_t)r];
         R.device = devices[(size_t)r];
         R.rank = r;
-        if (cudaSetDevice(R.device) != cudaSuccess) return false;
-        if (cudaStreamCreate(&R.stream) != cudaSuccess) return false;
+        if (cudaSetDevice(R.device) != cudaSuccess) {
+            rank_err[(size_t)r] = "cudaSetDevice failed";
+            return false;
+        }
+        if (cudaStreamCreate(&R.stream) != cudaSuccess) {
+            rank_err[(size_t)r] = "cudaStreamCreate failed";
+            return false;
+        }
         out.streams[(size_t)r] = R.stream;
 
         R.weights.policy = KimiK3Weights::ShardPolicy::ExpertsOnly;
@@ -71,27 +98,80 @@ bool kimi_k3_tp_init(const GGUF& g, const KimiK3Config& cfg, const K3PlanOptions
             : tp::Band{0, cfg.n_experts};
 
         if (!kimi_k3_load_weights(g, cfg, opt, R.weights, 0, cfg.n_layers - 1)) {
-            std::fprintf(stderr, "[k3-tp] rank %d: weight load failed\n", r);
+            rank_err[(size_t)r] = "weight load failed";
             return false;
         }
-        if (!kimi_k3_alloc_state(cfg, max_ctx, R.state)) return false;
+        if (!kimi_k3_alloc_state(cfg, max_ctx, R.state)) {
+            rank_err[(size_t)r] = "alloc_state failed";
+            return false;
+        }
 
         R.fwd.cfg = &out.cfg;
         R.fwd.w = &R.weights;
         R.fwd.state = &R.state;
         R.fwd.opt = out.opt;
         R.fwd.stream = R.stream;
-        if (!kimi_k3_forward_alloc_scratch(cfg, R.fwd)) return false;
+        if (!kimi_k3_forward_alloc_scratch(cfg, R.fwd)) {
+            rank_err[(size_t)r] = "forward_alloc_scratch failed";
+            return false;
+        }
 
-        if (cudaMalloc(&R.x, (size_t)cfg.hidden * sizeof(float)) != cudaSuccess) return false;
-        if (cudaMalloc(&R.x_next, (size_t)cfg.hidden * sizeof(float)) != cudaSuccess) return false;
+        if (cudaMalloc(&R.x, (size_t)cfg.hidden * sizeof(float)) != cudaSuccess ||
+            cudaMalloc(&R.x_next, (size_t)cfg.hidden * sizeof(float)) != cudaSuccess) {
+            rank_err[(size_t)r] = "cudaMalloc x/x_next failed";
+            return false;
+        }
         if (r == 0 &&
-            cudaMalloc(&R.logits, (size_t)cfg.vocab * sizeof(float)) != cudaSuccess) return false;
+            cudaMalloc(&R.logits, (size_t)cfg.vocab * sizeof(float)) != cudaSuccess) {
+            rank_err[(size_t)r] = "cudaMalloc logits failed";
+            return false;
+        }
 
-        std::fprintf(stderr, "[k3-tp] rank %d: device %d, experts [%d,%d)\n",
-                     r, R.device, R.weights.shard.expert_band.offset,
-                     R.weights.shard.expert_band.end());
+        // Buffered, not printed: eight ranks writing stderr concurrently interleaves
+        // mid-line. Emitted in rank order after the join so the log reads as before.
+        char line[160];
+        std::snprintf(line, sizeof(line), "[k3-tp] rank %d: device %d, experts [%d,%d)\n",
+                      r, R.device, R.weights.shard.expert_band.offset,
+                      R.weights.shard.expert_band.end());
+        rank_log[(size_t)r] = line;
+        return true;
+    };
+
+    // SPARKINFER_TP_SERIAL_LOAD forces the old path. A concurrency bug here looks like a
+    // corrupt weight tensor rather than a crash, so being able to bisect it without a
+    // rebuild is worth one branch.
+    const bool serial_load = std::getenv("SPARKINFER_TP_SERIAL_LOAD") != nullptr || tp_size == 1;
+    if (serial_load) {
+        for (int r = 0; r < tp_size; ++r) {
+            if (!load_rank(r)) {
+                std::fprintf(stderr, "[k3-tp] rank %d: %s\n", r, rank_err[(size_t)r].c_str());
+                return false;
+            }
+        }
+    } else {
+        std::vector<std::thread> workers;
+        workers.reserve((size_t)tp_size);
+        for (int r = 0; r < tp_size; ++r) workers.emplace_back(load_rank, r);
+        for (auto& t : workers) t.join();
     }
+    for (int r = 0; r < tp_size; ++r) {
+        if (!rank_log[(size_t)r].empty()) std::fputs(rank_log[(size_t)r].c_str(), stderr);
+    }
+    // Report EVERY failed rank, not just the first. With eight concurrent loads the
+    // interesting case is "ranks 4-7 ran out of memory", and stopping at the first hides
+    // whether one device is sick or the whole box is short.
+    bool any_failed = false;
+    for (int r = 0; r < tp_size; ++r) {
+        if (!rank_err[(size_t)r].empty()) {
+            std::fprintf(stderr, "[k3-tp] rank %d: %s\n", r, rank_err[(size_t)r].c_str());
+            any_failed = true;
+        }
+    }
+    if (any_failed) return false;
+
+    // The caller's device is thread-local and the workers set their own, so restore an
+    // explicit one before the collective and everything after it.
+    if (cudaSetDevice(devices[0]) != cudaSuccess) return false;
 
     // The collective. need_f32 because K3's residual stream is f32; max_count is the
     // widest payload the forward will reduce, which is the expert_latent partial.
