@@ -265,7 +265,7 @@ public:
         return allreduce_group(count, streams);
     }
 
-    bool supports_f32() const override { return T::kSupportsF32; }
+    bool supports_f32() const override { return Impl::kSupportsF32; }
 
     // Mode-A surface over mode-B buffers: stage the caller's f32 buffers through
     // the collective-owned, peer-registered ones. Two D2D copies of ~14 KB per
@@ -275,7 +275,7 @@ public:
     // erase the reason" concern in the forward's old refusal priced them wrong.
     bool allreduce_f32_group(const std::vector<void*>& bufs, std::size_t count,
                              const std::vector<cudaStream_t>& streams) override {
-        if constexpr (T::kSupportsF32) {
+        if constexpr (Impl::kSupportsF32) {
             if (static_cast<int>(bufs.size()) != n_ ||
                 static_cast<int>(streams.size()) != n_) return false;
             if (count == 0) return true;
