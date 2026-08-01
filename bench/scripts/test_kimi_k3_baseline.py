@@ -1290,6 +1290,32 @@ class CiWorkflowTest(unittest.TestCase):
         # and sealed is still only claimed once the log confirms it
         self.assertIn("contents/runs/", src)
 
+    def test_rebase_sweep_is_cheap_and_targeted(self):
+        """The label is meant to clear itself the moment a miner rebases, which only works
+        if checking costs seconds: requiring a 40-minute node eval to notice someone already
+        did what they were asked would leave them under a stale label they cannot remove.
+
+        It must also only touch PRs that HAVE a tier. needs-rebase means "your measured tier
+        is stale because the frontier moved"; a PR with no eval:* tier has no stale tier, and
+        noise on a label people are asked to act on is how labels stop being read."""
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        self.assertIn('"--rebase-sweep", action="store_true"', src)
+        sweep = src[src.index("    if args.rebase_sweep:"):src.index("    evaluated = 0")]
+        self.assertNotIn("evaluate(", sweep, "the sweep must not run a node eval")
+        self.assertIn('if behind and not any(l.startswith("eval:") for l in labels)',
+                      src, "the sweep would label PRs that were never scored")
+
+    def test_rebase_comment_never_shows_the_sentinel(self):
+        """merged_num is -1 for a standalone sweep, and interpolating it put a literal
+        '#-1 merged' in front of a contributor. A sentinel that reaches a human is a bug
+        regardless of what the code does with it."""
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        self.assertIn("if merged_num > 0", src,
+                      "the sentinel is interpolated straight into the comment body")
+        body = src[src.index("cause = (f\"#{merged_num} merged"):]
+        self.assertIn('else "The frontier"', body[:400],
+                      "no wording for the sweep case, so the sentinel leaks")
+
     def test_baseline_results_are_committable(self):
         """The `lock` job requires a committed bench/results JSON to back any pinned
         baseline. bench/.gitignore ignores results/ wholesale, so without an explicit

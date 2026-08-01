@@ -425,6 +425,13 @@ def sync_rebase_labels(repo, prs, merged_num, dry_run):
         labels = {l.get("name", "") for l in info.get("labels") or []}
         behind = info.get("mergeStateStatus") in ("BEHIND", "DIRTY", "BLOCKED", "UNKNOWN")
         has = REBASE_LABEL in labels
+        # The label means "your measured tier is stale because the frontier moved". A PR
+        # with no eval:* tier has no stale tier -- telling its author to rebase because of
+        # a scoring change that never applied to them is noise, and noise on a label people
+        # are asked to act on is how labels stop being read at all. Clearing still applies,
+        # so a tier removed later does not strand the label.
+        if behind and not any(l.startswith("eval:") for l in labels):
+            continue
         if behind and not has:
             if dry_run:
                 print(f"--- dry-run: would label #{num} {REBASE_LABEL}")
@@ -437,8 +444,14 @@ def sync_rebase_labels(repo, prs, merged_num, dry_run):
                 print(f"!! #{num}: could not label {REBASE_LABEL}: {q.stderr.strip()[:120]}",
                       file=sys.stderr)
                 continue
+            # merged_num is -1 when this is a standalone sweep rather than the tail of a
+            # merge, and interpolating the sentinel put a literal "#-1 merged" in front of
+            # a contributor. A sentinel that reaches a human is a bug regardless of what
+            # the code does with it.
+            cause = (f"#{merged_num} merged, so the frontier" if merged_num > 0
+                     else "The frontier")
             gh(["pr", "comment", str(num), "-R", repo, "--body",
-                f"### Rebase needed\n\n#{merged_num} merged, so the frontier this PR is "
+                f"### Rebase needed\n\n{cause} this PR is "
                 f"scored against has moved. The tier currently on it was measured against "
                 f"the old baseline and no longer means anything: you are paid for the gain "
                 f"**on top of what merged**, not the gain over where `main` used to be. If "
@@ -526,6 +539,10 @@ def main():
     ap.add_argument("--auto-merge", action="store_true",
                     help="queue GitHub native auto-merge on the merge-first winner. Waits "
                          "for the required review and checks; never bypasses them.")
+    ap.add_argument("--rebase-sweep", action="store_true",
+                    help="only reconcile needs-rebase labels against each PR's merge state "
+                         "and exit — no node run. Cheap enough to poll, which is what makes "
+                         "the label clear itself once a miner has rebased.")
     ap.add_argument("--list", action="store_true", help="show eligibility for every open PR and exit")
     args = ap.parse_args()
 
@@ -548,6 +565,15 @@ def main():
         for pr in prs:
             ok, why = eligibility(pr)
             print(f"  #{pr['number']:<5} {'ELIGIBLE' if ok else 'skip':<9} {why:<62} {pr['title'][:44]}")
+        return 0
+
+    if args.rebase_sweep:
+        # Deliberately cheap and separable from evaluation. The label is supposed to clear
+        # itself the moment a miner rebases, and that only works if checking costs seconds
+        # -- requiring a 40-minute node eval to notice someone already did what they were
+        # asked would make the self-clearing property useless in practice, and leave people
+        # sitting under a stale label they cannot remove.
+        sync_rebase_labels(args.repo, prs, merged_num=-1, dry_run=args.dry_run)
         return 0
 
     evaluated = 0
