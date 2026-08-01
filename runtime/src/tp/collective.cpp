@@ -303,6 +303,29 @@ public:
         }
     }
 
+    // Mode B, f32, no staging: the forward aimed its phase outputs at
+    // reduce_in() directly (kimi_k3_swap_partial_buffer), so unlike the staged
+    // group call above there is nothing to copy — bounds-check and launch. Reuse
+    // of the owned buffers across the token's 185 sequential collectives is safe
+    // because the kernel's barrier_at_end proves every peer finished reading
+    // this rank's input before the kernel exits, and the next phase's writes are
+    // stream-ordered after that exit.
+    bool allreduce_f32_owned(std::size_t count,
+                             const std::vector<cudaStream_t>& streams) override {
+        if constexpr (Impl::kSupportsF32) {
+            if (static_cast<int>(streams.size()) != n_) return false;
+            if (count == 0) return true;
+            if (count > max_count_) return false;
+            std::vector<void*> raw(streams.size());
+            for (std::size_t i = 0; i < streams.size(); ++i) raw[i] = (void*)streams[i];
+            impl_->allreduce_f32(count, raw);
+            return true;
+        } else {
+            (void)count; (void)streams;
+            return false;
+        }
+    }
+
     bool allreduce_group(std::size_t count,
                          const std::vector<cudaStream_t>& streams) override {
         if (static_cast<int>(streams.size()) != n_) return false;

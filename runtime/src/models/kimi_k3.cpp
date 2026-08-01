@@ -858,6 +858,20 @@ float* kimi_k3_partial_buffer(KimiK3Forward& fwd, int layer, K3LayerPhase phase,
     return nullptr;
 }
 
+float* kimi_k3_swap_partial_buffer(KimiK3Forward& fwd, K3LayerPhase phase,
+                                  float* buf) {
+    auto& s = *fwd.s;
+    float* old = nullptr;
+    if (phase == K3LayerPhase::Attn) {
+        old = s.attn_out;
+        s.attn_out = buf;
+    } else if (phase == K3LayerPhase::FfnPartial) {
+        old = s.moe_out;
+        s.moe_out = buf;
+    }
+    return old;
+}
+
 
 // ---------------------------------------------------------------------------
 // Launch-failure guard.

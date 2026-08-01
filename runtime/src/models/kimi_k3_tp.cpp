@@ -374,11 +374,37 @@ bool kimi_k3_tp_init(const GGUF& g, const KimiK3Config& cfg, const K3PlanOptions
                      tp::backend_name(out.coll->backend()));
         return false;
     }
-    // Owned-buffer backends are no longer refused: allreduce_f32_group on the
-    // adapter stages the caller's buffers through the collective-owned ones
-    // itself (two stream-ordered ~14 KB D2D copies per rank, ~2 us each), so
-    // from this forward's point of view the call is Mode A. supports_f32 above
+    // Owned-buffer backends run Mode B proper: the MoE partial is produced into
+    // reduce_in() and consumed from reduce_out() (see the swaps in the forward),
+    // so no staging copies exist on the collective path. supports_f32 above
     // remains the gate that matters; a backend that passes it can be driven.
+    const bool host_reduce_dbg = [] {
+        const char* e = std::getenv("SPARKINFER_K3_TP_HOST_REDUCE");
+        return e && e[0] == '1';
+    }();
+    if (out.coll->owns_buffers() && !host_reduce_dbg &&
+        out.coll->max_count() >= (size_t)cfg.expert_latent) {
+        const int n = (int)out.ranks.size();
+        out.zc_in.resize((size_t)n);
+        out.zc_out.resize((size_t)n);
+        out.orig_moe.resize((size_t)n);
+        for (int r = 0; r < n; ++r) {
+            out.zc_in[(size_t)r]  = (float*)out.coll->reduce_in(r);
+            out.zc_out[(size_t)r] = (float*)out.coll->reduce_out(r);
+            out.orig_moe[(size_t)r] = kimi_k3_partial_buffer(
+                out.ranks[(size_t)r].fwd, cfg.leading_dense,
+                K3LayerPhase::FfnPartial, nullptr);
+            if (!out.zc_in[(size_t)r] || !out.zc_out[(size_t)r] ||
+                !out.orig_moe[(size_t)r]) {
+                out.zc_in.clear(); out.zc_out.clear(); out.orig_moe.clear();
+                break;
+            }
+        }
+        out.zero_copy = !out.zc_in.empty();
+        if (out.zero_copy)
+            std::fprintf(stderr, "[k3-tp] f32 zero-copy: the expert partial writes the "
+                                 "collective's peer buffers directly (no staging)\n");
+    }
     return true;
 }
 
@@ -465,6 +491,21 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
         const bool mla_reduce = tp_size > 1 && !cfg.is_kda_layer(layer) &&
             KimiK3Weights::shards_mla(p.ranks[0].weights.policy);
         const bool attn_reduce = kda_reduce || mla_reduce;
+
+        // Zero-copy: aim the expert accumulator at the collective's peer-visible
+        // input before the dispatch writes it, so the reduce needs no staging.
+        // Reusing one in/out pair across the token's collectives is race-free: the
+        // one-shot kernel's exit barrier proves every peer finished reading this
+        // rank's input, and the next layer's dispatch is stream-ordered behind it.
+        //
+        // Done HERE, by the submitting thread, with the issue pool parked. These
+        // calls retarget scratch pointers the workers dereference, so performing
+        // them from inside a worker — or while one is running — would be a race.
+        if (p.zero_copy && is_moe && tp_size > 1) {
+            for (std::size_t r = 0; r < p.ranks.size(); ++r)
+                kimi_k3_swap_partial_buffer(p.ranks[r].fwd, K3LayerPhase::FfnPartial,
+                                            p.zc_in[r]);
+        }
 
         const IClock::time_point t_p12 = ip.on ? IClock::now() : IClock::time_point{};
         if (!issue_all([&](int r) {
@@ -563,8 +604,14 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
                 }
             } else {
                 const IClock::time_point tc = ip.on ? IClock::now() : IClock::time_point{};
-                const bool okc = p.coll->allreduce_f32_group(p.reduce_bufs, (size_t)count,
-                                                             p.streams);
+                // Zero-copy: the partials are ALREADY in reduce_in() — the swap
+                // above aimed them there — so this launches the reduce with no
+                // staging copies. The gather above still ran: it is what validates
+                // the width every rank agrees on.
+                const bool okc = p.zero_copy
+                    ? p.coll->allreduce_f32_owned((size_t)count, p.streams)
+                    : p.coll->allreduce_f32_group(p.reduce_bufs, (size_t)count,
+                                                  p.streams);
                 if (ip.on) ip.t_coll += secs_since(tc);
                 if (!okc) {
                     std::fprintf(stderr, "[k3-tp] all-reduce failed at layer %d\n", layer);
@@ -572,6 +619,14 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
                 }
             }
             ++p.n_collectives;
+            // Phase 3's routed_norm reads (and normalises in place) the reduced
+            // sum where the collective wrote it. In-place writes to reduce_out are
+            // rank-private: peers only ever read inputs.
+            if (p.zero_copy) {
+                for (std::size_t r = 0; r < p.ranks.size(); ++r)
+                    kimi_k3_swap_partial_buffer(p.ranks[r].fwd, K3LayerPhase::FfnPartial,
+                                                p.zc_out[r]);
+            }
         }
 
         // --- phase 3 on every rank ------------------------------------------
@@ -646,8 +701,20 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
 void kimi_k3_tp_free(KimiK3TP& p) {
     // Join the submission threads BEFORE any rank buffer is freed. They only
     // spin while parked, but a worker that is still inside a phase call would
-    // be launching against memory this loop is about to release.
+    // be launching against memory this loop is about to release. This also has to
+    // precede the pointer restore below, for the same reason the swaps are done
+    // by the submitting thread: no worker may be reading fwd.s while it changes.
     p.issue.shutdown();
+
+    // Point the scratch field back at scratch before teardown. Not load-bearing
+    // today (scratch frees via its owned list, not this field) but keeps the
+    // struct truthful for anything that walks it during shutdown.
+    if (p.zero_copy) {
+        for (std::size_t r = 0; r < p.ranks.size(); ++r)
+            kimi_k3_swap_partial_buffer(p.ranks[r].fwd, K3LayerPhase::FfnPartial,
+                                        p.orig_moe[r]);
+        p.zero_copy = false;
+    }
     for (auto& R : p.ranks) {
         cudaSetDevice(R.device);
         if (R.x) cudaFree(R.x);
@@ -661,6 +728,9 @@ void kimi_k3_tp_free(KimiK3TP& p) {
     p.ranks.clear();
     p.streams.clear();
     p.reduce_bufs.clear();
+    p.zc_in.clear();
+    p.zc_out.clear();
+    p.orig_moe.clear();
     p.coll.reset();
 }
 

@@ -143,6 +143,20 @@ struct KimiK3TP {
     // bypassed entirely at tp_size 1 — a single rank has nothing to parallelise
     // and the serial path stays byte-identical.
     K3IssuePool issue;
+
+    // Mode-B zero-copy: with an owned-buffer f32 backend, the expert partial is
+    // written into the collective's reduce_in() and consumed from reduce_out()
+    // directly (kimi_k3_swap_partial_buffer), skipping both staging copies of
+    // every collective. Off for NCCL (Mode A reduces in place already) and under
+    // SPARKINFER_K3_TP_HOST_REDUCE=1 (the debug path sums the swapped-in
+    // pointers and would leave reduce_out() unwritten).
+    //
+    // The swaps are done by the SUBMITTING thread while the issue pool is parked
+    // between phases, never by a worker mid-phase: they retarget scratch pointers
+    // the workers read, so doing them anywhere else would be a data race.
+    bool zero_copy = false;
+    std::vector<float*> zc_in, zc_out;   // reduce_in/out, rank order
+    std::vector<float*> orig_moe;        // scratch pointer, restored at free
 };
 
 // Load the model once per rank, banding the routed experts. `devices` gives tp_size.
