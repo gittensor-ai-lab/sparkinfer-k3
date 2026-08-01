@@ -285,8 +285,12 @@ def publish_receipt(repo_log, num, res, box_out, dry_run):
     rid = res.get("receipt_id")
     if not rid:
         return False
-    got = sh(f"cat {box_out}/*{rid[:8]}*.receipt.json 2>/dev/null || "
-             f"ls -t {box_out}/*.receipt.json 2>/dev/null | head -1 | xargs cat", timeout=120)
+    # Match on the receipt id INSIDE the file. The filenames are timestamp-based
+    # (k3_<node>_<stamp>.receipt.json) and carry no id, so a glob on the id never matches
+    # and any fallback to "newest file" quietly publishes whichever run finished last --
+    # which, with two PRs evaluated back to back, is a coin flip on the second one.
+    got = sh(f"grep -l '\"{rid}\"' {box_out}/*.receipt.json 2>/dev/null | head -1 | "
+             f"xargs -r cat", timeout=120)
     body = (got.stdout or "").strip()
     if not body.startswith("{"):
         print(f"#{num}: sealed but the receipt could not be read back from the box — "
