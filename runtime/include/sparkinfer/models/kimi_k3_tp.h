@@ -36,12 +36,85 @@
 #include "sparkinfer/models/kimi_k3_config.h"
 #include "sparkinfer/tp/collective.h"
 
+#include <atomic>
+#include <functional>
 #include <memory>
+#include <thread>
 #include <vector>
 
 #include <cuda_runtime.h>
 
 namespace sparkinfer {
+
+// ---------------------------------------------------------------------------
+// K3IssuePool — one host thread per rank, so submission is not serial
+// ---------------------------------------------------------------------------
+// MEASURED, at the scored 128k context, before this existed:
+//
+//     total 109.7 ms/token | host issue 88.4 (80.6%) | collective 5.9 | sync 14.9
+//     2232 phase calls/token, 1496 cudaSetDevice/token
+//
+// 80% of a decode token was ONE host thread asking eight GPUs to do things. The
+// GPU is starved, not saturated: when submission finally stops there are only
+// ~15 ms of work left to drain. Two consequences follow, and the second is the
+// one that matters.
+//
+//   1. Kernel-level optimisation is nearly invisible here. Making a kernel
+//      faster shortens something that was already hidden behind submission.
+//
+//   2. The rank skew at the collective is MANUFACTURED BY ISSUE ORDER. Rank 0's
+//      layer is submitted ~200 launches before rank 7's, so rank 7 arrives late
+//      at all 92 barriers, every token, by construction. That is not expert
+//      imbalance and no collective backend can fix it — the ranks genuinely
+//      were not asked at the same time.
+//
+// The eight ranks are independent between collectives, so they can be submitted
+// concurrently. Each worker owns exactly one device and calls cudaSetDevice ONCE
+// at thread start rather than 1496 times per token: the current device is
+// thread-local state, which is precisely what makes this both cheap and safe.
+//
+// THREAD SAFETY, and why this is sound rather than lucky. Every mutable static
+// on the forward path (g_mla_part_*, the IQ1_S/IQ2_XS lattice `ready` flags, the
+// MLA split cache) is indexed by cudaGetDevice(). Distinct workers own distinct
+// devices, so no two threads ever address the same slot. The per-device state
+// convention the kernels already follow is what makes per-rank threading safe;
+// a shared cache would have to be locked instead.
+//
+// Spin, not condvar: 186 releases per token against ~240 idle cores. A condvar
+// round trip is 10-20 us and would cost ~3 ms/token, eating a third of what
+// parallel submission buys. The spin yields after a bounded number of pauses so
+// an oversubscribed box degrades instead of livelocking.
+class K3IssuePool {
+public:
+    K3IssuePool() = default;
+    ~K3IssuePool() { shutdown(); }
+
+    K3IssuePool(const K3IssuePool&) = delete;
+    K3IssuePool& operator=(const K3IssuePool&) = delete;
+
+    bool started() const { return !workers_.empty(); }
+    int size() const { return (int)workers_.size(); }
+
+    // Spawn one thread per device. Each pins itself to devices[r] and parks.
+    void start(const std::vector<int>& devices);
+
+    // Run job(rank) on every rank concurrently; block until all finish.
+    // Returns false if ANY rank returned false. Never runs jobs partially: a
+    // failing rank still completes the barrier, so the pool cannot deadlock on
+    // an error path.
+    bool run(const std::function<bool(int)>& job);
+
+    void shutdown();
+
+private:
+    std::vector<std::thread> workers_;
+    std::vector<int> devices_;
+    const std::function<bool(int)>* job_ = nullptr;
+    std::atomic<unsigned> epoch_{0};
+    std::atomic<int> done_{0};
+    std::atomic<bool> failed_{false};
+    std::atomic<bool> stop_{false};
+};
 
 struct KimiK3TPRank {
     int device = 0;
@@ -65,6 +138,11 @@ struct KimiK3TP {
     std::vector<cudaStream_t> streams;   // cached in rank order for the group call
     std::vector<void*> reduce_bufs;      // scratch, refilled per collective
     long n_collectives = 0;              // counted, so a run can assert it saw 92/token
+
+    // One submission thread per rank. Empty until the first decode step, and
+    // bypassed entirely at tp_size 1 — a single rank has nothing to parallelise
+    // and the serial path stays byte-identical.
+    K3IssuePool issue;
 };
 
 // Load the model once per rank, banding the routed experts. `devices` gives tp_size.

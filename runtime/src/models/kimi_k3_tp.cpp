@@ -66,6 +66,20 @@ inline double secs_since(IClock::time_point t0) {
     return std::chrono::duration<double>(IClock::now() - t0).count();
 }
 
+// Bounded spin. Pause for cache-friendly waiting, then yield so a box that is
+// oversubscribed (or a rank that died) degrades to scheduling instead of
+// burning a core forever.
+inline void spin_step(int& n) {
+    if (++n < 4096) {
+#if defined(__x86_64__) || defined(__i386__)
+        __builtin_ia32_pause();
+#endif
+    } else {
+        std::this_thread::yield();
+        n = 4096;
+    }
+}
+
 // Token row gather. Same contract as the single-GPU path: token_embd is replicated,
 // so every rank does this identically and no broadcast is needed.
 bool embed_token(const KimiK3Weights& w, const KimiK3Config& cfg, int token_id,
@@ -80,6 +94,73 @@ bool embed_token(const KimiK3Weights& w, const KimiK3Config& cfg, int token_id,
 }
 
 }  // namespace
+
+// ---------------------------------------------------------------------------
+// K3IssuePool
+// ---------------------------------------------------------------------------
+
+void K3IssuePool::start(const std::vector<int>& devices) {
+    if (!workers_.empty()) return;
+    devices_ = devices;
+    stop_.store(false, std::memory_order_relaxed);
+    epoch_.store(0, std::memory_order_relaxed);
+    done_.store(0, std::memory_order_relaxed);
+
+    const int n = (int)devices_.size();
+    workers_.reserve((size_t)n);
+    for (int r = 0; r < n; ++r) {
+        workers_.emplace_back([this, r] {
+            // ONCE per thread, not once per launch. The current device is
+            // thread-local, so this is the whole reason the 1496 per-token
+            // cudaSetDevice calls disappear rather than merely moving.
+            cudaSetDevice(devices_[(size_t)r]);
+            unsigned seen = 0;
+            for (;;) {
+                int spins = 0;
+                while (epoch_.load(std::memory_order_acquire) == seen) {
+                    if (stop_.load(std::memory_order_acquire)) return;
+                    spin_step(spins);
+                }
+                seen = epoch_.load(std::memory_order_acquire);
+                if (stop_.load(std::memory_order_acquire)) return;
+
+                // A throwing job must not strand the barrier: the done_ count
+                // is what the submitter waits on, so it is incremented on every
+                // path out of the call.
+                bool ok = false;
+                try {
+                    ok = (*job_)(r);
+                } catch (...) {
+                    ok = false;
+                }
+                if (!ok) failed_.store(true, std::memory_order_relaxed);
+                done_.fetch_add(1, std::memory_order_release);
+            }
+        });
+    }
+}
+
+bool K3IssuePool::run(const std::function<bool(int)>& job) {
+    const int n = (int)workers_.size();
+    if (n == 0) return false;
+    job_ = &job;
+    failed_.store(false, std::memory_order_relaxed);
+    done_.store(0, std::memory_order_relaxed);
+    epoch_.fetch_add(1, std::memory_order_release);
+
+    int spins = 0;
+    while (done_.load(std::memory_order_acquire) < n) spin_step(spins);
+    job_ = nullptr;
+    return !failed_.load(std::memory_order_relaxed);
+}
+
+void K3IssuePool::shutdown() {
+    if (workers_.empty()) return;
+    stop_.store(true, std::memory_order_release);
+    epoch_.fetch_add(1, std::memory_order_release);   // wake the parked spinners
+    for (auto& t : workers_) if (t.joinable()) t.join();
+    workers_.clear();
+}
 
 bool kimi_k3_tp_init(const GGUF& g, const KimiK3Config& cfg, const K3PlanOptions& opt,
                     const std::vector<int>& devices, int max_ctx, KimiK3TP& out) {
@@ -271,6 +352,35 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
     IssueProfile& ip = issue_profile();
     const IClock::time_point t_tok0 = ip.on ? IClock::now() : IClock::time_point{};
 
+    // Parallel submission. Off at tp_size 1 (nothing to parallelise, and the
+    // single-rank path must stay identical) and off under SPARKINFER_K3_SERIAL_ISSUE=1,
+    // which is the A/B control: same binary, same kernels, only the submission
+    // order changes. Any measured delta is therefore the submission, not a rebuild.
+    static const bool serial_issue = [] {
+        const char* e = std::getenv("SPARKINFER_K3_SERIAL_ISSUE");
+        return e && e[0] == '1';
+    }();
+    const bool parallel_issue = (tp_size > 1) && !serial_issue;
+    if (parallel_issue && !p.issue.started()) {
+        std::vector<int> devs;
+        devs.reserve(p.ranks.size());
+        for (auto& R : p.ranks) devs.push_back(R.device);
+        p.issue.start(devs);
+    }
+
+    // Submit `job` on every rank — concurrently when the pool is up, otherwise
+    // in rank order exactly as before. The serial arm keeps its per-call
+    // cudaSetDevice; the parallel arm does not need one, because each worker
+    // pinned its device once at thread start.
+    auto issue_all = [&](const std::function<bool(int)>& job) -> bool {
+        if (parallel_issue) return p.issue.run(job);
+        for (int r = 0; r < tp_size; ++r) {
+            if (cudaSetDevice(p.ranks[(size_t)r].device) != cudaSuccess) return false;
+            if (!job(r)) return false;
+        }
+        return true;
+    };
+
     // The cross-layer residual bank is PER TOKEN on every rank — same lifetime rule
     // as the single-GPU path, and forgetting it here fails on token 2 rather than
     // token 1, because max_ckpt is exactly one token's worth of checkpoints.
@@ -278,11 +388,14 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
 
     {
         const IClock::time_point t0 = ip.on ? IClock::now() : IClock::time_point{};
-        for (auto& R : p.ranks) {
-            if (cudaSetDevice(R.device) != cudaSuccess) return false;
-            if (!embed_token(R.weights, cfg, token_id, R.x, R.stream)) return false;
+        if (!issue_all([&](int r) {
+                KimiK3TPRank& R = p.ranks[(size_t)r];
+                return embed_token(R.weights, cfg, token_id, R.x, R.stream);
+            })) return false;
+        if (ip.on) {
+            ip.t_issue += secs_since(t0);
+            if (!parallel_issue) ip.n_setdev += tp_size;
         }
-        if (ip.on) { ip.t_issue += secs_since(t0); ip.n_setdev += tp_size; }
     }
 
     for (int layer = 0; layer < cfg.n_layers; ++layer) {
@@ -295,17 +408,17 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
         // the call sites is what makes that a one-line change rather than a
         // re-split of the forward.
         const IClock::time_point t_p12 = ip.on ? IClock::now() : IClock::time_point{};
-        for (auto& R : p.ranks) {
-            if (cudaSetDevice(R.device) != cudaSuccess) return false;
-            if (!kimi_k3_forward_layer_phase(R.fwd, layer, K3LayerPhase::Attn,
-                                             R.x, R.x_next)) return false;
-            if (!kimi_k3_forward_layer_phase(R.fwd, layer, K3LayerPhase::FfnPartial,
-                                             R.x, R.x_next)) return false;
-        }
+        if (!issue_all([&](int r) {
+                KimiK3TPRank& R = p.ranks[(size_t)r];
+                if (!kimi_k3_forward_layer_phase(R.fwd, layer, K3LayerPhase::Attn,
+                                                 R.x, R.x_next)) return false;
+                return kimi_k3_forward_layer_phase(R.fwd, layer, K3LayerPhase::FfnPartial,
+                                                   R.x, R.x_next);
+            })) return false;
         if (ip.on) {
             ip.t_issue += secs_since(t_p12);
             ip.n_phase_calls += 2 * tp_size;
-            ip.n_setdev += tp_size;
+            if (!parallel_issue) ip.n_setdev += tp_size;
         }
 
         // --- the collective -------------------------------------------------
@@ -364,16 +477,20 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
 
         // --- phase 3 on every rank ------------------------------------------
         const IClock::time_point t_p3 = ip.on ? IClock::now() : IClock::time_point{};
-        for (auto& R : p.ranks) {
-            if (cudaSetDevice(R.device) != cudaSuccess) return false;
-            if (!kimi_k3_forward_layer_phase(R.fwd, layer, K3LayerPhase::FfnFinish,
-                                             R.x, R.x_next)) return false;
-            std::swap(R.x, R.x_next);
-        }
+        if (!issue_all([&](int r) {
+                KimiK3TPRank& R = p.ranks[(size_t)r];
+                if (!kimi_k3_forward_layer_phase(R.fwd, layer, K3LayerPhase::FfnFinish,
+                                                 R.x, R.x_next)) return false;
+                // Each worker swaps only its OWN rank's pair; no rank reads
+                // another's x, so this needs no synchronisation beyond the
+                // barrier that ends the phase.
+                std::swap(R.x, R.x_next);
+                return true;
+            })) return false;
         if (ip.on) {
             ip.t_issue += secs_since(t_p3);
             ip.n_phase_calls += tp_size;
-            ip.n_setdev += tp_size;
+            if (!parallel_issue) ip.n_setdev += tp_size;
         }
     }
 
@@ -428,6 +545,10 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
 }
 
 void kimi_k3_tp_free(KimiK3TP& p) {
+    // Join the submission threads BEFORE any rank buffer is freed. They only
+    // spin while parked, but a worker that is still inside a phase call would
+    // be launching against memory this loop is about to release.
+    p.issue.shutdown();
     for (auto& R : p.ranks) {
         cudaSetDevice(R.device);
         if (R.x) cudaFree(R.x);
