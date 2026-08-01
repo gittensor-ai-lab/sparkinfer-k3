@@ -8,19 +8,26 @@ name: cap-open-prs
 # baseline that the other one is about to move. Serialising them is what makes the
 # marginal-gain number mean anything.
 #
-# Newest-first, so the PR under review is the one that survives.
-# When a contributor is over the cap, their excess PRs (newest first) are auto-closed
-# with an explanatory comment. Maintainers and bots are exempt.
+# WHICH ONE SURVIVES. The PR that has been MEASURED wins, then the oldest. Node time is the
+# scarce thing here: a PR carrying an eval:* tier has had ~40 minutes of 8x H200 spent on it
+# and has a live number against the current frontier, so closing it in favour of an unmeasured
+# sibling throws that away and forces a re-run. Only when neither is measured does age decide.
 #
-#  - pull_request_target(opened/reopened): enforces the cap for that author on every new PR.
+#  - pull_request_target(opened/reopened/ready_for_review): enforces the cap for that author.
 #    (pull_request_target runs in the base-repo context so the token can close FORK PRs.)
+#
+#    ready_for_review IS THE ONE THAT MATTERS. Drafts deliberately do not count toward the
+#    cap, so without it the rule is trivially evaded: open the first PR as a DRAFT, open a
+#    second normally (the cap sees one non-draft and passes), then mark the draft ready --
+#    which fires ready_for_review, not opened, so nothing re-checked. That is exactly how
+#    widecloud came to hold #52 and #57 open at once.
 #  - workflow_dispatch: one-off sweep over ALL authors — use it to clear an existing backlog.
 #
 # Safe by design: it never checks out or runs PR code — it only calls the GitHub API.
 
 on:
   pull_request_target:
-    types: [opened, reopened]
+    types: [opened, reopened, ready_for_review]
   workflow_dispatch:
     inputs:
       max:
@@ -82,8 +89,13 @@ jobs:
               if (mine.some(p => EXEMPT_ASSOC.has(p.author_association))) continue;
               if (mine.length <= MAX) continue;
 
-              // Keep the MAX oldest; close the newest excess.
-              mine.sort((a, b) => a.number - b.number);
+              // Keep the MEASURED ones first, then the oldest. A PR with an eval:* tier
+              // has had ~40 minutes of 8x H200 spent on it and holds a live number against
+              // the current frontier; closing it in favour of an unmeasured sibling discards
+              // that and forces a re-run. Age only decides among equals.
+              const scored = p => (p.labels || []).some(l => l.name.startsWith('eval:') &&
+                                                             l.name !== 'eval:none');
+              mine.sort((a, b) => (scored(b) - scored(a)) || (a.number - b.number));
               const excess = mine.slice(MAX);
               for (const p of excess) {
                 try {
