@@ -133,11 +133,15 @@ struct KimiK3Weights {
     //                needs no per-rank shape threading.
     //
     //   Full         Also row/col-shard the attention and dense-FFN projections, per
-    //                weight_plan. Saves the remaining ~22 GiB and splits the attention
-    //                FLOPs, but every kernel then has to be handed per-rank widths and
-    //                the KDA/MLA state has to be sized per rank. NOT YET SUPPORTED by
+    //                weight_plan. Saves the remaining ~22 GiB. NOT YET SUPPORTED by
     //                the forward — the loader would shard weights the executor still
     //                indexes at full width, which reads past the end of the slice.
+    //
+    // This is about RESIDENCY, not about who does the work. Splitting the attention
+    // FLOPs across ranks does NOT need Full and does not go through here: a rank that
+    // holds the whole tensor can read a band of it, so KimiK3Forward::attn_band bands
+    // the work while every rank keeps ExpertsOnly's replicated attention weights. The
+    // ~22 GiB Full would additionally save is the part that has no speed in it.
     //
     // Kept explicit rather than inferred from tp_size so that turning on Full is a
     // deliberate act with a matching forward, not a silent consequence of tp>1.
@@ -265,6 +269,29 @@ int kimi_k3_mla_ordinal(const KimiK3Config& cfg, int layer);   // -1 if layer is
 // nothing when fwd.debug is unset.
 using KimiK3DebugFn = std::function<void(const char* tag, int layer, const float* dev_ptr, int64_t n)>;
 
+// The attention head band ONE rank computes.
+//
+// K3's attention is head-parallel end to end — q/k/v/gate rows, the KDA conv and scan
+// state, the MLA absorb and its decode kernel, and the columns of attn_output all carry
+// the head as their slowest index — so a rank can compute a contiguous band of heads
+// and nothing else needs to know. What it produces is attn_output's partial sum over
+// its own columns, at full hidden width; summing the bands reconstructs the layer.
+//
+// This is a split of the WORK, not of the weights. Every rank still holds the whole
+// attention tensor (~22 GiB of UD-IQ1_S's 553 GiB, against 531 GiB of routed experts),
+// so nothing in the loader changes and `KimiK3Weights::shard` stays ExpertsOnly. The
+// cost being removed is bandwidth and FLOPs, and a rank pays those only for the rows
+// it actually reads.
+//
+// count == 0 means "every head", which is the single-GPU path: every offset below
+// collapses to 0 and every width back to the full one, so that build is byte-for-byte
+// the code it was before this existed.
+struct K3AttnBand {
+    int offset = 0;
+    int count  = 0;
+    bool active() const { return count > 0; }
+};
+
 struct KimiK3Forward {
     const KimiK3Config* cfg = nullptr;
     const KimiK3Weights* w = nullptr;
@@ -272,6 +299,11 @@ struct KimiK3Forward {
     K3PlanOptions opt;
     cudaStream_t stream = nullptr;   // null = the default stream
     KimiK3DebugFn debug;             // may be empty
+
+    // Set by the TP driver before the first forward; left default on one GPU. When
+    // active, phase Attn leaves a PARTIAL sum in the attn_out buffer that the driver
+    // must all-reduce before phase FfnPartial — see K3LayerPhase below.
+    K3AttnBand attn_band;
 
     // Scratch buffers, sized once and reused every call. Allocated by
     // kimi_k3_forward_alloc_scratch(); forward_token() assumes they exist.
@@ -314,8 +346,11 @@ bool kimi_k3_forward_layer(KimiK3Forward& fwd, int layer, const float* hidden_in
 // group collective, then run phase N+1 on every rank.
 //
 //   Attn        res_mix, bank push, attn_norm, the attention branch, attn_output.
-//               attn_output is ColShard, so this leaves a FULL-WIDTH PARTIAL SUM.
-//                 -> reduce at hidden
+//               With an attn_band set, this rank ran only its own heads and reduced
+//               attn_output over only their columns, so it leaves a FULL-WIDTH
+//               PARTIAL SUM. Unbanded it is already the whole answer and reducing it
+//               would multiply it by tp_size.
+//                 -> reduce at hidden, IF banded
 //   FfnPartial  attention residual combine, ffn_res_mix, ffn_norm, then either the
 //               dense FFN (down is ColShard -> partial at hidden) or the MoE path
 //               (router, routed_down, expert dispatch -> partial at expert_latent,

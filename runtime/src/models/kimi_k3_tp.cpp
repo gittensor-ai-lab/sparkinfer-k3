@@ -31,6 +31,36 @@ bool embed_token(const KimiK3Weights& w, const KimiK3Config& cfg, int token_id,
     return k3k::dequant_f32_by_type(x, base, cfg.hidden, w.token_embd.type, stream);
 }
 
+// Whether to give each rank its own band of attention heads instead of running all
+// of them on all of them.
+//
+// SPARKINFER_K3_TP_REPLICATE_ATTN=1 forces the old replicated attention back on. It
+// is a bisecting tool, in the same spirit as SPARKINFER_K3_TP_HOST_REDUCE below:
+// replicated attention is bit-identical to the single-GPU forward, banded attention
+// reassociates attn_output's dot product across ranks, so flipping this separates "a
+// numeric difference from the head band" from "a numeric difference from anything
+// else". It can only make the model slower, never faster.
+bool shard_attention(const KimiK3Config& cfg, int tp_size) {
+    if (tp_size <= 1) return false;
+    if (const char* e = std::getenv("SPARKINFER_K3_TP_REPLICATE_ATTN")) {
+        if (e[0] == '1') {
+            std::fprintf(stderr, "[k3-tp] SPARKINFER_K3_TP_REPLICATE_ATTN=1: attention "
+                                 "runs on every rank\n");
+            return false;
+        }
+    }
+    // An uneven split is representable — every head width here is a multiple of the
+    // Q8_0 block, so a ragged band still lands on block boundaries — but it hands the
+    // ranks different launch geometries for no benefit at K3's 96 heads, and the
+    // all-reduce then waits on whichever rank drew the extra head every layer.
+    if (cfg.n_q_heads % tp_size != 0) {
+        std::fprintf(stderr, "[k3-tp] %d query heads do not divide %d ranks — attention "
+                             "stays replicated\n", cfg.n_q_heads, tp_size);
+        return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 bool kimi_k3_tp_init(const GGUF& g, const KimiK3Config& cfg, const K3PlanOptions& opt,
@@ -46,6 +76,7 @@ bool kimi_k3_tp_init(const GGUF& g, const KimiK3Config& cfg, const K3PlanOptions
 
     out.cfg = cfg;
     out.opt = opt;
+    out.shard_attn = shard_attention(cfg, tp_size);
     out.ranks.clear();
     out.ranks.resize((size_t)tp_size);
     out.streams.assign((size_t)tp_size, nullptr);
@@ -111,6 +142,13 @@ bool kimi_k3_tp_init(const GGUF& g, const KimiK3Config& cfg, const K3PlanOptions
         R.fwd.state = &R.state;
         R.fwd.opt = out.opt;
         R.fwd.stream = R.stream;
+        // The band is a property of this rank's forward, so it is set here in the worker
+        // rather than after the join — kimi_k3_forward_alloc_scratch reads fwd, and every
+        // rank writes only its own.
+        if (out.shard_attn) {
+            R.fwd.attn_band.offset = r * (cfg.n_q_heads / tp_size);
+            R.fwd.attn_band.count  = cfg.n_q_heads / tp_size;
+        }
         if (!kimi_k3_forward_alloc_scratch(cfg, R.fwd)) {
             rank_err[(size_t)r] = "forward_alloc_scratch failed";
             return false;
@@ -129,10 +167,14 @@ bool kimi_k3_tp_init(const GGUF& g, const KimiK3Config& cfg, const K3PlanOptions
 
         // Buffered, not printed: eight ranks writing stderr concurrently interleaves
         // mid-line. Emitted in rank order after the join so the log reads as before.
-        char line[160];
-        std::snprintf(line, sizeof(line), "[k3-tp] rank %d: device %d, experts [%d,%d)\n",
+        char line[200];
+        std::snprintf(line, sizeof(line),
+                      "[k3-tp] rank %d: device %d, experts [%d,%d), heads [%d,%d)\n",
                       r, R.device, R.weights.shard.expert_band.offset,
-                      R.weights.shard.expert_band.end());
+                      R.weights.shard.expert_band.end(),
+                      R.fwd.attn_band.active() ? R.fwd.attn_band.offset : 0,
+                      R.fwd.attn_band.active()
+                          ? R.fwd.attn_band.offset + R.fwd.attn_band.count : cfg.n_q_heads);
         rank_log[(size_t)r] = line;
         return true;
     };
@@ -174,7 +216,8 @@ bool kimi_k3_tp_init(const GGUF& g, const KimiK3Config& cfg, const K3PlanOptions
     if (cudaSetDevice(devices[0]) != cudaSuccess) return false;
 
     // The collective. need_f32 because K3's residual stream is f32; max_count is the
-    // widest payload the forward will reduce, which is the expert_latent partial.
+    // widest payload the forward will reduce — the expert_latent partial, or the
+    // full-width attention partial once the heads are banded.
     std::string requested_env;
     if (const char* e = std::getenv("SPARKINFER_TP_BACKEND")) requested_env = e;
     std::string why;
@@ -182,8 +225,10 @@ bool kimi_k3_tp_init(const GGUF& g, const KimiK3Config& cfg, const K3PlanOptions
     if (!why.empty()) std::fprintf(stderr, "[k3-tp] %s\n", why.c_str());
 
     std::string err;
-    out.coll = tp::make_collective(devices, requested, &err,
-                                   /*max_count=*/(size_t)cfg.expert_latent,
+    const size_t max_count = out.shard_attn
+        ? (size_t)(cfg.hidden > cfg.expert_latent ? cfg.hidden : cfg.expert_latent)
+        : (size_t)cfg.expert_latent;
+    out.coll = tp::make_collective(devices, requested, &err, max_count,
                                    /*need_f32=*/true);
     if (!out.coll) {
         std::fprintf(stderr, "[k3-tp] no collective: %s\n", err.c_str());
@@ -230,69 +275,93 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
         if (!embed_token(R.weights, cfg, token_id, R.x, R.stream)) return false;
     }
 
+    // Reduce every rank's partial for `phase` in place. Enqueued on each rank's own
+    // stream, after that rank's work, so the ordering is stream-ordered — no host
+    // barrier, and no cudaDeviceSynchronize on the critical path. The GROUP form is
+    // mandatory: a single host thread looping per-rank allreduce deadlocks (see
+    // collective.h).
+    // SPARKINFER_K3_TP_HOST_REDUCE=1 replaces the collective with an explicit
+    // device->host->sum->device round trip. Slow and only for bisecting: it isolates
+    // "the reduce is wrong" from "the reduce is right but something around it is",
+    // which are otherwise indistinguishable from the logits.
+    static const bool host_reduce = [] {
+        const char* e = std::getenv("SPARKINFER_K3_TP_HOST_REDUCE");
+        return e && e[0] == '1';
+    }();
+    auto reduce_phase = [&](int layer, K3LayerPhase phase) -> bool {
+        int count = 0;
+        for (int r = 0; r < tp_size; ++r) {
+            int n = 0;
+            float* buf = kimi_k3_partial_buffer(p.ranks[(size_t)r].fwd, layer, phase, &n);
+            if (!buf || n <= 0) return false;
+            if (r == 0) count = n;
+            else if (n != count) return false;   // ranks must agree on the width
+            p.reduce_bufs[(size_t)r] = buf;
+        }
+        if (host_reduce) {
+            std::vector<float> sum((size_t)count, 0.0f), tmp((size_t)count);
+            for (int r = 0; r < tp_size; ++r) {
+                cudaSetDevice(p.ranks[(size_t)r].device);
+                cudaStreamSynchronize(p.ranks[(size_t)r].stream);
+                cudaMemcpy(tmp.data(), p.reduce_bufs[(size_t)r],
+                           (size_t)count * sizeof(float), cudaMemcpyDeviceToHost);
+                for (int i = 0; i < count; ++i) sum[(size_t)i] += tmp[(size_t)i];
+            }
+            for (int r = 0; r < tp_size; ++r) {
+                cudaSetDevice(p.ranks[(size_t)r].device);
+                cudaMemcpy(p.reduce_bufs[(size_t)r], sum.data(),
+                           (size_t)count * sizeof(float), cudaMemcpyHostToDevice);
+            }
+        } else if (!p.coll->allreduce_f32_group(p.reduce_bufs, (size_t)count, p.streams)) {
+            return false;
+        }
+        ++p.n_collectives;
+        return true;
+    };
+
     for (int layer = 0; layer < cfg.n_layers; ++layer) {
         const bool is_moe = layer >= cfg.leading_dense;
 
-        // --- phase 1 + 2 on every rank -------------------------------------
-        // Under ExpertsOnly, attention is replicated, so no collective separates
-        // these two phases. They are still issued as distinct calls because the
-        // phase boundary is where a fully-sharded build WOULD reduce, and keeping
-        // the call sites is what makes that a one-line change rather than a
-        // re-split of the forward.
+        // --- phase 1 on every rank ------------------------------------------
         for (auto& R : p.ranks) {
             if (cudaSetDevice(R.device) != cudaSuccess) return false;
             if (!kimi_k3_forward_layer_phase(R.fwd, layer, K3LayerPhase::Attn,
                                              R.x, R.x_next)) return false;
+        }
+
+        // --- the attention collective ---------------------------------------
+        // Only when the heads are banded. With attention replicated, phase Attn holds
+        // a complete result on every rank and reducing it would multiply it by tp_size
+        // — which is exactly the failure this branch exists to avoid, so it is keyed
+        // off the same flag that set the bands.
+        //
+        // EVERY layer, including the leading dense one: every layer has attention.
+        // That is 93 more collectives per token on top of the 92 the experts need. The
+        // trade is deliberate and it is the whole risk of this change — see the header.
+        if (p.shard_attn) {
+            if (!reduce_phase(layer, K3LayerPhase::Attn)) {
+                std::fprintf(stderr, "[k3-tp] attention all-reduce failed at layer %d\n",
+                             layer);
+                return false;
+            }
+        }
+
+        // --- phase 2 on every rank ------------------------------------------
+        for (auto& R : p.ranks) {
+            if (cudaSetDevice(R.device) != cudaSuccess) return false;
             if (!kimi_k3_forward_layer_phase(R.fwd, layer, K3LayerPhase::FfnPartial,
                                              R.x, R.x_next)) return false;
         }
 
-        // --- the collective -------------------------------------------------
+        // --- the FFN collective ---------------------------------------------
         // MoE layers only. The leading dense layer's FFN is replicated under this
         // policy, so it holds a complete result already and reducing it would
         // multiply it by tp_size.
         if (is_moe && tp_size > 1) {
-            int count = 0;
-            for (int r = 0; r < tp_size; ++r) {
-                int n = 0;
-                float* buf = kimi_k3_partial_buffer(p.ranks[(size_t)r].fwd, layer,
-                                                    K3LayerPhase::FfnPartial, &n);
-                if (!buf || n <= 0) return false;
-                if (r == 0) count = n;
-                else if (n != count) return false;   // ranks must agree on the width
-                p.reduce_bufs[(size_t)r] = buf;
-            }
-            // Enqueued on each rank's own stream, after that rank's dispatch, so the
-            // ordering is stream-ordered — no host barrier, and no cudaDeviceSynchronize
-            // on the critical path. The GROUP form is mandatory: a single host thread
-            // looping per-rank allreduce deadlocks (see collective.h).
-            // SPARKINFER_K3_TP_HOST_REDUCE=1 replaces the collective with an explicit
-            // device->host->sum->device round trip. Slow and only for bisecting: it
-            // isolates "the reduce is wrong" from "the reduce is right but something
-            // around it is", which are otherwise indistinguishable from the logits.
-            static const bool host_reduce = [] {
-                const char* e = std::getenv("SPARKINFER_K3_TP_HOST_REDUCE");
-                return e && e[0] == '1';
-            }();
-            if (host_reduce) {
-                std::vector<float> sum((size_t)count, 0.0f), tmp((size_t)count);
-                for (int r = 0; r < tp_size; ++r) {
-                    cudaSetDevice(p.ranks[(size_t)r].device);
-                    cudaStreamSynchronize(p.ranks[(size_t)r].stream);
-                    cudaMemcpy(tmp.data(), p.reduce_bufs[(size_t)r],
-                               (size_t)count * sizeof(float), cudaMemcpyDeviceToHost);
-                    for (int i = 0; i < count; ++i) sum[(size_t)i] += tmp[(size_t)i];
-                }
-                for (int r = 0; r < tp_size; ++r) {
-                    cudaSetDevice(p.ranks[(size_t)r].device);
-                    cudaMemcpy(p.reduce_bufs[(size_t)r], sum.data(),
-                               (size_t)count * sizeof(float), cudaMemcpyHostToDevice);
-                }
-            } else if (!p.coll->allreduce_f32_group(p.reduce_bufs, (size_t)count, p.streams)) {
+            if (!reduce_phase(layer, K3LayerPhase::FfnPartial)) {
                 std::fprintf(stderr, "[k3-tp] all-reduce failed at layer %d\n", layer);
                 return false;
             }
-            ++p.n_collectives;
         }
 
         // --- phase 3 on every rank ------------------------------------------

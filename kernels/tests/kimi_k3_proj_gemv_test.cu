@@ -207,6 +207,154 @@ int main() {
         cudaFree(dW); cudaFree(dx); cudaFree(dy);
     }
 
+    // ---- column-sliced projection: the tensor-parallel partition ----
+    //
+    // k3_proj_cols_f32 reduces a column band of a WHOLE tensor, so it has to keep two
+    // widths apart: how many blocks it visits, and how far apart two rows are. Getting
+    // those confused reads the right number of blocks from the wrong place, which lands
+    // inside the allocation and produces a plausible wrong answer rather than a fault —
+    // so this checks the reconstructed sum against the float64 reference AND against
+    // the whole-row call on the same weights.
+    //
+    // N = 1026 puts it on the multirow kernel (N >= 1024, and N % ROWS != 0 so the last
+    // block runs partly out of range). K = 2048 over 4 bands is 512 columns each, well
+    // clear of a single 32-value block, and every band start is block-aligned.
+    {
+        const int N = 1026, K = 2048, TP = 4;
+        const int bpr = K / 32, per = K / TP;
+        std::vector<BlockQ8_0> W((size_t)N * bpr);
+        for (auto& b : W) {
+            const uint16_t exp = (uint16_t)(9 + (rng() % 8));
+            b.d = (uint16_t)(((rng() & 1) << 15) | (exp << 10) | (rng() % 1024));
+            for (auto& q : b.qs) q = (int8_t)((int)(rng() % 256) - 128);
+        }
+        std::vector<float> x(K); for (auto& v : x) v = U(rng);
+
+        std::vector<double> ref(N, 0.0);
+        for (int n = 0; n < N; ++n) {
+            double acc = 0;
+            for (int b = 0; b < bpr; ++b) {
+                const auto& blk = W[(size_t)n * bpr + b];
+                const double d = h2f(blk.d);
+                for (int j = 0; j < 32; ++j) acc += d * (double)blk.qs[j] * (double)x[b * 32 + j];
+            }
+            ref[n] = acc;
+        }
+
+        void *dW, *dx, *dy, *dq;
+        CU(cudaMalloc(&dW, W.size() * sizeof(BlockQ8_0)));
+        CU(cudaMalloc(&dx, K * sizeof(float)));
+        CU(cudaMalloc(&dy, N * sizeof(float)));
+        CU(cudaMalloc(&dq, k3_q8_0_bytes(K)));
+        CU(cudaMemcpy(dW, W.data(), W.size() * sizeof(BlockQ8_0), cudaMemcpyHostToDevice));
+        CU(cudaMemcpy(dx, x.data(), K * sizeof(float), cudaMemcpyHostToDevice));
+
+        std::vector<float> full(N), part(N), summed(N, 0.f);
+        bool ok = k3_proj_f32((float*)dy, (const float*)dx, dW, 8, N, K, 0);
+        CU(cudaDeviceSynchronize());
+        CU(cudaMemcpy(full.data(), dy, N * sizeof(float), cudaMemcpyDeviceToHost));
+
+        for (int r = 0; r < TP; ++r) {
+            ok = ok && k3_proj_cols_f32((float*)dy, (const float*)dx, dW, 8, N,
+                                        r * per, per, K, 0);
+            CU(cudaDeviceSynchronize());
+            CU(cudaMemcpy(part.data(), dy, N * sizeof(float), cudaMemcpyDeviceToHost));
+            for (int n = 0; n < N; ++n) summed[n] += part[n];
+        }
+
+        // Both comparisons are NORM-WISE, not per element. The partition reassociates
+        // the sum, so a row whose full-width value lands near zero has an unbounded
+        // RELATIVE difference from a difference that is absolutely tiny — a per-element
+        // ratio measures the cancellation, not the kernel.
+        double num = 0, den = 0, fnum = 0, fden = 0;
+        for (int n = 0; n < N; ++n) {
+            const double d = summed[n] - ref[n];
+            num += d * d; den += ref[n] * ref[n];
+            const double f = (double)summed[n] - (double)full[n];
+            fnum += f * f; fden += (double)full[n] * (double)full[n];
+        }
+        const double rl2 = std::sqrt(num / (den + 1e-30));
+        const double vs_full = std::sqrt(fnum / (fden + 1e-30));
+        std::printf("[Q8_0 cols] N=%d K=%d tp=%d accepted=%s relL2=%.3e vs_full_relL2=%.3e\n",
+                    N, K, TP, ok ? "yes" : "NO", rl2, vs_full);
+        if (!ok || rl2 > 1e-5 || vs_full > 1e-5) ++fail;
+
+        // The same partition on the reference-compatible activation path. Each band
+        // quantizes only its own columns, which is the SAME set of 32-value blocks the
+        // whole-row call produces, so this is the same claim about the same blocks.
+        for (auto& v : summed) v = 0.f;
+        ok = true;
+        for (int r = 0; r < TP; ++r) {
+            ok = ok && k3_proj_cols_ggml_f32((float*)dy, (const float*)dx, dW, 8, N,
+                                             r * per, per, K, dq, 0);
+            CU(cudaDeviceSynchronize());
+            CU(cudaMemcpy(part.data(), dy, N * sizeof(float), cudaMemcpyDeviceToHost));
+            for (int n = 0; n < N; ++n) summed[n] += part[n];
+        }
+        ok = ok && k3_proj_ggml_f32((float*)dy, (const float*)dx, dW, 8, N, K, dq, 0);
+        CU(cudaDeviceSynchronize());
+        CU(cudaMemcpy(full.data(), dy, N * sizeof(float), cudaMemcpyDeviceToHost));
+        double qnum2 = 0, qden2 = 0;
+        for (int n = 0; n < N; ++n) {
+            const double f = (double)summed[n] - (double)full[n];
+            qnum2 += f * f; qden2 += (double)full[n] * (double)full[n];
+        }
+        const double qvs = std::sqrt(qnum2 / (qden2 + 1e-30));
+        std::printf("[Q8_0 cols x Q8_0] tp=%d accepted=%s vs_full_relL2=%.3e\n",
+                    TP, ok ? "yes" : "NO", qvs);
+        if (!ok || qvs > 1e-5) ++fail;
+
+        // A band that starts mid-block cannot be served and must be refused, not
+        // rounded down to the block below it.
+        const bool bad = k3_proj_cols_f32((float*)dy, (const float*)dx, dW, 8, N,
+                                          16, per, K, 0);
+        std::printf("[Q8_0 cols] unaligned k_off=16 accepted=%s\n",
+                    bad ? "YES -- BUG" : "no (correct)");
+        if (bad) ++fail;
+        const bool over = k3_proj_cols_f32((float*)dy, (const float*)dx, dW, 8, N,
+                                           K - 32, 64, K, 0);
+        std::printf("[Q8_0 cols] band past the end accepted=%s\n",
+                    over ? "YES -- BUG" : "no (correct)");
+        if (over) ++fail;
+
+        cudaFree(dW); cudaFree(dx); cudaFree(dy); cudaFree(dq);
+    }
+
+    // ---- column-sliced F32 weights ----
+    {
+        const int N = 200, K = 384, TP = 4;
+        const int per = K / TP;
+        std::vector<float> W((size_t)N * K), x(K);
+        for (auto& v : W) v = U(rng);
+        for (auto& v : x) v = U(rng);
+        std::vector<double> ref(N, 0.0);
+        for (int n = 0; n < N; ++n) {
+            double acc = 0;
+            for (int k = 0; k < K; ++k) acc += (double)W[(size_t)n * K + k] * (double)x[k];
+            ref[n] = acc;
+        }
+        void *dW, *dx, *dy;
+        CU(cudaMalloc(&dW, W.size() * 4)); CU(cudaMalloc(&dx, K * 4)); CU(cudaMalloc(&dy, N * 4));
+        CU(cudaMemcpy(dW, W.data(), W.size() * 4, cudaMemcpyHostToDevice));
+        CU(cudaMemcpy(dx, x.data(), K * 4, cudaMemcpyHostToDevice));
+        std::vector<float> part(N), summed(N, 0.f);
+        bool ok = true;
+        for (int r = 0; r < TP; ++r) {
+            ok = ok && k3_proj_cols_f32((float*)dy, (const float*)dx, dW, 0, N,
+                                        r * per, per, K, 0);
+            CU(cudaDeviceSynchronize());
+            CU(cudaMemcpy(part.data(), dy, N * 4, cudaMemcpyDeviceToHost));
+            for (int n = 0; n < N; ++n) summed[n] += part[n];
+        }
+        double num = 0, den = 0;
+        for (int n = 0; n < N; ++n) { double d = summed[n] - ref[n]; num += d * d; den += ref[n] * ref[n]; }
+        const double rl2 = std::sqrt(num / (den + 1e-30));
+        std::printf("[F32 cols] N=%d K=%d tp=%d accepted=%s relL2=%.3e\n",
+                    N, K, TP, ok ? "yes" : "NO", rl2);
+        if (!ok || rl2 > 1e-6) ++fail;
+        cudaFree(dW); cudaFree(dx); cudaFree(dy);
+    }
+
     // ---- unsupported type must be refused ----
     {
         float *dy=nullptr, *dx=nullptr; void* dW=nullptr;

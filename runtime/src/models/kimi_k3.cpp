@@ -812,8 +812,51 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
         return k3k::k3_proj_f32(y, x, W.data, W.type, N, K, stream);
     };
 
-    // ---- phase 1: attention. Ends holding a FULL-WIDTH PARTIAL SUM,
-    // because attn_output is ColShard. The driver reduces it before phase 2. ----
+    // ---- this rank's attention head band ----------------------------------
+    // h0/hn are 0/qh unless a TP driver set a band, so every offset below is +0 and
+    // every width the full one on the single-GPU path.
+    const int h0 = fwd.attn_band.active() ? fwd.attn_band.offset : 0;
+    const int hn = fwd.attn_band.active() ? fwd.attn_band.count  : qh;
+    if (h0 < 0 || hn <= 0 || h0 + hn > qh) return false;
+
+    // Row-parallel projection: rows [row_off, row_off+n_rows) of a GGUF-native [N, K]
+    // tensor, written to the matching slots of y. The rows this rank does not own are
+    // never read, which is the entire saving — the tensor itself is still whole.
+    auto proj_rows = [&](float* y, const float* x, const KimiK3Tensor& W,
+                         int row_off, int n_rows, int K) {
+        if (!W.ok()) return false;
+        long row_bytes = 0;
+        if (W.type == 0)      row_bytes = (long)K * (long)sizeof(float);
+        else if (W.type == 8) row_bytes = (long)(K / 32) * 34;
+        else return false;
+        const void* Wd = (const char*)W.data + (size_t)row_off * (size_t)row_bytes;
+        if (ggml_qact_proj)
+            return k3k::k3_proj_ggml_f32(y + row_off, x, Wd, W.type, n_rows, K,
+                                         s.proj_q8, stream);
+        return k3k::k3_proj_f32(y + row_off, x, Wd, W.type, n_rows, K, stream);
+    };
+
+    // Column-parallel projection: the partial sum over columns [k_off, k_off+k_len).
+    // This is attn_output, and it is why phase Attn ends holding a partial rather than
+    // an answer.
+    auto proj_cols = [&](float* y, const float* x, const KimiK3Tensor& W,
+                         int N, int k_off, int k_len, int K) {
+        if (!W.ok()) return false;
+        if (ggml_qact_proj)
+            return k3k::k3_proj_cols_ggml_f32(y, x, W.data, W.type, N, k_off, k_len, K,
+                                              s.proj_q8, stream);
+        return k3k::k3_proj_cols_f32(y, x, W.data, W.type, N, k_off, k_len, K, stream);
+    };
+
+    // Row base of a Q8_0 [N, K] tensor. Its only caller is the Q8_0-only x4 fusion,
+    // which has already established the type before it gets here.
+    auto q8_row = [](const KimiK3Tensor& W, int row_off, int K) -> const void* {
+        return (const char*)W.data + (size_t)row_off * (size_t)(K / 32) * 34;
+    };
+
+    // ---- phase 1: attention. With a head band set, this ends holding a FULL-WIDTH
+    // PARTIAL SUM — attn_output was reduced over only this rank's columns — and the
+    // driver reduces it before phase 2. Without one it is already the answer. ----
     if (do_attn) {
         // --- pre-attention mix, then bank push (raw pre-mix value) ---
         if (res_bs > 0) {
@@ -841,7 +884,11 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
         if (L.is_kda) {
             const int kda_ord = kimi_k3_kda_ordinal(cfg, layer);
             if (kda_ord < 0) return false;
-            const int head_dim = cfg.kda_head_dim, n_head = cfg.n_q_heads;
+            const int head_dim = cfg.kda_head_dim;
+            const int n_head = hn;          // heads THIS rank runs the scan for
+            const int c0 = h0 * head_dim;   // first channel of this rank's band
+            const int cn = hn * head_dim;   // channels in it
+            const int d_conv = cfg.kda_conv_kernel;
 
             // attn_q / attn_k / attn_v / ssm_g all read the SAME s.normed at the same
             // [qkv, H] shape, so they go out as one launch instead of four, and one
@@ -854,102 +901,148 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             // k3_proj_f32_x4 returns false for anything outside its narrow contract
             // (non-Q8_0, mismatched shape, missing tensor) — that is "use the slow path",
             // not an error, so the fallback below is the general case, not dead code.
+            //
+            // Every tensor in this block carries the head as its SLOWEST index, so
+            // running only heads [h0, h0+hn) is a pointer bump on each of them and a
+            // smaller head count — no kernel learns anything new. Buffers stay at full
+            // width and this rank writes only its own band; the band it does not write
+            // is never read, because attn_output below reduces exactly [c0, c0+cn).
             const bool fused_qkvg =
                 !ggml_qact_proj &&
                 L.attn_q.ok() && L.attn_k.ok() && L.attn_v.ok() && L.ssm_g.ok() &&
                 L.attn_q.type == 8 && L.attn_k.type == 8 &&
                 L.attn_v.type == 8 && L.ssm_g.type == 8 &&
-                k3k::k3_proj_f32_x4(s.qkv_q, s.qkv_k, s.qkv_v, s.g_proj_out, s.normed,
-                                    L.attn_q.data, L.attn_k.data, L.attn_v.data,
-                                    L.ssm_g.data, L.attn_q.type, qkv, H, stream);
+                k3k::k3_proj_f32_x4(s.qkv_q + c0, s.qkv_k + c0, s.qkv_v + c0,
+                                    s.g_proj_out + c0, s.normed,
+                                    q8_row(L.attn_q, c0, H), q8_row(L.attn_k, c0, H),
+                                    q8_row(L.attn_v, c0, H), q8_row(L.ssm_g, c0, H),
+                                    L.attn_q.type, cn, H, stream);
             if (!fused_qkvg) {
-                if (!proj(s.qkv_q, s.normed, L.attn_q, qkv, H)) return false;
-                if (!proj(s.qkv_k, s.normed, L.attn_k, qkv, H)) return false;
-                if (!proj(s.qkv_v, s.normed, L.attn_v, qkv, H)) return false;
+                if (!proj_rows(s.qkv_q, s.normed, L.attn_q, c0, cn, H)) return false;
+                if (!proj_rows(s.qkv_k, s.normed, L.attn_k, c0, cn, H)) return false;
+                if (!proj_rows(s.qkv_v, s.normed, L.attn_v, c0, cn, H)) return false;
             }
 
             if (!L.ssm_conv1d_q.ok() || !L.ssm_conv1d_k.ok() || !L.ssm_conv1d_v.ok())
                 return false;
-            k3k::kda_conv_step_f32(s.conv_q, st.conv_state_q[kda_ord], s.qkv_q,
-                                   (const float*)L.ssm_conv1d_q.data, cfg.kda_conv_kernel,
-                                   qkv, stream);
-            k3k::kda_conv_step_f32(s.conv_k, st.conv_state_k[kda_ord], s.qkv_k,
-                                   (const float*)L.ssm_conv1d_k.data, cfg.kda_conv_kernel,
-                                   qkv, stream);
-            k3k::kda_conv_step_f32(s.conv_v, st.conv_state_v[kda_ord], s.qkv_v,
-                                   (const float*)L.ssm_conv1d_v.data, cfg.kda_conv_kernel,
-                                   qkv, stream);
-            if (fwd.debug) fwd.debug("dbg_conv_q", layer, s.conv_q, qkv);
-            if (fwd.debug) fwd.debug("dbg_conv_v", layer, s.conv_v, qkv);
+            // conv state is [d_conv-1, d_inner] and the weight [d_conv, d_inner], both
+            // with the time index fastest — so a channel's history and its filter are
+            // each contiguous and the band is a flat offset.
+            const size_t conv_st_off = (size_t)c0 * (size_t)(d_conv - 1);
+            const size_t conv_w_off  = (size_t)c0 * (size_t)d_conv;
+            k3k::kda_conv_step_f32(s.conv_q + c0, st.conv_state_q[kda_ord] + conv_st_off,
+                                   s.qkv_q + c0,
+                                   (const float*)L.ssm_conv1d_q.data + conv_w_off,
+                                   d_conv, cn, stream);
+            k3k::kda_conv_step_f32(s.conv_k + c0, st.conv_state_k[kda_ord] + conv_st_off,
+                                   s.qkv_k + c0,
+                                   (const float*)L.ssm_conv1d_k.data + conv_w_off,
+                                   d_conv, cn, stream);
+            k3k::kda_conv_step_f32(s.conv_v + c0, st.conv_state_v[kda_ord] + conv_st_off,
+                                   s.qkv_v + c0,
+                                   (const float*)L.ssm_conv1d_v.data + conv_w_off,
+                                   d_conv, cn, stream);
+            if (fwd.debug) fwd.debug("dbg_conv_q", layer, s.conv_q + c0, cn);
+            if (fwd.debug) fwd.debug("dbg_conv_v", layer, s.conv_v + c0, cn);
 
             // q gets the extra 1/sqrt(head_dim) scale the reference applies before the
             // scan; k does not (see kda_decode_step_f32's contract on pre-scaled q).
-            k3k::l2_norm_heads_f32(s.conv_q, s.conv_q, head_dim, n_head,
+            k3k::l2_norm_heads_f32(s.conv_q + c0, s.conv_q + c0, head_dim, n_head,
                                    1.0f / std::sqrt((float)head_dim), eps, stream);
-            k3k::l2_norm_heads_f32(s.conv_k, s.conv_k, head_dim, n_head, 1.0f, eps, stream);
-            if (fwd.debug) fwd.debug("dbg_l2_q", layer, s.conv_q, qkv);
+            k3k::l2_norm_heads_f32(s.conv_k + c0, s.conv_k + c0, head_dim, n_head, 1.0f,
+                                   eps, stream);
+            if (fwd.debug) fwd.debug("dbg_l2_q", layer, s.conv_q + c0, cn);
 
+            // ssm_f_a is the SHARED low-rank factor — [head_dim, H], no head axis — so
+            // it stays replicated. Only f_b, which fans it back out per head, bands.
             if (!proj(s.f_a_out, s.normed, L.ssm_f_a, head_dim, H)) return false;
-            if (!proj(s.g_raw, s.f_a_out, L.ssm_f_b, qkv, head_dim)) return false;
+            if (!proj_rows(s.g_raw, s.f_a_out, L.ssm_f_b, c0, cn, head_dim)) return false;
             if (!L.ssm_dt_bias.ok()) return false;
-            k3k::k3_add_f32(s.g_raw, s.g_raw, (const float*)L.ssm_dt_bias.data, qkv, stream);
+            k3k::k3_add_f32(s.g_raw + c0, s.g_raw + c0,
+                            (const float*)L.ssm_dt_bias.data + c0, cn, stream);
 
             if (!L.ssm_a.ok()) return false;
-            k3k::kda_decay_gate_f32(s.decay_g, s.g_raw, (const float*)L.ssm_a.data,
+            k3k::kda_decay_gate_f32(s.decay_g + c0, s.g_raw + c0,
+                                    (const float*)L.ssm_a.data + h0,
                                     head_dim, n_head, cfg.kda_gate_lower_bound, stream);
 
-            if (!proj(s.beta_out, s.normed, L.ssm_beta, n_head, H)) return false;
+            if (!proj_rows(s.beta_out, s.normed, L.ssm_beta, h0, hn, H)) return false;
             // beta is the delta-rule update rate: llama.cpp's build_kda_layer applies
             // a sigmoid to the projection before the scan consumes it. Omitting this
             // left beta unbounded (rms ~1.7 vs the correct ~0.75) and scaled the whole
             // KDA output — the layer-0 divergence vs llama that this restores.
-            k3k::sigmoid_inplace_f32(s.beta_out, n_head, stream);
+            k3k::sigmoid_inplace_f32(s.beta_out + h0, hn, stream);
 
-            if (fwd.debug) fwd.debug("dbg_decay_g", layer, s.decay_g, qkv);
-            if (fwd.debug) fwd.debug("dbg_beta", layer, s.beta_out, n_head);
-            k3k::kda_decode_step_f32(s.delta_out, st.delta_state[kda_ord],
-                                     s.conv_q, s.conv_k, s.conv_v, s.decay_g, s.beta_out,
+            if (fwd.debug) fwd.debug("dbg_decay_g", layer, s.decay_g + c0, cn);
+            if (fwd.debug) fwd.debug("dbg_beta", layer, s.beta_out + h0, hn);
+            // delta state is [head_dim, head_dim, n_head] with the head slowest, so this
+            // rank owns a contiguous run of whole per-head matrices and never touches
+            // another rank's. The band is fixed for the life of the process, so the
+            // state a rank carries forward is always the state it wrote.
+            k3k::kda_decode_step_f32(s.delta_out + c0,
+                                     st.delta_state[kda_ord] +
+                                         (size_t)h0 * head_dim * head_dim,
+                                     s.conv_q + c0, s.conv_k + c0, s.conv_v + c0,
+                                     s.decay_g + c0, s.beta_out + h0,
                                      head_dim, n_head, stream);
-            if (fwd.debug) fwd.debug("dbg_delta_out", layer, s.delta_out, qkv);
+            if (fwd.debug) fwd.debug("dbg_delta_out", layer, s.delta_out + c0, cn);
 
             // Already computed above when the q/k/v/g fusion took the fast path.
-            if (!fused_qkvg && !proj(s.g_proj_out, s.normed, L.ssm_g, qkv, H)) return false;
+            if (!fused_qkvg &&
+                !proj_rows(s.g_proj_out, s.normed, L.ssm_g, c0, cn, H)) return false;
             if (!L.ssm_norm.ok()) return false;
-            k3k::kda_gate_out_f32(s.gate_out, s.delta_out, (const float*)L.ssm_norm.data,
-                                  s.g_proj_out, head_dim, n_head, eps, stream);
-            if (fwd.debug) fwd.debug("dbg_gate_out", layer, s.gate_out, qkv);
+            // ssm_norm is [head_dim] — one weight vector shared by every head, so it is
+            // the one pointer here that does NOT move with the band.
+            k3k::kda_gate_out_f32(s.gate_out + c0, s.delta_out + c0,
+                                  (const float*)L.ssm_norm.data,
+                                  s.g_proj_out + c0, head_dim, n_head, eps, stream);
+            if (fwd.debug) fwd.debug("dbg_gate_out", layer, s.gate_out + c0, cn);
 
-            if (!proj(s.attn_out, s.gate_out, L.attn_output, H, qkv)) return false;
+            if (!proj_cols(s.attn_out, s.gate_out, L.attn_output, H, c0, cn, qkv))
+                return false;
             if (fwd.debug) fwd.debug("kda_out", layer, s.attn_out, H);
         } else {
             const int mla_ord = kimi_k3_mla_ordinal(cfg, layer);
             if (mla_ord < 0) return false;
 
+            // q_a and kv_a are NOT banded. q_a's output is the shared low-rank q latent
+            // every head reads, and kv_a produces the row this token appends to the
+            // K-cache — MLA is MQA, so that row belongs to all 96 heads and every rank
+            // needs the identical copy in its own cache. Both are small (K3 spends
+            // ~200 MB per MLA layer on the banded projections against ~16 MB on these
+            // two), so replicating them costs almost nothing and keeps the cache
+            // rank-invariant.
+            const int qb_off = h0 * cfg.key_length_mla;
+            const int qb_len = hn * cfg.key_length_mla;
             if (L.has_q_lora) {
                 if (!proj(s.q_lora_out, s.normed, L.attn_q_a, cfg.q_lora_rank, H)) return false;
                 if (!L.attn_q_a_norm.ok()) return false;
                 k3k::rms_norm_f32(s.q_lora_out, s.q_lora_out,
                                   (const float*)L.attn_q_a_norm.data, cfg.q_lora_rank, eps,
                                   stream);
-                if (!proj(s.q_proj_out, s.q_lora_out, L.attn_q_b, qh * cfg.key_length_mla,
-                         cfg.q_lora_rank))
+                if (!proj_rows(s.q_proj_out, s.q_lora_out, L.attn_q_b, qb_off, qb_len,
+                               cfg.q_lora_rank))
                     return false;
             } else {
-                if (!proj(s.q_proj_out, s.normed, L.attn_q_dense, qh * cfg.key_length_mla, H))
+                if (!proj_rows(s.q_proj_out, s.normed, L.attn_q_dense, qb_off, qb_len, H))
                     return false;
             }
 
             // De-interleave [qh, key_length_mla] into q_nope [qh, qk_nope] and
             // q_pe [qh, rope_dim] — each head's 192 values are qk_nope(128) then
             // rope_dim(64) concatenated, so this is a strided 2-D copy, not a plain split.
-            cudaMemcpy2DAsync(s.q_nope, (size_t)qk_nope * sizeof(float),
-                              s.q_proj_out, (size_t)cfg.key_length_mla * sizeof(float),
-                              (size_t)qk_nope * sizeof(float), qh,
-                              cudaMemcpyDeviceToDevice, stream);
-            cudaMemcpy2DAsync(s.q_pe, (size_t)cfg.rope_dim * sizeof(float),
-                              (const char*)s.q_proj_out + (size_t)qk_nope * sizeof(float),
+            cudaMemcpy2DAsync(s.q_nope + (size_t)h0 * qk_nope,
+                              (size_t)qk_nope * sizeof(float),
+                              s.q_proj_out + (size_t)qb_off,
                               (size_t)cfg.key_length_mla * sizeof(float),
-                              (size_t)cfg.rope_dim * sizeof(float), qh,
+                              (size_t)qk_nope * sizeof(float), hn,
+                              cudaMemcpyDeviceToDevice, stream);
+            cudaMemcpy2DAsync(s.q_pe + (size_t)h0 * cfg.rope_dim,
+                              (size_t)cfg.rope_dim * sizeof(float),
+                              (const char*)(s.q_proj_out + (size_t)qb_off) +
+                                  (size_t)qk_nope * sizeof(float),
+                              (size_t)cfg.key_length_mla * sizeof(float),
+                              (size_t)cfg.rope_dim * sizeof(float), hn,
                               cudaMemcpyDeviceToDevice, stream);
 
             if (!proj(s.kv_a_out, s.normed, L.attn_kv_a_mqa, cfg.key_length, H)) return false;
@@ -967,29 +1060,46 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
                             (size_t)cfg.rope_dim * sizeof(float),
                             cudaMemcpyDeviceToDevice, stream);
 
+            // wk_b is [qk_nope, kv_lora, n_head] and wv_b [kv_lora, v_dim, n_head], both
+            // head-slowest, so each is a flat offset away from this rank's band.
+            const int vl = cfg.value_length_mla;
+            const int v_off = h0 * vl, v_len = hn * vl;
             if (!L.attn_k_b.ok() || !L.attn_v_b.ok()) return false;
-            k3k::mla_absorb_q_f32(s.absorbed_q, s.q_nope, s.q_pe,
-                                  (const float*)L.attn_k_b.data, qk_nope, cfg.kv_lora_rank,
-                                  cfg.rope_dim, qh, stream);
-            if (fwd.debug) fwd.debug("mla_absorb_q", layer, s.absorbed_q, qh * cfg.key_length);
+            k3k::mla_absorb_q_f32(s.absorbed_q + (size_t)h0 * cfg.key_length,
+                                  s.q_nope + (size_t)h0 * qk_nope,
+                                  s.q_pe + (size_t)h0 * cfg.rope_dim,
+                                  (const float*)L.attn_k_b.data +
+                                      (size_t)h0 * qk_nope * cfg.kv_lora_rank,
+                                  qk_nope, cfg.kv_lora_rank, cfg.rope_dim, hn, stream);
+            if (fwd.debug) fwd.debug("mla_absorb_q", layer,
+                                     s.absorbed_q + (size_t)h0 * cfg.key_length,
+                                     hn * cfg.key_length);
 
+            // The K-cache is MQA — one latent per position, shared by all 96 heads — so
+            // banding the heads does NOT divide the cache. What it divides is how many
+            // times the cache is walked: this rank walks it for its 12 heads instead of
+            // all 96, and at 128k that walk is the largest single kernel in the token.
             const float mla_scale = 1.0f / std::sqrt((float)cfg.key_length_mla);
-            k3k::mla_decode_attn_f32(s.mla_attn_out, s.absorbed_q, st.mla_kv_cache[mla_ord],
-                                     (const float*)L.attn_v_b.data, cfg.key_length,
-                                     cfg.kv_lora_rank, cfg.value_length_mla, qh,
+            k3k::mla_decode_attn_f32(s.mla_attn_out + (size_t)v_off,
+                                     s.absorbed_q + (size_t)h0 * cfg.key_length,
+                                     st.mla_kv_cache[mla_ord],
+                                     (const float*)L.attn_v_b.data +
+                                         (size_t)h0 * cfg.kv_lora_rank * vl,
+                                     cfg.key_length, cfg.kv_lora_rank, vl, hn,
                                      st.position + 1, mla_scale, stream);
-            if (fwd.debug) fwd.debug("dbg_preattn", layer, s.mla_attn_out, qh * cfg.value_length_mla);
+            if (fwd.debug) fwd.debug("dbg_preattn", layer, s.mla_attn_out + v_off, v_len);
 
             if (L.has_attn_gate) {
-                if (!proj(s.gate_proj_out, s.normed, L.attn_gate, qh * cfg.value_length_mla, H))
+                if (!proj_rows(s.gate_proj_out, s.normed, L.attn_gate, v_off, v_len, H))
                     return false;
-                if (fwd.debug) fwd.debug("dbg_gateproj", layer, s.gate_proj_out, qh * cfg.value_length_mla);
-                k3k::mla_gate_out_f32(s.mla_attn_out, s.mla_attn_out, s.gate_proj_out,
-                                      (int64_t)qh * cfg.value_length_mla, stream);
-                if (fwd.debug) fwd.debug("dbg_postgate", layer, s.mla_attn_out, qh * cfg.value_length_mla);
+                if (fwd.debug) fwd.debug("dbg_gateproj", layer, s.gate_proj_out + v_off, v_len);
+                k3k::mla_gate_out_f32(s.mla_attn_out + v_off, s.mla_attn_out + v_off,
+                                      s.gate_proj_out + v_off, (int64_t)v_len, stream);
+                if (fwd.debug) fwd.debug("dbg_postgate", layer, s.mla_attn_out + v_off, v_len);
             }
 
-            if (!proj(s.attn_out, s.mla_attn_out, L.attn_output, H, qh * cfg.value_length_mla))
+            if (!proj_cols(s.attn_out, s.mla_attn_out, L.attn_output, H, v_off, v_len,
+                           qh * vl))
                 return false;
             if (fwd.debug) fwd.debug("mla_out", layer, s.attn_out, H);
         }
@@ -1158,6 +1268,18 @@ bool kimi_k3_forward_token(KimiK3Forward& fwd, int token_id, float* out_logits) 
     // Deliberately NOT reset inside forward_layer: that entry point is also used
     // standalone for per-layer validation, where the caller owns bank lifetime.
     fwd.state->n_ckpt = 0;
+
+    // A head band means phase Attn produces a PARTIAL sum that only a collective can
+    // complete. This entry point has no collective, so a banded forward here would
+    // return 1/tp_size of every attention output as if it were the answer — fluent and
+    // wrong. The banded path is kimi_k3_tp_forward_token's alone.
+    if (fwd.attn_band.active()) {
+        std::fprintf(stderr, "[k3] kimi_k3_forward_token called with an attention head "
+                             "band [%d,%d) — that path leaves a partial sum and needs "
+                             "the TP driver's all-reduce\n",
+                     fwd.attn_band.offset, fwd.attn_band.offset + fwd.attn_band.count);
+        return false;
+    }
 
     float* x = nullptr;
     float* x_next = nullptr;

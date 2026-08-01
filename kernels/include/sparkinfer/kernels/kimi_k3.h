@@ -449,6 +449,27 @@ void mla_decode_attn_f32(float* out, const float* q, const float* k_cache,
 bool k3_proj_f32(float* y, const float* x, const void* W, int wtype,
                  int N, int K, cudaStream_t stream);
 
+// The same GEMV over a CONTIGUOUS COLUMN SLICE of W, for the row-parallel half of
+// tensor parallelism:
+//
+//   y[n] = sum_{k in [k_off, k_off+k_len)} x[k] * W[k + n*K]
+//
+// W keeps its full [N, K] pitch — this reads a slice of a whole tensor, it does not
+// take a pre-sliced one. That is deliberate: K3's attention weights are replicated
+// on every rank, so sharding the WORK needs no change to what was loaded.
+//
+// `x` is the full-width activation and is indexed from k_off, so caller and kernel
+// cannot disagree about who applied the offset.
+//
+// Summing the tp_size slices of a row gives the same products as the full-width call
+// in a different association order, so the reconstructed y agrees to ~1 ulp rather
+// than bitwise — the same trade the expert all-reduce already makes.
+//
+// For Q8_0, k_off and k_len must be multiples of 32 (the block size); every K3 head
+// band satisfies this. Returns false otherwise rather than reading a partial block.
+bool k3_proj_cols_f32(float* y, const float* x, const void* W, int wtype,
+                      int N, int k_off, int k_len, int K, cudaStream_t stream);
+
 // Four projections that share ONE activation and one [N, K] shape, in a single launch.
 //
 // This is the KDA block's attn_q / attn_k / attn_v / ssm_g, all computed from the same
@@ -476,6 +497,13 @@ bool k3_proj_f32_x4(float* y0, float* y1, float* y2, float* y3, const float* x,
 // conversion only for Q8_0 weights. q8_scratch must hold (K/32)*34 bytes.
 bool k3_proj_ggml_f32(float* y, const float* x, const void* W, int wtype,
                       int N, int K, void* q8_scratch, cudaStream_t stream);
+
+// k3_proj_cols_f32 on the reference-compatible activation path. q8_scratch need only
+// hold (k_len/32)*34 bytes here, but the caller sizes it for the widest K it will
+// ever pass, so the existing whole-tensor sizing already covers every slice of it.
+bool k3_proj_cols_ggml_f32(float* y, const float* x, const void* W, int wtype,
+                           int N, int k_off, int k_len, int K, void* q8_scratch,
+                           cudaStream_t stream);
 
 // Scratch sizing helpers for the two reference-compatible activation paths.
 // K must be divisible by the corresponding block size (32 or 256).

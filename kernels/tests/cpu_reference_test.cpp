@@ -647,6 +647,189 @@ static double test_mla_split_merge_needs_rescale() {
     return worst;
 }
 
+// ---------------------------------------------------------------------------
+// 12. Tensor-parallel attention head banding.
+//
+// Two separate claims hold up kimi_k3_tp's banded attention, and neither needs a
+// GPU to check.
+//
+// (a) THE LAYOUTS. Every per-head tensor in K3's attention carries the head as its
+//     SLOWEST index, which is the only reason a rank can take its band with a flat
+//     pointer offset of h0*per_head. Each case below writes the offset the forward
+//     uses next to an indexer derived independently from the shape in
+//     kernels/include/sparkinfer/kernels/kimi_k3.h, and fails if they disagree.
+//     The conv state is the one that bites: [d_conv-1, d_inner] with the TIME index
+//     fastest means channel-major, so a channel's history is contiguous. Read the
+//     other way — time-major over all channels, which is the same shape written in
+//     the other order — a flat per-head offset silently addresses another head's
+//     history. test_band_conv_state_is_channel_major pins which reading is assumed.
+//
+// (b) THE PARTITION. attn_output is reduced over a column band per rank, so the
+//     answer is a sum of tp_size partial dot products instead of one. That is a
+//     REASSOCIATION, not a rewrite: the same products are summed in a different
+//     order, so the result is within rounding of the full-width dot but NOT bitwise
+//     equal to it. Both halves are asserted — that it agrees to f32 rounding, and
+//     that it is genuinely a different summation order rather than an accident of
+//     small test data.
+// ---------------------------------------------------------------------------
+static int g_ne_fail = 0;
+static void check_differs(const char* name, bool differs) {
+    printf("  [%s] %-34s differs=%s\n", differs ? "PASS" : "FAIL", name,
+           differs ? "yes" : "no");
+    if (!differs) g_ne_fail++;
+}
+
+// A miniature of the KDA head pipeline: the causal short conv (which carries state
+// across tokens) followed by a per-head gate. Run once over all heads, then again
+// one band at a time with the offsets the forward applies, over a FRESH copy of the
+// same state. Returns the largest disagreement.
+//
+// `state_stride` and `w_stride` are the per-channel pitches the band offset is built
+// from. Passing the right ones (d_conv-1 and d_conv) must reproduce the full run
+// exactly — same values, same order, so the tolerance is 0. Passing wrong ones is
+// what the companion negative case does.
+static double test_band_kda_conv(int n_head, int tp_size, int head_dim,
+                                 int state_stride, int w_stride) {
+    const int d_conv = 4;
+    const int d_inner = n_head * head_dim;
+    const int hn = n_head / tp_size;
+
+    vector<float> x(d_inner), w((size_t)d_inner * d_conv), st0((size_t)d_inner * (d_conv - 1));
+    for (auto& v : x) v = frand();
+    for (auto& v : w) v = frand();
+    for (auto& v : st0) v = frand();
+
+    // One channel's step, given base pointers into its own history and filter.
+    auto step = [&](const float* hist, const float* filt, float xc, float* hist_out) {
+        float acc = 0.f;
+        for (int t = 0; t < d_conv - 1; ++t) acc += hist[t] * filt[t];
+        acc += xc * filt[d_conv - 1];
+        for (int t = 0; t < d_conv - 2; ++t) hist_out[t] = hist[t + 1];
+        hist_out[d_conv - 2] = xc;
+        return silu(acc);
+    };
+
+    // (a) all channels at once.
+    vector<float> full(d_inner), st_full = st0;
+    for (int c = 0; c < d_inner; ++c)
+        full[c] = step(&st_full[(size_t)c * (d_conv - 1)], &w[(size_t)c * d_conv], x[c],
+                       &st_full[(size_t)c * (d_conv - 1)]);
+
+    // (b) band by band, from the same starting state, using the forward's offsets.
+    vector<float> banded(d_inner, 0.f), st_band = st0;
+    for (int r = 0; r < tp_size; ++r) {
+        const int c0 = r * hn * head_dim, cn = hn * head_dim;
+        float* st_base = &st_band[(size_t)c0 * state_stride];
+        const float* w_base = &w[(size_t)c0 * w_stride];
+        for (int c = 0; c < cn; ++c)
+            banded[c0 + c] = step(st_base + (size_t)c * (d_conv - 1),
+                                  w_base + (size_t)c * d_conv, x[c0 + c],
+                                  st_base + (size_t)c * (d_conv - 1));
+    }
+
+    double worst = 0;
+    for (int c = 0; c < d_inner; ++c)
+        worst = std::max(worst, (double)std::abs(full[c] - banded[c]));
+    for (size_t i = 0; i < st_full.size(); ++i)
+        worst = std::max(worst, (double)std::abs(st_full[i] - st_band[i]));
+    return worst;
+}
+
+// The MLA absorb, whose weight is [qk_nope, kv_lora, n_head] — head slowest, so a
+// band is h0*qk_nope*kv_lora away. `w_head_stride` is that pitch, passed in so the
+// negative case can supply the wrong one.
+static double test_band_mla_absorb(int n_head, int tp_size, int qk_nope, int kv_lora,
+                                   long w_head_stride) {
+    const int hn = n_head / tp_size;
+    vector<float> q((size_t)n_head * qk_nope), wk((size_t)n_head * qk_nope * kv_lora);
+    for (auto& v : q) v = frand();
+    for (auto& v : wk) v = frand();
+
+    vector<float> full((size_t)n_head * kv_lora), banded((size_t)n_head * kv_lora, 0.f);
+    for (int h = 0; h < n_head; ++h)
+        for (int r = 0; r < kv_lora; ++r) {
+            float a = 0.f;
+            for (int d = 0; d < qk_nope; ++d)
+                a += wk[(size_t)h * qk_nope * kv_lora + (size_t)r * qk_nope + d] *
+                     q[(size_t)h * qk_nope + d];
+            full[(size_t)h * kv_lora + r] = a;
+        }
+
+    for (int rk = 0; rk < tp_size; ++rk) {
+        const int h0 = rk * hn;
+        const float* wb = &wk[(size_t)h0 * w_head_stride];
+        const float* qb = &q[(size_t)h0 * qk_nope];
+        float* ob = &banded[(size_t)h0 * kv_lora];
+        for (int h = 0; h < hn; ++h)
+            for (int r = 0; r < kv_lora; ++r) {
+                float a = 0.f;
+                for (int d = 0; d < qk_nope; ++d)
+                    a += wb[(size_t)h * qk_nope * kv_lora + (size_t)r * qk_nope + d] *
+                         qb[(size_t)h * qk_nope + d];
+                ob[(size_t)h * kv_lora + r] = a;
+            }
+    }
+
+    double worst = 0;
+    for (size_t i = 0; i < full.size(); ++i)
+        worst = std::max(worst, (double)std::abs(full[i] - banded[i]));
+    return worst;
+}
+
+// Q8_0 GEMV, one row, split into tp_size column bands. Models the kernel exactly:
+// per 32-value block, an f32 scale times a sum of eight 4-wide products accumulated
+// in the thread's own partial, then a block reduction. Returns the error of the
+// summed bands against a float64 ground truth.
+static double test_proj_cols_partition(int K, int tp_size, int rows, int* n_differ) {
+    const int nb = K / 32;
+    const int BLOCK = 128;
+    double worst = 0;
+    if (n_differ) *n_differ = 0;
+
+    for (int row = 0; row < rows; ++row) {
+        vector<float> x(K);
+        vector<int8_t> q(K);
+        vector<float> d(nb);
+        for (auto& v : x) v = frand();
+        for (auto& v : q) v = (int8_t)std::lround(frand() * 100.f);
+        for (auto& v : d) v = frand() * 0.01f;
+
+        double want = 0;
+        for (int b = 0; b < nb; ++b)
+            for (int j = 0; j < 32; ++j)
+                want += (double)d[b] * (double)q[b * 32 + j] * (double)x[b * 32 + j];
+
+        // One block of BLOCK threads striding over the blocks it was given, exactly
+        // as proj_q8_0_kernel does. `first`/`count` are the band's blocks — which is
+        // all the column slice changes: the row's OTHER blocks are still there, at
+        // the full row pitch, and are simply not visited.
+        auto dot = [&](int first, int count) {
+            vector<float> acc(BLOCK, 0.f);
+            for (int tid = 0; tid < BLOCK; ++tid)
+                for (int b = tid; b < count; b += BLOCK) {
+                    float s = 0.f;
+                    for (int i = 0; i < 8; ++i)
+                        for (int j = 0; j < 4; ++j)
+                            s += (float)q[(first + b) * 32 + 4 * i + j] *
+                                 x[(first + b) * 32 + 4 * i + j];
+                    acc[tid] += d[first + b] * s;
+                }
+            // Tree reduction over the block, the shape block_sum produces.
+            for (int stride = BLOCK / 2; stride > 0; stride >>= 1)
+                for (int t = 0; t < stride; ++t) acc[t] += acc[t + stride];
+            return acc[0];
+        };
+
+        const float full = dot(0, nb);
+        float summed = 0.f;
+        const int per = nb / tp_size;
+        for (int r = 0; r < tp_size; ++r) summed += dot(r * per, per);
+        if (n_differ && summed != full) ++*n_differ;
+        worst = std::max(worst, std::abs((double)summed - want));
+    }
+    return worst;
+}
+
 int main() {
     printf("sparkinfer kernel algorithm correctness (CPU reference)\n");
     check("attention hd128 kv1",   test_attention(128, 1),    1e-4);
@@ -684,6 +867,32 @@ int main() {
     check("mla hbatch ctx8192 hpb8",  test_mla_decode_hbatch(576, 512, 128, 8192, 8,  8,  8), 2e-4);
     check("mla hbatch ctx300 hpb4",   test_mla_decode_hbatch(576, 512, 128, 300,  4,  4,  2), 2e-4);
     check_min("mla split merge needs rescale", test_mla_split_merge_needs_rescale(), 1e-2);
+
+    // Tensor-parallel attention head banding. The positives are exact — a band runs
+    // the same arithmetic on the same values — so they carry a zero tolerance, and
+    // each is paired with the wrong-pitch version that a plausible misreading of the
+    // layout would produce.
+    check("kda band conv 96h/tp8",   test_band_kda_conv(96, 8, 128, 3, 4),  0.0);
+    check("kda band conv 96h/tp4",   test_band_kda_conv(96, 4, 128, 3, 4),  0.0);
+    check("kda band conv 96h/tp1",   test_band_kda_conv(96, 1, 128, 3, 4),  0.0);
+    check_differs("kda band conv state pitch 1",
+                  test_band_kda_conv(96, 8, 128, 1, 4) != 0.0);
+    check_differs("kda band conv weight pitch 3",
+                  test_band_kda_conv(96, 8, 128, 3, 3) != 0.0);
+    check("mla band absorb 16h/tp4", test_band_mla_absorb(16, 4, 16, 32, 16L * 32), 0.0);
+    check("mla band absorb 16h/tp2", test_band_mla_absorb(16, 2, 16, 32, 16L * 32), 0.0);
+    check_differs("mla band absorb pitch qk_nope",
+                  test_band_mla_absorb(16, 4, 16, 32, 16L) != 0.0);
+
+    // attn_output's column partition: within f32 rounding of the whole-row dot, and
+    // genuinely a different summation order rather than an accident of the data.
+    int n_differ = 0;
+    check("proj cols K7168/tp8", test_proj_cols_partition(7168, 8, 16, &n_differ), 2e-3);
+    check_differs("proj cols K7168/tp8 reassociates", n_differ > 0);
+    check("proj cols K12288/tp8", test_proj_cols_partition(12288, 8, 16, &n_differ), 3e-3);
+    check_differs("proj cols K12288/tp8 reassociates", n_differ > 0);
+
+    g_fail += g_ne_fail;
     printf("%s (%d failures)\n", g_fail ? "FAILED" : "ALL PASSED", g_fail);
     return g_fail ? 1 : 0;
 }
