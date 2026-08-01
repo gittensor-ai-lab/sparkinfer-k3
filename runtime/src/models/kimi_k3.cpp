@@ -722,6 +722,53 @@ float* kimi_k3_partial_buffer(KimiK3Forward& fwd, int layer, K3LayerPhase phase,
     return nullptr;
 }
 
+
+// ---------------------------------------------------------------------------
+// Launch-failure guard.
+//
+// 18 of the k3 kernel launchers return void, and nothing on this path polls
+// cudaGetLastError. A launch that fails its CONFIGURATION — too much dynamic shared
+// memory, a bad grid — never runs, returns no status anybody reads, and leaves the
+// destination buffer holding whatever was in it before. Every scratch buffer here is
+// reused across layers, so that is the PREVIOUS layer's tensor: the model stays
+// fluent and the output is quietly wrong.
+//
+// That is not hypothetical. mla_decode_attn_kernel sized its dynamic shared memory by
+// context length and stopped launching at n_ctx = 11,767; past that, all 24 MLA layers
+// silently reused stale scratch, and a 32k decode measured FASTER than a 4k one because
+// it was skipping a quarter of the model. Confirmed on 8x H200:
+//
+//     [MLA-LAUNCH-FAIL] layer 3 n_ctx=32763 : invalid argument
+//
+// gittensor-ai-lab/sparkinfer-k3#33 fixes that kernel's sizing, and this does NOT
+// duplicate it — the sizing fix is that PR's, and it is the right fix. This closes the
+// other half: the reason the failure was invisible for as long as it was. With this in
+// place a launch-config regression in ANY of the 18 launchers fails the forward loudly
+// instead of degrading the output.
+//
+// Polled once per phase rather than after every launch: three calls per layer, ~279 per
+// token, against ~2300 kernel launches. cudaGetLastError is host-side and does not
+// synchronise, so it costs no device time and cannot hide a stall.
+//
+// It reports the LAST error in the phase, not the first. That is enough to fail the run
+// and name the layer and phase; bisecting to the exact kernel is what the debug callback
+// is for.
+static bool k3_check_launch(int layer, K3LayerPhase phase) {
+    const cudaError_t e = cudaGetLastError();
+    if (e == cudaSuccess) return true;
+    const char* pn = phase == K3LayerPhase::All        ? "All"
+                   : phase == K3LayerPhase::Attn       ? "Attn"
+                   : phase == K3LayerPhase::FfnPartial ? "FfnPartial" : "FfnFinish";
+    std::fprintf(stderr,
+                 "[k3] LAUNCH FAILED at layer %d, phase %s: %s\n"
+                 "     A kernel did not launch. Its output buffer still holds the "
+                 "previous layer's data,\n"
+                 "     so continuing would produce fluent, wrong output. Failing the "
+                 "forward instead.\n",
+                 layer, pn, cudaGetErrorString(e));
+    return false;
+}
+
 bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase phase,
                                 const float* hidden_in, float* hidden_out) {
     const KimiK3Config& cfg = *fwd.cfg;
@@ -1067,7 +1114,7 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
         k3k::k3_add_f32(hidden_out, hidden_out, s.ffn_out, H, stream);
         if (fwd.debug) fwd.debug("l_out", layer, hidden_out, H);
     }
-    return true;
+    return k3_check_launch(layer, phase);
 }
 
 // ---------------------------------------------------------------------------
@@ -1161,6 +1208,10 @@ bool kimi_k3_forward_token(KimiK3Forward& fwd, int token_id, float* out_logits) 
             : k3k::k3_proj_f32(logits_dev, x, w.output.data, w.output.type,
                                cfg.vocab, H, stream);
     }
+    // The head is outside the layer loop, so the per-phase guard does not cover it.
+    // Checked BEFORE the sync so a failed lm_head launch is reported as a launch
+    // failure rather than surfacing later as an unrelated error at some other call.
+    if (ok) ok = k3_check_launch(cfg.n_layers, K3LayerPhase::All);
     if (ok) {
         cudaStreamSynchronize(stream);
         cudaMemcpy(out_logits, logits_dev, (size_t)cfg.vocab * sizeof(float),

@@ -16,6 +16,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <math.h>
+#include <algorithm>
 #include <cstdio>
 #include <cstdint>   // uintptr_t — the float4-alignment test in the MoE dispatch
 
@@ -979,6 +980,49 @@ __device__ __forceinline__ float block_max(float v, float* shm) {
 // coalesced; it just gains the online-softmax rescale.
 constexpr int kMlaCtxTile = 128;
 
+// Context-split tunables. kMlaSplitMinCtx is the slice length below which splitting is
+// not worth the combine pass; kMlaMaxSplits caps the scratch and keeps the combine's
+// per-slice loop short.
+constexpr int kMlaSplitMinCtx = 4096;
+constexpr int kMlaMaxSplits   = 32;
+
+// Scratch for the partials, grown on demand and reused. Sized n_head * splits *
+// (kv_lora + 2) floats — 6.3 MB at K3's dims with 32 splits, against ~140 GB of weights,
+// so a one-off allocation is cheaper than threading a buffer through every caller.
+//
+// PER DEVICE, not one global. K3 runs tensor-parallel across 8 ranks, each owning its
+// own device and its own thread. A single static pointer is allocated by whichever rank
+// arrives first and then dereferenced by the other seven on devices it does not belong
+// to — an illegal access that surfaces later and elsewhere, as a sticky error inside the
+// next NCCL all-reduce. A single-device numeric test cannot catch that by construction.
+//
+// Each slot is touched by exactly one rank thread (a rank owns its device for the whole
+// run), so the slots need no lock; the array itself is only ever read by index.
+static constexpr int kMlaMaxDevices = 16;
+static float* g_mla_part_acc[kMlaMaxDevices] = {nullptr};
+static float* g_mla_part_ml [kMlaMaxDevices] = {nullptr};
+static size_t g_mla_part_cap[kMlaMaxDevices] = {0};
+
+static bool k3_mla_split_scratch(int n_head, int kv_lora, int* dev_out) {
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return false;
+    if (dev < 0 || dev >= kMlaMaxDevices) return false;   // fall back to the un-split path
+    *dev_out = dev;
+
+    const size_t need = (size_t)n_head * kMlaMaxSplits * (size_t)kv_lora;
+    if (need <= g_mla_part_cap[dev]) return true;
+    cudaFree(g_mla_part_acc[dev]);
+    cudaFree(g_mla_part_ml [dev]);
+    g_mla_part_acc[dev] = nullptr; g_mla_part_ml[dev] = nullptr; g_mla_part_cap[dev] = 0;
+    if (cudaMalloc((void**)&g_mla_part_acc[dev], need * sizeof(float)) != cudaSuccess) return false;
+    if (cudaMalloc((void**)&g_mla_part_ml[dev],
+                   (size_t)n_head * kMlaMaxSplits * 2 * sizeof(float)) != cudaSuccess) {
+        cudaFree(g_mla_part_acc[dev]); g_mla_part_acc[dev] = nullptr; return false;
+    }
+    g_mla_part_cap[dev] = need;
+    return true;
+}
+
 template <int BLOCK>
 __global__ void mla_decode_attn_kernel(float* __restrict__ out,
                                        const float* __restrict__ q,
@@ -1159,6 +1203,169 @@ __global__ void quantize_q8_k_kernel(BlockQ8K* __restrict__ out,
         q.bsums[j] = (int16_t)sum;
     }
     q.d = 1.0f / iscale;
+}
+
+
+// ---------------------------------------------------------------------------
+// MLA decode, split over context (flash-decoding style).
+//
+// WHY. The single-block-per-head kernel launches <<<96, 256>>> — 24,576 threads on a
+// 132-SM H200 with ~270k thread slots. That is ~9% occupancy and 36 SMs get no work at
+// all, and at ctx 128k each block then walks 1024 tiles serially. Measured on 8x H200:
+// attn_mla is 69.2% of decode at 128k (against 18.2% at 8k), and MLA time grows 23.8x
+// for a 16x context increase — superlinear, which is what a kernel that cannot fill the
+// machine looks like as its serial loop gets longer.
+//
+// This splits the context across SPLITS blocks per head, so the grid becomes
+// n_head * SPLITS. Each block runs the same online softmax over its slice and writes a
+// PARTIAL (m, l, latent); mla_decode_combine_kernel merges them. The math is the standard
+// flash-decoding merge and is exact up to float rounding:
+//
+//     m   = max_i m_i
+//     l   = sum_i l_i * exp(m_i - m)
+//     acc = sum_i acc_i * exp(m_i - m)
+//
+// The wv_b projection moves to the combine pass because it needs the merged latent.
+//
+// NOT bit-identical to the single-block version: summing per-slice partials reassociates
+// the same terms. The parity gate is top-1 >= 0.90 / KL <= 0.20 and the reference here is
+// float64, so this is checked on tolerance, like the online-softmax rewrite it builds on.
+template <int BLOCK>
+__global__ void mla_decode_attn_split_kernel(float* __restrict__ part_acc,
+                                             float* __restrict__ part_ml,
+                                             const float* __restrict__ q,
+                                             const float* __restrict__ k_cache,
+                                             int key_length, int kv_lora,
+                                             int n_ctx, float scale, int splits) {
+    constexpr int NWARP = BLOCK / 32;
+    const int h    = blockIdx.x;
+    const int sp   = blockIdx.y;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+
+    // Contiguous slice per split: keeps each block's cache walk sequential, which is what
+    // the hardware prefetcher wants. A strided split would interleave 96 streams.
+    const int chunk = (n_ctx + splits - 1) / splits;
+    const int t_beg = sp * chunk;
+    const int t_end = min(n_ctx, t_beg + chunk);
+
+    const float* qh = q + (size_t)h * key_length;
+    extern __shared__ float smem[];
+    float* s_q   = smem;                      // key_length
+    float* s_acc = s_q + key_length;          // kv_lora
+    float* s_p   = s_acc + kv_lora;           // kMlaCtxTile
+    float* red   = s_p + kMlaCtxTile;         // BLOCK/32 + 1
+
+    for (int d = threadIdx.x; d < key_length; d += BLOCK) s_q[d] = qh[d];
+    for (int r = threadIdx.x; r < kv_lora;    r += BLOCK) s_acc[r] = 0.0f;
+    __syncthreads();
+
+    float m = -1e30f, l = 0.0f;
+
+    for (int t0 = t_beg; t0 < t_end; t0 += kMlaCtxTile) {
+        const int tn = min(kMlaCtxTile, t_end - t0);
+
+        for (int t = warp; t < tn; t += NWARP) {
+            const float* kt = k_cache + (size_t)(t0 + t) * key_length;
+            float sdot = 0.0f;
+            for (int d = lane; d < key_length; d += 32) sdot += s_q[d] * kt[d];
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                sdot += __shfl_down_sync(0xffffffff, sdot, off);
+            if (lane == 0) s_p[t] = sdot * scale;
+        }
+        __syncthreads();
+
+        float tm = -1e30f;
+        for (int t = threadIdx.x; t < tn; t += BLOCK) tm = fmaxf(tm, s_p[t]);
+        tm = block_max<BLOCK>(tm, red);
+        const float m_new = fmaxf(m, tm);
+        const float corr  = __expf(m - m_new);
+
+        float ls = 0.0f;
+        for (int t = threadIdx.x; t < tn; t += BLOCK) {
+            const float e = __expf(s_p[t] - m_new);
+            s_p[t] = e;
+            ls += e;
+        }
+        ls = block_sum<BLOCK>(ls, red);
+        l = l * corr + ls;
+        m = m_new;
+        __syncthreads();
+
+        for (int r = threadIdx.x; r < kv_lora; r += BLOCK) {
+            float a = s_acc[r] * corr;
+            for (int t = 0; t < tn; ++t)
+                a += s_p[t] * k_cache[(size_t)(t0 + t) * key_length + r];
+            s_acc[r] = a;
+        }
+        __syncthreads();
+    }
+
+    // UNNORMALISED partial: the 1/l cannot be applied per slice, only after the merge.
+    float* pa = part_acc + ((size_t)h * splits + sp) * kv_lora;
+    for (int r = threadIdx.x; r < kv_lora; r += BLOCK) pa[r] = s_acc[r];
+    if (threadIdx.x == 0) {
+        // An empty slice (n_ctx < splits) must contribute nothing: l = 0 and a very
+        // negative m make its weight exactly zero in the merge.
+        float* pm = part_ml + ((size_t)h * splits + sp) * 2;
+        pm[0] = (t_end > t_beg) ? m : -1e30f;
+        pm[1] = (t_end > t_beg) ? l : 0.0f;
+    }
+}
+
+// Merge the per-slice partials, normalise, then project through wv_b.
+template <int BLOCK>
+__global__ void mla_decode_combine_kernel(float* __restrict__ out,
+                                          const float* __restrict__ part_acc,
+                                          const float* __restrict__ part_ml,
+                                          const float* __restrict__ wv_b,
+                                          int kv_lora, int v_dim, int splits) {
+    constexpr int NWARP = BLOCK / 32;
+    const int h    = blockIdx.x;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+
+    extern __shared__ float smem[];
+    float* s_acc = smem;                    // kv_lora
+    float* s_w   = s_acc + kv_lora;         // splits (per-slice rescale factor)
+
+    const float* pml = part_ml + (size_t)h * splits * 2;
+
+    // m = max over slices. Small (splits <= 64), so thread 0 is cheaper than a reduction.
+    if (threadIdx.x == 0) {
+        float m = -1e30f;
+        for (int i = 0; i < splits; ++i) m = fmaxf(m, pml[2 * i]);
+        float l = 0.0f;
+        for (int i = 0; i < splits; ++i) {
+            const float w = __expf(pml[2 * i] - m);
+            s_w[i] = w;
+            l += pml[2 * i + 1] * w;
+        }
+        s_w[splits] = l > 0.0f ? 1.0f / l : 0.0f;   // one slot past: the 1/l
+    }
+    __syncthreads();
+    const float inv = s_w[splits];
+
+    for (int r = threadIdx.x; r < kv_lora; r += BLOCK) {
+        float a = 0.0f;
+        for (int i = 0; i < splits; ++i)
+            a += part_acc[((size_t)h * splits + i) * kv_lora + r] * s_w[i];
+        s_acc[r] = a * inv;
+    }
+    __syncthreads();
+
+    const float* wh = wv_b + (size_t)h * (size_t)kv_lora * v_dim;
+    float* oh = out + (size_t)h * v_dim;
+    for (int v = warp; v < v_dim; v += NWARP) {
+        const float* wr = wh + (size_t)v * kv_lora;
+        float acc = 0.0f;
+        for (int r = lane; r < kv_lora; r += 32) acc += wr[r] * s_acc[r];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            acc += __shfl_down_sync(0xffffffff, acc, off);
+        if (lane == 0) oh[v] = acc;
+    }
 }
 
 template <int BLOCK>
@@ -1828,8 +2035,35 @@ void mla_decode_attn_f32(float* out, const float* q, const float* k_cache,
     // what the n_ctx-proportional version did past 11,767 tokens.
     const size_t shm = ((size_t)key_length + (size_t)kv_lora + kMlaCtxTile +
                         BLOCK / 32 + 1) * sizeof(float);
-    mla_decode_attn_kernel<BLOCK><<<(unsigned)n_head, BLOCK, shm, stream>>>(
-        out, q, k_cache, wv_b, key_length, kv_lora, v_dim, n_ctx, scale);
+
+    // SPLIT THE CONTEXT when one block per head cannot fill the machine.
+    //
+    // n_head is 96 and K3 runs on 132-SM H200s, so the un-split grid leaves ~27% of the
+    // device idle before occupancy is even considered — and each block then walks n_ctx
+    // serially. Splitting trades one extra kernel and a scratch buffer for a grid of
+    // n_head * splits.
+    //
+    // Only above kMlaSplitMinCtx: below it the slice is short enough that the combine
+    // pass and the extra global round trip cost more than the parallelism buys, and the
+    // un-split kernel is also the one the numeric test pins bit-for-bit.
+    int dev = 0;
+    const int splits = (n_ctx >= kMlaSplitMinCtx && k3_mla_split_scratch(n_head, kv_lora, &dev))
+                     ? std::min(kMlaMaxSplits, (n_ctx + kMlaSplitMinCtx - 1) / kMlaSplitMinCtx)
+                     : 1;
+    if (splits <= 1) {
+        mla_decode_attn_kernel<BLOCK><<<(unsigned)n_head, BLOCK, shm, stream>>>(
+            out, q, k_cache, wv_b, key_length, kv_lora, v_dim, n_ctx, scale);
+        return;
+    }
+
+    dim3 grid((unsigned)n_head, (unsigned)splits);
+    mla_decode_attn_split_kernel<BLOCK><<<grid, BLOCK, shm, stream>>>(
+        g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora,
+        n_ctx, scale, splits);
+    // s_acc + s_w, where s_w needs splits + 1 slots (the last holds 1/l).
+    const size_t cshm = ((size_t)kv_lora + (size_t)splits + 1) * sizeof(float);
+    mla_decode_combine_kernel<BLOCK><<<(unsigned)n_head, BLOCK, cshm, stream>>>(
+        out, g_mla_part_acc[dev], g_mla_part_ml[dev], wv_b, kv_lora, v_dim, splits);
 }
 
 // Threads that would run ZERO iterations of the block loop are not free.
