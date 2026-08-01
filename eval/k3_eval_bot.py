@@ -104,6 +104,23 @@ def evaluate(pr, repo, seal=False):
         "git fetch -q origin +refs/pull/*/head:refs/remotes/origin/pr/* --force",
         f"git fetch -q origin {sha} || true",
         f"git checkout -q --detach {sha}",
+        # GRADE WITH THE PROTECTED HARNESS, NEVER THE PR'S COPY. Two reasons, and the
+        # second is why this is not merely a convenience:
+        #
+        #   Version skew. The harness moves independently of the code under test, so an
+        #   older branch carries an older harness. #25's head predates --seal entirely, so
+        #   sealing failed with "unknown arg --seal" on a PR that was otherwise fine. The
+        #   same skew is what made its reference.lock resolve frontier=0 and label a real
+        #   speedup BASELINE.
+        #
+        #   Trust. CONTRIBUTING states the evaluator "grades with the harness pinned to the
+        #   protected branch, so editing it in a PR never affects that PR's own score."
+        #   That was not true of this bot. sensitive-paths-guard stops a non-maintainer
+        #   editing these paths, but a guard that fails the PR and a grader that ignores
+        #   the PR's copy are different defences, and only the second holds if the guard is
+        #   ever misconfigured. refdata/ is included because it IS the accuracy answer key.
+        "git fetch -q origin main",
+        "git checkout -q origin/main -- bench/scripts bench/refdata",
         "export PATH=/usr/local/cuda/bin:$PATH",
         # -DSPARKINFER_TP=ON is not optional here. Without it the runtime has no NCCL
         # collective, and kimi_k3_tp_bench refuses to run sharded rather than silently
