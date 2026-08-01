@@ -17,12 +17,22 @@ LABEL = ROOT / "bench" / "scripts" / "label.py"
 
 
 def score(tps, frontier=100.0, ceiling=200.0, top1=0.97, kl=0.02, commit="deadbee",
-          prov=None, env=None):
+          prov=None, env=None, guards=None):
     cmd = [sys.executable, str(LABEL), str(tps), str(frontier), str(ceiling),
            str(top1), str(kl), commit]
     if prov is not None:
         cmd.append(json.dumps(prov, separators=(",", ":")))
     run_env = os.environ.copy()
+    # Guards are opt-in per case. Popping first keeps a value in the developer's own shell from
+    # leaking in and silently gating every unrelated case.
+    run_env.pop("SPARKINFER_GUARDS", None)
+    if guards is not None:
+        run_env["SPARKINFER_GUARDS"] = json.dumps(guards, separators=(",", ":"))
+    # label.py deliberately has NO default llama anchor: it used to default to 365.85, a Qwen
+    # constant, so anything that forgot to pass one was silently scored on Qwen's maturity
+    # curve. These tests use synthetic frontier=100 numbers rather than K3's, so they pin a
+    # synthetic anchor too; a test that cares about the basis overrides it via env=.
+    run_env.setdefault("SPARKINFER_DIFFICULTY_REF", "400")
     if env:
         run_env.update(env)
     out = subprocess.check_output(cmd, text=True, env=run_env).strip()
@@ -31,8 +41,15 @@ def score(tps, frontier=100.0, ceiling=200.0, top1=0.97, kl=0.02, commit="deadbe
 
 
 class LabelPolicyTest(unittest.TestCase):
+    # A synthetic llama anchor. These cases use frontier=100 rather than K3 numbers because
+    # they exercise the correctness GATE, not the tier; 400 is chosen so the incidental speed
+    # tier lands in M. Previously this test passed no anchor at all and silently inherited
+    # label.py's old 365.85 default -- a Qwen constant -- so it was asserting Qwen behaviour
+    # in a K3 repo. label.py now refuses an unset anchor, which is what surfaced it.
+    SYNTH_REF = {"SPARKINFER_DIFFICULTY_REF": "400"}
+
     def test_correctness_gate_rejects_bad_accuracy(self):
-        # +30 over frontier=100 clears significance; llama-anchored tier is M (~8% of 365.85).
+        # +30 over frontier=100 clears significance; anchored tier is M (30/400 = 7.5%).
         low_top1 = score(130, top1=0.89, kl=0.02)
         self.assertEqual(low_top1["label"], "REJECT")
         self.assertFalse(low_top1["pass"])
@@ -113,6 +130,9 @@ class LabelPolicyTest(unittest.TestCase):
         self.assertLess(res["effective_pct"], 10.0)
 
     def test_long_context_metadata_is_preserved_in_verdict(self):
+        # Anchor pinned explicitly: this case asserts XL, which needs 70/ref >= 0.18, so the
+        # helper's default 400 would land it in L. Stating it here keeps the tier the test
+        # is asserting a property of the input rather than of a shared constant.
         prov = {
             "eval_mode": "longctx",
             "score_context": 16384,
@@ -139,7 +159,7 @@ class LabelPolicyTest(unittest.TestCase):
             "guard_32k_ratio": 1.125,
             "guard_32k_pass": True,
         }
-        res = score(170.0, frontier=100.0, prov=prov)   # +70 = 19.1% of llama -> XL
+        res = score(170.0, frontier=100.0, prov=prov, env={"SPARKINFER_DIFFICULTY_REF": "350"})   # +70 = 19.1% of llama -> XL
         self.assertEqual(res["label"], "XL")
         self.assertEqual(res["eval_mode"], "longctx")
         self.assertEqual(res["score_context"], 16384)
@@ -174,6 +194,107 @@ class LabelPolicyTest(unittest.TestCase):
                     env={"SPARKINFER_DIFFICULTY_REF": "0", "SPARKINFER_DIFFICULTY_BOOST": "1"})
         self.assertEqual(res["label"], "XL")
         self.assertGreater(res["pct_over_frontier"], 40.0)
+
+
+class NoRegressionGuardTest(unittest.TestCase):
+    """The tier is earned at one context; the others may not be paid out to buy it.
+
+    Shape: score 128k, guard 128 / 4k / 32k. `base` is the RATCHETED per-context frontier that the
+    merge path maintains with max(old, measured) — see the SPARKINFER_GUARDS comment in label.py for
+    why a plain assignment there turns GUARD_TOL into a slow leak.
+    """
+
+    def guards(self, c128=3.61, c4k=3.40, c32k=3.10):
+        return {"128": {"tps": c128, "base": 3.55},
+                "4096": {"tps": c4k, "base": 3.40},
+                "32768": {"tps": c32k, "base": 3.10}}
+
+    def test_absent_guards_are_inert(self):
+        # The whole block must stay dormant until the bench can actually measure the contexts.
+        res = score(130.0)
+        self.assertEqual(res["label"], "M")
+        self.assertNotIn("guards", res)
+        self.assertNotIn("guards_pass", res)
+
+    def test_all_guards_holding_leaves_the_tier_alone(self):
+        res = score(130.0, guards=self.guards())
+        self.assertEqual(res["label"], "M")
+        self.assertTrue(res["pass"])
+        self.assertTrue(res["guards_pass"])
+        self.assertEqual([g["ctx"] for g in res["guards"]], [128, 4096, 32768])
+        self.assertTrue(all(g["pass"] for g in res["guards"]))
+
+    def test_regression_at_one_context_rejects_despite_a_real_gain(self):
+        # 32k drops 12.9% while the scored context gains 30%. This is a trade, not a speedup.
+        res = score(130.0, guards=self.guards(c32k=2.70))
+        self.assertEqual(res["label"], "REJECT")
+        self.assertFalse(res["pass"])
+        self.assertFalse(res["guards_pass"])
+        self.assertIn("32768", res["reason"])
+        # The gain is still reported — a rejected PR that really was faster should not have to
+        # argue about whether the number was real.
+        self.assertEqual(res["speed_label"], "M")
+        self.assertEqual(res["pct_over_frontier"], 30.0)
+
+    def test_tolerance_absorbs_noise_but_not_decay(self):
+        # Default TOL 0.98: a 1% wobble is measurement, a 2.5% drop is not.
+        self.assertTrue(score(130.0, guards=self.guards(c4k=3.366))["guards_pass"])   # -1.0%
+        self.assertEqual(score(130.0, guards=self.guards(c4k=3.315))["label"], "REJECT")  # -2.5%
+
+    def test_unset_baseline_cannot_regress(self):
+        # A context measured for the first time has nothing to fall below; it must not block a PR.
+        res = score(130.0, guards={"131072": {"tps": 1.2, "base": 0}})
+        self.assertTrue(res["guards_pass"])
+        self.assertIsNone(res["guards"][0]["pct"])
+
+    def test_correctness_outranks_regression_in_the_reason(self):
+        # Both gates fail. A wrong answer is disqualifying on its own, so it owns the reason.
+        res = score(130.0, top1=0.80, guards=self.guards(c32k=2.70))
+        self.assertEqual(res["label"], "REJECT")
+        self.assertIn("correctness gate", res["reason"])
+        self.assertFalse(res["guards_pass"])
+
+    def test_latency_guards_respect_direction(self):
+        # LOWER_IS_BETTER: a guard passes when the measured TTFT is no HIGHER than its baseline.
+        env = {"SPARKINFER_LABEL_LOWER_IS_BETTER": "1", "SPARKINFER_DIFFICULTY_REF": "0"}
+        faster = score(0.80, frontier=1.00, env=env, guards={"4096": {"tps": 1.90, "base": 2.00}})
+        self.assertTrue(faster["guards_pass"])
+        slower = score(0.80, frontier=1.00, env=env, guards={"4096": {"tps": 2.40, "base": 2.00}})
+        self.assertEqual(slower["label"], "REJECT")
+
+    def test_provenance_cannot_forge_a_passing_guard(self):
+        # The forgery this exists to stop: a receipt that says the guards held when they did not.
+        res = score(130.0, guards=self.guards(c32k=2.70),
+                    prov={"guards_pass": True, "guards": [], "reason": "all good",
+                          "node": "h200x8"})
+        self.assertEqual(res["label"], "REJECT")
+        self.assertFalse(res["guards_pass"])
+        self.assertIn("32768", res["reason"])
+        self.assertEqual(res["provenance_rejected"], ["guards", "guards_pass", "reason"])
+        self.assertEqual(res["node"], "h200x8")          # non-verdict provenance still passes through
+
+    def test_qwen_provenance_guard_fields_are_still_writable(self):
+        # The Qwen long-context path ships flat guard_<ctx>_* through provenance. The K3 block is
+        # namespaced away from those on purpose, so adding it must not break that path.
+        res = score(130.0, prov={"score_context": 16384, "guard_32k_pass": True,
+                                 "guard_32k_baseline": 71.11})
+        self.assertEqual(res["score_context"], 16384)
+        self.assertTrue(res["guard_32k_pass"])
+        self.assertNotIn("provenance_rejected", res)
+
+    def test_scored_context_is_recorded(self):
+        res = score(130.0, env={"SPARKINFER_SCORED_CONTEXT": "131072"})
+        self.assertEqual(res["scored_context"], 131072)
+
+    def test_unparseable_guards_refuse_to_score(self):
+        # A malformed guard set is silently NO guard set — the one failure mode that must be loud.
+        env = os.environ.copy()
+        env["SPARKINFER_DIFFICULTY_REF"] = "400"
+        env["SPARKINFER_GUARDS"] = "{not json"
+        p = subprocess.run([sys.executable, str(LABEL), "130", "100", "200", "0.97", "0.02", "abc"],
+                           env=env, capture_output=True, text=True)
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("not valid JSON", p.stderr)
 
 
 if __name__ == "__main__":

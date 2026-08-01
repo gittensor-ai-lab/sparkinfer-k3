@@ -885,10 +885,11 @@ class CiWorkflowTest(unittest.TestCase):
         the verdict. Unfiltered, a provenance blob carrying {"label": "XL"} silently becomes
         the tier. The inline comment called it non-scoring; it was not."""
         import subprocess as sp, json as _j
+        env = {**os.environ, "SPARKINFER_DIFFICULTY_REF": "18.321"}   # K3's pinned llama ref
         out = sp.run([sys.executable, str(ROOT / "bench/scripts/label.py"),
                       "4.0", "3.55", "0", "1.0", "0.001", "abc123",
                       _j.dumps({"label": "XL", "pass": True, "clock_mhz": 1980})],
-                     capture_output=True, text=True, check=True).stdout
+                     capture_output=True, text=True, check=True, env=env).stdout
         res = _j.loads(out.split("RESULT_JSON ", 1)[1])
         self.assertNotEqual(res["label"], "XL", "provenance overwrote the computed tier")
         self.assertIn("label", res.get("provenance_rejected", []))
