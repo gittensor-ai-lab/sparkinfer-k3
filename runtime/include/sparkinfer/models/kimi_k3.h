@@ -156,7 +156,23 @@ struct KimiK3Weights {
     //
     // Kept explicit rather than inferred from tp_size so that turning one on is a
     // deliberate act with a matching forward, not a silent consequence of tp>1.
-    enum class ShardPolicy { ExpertsOnly, ExpertsAndKda, Full };
+    //   ExpertsAndMla  Also head-band the 24 MLA layers' per-head projections
+    //                (q_b, k_b, v_b, gate) and col-shard their output. The latent
+    //                KV projection and the KV cache stay REPLICATED — that is what
+    //                MQA means. Costs one all-reduce per MLA layer.
+    //
+    // MLA IS SHARDED AND KDA IS NOT, WHICH LOOKS BACKWARDS UNTIL IT IS PRICED.
+    // KDA is 69 of the 93 layers and MLA only 24, but measured on the shipped
+    // build MLA attention is 36.9% of GPU kernel time against KDA's 6.6% — 16x
+    // more per layer. Both cost one collective per layer, and collectives are
+    // ~0.088% of GPU time each, so:
+    //
+    //     shard KDA:  +5.8% compute, -6.1% collectives  =  -0.3%, a REGRESSION
+    //     shard MLA: +32.3% compute, -2.1% collectives  = +30.2%
+    //
+    // ExpertsAndKda therefore stays available and stays OFF; it is kept because
+    // the arithmetic above is only obvious once both branches exist to compare.
+    enum class ShardPolicy { ExpertsOnly, ExpertsAndKda, ExpertsAndMla, Full };
     ShardPolicy policy = ShardPolicy::ExpertsOnly;
 
     // WHICH SLICE OF EACH TENSOR THIS RANK HOLDS. Set BEFORE calling the loader;
@@ -175,6 +191,12 @@ struct KimiK3Weights {
     // reads it unconditionally and the unsharded path is the same code with the
     // same values it always had — not a branch that can drift.
     tp::KdaShardDims kda;
+
+    // This rank's MLA head slice, under ShardPolicy::ExpertsAndMla. Same
+    // discipline as `kda`: left at the tp=1 identity under every other policy so
+    // the forward reads it unconditionally and the replicated path is the same
+    // code with the same values, not a branch that can drift out of step.
+    tp::MlaShardDims mla;
 
     // Every device buffer this struct owns, for bulk free in the destructor.
     std::vector<void*> owned;

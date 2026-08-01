@@ -114,7 +114,8 @@ bool upload_sliced(const GGUF& g, const std::string& name, KimiK3Weights& w,
     // band the head axis), and banding those without teaching the MLA kernels their
     // per-rank head count would silently drop 7/8 of the attention heads.
     if (w.policy == KimiK3Weights::ShardPolicy::ExpertsOnly ||
-        w.policy == KimiK3Weights::ShardPolicy::ExpertsAndKda) {
+        w.policy == KimiK3Weights::ShardPolicy::ExpertsAndKda ||
+        w.policy == KimiK3Weights::ShardPolicy::ExpertsAndMla) {
         auto ends_with = [&](const char* suf) {
             const std::size_t n = std::strlen(suf);
             return name.size() >= n && name.compare(name.size() - n, n, suf) == 0;
@@ -122,6 +123,24 @@ bool upload_sliced(const GGUF& g, const std::string& name, KimiK3Weights& w,
         const bool routed_expert_stack = ends_with("ffn_gate_exps.weight") ||
                                          ends_with("ffn_up_exps.weight")   ||
                                          ends_with("ffn_down_exps.weight");
+
+        // ExpertsAndMla bands the 24 MLA layers' PER-HEAD tensors and col-shards
+        // their output. `!kda_layer` carries exactly the same weight here that
+        // `kda_layer` does below, and for the same reason: attn_output.weight and
+        // attn_q.weight are written by BOTH branches. Banding either by name alone
+        // would shard the wrong two-thirds of the model and leave every KDA layer
+        // contracting over an eighth of its input, which stays fluent and is wrong.
+        //
+        // attn_kv_a_mqa / attn_kv_a_norm are NOT here: MQA means one latent KV
+        // shared by all 96 heads, so every rank needs that projection — and the
+        // cache it fills — whole. Banding it is the one mistake that would make
+        // this look like it works while each rank attended to an eighth of the
+        // context.
+        const bool mla_sharded =
+            w.policy == KimiK3Weights::ShardPolicy::ExpertsAndMla && !kda_layer &&
+            (ends_with("attn_q_b.weight")  || ends_with("attn_k_b.weight") ||
+             ends_with("attn_v_b.weight")  || ends_with("attn_gate.weight") ||
+             ends_with("attn_q.weight")    || ends_with("attn_output.weight"));
 
         // ExpertsAndKda additionally bands the KDA attention projections.
         //
@@ -140,7 +159,7 @@ bool upload_sliced(const GGUF& g, const std::string& name, KimiK3Weights& w,
              ends_with("attn_v.weight")  || ends_with("ssm_g.weight")  ||
              ends_with("ssm_f_b.weight") || ends_with("attn_output.weight"));
 
-        if (!routed_expert_stack && !kda_sharded) {
+        if (!routed_expert_stack && !kda_sharded && !mla_sharded) {
             void* d = nullptr;
             if (cudaMalloc(&d, (size_t)t->n_bytes) != cudaSuccess) {
                 std::fprintf(stderr, "[k3] cudaMalloc failed for %s (%ld bytes)\n",
@@ -414,6 +433,29 @@ bool kimi_k3_load_weights_scoped(const GGUF& g, const KimiK3Config& cfg,
         tp::ShardError e = tp::kda_shard_dims(ks, tcfg, r, &out.kda);
         if (!e.ok()) {
             std::fprintf(stderr, "[k3] KDA shard: %s\n", e.message.c_str());
+            return false;
+        }
+    }
+
+    // THIS RANK's MLA head slice, on the same discipline: derived once, carried on
+    // the weights, tp=1 identity under any policy but ExpertsAndMla. The forward
+    // reads md.n_heads unconditionally, so a policy that does not shard MLA gets
+    // the full 96 from the same field rather than from a different code path.
+    {
+        tp::Config tcfg;
+        tcfg.tp_size = (out.policy == KimiK3Weights::ShardPolicy::ExpertsAndMla)
+                     ? (out.shard.tp_size > 0 ? out.shard.tp_size : 1) : 1;
+        tp::MlaShape ms;
+        ms.hidden = cfg.hidden;
+        ms.n_q_heads = cfg.n_q_heads;
+        ms.key_length_mla = cfg.key_length_mla;
+        ms.value_length_mla = cfg.value_length_mla;
+        ms.qk_nope = cfg.key_length_mla - cfg.rope_dim;
+        ms.kv_lora_rank = cfg.kv_lora_rank;
+        const int r = tcfg.tp_size > 1 ? out.shard.rank : 0;
+        tp::ShardError e = tp::mla_shard_dims(ms, tcfg, r, &out.mla);
+        if (!e.ok()) {
+            std::fprintf(stderr, "[k3] MLA shard: %s\n", e.message.c_str());
             return false;
         }
     }
@@ -883,12 +925,20 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
     // full dimensions, because KimiK3Weights::kda is left at the tp=1 identity --
     // so the unsharded path is the same code with the same values, not a branch.
     //
-    // qh (MLA's head count) is deliberately NOT sharded: MLA is MQA, every rank
-    // walks the whole latent cache, so head-sharding divides the FLOPs but not the
-    // bytes.
+    // qh IS this rank's MLA head count, and the note that used to sit here said
+    // the opposite: that head-sharding MLA "divides the FLOPs but not the bytes",
+    // because MQA means every rank walks the whole latent cache. That is wrong for
+    // this kernel and the profile is what corrected it. mla_decode_attn_hbatch
+    // stages 12 heads per block, so 96 heads is EIGHT passes over the 302 MB
+    // latent cache per layer; a 12-head band is ONE pass. The bytes divide by 8
+    // because the unsharded kernel was already reading the cache eight times.
+    //
+    // Under every other policy `mla` holds the tp=1 identity, so this is the same
+    // value the replicated path always had rather than a branch that can drift.
     const tp::KdaShardDims& kd = fwd.w->kda;
+    const tp::MlaShardDims& md = fwd.w->mla;
     const int qkv = kd.qkv;
-    const int qh = cfg.n_q_heads;
+    const int qh = md.n_heads;
     const int qk_nope = cfg.key_length_mla - cfg.rope_dim;
     const int res_bs = cfg.attn_res_block_size;
     const bool banked = res_bs > 0 && (layer % res_bs == 0);

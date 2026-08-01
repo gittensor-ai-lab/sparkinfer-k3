@@ -304,10 +304,92 @@ ShardError kda_shard_dims(const KdaShape& shape, const Config& cfg, int rank,
     return {};
 }
 
+ShardError mla_shard_dims(const MlaShape& shape, const Config& cfg, int rank,
+                          MlaShardDims* out) {
+    std::ostringstream os;
+    bool any = false;
+
+    if (!out) return ShardError{"mla_shard_dims: null out"};
+    if (cfg.tp_size <= 0) return ShardError{"tp_size must be >= 1"};
+    if (rank < 0 || rank >= cfg.tp_size) {
+        os << "rank " << rank << " outside [0," << cfg.tp_size << ")";
+        return ShardError{os.str()};
+    }
+    if (!cfg.devices.empty() && static_cast<int>(cfg.devices.size()) != cfg.tp_size) {
+        os << "devices.size()=" << cfg.devices.size() << " != tp_size=" << cfg.tp_size;
+        return ShardError{os.str()};
+    }
+
+    // Shape sanity before divisibility, same reason as the KDA path: a zeroed
+    // MlaShape should say "n_q_heads must be > 0", not "0 not divisible by 8".
+    if (shape.hidden <= 0)           add_err(os, any, "hidden must be > 0");
+    if (shape.n_q_heads <= 0)        add_err(os, any, "n_q_heads must be > 0");
+    if (shape.key_length_mla <= 0)   add_err(os, any, "key_length_mla must be > 0");
+    if (shape.value_length_mla <= 0) add_err(os, any, "value_length_mla must be > 0");
+    if (shape.qk_nope <= 0)          add_err(os, any, "qk_nope must be > 0");
+    if (shape.kv_lora_rank <= 0)     add_err(os, any, "kv_lora_rank must be > 0");
+    if (any) return ShardError{os.str()};
+
+    MlaShardDims d;
+    d.tp_size = cfg.tp_size;
+    d.rank = rank;
+    d.hidden = shape.hidden;
+    d.n_heads_total = shape.n_q_heads;
+
+    if (cfg.tp_size == 1) {
+        d.n_heads = shape.n_q_heads;
+        d.head_band = Band{0, shape.n_q_heads};
+    } else {
+        if (!divisible(shape.n_q_heads, cfg.tp_size)) {
+            std::ostringstream m;
+            m << "n_q_heads=" << shape.n_q_heads << " not divisible by tp_size="
+              << cfg.tp_size << " (softmax is over a whole head; a head cannot split)";
+            return ShardError{m.str()};
+        }
+        d.head_band = even_band(shape.n_q_heads, cfg.tp_size, rank);
+        d.n_heads = d.head_band.extent;
+    }
+
+    // Every derived band is the head band scaled by that tensor's per-head
+    // stride. Deriving them all from one band is what makes it impossible for
+    // q_b, k_b, v_b, the gate and the output projection to disagree about which
+    // heads this rank owns — the failure that runs at full speed and emits
+    // fluent, wrong tokens because nothing bounds-checks a head id.
+    auto scaled = [&](int stride) {
+        return Band{d.head_band.offset * stride, d.head_band.extent * stride};
+    };
+    d.q_rows_band = scaled(shape.key_length_mla);
+    d.v_rows_band = scaled(shape.value_length_mla);
+    d.wk_b_band   = scaled(shape.qk_nope * shape.kv_lora_rank);
+    d.wv_b_band   = scaled(shape.kv_lora_rank * shape.value_length_mla);
+
+    // Checked, not assumed — same reason the KDA path checks its invariant.
+    const bool consistent =
+        d.q_rows_band.extent == d.n_heads * shape.key_length_mla &&
+        d.v_rows_band.extent == d.n_heads * shape.value_length_mla &&
+        d.wk_b_band.extent   == d.n_heads * shape.qk_nope * shape.kv_lora_rank &&
+        d.wv_b_band.extent   == d.n_heads * shape.kv_lora_rank * shape.value_length_mla;
+    if (!consistent) {
+        std::ostringstream m;
+        m << "derived MLA bands disagree with head_band [" << d.head_band.offset
+          << "," << d.head_band.end() << ") x n_heads=" << d.n_heads;
+        return ShardError{m.str()};
+    }
+
+    *out = d;
+    return {};
+}
+
 int k3_reduce_count_per_token(int n_kda_layers, int n_moe_layers, bool kda_sharded) {
+    return k3_reduce_count_per_token(n_kda_layers, 0, n_moe_layers, kda_sharded, false);
+}
+
+int k3_reduce_count_per_token(int n_kda_layers, int n_mla_layers, int n_moe_layers,
+                              bool kda_sharded, bool mla_sharded) {
     const int kda = (kda_sharded && n_kda_layers > 0) ? n_kda_layers : 0;
+    const int mla = (mla_sharded && n_mla_layers > 0) ? n_mla_layers : 0;
     const int moe = n_moe_layers > 0 ? n_moe_layers : 0;
-    return kda + moe;
+    return kda + mla + moe;
 }
 
 }  // namespace tp

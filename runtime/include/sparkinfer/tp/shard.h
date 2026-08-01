@@ -298,12 +298,86 @@ ShardError kda_shard_dims(const KdaShape& shape, const Config& cfg, int rank,
 // stays fluent — so the offsets are pinned in the CPU test, not left to the
 // call site.
 
+// ---------------------------------------------------------------------------
+// MLA head-parallel shard — the 24 MLA layers
+// ---------------------------------------------------------------------------
+//
+// WHY MLA AND NOT KDA, when KDA is 69 of the 93 layers. Measured on the shipped
+// build (nsys, 8x H200, ctx 131072), as a share of all GPU kernel time:
+//
+//     mla_decode_attn_hbatch   36.9%   1344 inst   1.43 ms each   24 layers
+//     kda_decode_step_smem      6.6%   3864 inst     89 us each   69 layers
+//
+// MLA costs 16x more per layer per rank. Both bands cost one all-reduce per
+// layer, so the two decompose completely differently once the collective is
+// priced in (NCCL is 8.1% of GPU time for 92 collectives, ~0.088%/collective):
+//
+//              compute saved      collectives added        net
+//     KDA          +5.8%          -6.1%  (69 more)      -0.3%   LOSES MONEY
+//     MLA         +32.3%          -2.1%  (24 more)     +30.2%
+//
+// Sharding the KDA two-thirds costs more in collectives than it saves in
+// compute. That is why this exists alongside KdaShardDims rather than replacing
+// it, and why the MLA band is the one wired on by default.
+//
+// AND WHY THE 8x IS REAL, which I got wrong once. MLA is MQA: 96 query heads
+// share ONE latent KV cache, so it is tempting to say head-sharding divides the
+// FLOPs but not the memory traffic, since every rank still walks the whole
+// cache. That is wrong for THIS kernel. mla_decode_attn_hbatch stages 12 heads
+// per block, so 96 heads means EIGHT passes over the 302 MB latent cache per
+// layer. One band of 12 heads is ONE pass. The traffic divides by 8 because the
+// unsharded kernel was already reading the cache eight times.
+struct MlaShape {
+    int hidden = 0;
+    int n_q_heads = 0;          // 96
+    int key_length_mla = 0;     // qk_nope + rope_dim, the q_b output stride (192)
+    int value_length_mla = 0;   // 128
+    int qk_nope = 0;            // 128
+    int kv_lora_rank = 0;       // 512
+};
+
+// Bands for every MLA tensor a head shard touches. All four derived bands are
+// the head band scaled by that tensor's per-head stride, so they cannot drift
+// apart — the same invariant KdaShardDims enforces between head and qkv.
+struct MlaShardDims {
+    int tp_size = 1;
+    int rank = 0;
+    int hidden = 0;
+    int n_heads_total = 0;
+    int n_heads = 0;            // this rank's share
+    Band head_band;
+
+    // attn_q_b / attn_q_dense OUTPUT rows: [n_q_heads * key_length_mla, ...]
+    Band q_rows_band;
+    // attn_gate OUTPUT rows, and attn_output INPUT columns:
+    // [n_q_heads * value_length_mla, ...]
+    Band v_rows_band;
+    // attn_k_b: [qk_nope, kv_lora, n_head], head SLOWEST -> contiguous per head.
+    Band wk_b_band;
+    // attn_v_b: [kv_lora, v_dim, n_head], head SLOWEST -> contiguous per head.
+    Band wv_b_band;
+};
+
+// REPLICATED under an MLA head shard, and this is the whole point of MQA:
+//
+//   attn_kv_a_mqa / attn_kv_a_norm   the latent KV projection — shared by every
+//                                    head, so every rank needs it whole
+//   the MLA KV cache itself          likewise; each rank keeps the full cache
+//   attn_q_a / attn_q_a_norm         the q_lora down-projection feeds ALL heads
+//
+// Only the per-head tensors band: q_b (up), k_b, v_b, gate, and the output
+// projection's input columns.
+ShardError mla_shard_dims(const MlaShape& shape, const Config& cfg, int rank,
+                          MlaShardDims* out);
+
 // Collectives per token under K3's hybrid plan.
 //
 // ExpertsOnly today: one per MoE layer (the expert partial at expert_latent).
 // With KDA sharded: that, plus one per KDA layer (the attn_output partial at
-// hidden). MLA layers add none — they stay replicated.
+// hidden). With MLA sharded: plus one per MLA layer, same partial, same width.
 int k3_reduce_count_per_token(int n_kda_layers, int n_moe_layers, bool kda_sharded);
+int k3_reduce_count_per_token(int n_kda_layers, int n_mla_layers, int n_moe_layers,
+                              bool kda_sharded, bool mla_sharded);
 
 }  // namespace tp
 }  // namespace sparkinfer
