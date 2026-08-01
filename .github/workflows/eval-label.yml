@@ -137,9 +137,13 @@ jobs:
         env:
           BODY: ${{ github.event.comment.body }}
           DISPATCH_JSON: ${{ github.event.inputs.result_json }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.issue.number }}
         run: |
           set -euo pipefail
           if [ -n "${DISPATCH_JSON:-}" ]; then RAW="$DISPATCH_JSON"; else RAW="$BODY"; fi
+          PR_HEAD_SHA="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" -q .head.sha 2>/dev/null || true)"
+          export PR_HEAD_SHA
           PAYLOAD="$(printf '%s' "$RAW" | sed -n 's/.*RESULT_JSON[[:space:]]*\({.*}\).*/\1/p' | head -1)"
           if [ -z "$PAYLOAD" ]; then
             echo "::error::no RESULT_JSON found. Post the output of bench/scripts/kimi_k3_eval.sh"
@@ -148,19 +152,71 @@ jobs:
           # RE-DERIVE rather than trust. label.py is deterministic, so recomputing from the
           # reported measurements must reproduce the reported label; if it does not, the
           # payload was edited between the node and the comment.
-          python3 - "$PAYLOAD" <<'PY' >> "$GITHUB_OUTPUT"
-          import json, os, subprocess, sys
+          python3 - "$PAYLOAD" "$PR_HEAD_SHA" <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os, re, subprocess, sys
           d = json.loads(sys.argv[1])
+          head_sha = (sys.argv[2] or "").strip()
           claimed = d.get("label", "")
-          need = ["tps", "frontier_tps", "top1", "kl", "commit"]
+          need = ["tps", "top1", "kl", "commit"]
           missing = [k for k in need if k not in d]
           if missing:
               print(f"::error::RESULT_JSON missing {missing}", file=sys.stderr); sys.exit(1)
+
+          # --- bind the payload to THIS pull request -------------------------------
+          # Without this, a RESULT_JSON (and its receipt) measured on any branch labels any
+          # PR. The commit the node actually evaluated must be the commit under review.
+          rc = str(d["commit"]).strip().lower()
+          if not head_sha:
+              print("::error::could not resolve PR head sha", file=sys.stderr); sys.exit(1)
+          if not (head_sha.startswith(rc) or rc.startswith(head_sha[:len(rc)])) or len(rc) < 7:
+              print(f"::error::RESULT_JSON commit {rc!r} is not this PR's head {head_sha[:12]!r} — "
+                    f"a result measured on another commit cannot label this one",
+                    file=sys.stderr)
+              sys.exit(1)
+
+          # --- take the tier denominators from TRUSTED main, never the payload ------
+          # frontier_tps and llama_ref set the basis the gain is measured against, so a
+          # payload that supplies them is a payload that sets its own tier: understate the
+          # frontier and any speed looks like a large win. This checkout is the base branch
+          # (issue_comment checks out the default branch), so reference.lock here is the
+          # protected copy, not the PR's.
+          node = re.sub(r"[^A-Za-z0-9]", "", str(d.get("node", "h200x8"))).upper()
+          quant = re.sub(r"[^A-Za-z0-9]", "",
+                         re.sub(r"^UD-", "", str(d.get("quant", "UD-IQ1_S")))).upper()
+          # reference.lock stores each slot as NAME="${NAME:-VALUE}" so an exported env var
+          # wins when the harness sources it. Here we want the PINNED value specifically, so
+          # read the default out of the file rather than sourcing it.
+          lock = {}
+          for line in open("bench/scripts/reference.lock"):
+              m = re.match(r'\s*(?:export\s+)?([A-Z0-9_]+)="?\$\{[A-Z0-9_]+:-([^}"]*)\}"?', line)
+              if m: lock[m.group(1)] = m.group(2).strip()
+          def slot(kind):
+              pfx = f"KIMI_K3_{node}"
+              for key in (f"{pfx}_{quant}_{kind}_128", f"{pfx}_{kind}_128"):
+                  v = lock.get(key, "")
+                  try:
+                      if v and float(v) > 0: return float(v)
+                  except ValueError: pass
+              return 0.0
+          frontier = slot("SPARKINFER")
+          ref = slot("LLAMA")
+          if not ref:
+              print(f"::error::no llama reference pinned for {node}/{quant} in reference.lock — "
+                    f"the tier basis is unset, refusing to score", file=sys.stderr)
+              sys.exit(1)
+          claimed_f = float(d.get("frontier_tps", frontier) or frontier)
+          if frontier and abs(claimed_f - frontier) > max(0.01, 0.01 * frontier):
+              print(f"::warning::payload frontier_tps={claimed_f} differs from pinned "
+                    f"{frontier}; using the pinned value", file=sys.stderr)
+          # stdout of this heredoc IS $GITHUB_OUTPUT, so anything that is not key=value
+          # goes to stderr or it corrupts the step outputs.
+          print(f"::notice::tier basis from reference.lock — frontier={frontier} "
+                f"llama_ref={ref}", file=sys.stderr)
+
           env = dict(os.environ)
-          ref = (d.get("provenance") or {}).get("llama_ref") or d.get("llama_ref") or 0
-          if ref: env["SPARKINFER_DIFFICULTY_REF"] = str(ref)
+          env["SPARKINFER_DIFFICULTY_REF"] = str(ref)
           out = subprocess.run(
-              [sys.executable, "bench/scripts/label.py", str(d["tps"]), str(d["frontier_tps"]),
+              [sys.executable, "bench/scripts/label.py", str(d["tps"]), str(frontier),
                "0", str(d["top1"]), str(d["kl"]), str(d["commit"])],
               capture_output=True, text=True, env=env, check=True).stdout
           re_d = json.loads(out.split("RESULT_JSON", 1)[1].strip())
