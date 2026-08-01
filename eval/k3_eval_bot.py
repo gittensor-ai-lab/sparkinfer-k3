@@ -47,6 +47,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 
 REPO_DEFAULT = "gittensor-ai-lab/sparkinfer-k3"
@@ -168,7 +169,15 @@ def _box_build(sha, what):
         #   the PR's copy are different defences, and only the second holds if the guard is
         #   ever misconfigured. refdata/ is included because it IS the accuracy answer key.
         "git fetch -q origin main",
-        "git checkout -q origin/main -- bench/scripts bench/refdata",
+        # bench/scripts ONLY -- bench/refdata is deliberately NOT restored any more.
+        #
+        # The answer key used to be checked out into the very tree this binary runs in, at a
+        # fixed relative path, with cwd at the repo root. A bench could open
+        # bench/refdata/hello.spkl and write it back out as its own --logits dump: top1 1.0,
+        # KL 0.0, for a binary that computed nothing. Accuracy is measured by the controller
+        # now (measure_accuracy), against a reference this box never receives.
+        "git checkout -q origin/main -- bench/scripts",
+        "rm -rf bench/refdata",
         "export PATH=/usr/local/cuda/bin:$PATH",
         # -DSPARKINFER_TP=ON is not optional here. Without it the runtime has no NCCL
         # collective, and kimi_k3_tp_bench refuses to run sharded rather than silently
@@ -191,7 +200,72 @@ def _box_build(sha, what):
                                         "chain before cmake ran"))
 
 
-def _box_eval(what, frontier=None, seal=False):
+REFDATA = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                       "bench", "refdata")
+
+
+def measure_accuracy(what):
+    """Grade the box's logits HERE, against a reference the box never sees.
+
+    The correctness gate is the only thing standing between a fast-but-wrong kernel and a
+    payout, and it used to be decided on the box: bench/refdata was checked out into the
+    working tree the PR's binary ran in, so the binary could read the answer key and echo it
+    back as its own output. Perfect top1, zero KL, no work done -- and nothing rejected a
+    suspiciously exact result, because label.py only bounds top1 >= 0.90 and KL <= 0.20.
+
+    So: the ids go out, the logits come back, and compare_logits.py runs on this machine
+    against this machine's copy of the reference. The box cannot match a file it does not
+    have.
+
+    Returns (top1, kl) or raises RuntimeError.
+    """
+    ids_file = os.path.join(REFDATA, "hello.ids")
+    ref_spkl = os.path.join(REFDATA, "hello.spkl")
+    for p in (ids_file, ref_spkl):
+        if not os.path.isfile(p):
+            raise RuntimeError(f"missing controller-side reference {p} — refusing to score "
+                               f"without a correctness gate")
+    with open(ids_file) as f:
+        # hello.ids holds prompt ids THEN the reference continuations; the prompt is the
+        # first 4. Taking the whole file would score a different step.
+        ids_csv = ",".join(l.strip() for l in list(f)[:4] if l.strip())
+
+    remote = "/tmp/k3acc_$$.spkl"
+    # base64 back over the same ssh channel: no scp, no second auth, and the transfer is
+    # part of the command whose exit status we already check.
+    cmd = (f"cd {BOX_REPO_DIR} && "
+           f"env -u POLARIS_API_KEY {BOX_REPO_DIR}/build/runtime/kimi_k3_tp_bench "
+           f"$(ls {BOX_MODELS_DIR}/*/*-00001-of-*.gguf | head -1) "
+           f"{len(DEVICES.split(','))} 93 1 --ids {ids_csv} --logits {remote} "
+           f">/dev/null 2>&1; "
+           f"[ -s {remote} ] && base64 -w0 {remote}; rm -f {remote}")
+    r = sh(cmd, timeout=3600)
+    blob = (r.stdout or "").strip()
+    if not blob:
+        raise RuntimeError(f"no logits dump came back for {what} — cannot grade correctness"
+                           + (f": {(r.stderr or '').strip()[:200]}" if r.stderr else ""))
+    fd, ours = tempfile.mkstemp(prefix="k3acc_", suffix=".spkl")
+    with os.fdopen(fd, "wb") as f:
+        f.write(base64.b64decode(blob))
+    try:
+        cmp_py = os.path.join(os.path.dirname(REFDATA), "scripts", "compare_logits.py")
+        p = subprocess.run([sys.executable, cmp_py, ref_spkl, ours, "--json"],
+                           capture_output=True, text=True, timeout=600)
+        if p.returncode != 0 or not (p.stdout or "").strip():
+            raise RuntimeError(f"compare_logits failed for {what}: "
+                               f"{(p.stderr or '').strip()[:300]}")
+        d = json.loads(p.stdout)
+        top1, kl = float(d["top1_agreement"]), float(d["mean_kld"])
+    finally:
+        try:
+            os.unlink(ours)
+        except OSError:
+            pass
+    print(f"{what}: accuracy measured HERE — top1={top1} kl={kl}")
+    return top1, kl
+
+
+def _box_eval(what, frontier=None, seal=False, top1=None, kl=None):
     """Run the K3 harness on the box against the build already checked out there.
 
     `frontier` is passed through to the harness as --frontier. Passing it EXPLICITLY is the
@@ -204,6 +278,9 @@ def _box_eval(what, frontier=None, seal=False):
     """
     seal_flag = " --seal" if seal else ""
     front_flag = "" if frontier is None else f" --frontier {frontier}"
+    # Accuracy graded on THIS machine, handed to the harness. Without these the harness
+    # falls back to comparing on the box against a reference the binary can read.
+    acc_flag = "" if top1 is None or kl is None else f" --top1 {top1} --kl {kl}"
     # POLARIS_API_KEY lives in a 0600 file on the box, not in this command line and not in
     # the repo: anything passed as an ssh argument shows up in ps on a shared machine.
     evalcmd = (
@@ -214,7 +291,7 @@ def _box_eval(what, frontier=None, seal=False):
         # "not built" immediately after a build that in fact succeeded.
         f"KIMI_K3_MODELS_DIR={BOX_MODELS_DIR} SPARKINFER_BUILD={BOX_REPO_DIR}/build/runtime "
         f"bash bench/scripts/kimi_k3_eval.sh --node {NODE} --devices {DEVICES}"
-        f"{front_flag}{seal_flag}"
+        f"{front_flag}{acc_flag}{seal_flag}"
     )
     r = sh(evalcmd, timeout=7200)
     out = (r.stdout or "") + "\n" + (r.stderr or "")
@@ -251,7 +328,8 @@ def measure_frontier(repo):
     _box_build(sha, "main")
     # frontier=0 makes label.py return BASELINE, which is what we want: this run is not a
     # submission and must not be sealed or scored. Only its tps is used.
-    res, _, _ = _box_eval("main", frontier=0, seal=False)
+    top1, kl = measure_accuracy("main")
+    res, _, _ = _box_eval("main", frontier=0, seal=False, top1=top1, kl=kl)
     tps = float(res.get("tps") or 0)
     if tps <= 0:
         raise RuntimeError(f"main measured {tps} tok/s — refusing to score a round against it")
@@ -438,7 +516,8 @@ def evaluate(pr, repo, frontier, seal=False):
     sha = pr["headRefOid"]
     num = pr["number"]
     _box_build(sha, f"#{num}")
-    res, out, rc = _box_eval(f"#{num}", frontier=frontier, seal=seal)
+    top1, kl = measure_accuracy(f"#{num}")
+    res, out, rc = _box_eval(f"#{num}", frontier=frontier, seal=seal, top1=top1, kl=kl)
     # --seal publishes to sparkinfer-k3-log and prints the receipt id. Carry it in the
     # payload: eval-label.yml looks it up there when REQUIRE_EVAL_RECEIPT is on, and
     # without it a sealed run is indistinguishable from an unsealed one.

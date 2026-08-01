@@ -1167,14 +1167,45 @@ class CiWorkflowTest(unittest.TestCase):
         The trust argument is the obvious one, but version skew is what actually broke it:
         #25's head predates --seal, so sealing died with "unknown arg --seal" on a PR that
         was otherwise fine, and the same skew made its reference.lock resolve frontier=0 and
-        label a real speedup BASELINE. refdata/ is pinned too because it IS the accuracy
-        answer key."""
+        label a real speedup BASELINE.
+
+        refdata/ is NO LONGER shipped to the box, and that is the point. Restoring the answer
+        key into the same working tree the PR's binary runs in -- fixed relative path, cwd at
+        the repo root -- meant a bench could open bench/refdata/hello.spkl and write it back
+        out as its own --logits dump: top1 1.0, KL 0.0, no work done. Nothing rejected a
+        suspiciously exact result either, since label.py only bounds top1 >= 0.90 and
+        KL <= 0.20 while honest main measures 0.004."""
         src = (ROOT / "eval/k3_eval_bot.py").read_text()
-        self.assertIn("git checkout -q origin/main -- bench/scripts bench/refdata", src,
+        self.assertIn("git checkout -q origin/main -- bench/scripts", src,
                       "the bot grades with the PR's own harness")
+        self.assertNotIn("origin/main -- bench/scripts bench/refdata", src,
+                         "the answer key must not be shipped to the box")
+        self.assertIn('"rm -rf bench/refdata"', src,
+                      "a PR could otherwise carry its own copy of the answer key")
         self.assertLess(src.index("origin/main -- bench/scripts"),
                         src.index("kimi_k3_eval.sh --node"),
                         "the harness must be restored BEFORE the eval runs")
+
+    def test_accuracy_is_graded_off_the_box(self):
+        """The correctness gate is all that stands between a fast-but-wrong kernel and a
+        payout, so it must not be decided by the machine running the code under test.
+
+        The ids go out, the logits come back, and compare_logits.py runs on the controller
+        against the controller's reference. The box cannot fake a match to a file it does not
+        have. Both main and the PRs are graded this way -- the frontier and the things
+        compared to it have to be produced by an identical procedure."""
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        self.assertIn("def measure_accuracy(", src)
+        self.assertIn("compare_logits.py", src, "the comparison must run here")
+        self.assertEqual(src.count("measure_accuracy("), 3,
+                         "definition + main + each PR: the frontier must be graded like the "
+                         "PRs it is compared against")
+        # the harness must accept the controller's numbers, and say where they came from
+        ev = (ROOT / "bench/scripts/kimi_k3_eval.sh").read_text()
+        self.assertIn("--top1)", ev)
+        self.assertIn("--kl)", ev)
+        self.assertIn("accuracy_source", ev,
+                      "a verifier cannot otherwise tell which path graded the run")
 
     def test_bot_resets_box_state_between_prs(self):
         """Each PR must start from a clean box, and both ways it fails blame the wrong PR.
@@ -1329,23 +1360,58 @@ class CiWorkflowTest(unittest.TestCase):
                          "accuracy measured over a zeroed cache is not accuracy")
         self.assertNotIn("--ctx", acc)
 
-    def test_bench_must_prove_it_seeked(self):
-        """kimi_k3_tp_bench is built from the PR's OWN runtime/ -- only bench/scripts and
-        bench/refdata are restored from the protected branch. So the flags that select the
-        scored context live in code the PR controls, and the arg loop IGNORES unknown flags
-        rather than rejecting them, which makes a silent stub the easiest possible edit.
+    def test_speed_is_timed_externally_not_read_from_the_binary(self):
+        """kimi_k3_tp_bench is built from the PR's OWN runtime/, so anything it PRINTS is
+        under the PR's control.
 
-        A --seek that does nothing measures ctx 64 and reports it as 128k: 10.34 vs 1.00
-        tok/s measured, so roughly 10x the score. The harness therefore requires the bench to
-        announce the seek AND to name the context it was asked for."""
+        The tier used to be sed'd straight out of its stdout with `head -1`, while the honest
+        line is printed near the end -- so one printf at startup set the score. An earlier
+        attempt to guard this by requiring the bench to announce its seek was defeated the
+        same way: by printing the announcement. A binary cannot be asked to certify itself.
+
+        So the cost per token is derived from WALL CLOCK across two runs at different token
+        counts; fixed costs (the ~150 s load) cancel in the difference. Elapsed time is the
+        one thing a printf cannot forge."""
         ev = (ROOT / "bench/scripts/kimi_k3_eval.sh").read_text()
-        self.assertIn('grep -q "seek: position -> .*(ctx alloc $SCORED_CTX)"', ev,
-                      "a stubbed --seek would score short-context decode as 128k")
-        guard = ev[ev.index("seek: position -> .*(ctx alloc"):]
-        self.assertIn("exit 1", guard[:600], "the guard must refuse, not warn")
-        # and the bench must actually emit that line
-        cpp = (ROOT / "runtime/examples/kimi_k3_tp_bench.cpp").read_text()
-        self.assertIn('"seek: position -> %d (ctx alloc %d)\\n"', cpp)
+        self.assertNotIn("sed -n 's/.*ms\\/token[^(]*(\\([0-9.]*\\) tok\\/s).*/\\1/p' | head -1)\"\nMSTOK", ev)
+        self.assertIn("TOKENS_HI=", ev, "the second run is what makes the difference a rate")
+        self.assertIn("date +%s%N", ev, "the timing must come from the controller's clock")
+        speed = ev[ev.index("# ---- 1. speed"):ev.index("# ---- 2. correctness")]
+        self.assertIn("ns_hi - ns_lo", speed, "ms/token must be a wall-clock differential")
+        # the self-report is kept only as a cross-check, and disagreement must REFUSE
+        self.assertIn("refusing to score", speed)
+        self.assertIn("self_tps / ext_tps > 1.25", speed,
+                      "a binary claiming to be faster than elapsed time must be rejected")
+
+    def test_polaris_key_is_kept_out_of_the_benchs_environment(self):
+        """`. /root/.polaris_env` exports POLARIS_API_KEY, and every child inherits it --
+        including kimi_k3_tp_bench, which the PR wrote. One getenv() exfiltrates the key that
+        signs the attestation ledger, which would let anyone forge a receipt for any run.
+
+        The harness needs the key for the seal step, so it keeps it; the bench does not, so
+        every invocation of the bench strips it."""
+        ev = (ROOT / "bench/scripts/kimi_k3_eval.sh").read_text()
+        self.assertIn("env -u POLARIS_API_KEY", ev)
+        # EVERY invocation, not just the first
+        import re as _re
+        calls = _re.findall(r'^\s*(?:\w+="\$\()?.*"\$BENCH"', ev, _re.M)
+        stripped = _re.findall(r'env -u POLARIS_API_KEY "\$BENCH"', ev)
+        self.assertGreaterEqual(len(stripped), 2,
+                                f"a bench call still gets the signing key: {calls}")
+
+    def test_model_weights_are_fingerprinted_before_scoring(self):
+        """The weights are shared state and the binary under test runs as root, so a
+        malicious build can corrupt the baseline every later measurement depends on --
+        exactly what reference.lock's C2 quarantine exists for, and the eval path never
+        checked. A full sha256 is unaffordable (553 GiB per run), so the shard set is
+        fingerprinted by size and mtime.
+
+        This DETECTS tampering; preventing it means mounting the models dir read-only."""
+        ev = (ROOT / "bench/scripts/kimi_k3_eval.sh").read_text()
+        self.assertIn("FINGERPRINT=", ev)
+        self.assertIn("model_fingerprint", ev, "the fingerprint must reach the receipt")
+        fp = ev[ev.index("FINGERPRINT="):ev.index("# ---- 1. speed")]
+        self.assertIn("exit 1", fp, "a mismatch against a pinned fingerprint must refuse")
 
     def test_frontier_is_measured_not_pinned(self):
         """main is benchmarked every round and THAT is what PRs are scored against.
