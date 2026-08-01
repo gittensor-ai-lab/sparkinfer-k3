@@ -12,19 +12,32 @@
 //              across ranks, so the 70%-of-runtime MoE dispatch is divided by
 //              tp_size, at the cost of one all-reduce per MoE layer.
 //
-// SCOPE: ShardPolicy::ExpertsOnly. The 896 routed experts (531 of UD-IQ1_S's 553 GiB)
-// are banded; everything else is replicated. Consequences, all deliberate:
+// SCOPE. Two things are split across ranks, for two different reasons:
 //
-//   - The MoE dispatch is the ONLY sharded op, so there is exactly ONE collective per
-//     MoE layer — 92 per token, not the 186 a fully-sharded K3 would need. It lands
-//     at expert_latent (3584), before ffn_routed_norm, because rms_norm is not linear
-//     and cannot be applied to a partial sum. See kimi_k3_decode_plan.cpp.
-//   - Attention runs REDUNDANTLY on every rank. That is 8x wasted attention FLOPs and
-//     it is the honest cost of not yet threading per-rank head counts through the KDA
-//     and MLA kernels. Given the measured split (ffn_moe 69.7%, attention 26.8%), the
-//     ceiling here is ~2.6x rather than ~8x — real, but not the end state.
-//   - Every rank therefore holds an IDENTICAL hidden state at every layer boundary,
-//     which is what lets rank 0's logits be the answer with no gather.
+//   - WEIGHTS: ShardPolicy::ExpertsOnly. The 896 routed experts (531 of UD-IQ1_S's
+//     553 GiB) are banded; everything else is replicated. That is the memory win, and
+//     it is essentially all of it — the remaining ~22 GiB fits on every rank.
+//   - WORK: each rank computes a band of the 96 query heads (KimiK3Forward::attn_band),
+//     and nothing else. Attention used to run REDUNDANTLY on every rank: 8x the FLOPs
+//     and, at long context, 8x the KV-cache walk. Banding it needs no change to what
+//     was loaded, because a rank holding the whole tensor is free to read a slice.
+//
+// Consequences, all deliberate:
+//
+//   - TWO collectives per layer: the attention partial at hidden (7168, every layer)
+//     and the expert partial at expert_latent (3584, every MoE layer) — 185 per token
+//     rather than 92. Each lands where it does because the next operator is an
+//     rms_norm, which is not linear and cannot be applied to a partial sum. See
+//     kimi_k3_decode_plan.cpp.
+//   - The extra collectives are the price of the sharding, and on an 8x H200 they are
+//     worth roughly a fifth of what the redundant attention cost. That ratio is
+//     hardware-dependent; SPARKINFER_K3_TP_REPLICATE_ATTN=1 puts the old behaviour
+//     back for a box where it is not.
+//   - attn_output's dot product is reassociated across ranks, so a banded forward
+//     agrees with a replicated one to ~1 ulp rather than bitwise — the same trade the
+//     expert reduce already made.
+//   - Every rank still holds an IDENTICAL hidden state at every layer boundary, which
+//     is what lets rank 0's logits be the answer with no gather.
 //
 // The collective is f32, not bf16: K3's residual stream is f32 by design and reducing
 // it in bf16 would truncate to ~8 mantissa bits 92 times per token. make_collective is
@@ -64,7 +77,9 @@ struct KimiK3TP {
     std::unique_ptr<tp::Collective> coll;
     std::vector<cudaStream_t> streams;   // cached in rank order for the group call
     std::vector<void*> reduce_bufs;      // scratch, refilled per collective
-    long n_collectives = 0;              // counted, so a run can assert it saw 92/token
+    long n_collectives = 0;              // counted, so a run can assert it saw the
+                                         // expected 92 or 185 per token
+    bool shard_attn = false;             // each rank owns a band of the query heads
 };
 
 // Load the model once per rank, banding the routed experts. `devices` gives tp_size.

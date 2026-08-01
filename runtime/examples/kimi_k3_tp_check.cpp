@@ -165,6 +165,7 @@ int main(int argc, char** argv) {
     // ---- candidate: tp_size N ----
     std::vector<std::vector<float>> got(n_tokens);
     long collectives = 0;
+    bool shard_attn = false;
     {
         std::vector<int> devs;
         for (int i = 0; i < tp_size; ++i) devs.push_back(i);
@@ -180,13 +181,20 @@ int main(int argc, char** argv) {
             }
         }
         collectives = many.n_collectives;
+        shard_attn = many.shard_attn;
         kimi_k3_tp_free(many);
     }
 
-    // One collective per MoE layer per token; the leading dense layer has none.
-    const long want_coll = (long)(cfg.n_layers - cfg.leading_dense) * n_tokens;
-    std::printf("candidate (tp=%d): %ld collectives (expected %ld = %d MoE layers x %d tokens)\n",
-                tp_size, collectives, want_coll, cfg.n_layers - cfg.leading_dense, n_tokens);
+    // One collective per MoE layer per token for the expert partial (the leading dense
+    // layer has none), plus — when the query heads are banded across ranks — one per
+    // layer for the attention partial, EVERY layer including the leading dense one.
+    const int coll_per_token =
+        (cfg.n_layers - cfg.leading_dense) + (shard_attn ? cfg.n_layers : 0);
+    const long want_coll = (long)coll_per_token * n_tokens;
+    std::printf("candidate (tp=%d): %ld collectives (expected %ld = %d/token x %d tokens, "
+                "attention %s)\n",
+                tp_size, collectives, want_coll, coll_per_token, n_tokens,
+                shard_attn ? "banded" : "replicated");
 
     int failures = 0;
     if (collectives != want_coll) {

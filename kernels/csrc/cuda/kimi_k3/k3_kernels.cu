@@ -986,6 +986,19 @@ constexpr int kMlaCtxTile = 128;
 constexpr int kMlaSplitMinCtx = 4096;
 constexpr int kMlaMaxSplits   = 32;
 
+// ...and the two the OCCUPANCY floor needs. n_head is how many heads THIS CALL runs,
+// which under tensor parallelism is a band rather than all 96, and the grid is
+// n_head * splits. A slice count fixed against context alone therefore shrinks the
+// grid by exactly the factor the band shrank the work, and hands the saving back as
+// idle SMs: at 128k a 12-head rank would launch 384 blocks onto 132 SMs where the
+// unbanded call launches 3072.
+//
+// kMlaMinSlice is the floor on slice LENGTH — the point past which a block spends
+// more on its own prologue and its combine partial than on the cache walk. It binds
+// before kMlaMaxSplitsAbs at every context below 128k.
+constexpr int kMlaMinSlice     = 1024;
+constexpr int kMlaMaxSplitsAbs = 128;
+
 // Scratch for the partials, grown on demand and reused. Sized n_head * splits *
 // (kv_lora + 2) floats — 6.3 MB at K3's dims with 32 splits, against ~140 GB of weights,
 // so a one-off allocation is cheaper than threading a buffer through every caller.
@@ -1003,25 +1016,26 @@ static float* g_mla_part_acc[kMlaMaxDevices] = {nullptr};
 static float* g_mla_part_ml [kMlaMaxDevices] = {nullptr};
 static size_t g_mla_part_cap[kMlaMaxDevices] = {0};
 
-static bool k3_mla_split_scratch(int n_head, int kv_lora, int* dev_out) {
+static bool k3_mla_split_scratch(int n_head, int splits, int kv_lora, int* dev_out) {
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess) return false;
     if (dev < 0 || dev >= kMlaMaxDevices) return false;   // fall back to the un-split path
     *dev_out = dev;
 
-    const size_t need = (size_t)n_head * kMlaMaxSplits * (size_t)kv_lora;
+    const size_t need = (size_t)n_head * (size_t)splits * (size_t)kv_lora;
     if (need <= g_mla_part_cap[dev]) return true;
     cudaFree(g_mla_part_acc[dev]);
     cudaFree(g_mla_part_ml [dev]);
     g_mla_part_acc[dev] = nullptr; g_mla_part_ml[dev] = nullptr; g_mla_part_cap[dev] = 0;
     if (cudaMalloc((void**)&g_mla_part_acc[dev], need * sizeof(float)) != cudaSuccess) return false;
     if (cudaMalloc((void**)&g_mla_part_ml[dev],
-                   (size_t)n_head * kMlaMaxSplits * 2 * sizeof(float)) != cudaSuccess) {
+                   (size_t)n_head * (size_t)splits * 2 * sizeof(float)) != cudaSuccess) {
         cudaFree(g_mla_part_acc[dev]); g_mla_part_acc[dev] = nullptr; return false;
     }
     g_mla_part_cap[dev] = need;
     return true;
 }
+
 
 template <int BLOCK>
 __global__ void mla_decode_attn_kernel(float* __restrict__ out,
@@ -1368,11 +1382,16 @@ __global__ void mla_decode_combine_kernel(float* __restrict__ out,
     }
 }
 
+// `blocks_per_row` is how many blocks this call REDUCES; `row_stride` is how far apart
+// two rows of W are. They differ only when the caller is reducing a column slice of a
+// wider tensor (see k3_proj_cols_f32) — for a whole-row projection they are equal and
+// the indexing is byte-for-byte what it was before the parameter existed.
 template <int BLOCK>
 __global__ void proj_q8_0_kernel(float* __restrict__ y, const float* __restrict__ x,
-                                 const BlockQ8_0* __restrict__ W, int blocks_per_row) {
+                                 const BlockQ8_0* __restrict__ W, int blocks_per_row,
+                                 int row_stride) {
     const int n = blockIdx.x;
-    const BlockQ8_0* row = W + (size_t)n * blocks_per_row;
+    const BlockQ8_0* row = W + (size_t)n * row_stride;
     __shared__ float shm[BLOCK / 32 + 1];
 
     float acc = 0.0f;
@@ -1424,7 +1443,8 @@ template <int BLOCK, int ROWS>
 __global__ void proj_q8_0_multirow_kernel(float* __restrict__ y,
                                           const float* __restrict__ x,
                                           const BlockQ8_0* __restrict__ W,
-                                          int blocks_per_row, int n_rows) {
+                                          int blocks_per_row, int n_rows,
+                                          int row_stride) {
     const int n0 = blockIdx.x * ROWS;
     __shared__ float shm[BLOCK / 32 + 1];
 
@@ -1446,7 +1466,7 @@ __global__ void proj_q8_0_multirow_kernel(float* __restrict__ y,
 #pragma unroll
             for (int r = 0; r < ROWS; ++r) {
                 if (n0 + r >= n_rows) continue;
-                const BlockQ8_0* row = W + (size_t)(n0 + r) * blocks_per_row;
+                const BlockQ8_0* row = W + (size_t)(n0 + r) * row_stride;
                 const int wq = get_int_b2(row[b].qs, i);
                 s[r] += (float)(int8_t)(wq >>  0) * x0;
                 s[r] += (float)(int8_t)(wq >>  8) * x1;
@@ -1457,7 +1477,7 @@ __global__ void proj_q8_0_multirow_kernel(float* __restrict__ y,
 #pragma unroll
         for (int r = 0; r < ROWS; ++r) {
             if (n0 + r >= n_rows) continue;
-            const BlockQ8_0* row = W + (size_t)(n0 + r) * blocks_per_row;
+            const BlockQ8_0* row = W + (size_t)(n0 + r) * row_stride;
             acc[r] += __half2float(__ushort_as_half(row[b].d)) * s[r];
         }
     }
@@ -1559,9 +1579,9 @@ template <int BLOCK>
 __global__ void proj_q8_0_q8_0_kernel(float* __restrict__ y,
                                       const BlockQ8_0* __restrict__ x,
                                       const BlockQ8_0* __restrict__ W,
-                                      int blocks_per_row) {
+                                      int blocks_per_row, int row_stride) {
     const int n = blockIdx.x;
-    const BlockQ8_0* row = W + (size_t)n * blocks_per_row;
+    const BlockQ8_0* row = W + (size_t)n * row_stride;
     __shared__ float shm[BLOCK / 32 + 1];
     float acc = 0.0f;
     for (int b = threadIdx.x; b < blocks_per_row; b += BLOCK) {
@@ -1611,9 +1631,9 @@ __global__ void dequant_f32_passthrough_kernel(float* __restrict__ out,
 
 template <int BLOCK>
 __global__ void proj_f32_kernel(float* __restrict__ y, const float* __restrict__ x,
-                                const float* __restrict__ W, int K) {
+                                const float* __restrict__ W, int K, int row_stride) {
     const int n = blockIdx.x;
-    const float* row = W + (size_t)n * K;
+    const float* row = W + (size_t)n * row_stride;
     __shared__ float shm[BLOCK / 32 + 1];
 
     float acc = 0.0f;
@@ -2024,6 +2044,57 @@ void mla_absorb_q_f32(float* out, const float* q_nope, const float* q_pe,
         out, q_nope, q_pe, wk_b, qk_nope, kv_lora, rope_dim);
 }
 
+// Blocks of this kernel that fit on one SM, asked of the driver rather than guessed,
+// and cached per device because it is a property of the compiled kernel and the
+// launch shape, both fixed for the life of the process.
+//
+// Used only to decide how many slices keep the machine busy — a wrong answer costs
+// occupancy, never correctness — so a failed query degrades to 1 rather than failing.
+template <int BLOCK>
+static int k3_mla_blocks_per_sm(size_t shm) {
+    static int cached[kMlaMaxDevices] = {0};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= kMlaMaxDevices) return 1;
+    if (cached[dev] > 0) return cached[dev];
+    int n = 0;
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &n, mla_decode_attn_split_kernel<BLOCK>, BLOCK, shm) != cudaSuccess || n < 1)
+        n = 1;
+    cached[dev] = n;
+    return n;
+}
+
+// How many context slices to cut, given the heads this call actually runs.
+//
+// Two rules, and the second only ever RAISES the count:
+//   1. context: one slice per kMlaSplitMinCtx tokens, capped at kMlaMaxSplits. This
+//      is unchanged, and at the full 96 heads it is still what decides — rule 2 asks
+//      for 11 slices there, well under the 32 this gives at 128k.
+//   2. occupancy: enough slices that n_head * splits covers the resident blocks the
+//      device can hold, bounded by kMlaMinSlice tokens per slice.
+//
+// Rule 2 only ever RESCALES a launch rule 1 already chose to split. Where rule 1 says
+// one block per head, that stands — the un-split kernel is the one kimi_k3_numeric_test
+// pins bit-for-bit, and moving that boundary would move what the test is testing.
+static int k3_mla_split_count(int n_head, int n_ctx, size_t shm, int blocks_per_sm) {
+    if (n_ctx < kMlaSplitMinCtx || n_head <= 0) return 1;
+    (void)shm;
+    int splits = std::min(kMlaMaxSplits, (n_ctx + kMlaSplitMinCtx - 1) / kMlaSplitMinCtx);
+    if (splits <= 1) return 1;
+
+    int sms = 0, dev = 0;
+    if (cudaGetDevice(&dev) == cudaSuccess &&
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) == cudaSuccess &&
+        sms > 0) {
+        const int want = (sms * blocks_per_sm + n_head - 1) / n_head;
+        if (want > splits) splits = want;
+    }
+    const int by_length = n_ctx / kMlaMinSlice;
+    if (splits > by_length) splits = by_length;
+    if (splits > kMlaMaxSplitsAbs) splits = kMlaMaxSplitsAbs;
+    return splits < 1 ? 1 : splits;
+}
+
 void mla_decode_attn_f32(float* out, const float* q, const float* k_cache,
                          const float* wv_b, int key_length, int kv_lora,
                          int v_dim, int n_head, int n_ctx, float scale,
@@ -2046,10 +2117,12 @@ void mla_decode_attn_f32(float* out, const float* q, const float* k_cache,
     // Only above kMlaSplitMinCtx: below it the slice is short enough that the combine
     // pass and the extra global round trip cost more than the parallelism buys, and the
     // un-split kernel is also the one the numeric test pins bit-for-bit.
+    //
+    // n_head is whatever the CALLER runs, which under tensor parallelism is a band, so
+    // the slice count is derived from it — see k3_mla_split_count.
     int dev = 0;
-    const int splits = (n_ctx >= kMlaSplitMinCtx && k3_mla_split_scratch(n_head, kv_lora, &dev))
-                     ? std::min(kMlaMaxSplits, (n_ctx + kMlaSplitMinCtx - 1) / kMlaSplitMinCtx)
-                     : 1;
+    int splits = k3_mla_split_count(n_head, n_ctx, shm, k3_mla_blocks_per_sm<BLOCK>(shm));
+    if (splits > 1 && !k3_mla_split_scratch(n_head, splits, kv_lora, &dev)) splits = 1;
     if (splits <= 1) {
         mla_decode_attn_kernel<BLOCK><<<(unsigned)n_head, BLOCK, shm, stream>>>(
             out, q, k_cache, wv_b, key_length, kv_lora, v_dim, n_ctx, scale);
@@ -2100,17 +2173,24 @@ static inline int proj_block_for(int blocks_per_row) {
     return 128;
 }
 
-bool k3_proj_f32(float* y, const float* x, const void* W, int wtype,
-                 int N, int K, cudaStream_t stream) {
-    if (N <= 0 || K <= 0) return false;
+// The one dispatch both k3_proj_f32 and k3_proj_cols_f32 go through. `W` already
+// points at the first element (F32) or block (Q8_0) of THIS call's slice of row 0;
+// `K` is the slice width and `K_stride` the distance between rows of the underlying
+// tensor. K == K_stride is the whole-row case and reproduces the previous code
+// exactly — same kernels, same block sizes, same thread-to-block striding, so the
+// result is bit-identical, not merely close.
+static bool proj_launch(float* y, const float* x, const void* W, int wtype,
+                        int N, int K, int K_stride, cudaStream_t stream) {
+    if (N <= 0 || K <= 0 || K_stride < K) return false;
     constexpr int BLOCK = 128;
     switch (wtype) {
         case 0:   // F32, dense
             proj_f32_kernel<BLOCK><<<(unsigned)N, BLOCK, 0, stream>>>(
-                y, x, (const float*)W, K);
+                y, x, (const float*)W, K, K_stride);
             return true;
         case 8: {  // Q8_0
-            if (K % 32 != 0) return false;
+            if (K % 32 != 0 || K_stride % 32 != 0) return false;
+            const int stride_nb = K_stride / 32;
             // Multi-row amortises the activation re-read, but it also divides the grid
             // by ROWS. That is only free while the grid still covers the device several
             // times over — K3's big projections are N=12288 (grid 3072), whereas the
@@ -2126,30 +2206,30 @@ bool k3_proj_f32(float* y, const float* x, const void* W, int wtype,
                 switch (TB) {
                     case 32:
                         proj_q8_0_multirow_kernel<32, ROWS><<<grid, 32, 0, stream>>>(
-                            y, x, (const BlockQ8_0*)W, nb, N);
+                            y, x, (const BlockQ8_0*)W, nb, N, stride_nb);
                         break;
                     case 64:
                         proj_q8_0_multirow_kernel<64, ROWS><<<grid, 64, 0, stream>>>(
-                            y, x, (const BlockQ8_0*)W, nb, N);
+                            y, x, (const BlockQ8_0*)W, nb, N, stride_nb);
                         break;
                     default:
                         proj_q8_0_multirow_kernel<BLOCK, ROWS><<<grid, BLOCK, 0, stream>>>(
-                            y, x, (const BlockQ8_0*)W, nb, N);
+                            y, x, (const BlockQ8_0*)W, nb, N, stride_nb);
                         break;
                 }
             } else {
                 switch (TB) {
                     case 32:
                         proj_q8_0_kernel<32><<<(unsigned)N, 32, 0, stream>>>(
-                            y, x, (const BlockQ8_0*)W, nb);
+                            y, x, (const BlockQ8_0*)W, nb, stride_nb);
                         break;
                     case 64:
                         proj_q8_0_kernel<64><<<(unsigned)N, 64, 0, stream>>>(
-                            y, x, (const BlockQ8_0*)W, nb);
+                            y, x, (const BlockQ8_0*)W, nb, stride_nb);
                         break;
                     default:
                         proj_q8_0_kernel<BLOCK><<<(unsigned)N, BLOCK, 0, stream>>>(
-                            y, x, (const BlockQ8_0*)W, nb);
+                            y, x, (const BlockQ8_0*)W, nb, stride_nb);
                         break;
                 }
             }
@@ -2158,6 +2238,33 @@ bool k3_proj_f32(float* y, const float* x, const void* W, int wtype,
         default:
             return false;
     }
+}
+
+bool k3_proj_f32(float* y, const float* x, const void* W, int wtype,
+                 int N, int K, cudaStream_t stream) {
+    return proj_launch(y, x, W, wtype, N, K, K, stream);
+}
+
+// Byte offset of column k_off in a row of a [*, K] tensor of type `wtype`. Q8_0 rows
+// are 34-byte blocks of 32 weights, so a slice can only start on a block boundary —
+// which every K3 head band does (all head widths here are multiples of 32).
+static bool proj_col_offset(int wtype, int k_off, size_t* out_bytes) {
+    if (k_off < 0) return false;
+    if (wtype == 0) { *out_bytes = (size_t)k_off * sizeof(float); return true; }
+    if (wtype == 8) {
+        if (k_off % 32 != 0) return false;
+        *out_bytes = (size_t)(k_off / 32) * sizeof(BlockQ8_0);
+        return true;
+    }
+    return false;
+}
+
+bool k3_proj_cols_f32(float* y, const float* x, const void* W, int wtype,
+                      int N, int k_off, int k_len, int K, cudaStream_t stream) {
+    if (k_len <= 0 || k_off + k_len > K) return false;
+    size_t off = 0;
+    if (!proj_col_offset(wtype, k_off, &off)) return false;
+    return proj_launch(y, x + k_off, (const char*)W + off, wtype, N, k_len, K, stream);
 }
 
 bool k3_proj_f32_x4(float* y0, float* y1, float* y2, float* y3, const float* x,
@@ -2192,13 +2299,23 @@ bool k3_proj_f32_x4(float* y0, float* y1, float* y2, float* y3, const float* x,
     return true;
 }
 
-bool k3_proj_ggml_f32(float* y, const float* x, const void* W, int wtype,
-                      int N, int K, void* q8_scratch, cudaStream_t stream) {
-    if (N <= 0 || K <= 0) return false;
+// Shared by k3_proj_ggml_f32 and its column-sliced form, on the same terms as
+// proj_launch: `W` points at row 0 of the slice, `K` is the slice width, `K_stride`
+// the row pitch of the underlying tensor.
+//
+// Quantising only the slice is not an approximation of quantising the whole
+// activation and taking part of it. Q8_0 scales are per 32-value block and the
+// slice is block-aligned, so the blocks this call produces are the same blocks,
+// with the same scales, that the full-width call would have produced.
+static bool proj_q8act_launch(float* y, const float* x, const void* W, int wtype,
+                              int N, int K, int K_stride, void* q8_scratch,
+                              cudaStream_t stream) {
+    if (N <= 0 || K <= 0 || K_stride < K) return false;
     if (wtype == 0)
-        return k3_proj_f32(y, x, W, wtype, N, K, stream);
-    if (wtype != 8 || !q8_scratch || K % 32 != 0) return false;
+        return proj_launch(y, x, W, wtype, N, K, K_stride, stream);
+    if (wtype != 8 || !q8_scratch || K % 32 != 0 || K_stride % 32 != 0) return false;
     const int nb = K / 32;
+    const int stride_nb = K_stride / 32;
     constexpr int QT = 128;
     quantize_q8_0_kernel<<<(nb + QT - 1) / QT, QT, 0, stream>>>(
         (BlockQ8_0*)q8_scratch, x, nb);
@@ -2207,18 +2324,33 @@ bool k3_proj_ggml_f32(float* y, const float* x, const void* W, int wtype,
     switch (proj_block_for(nb)) {
         case 32:
             proj_q8_0_q8_0_kernel<32><<<(unsigned)N, 32, 0, stream>>>(
-                y, (const BlockQ8_0*)q8_scratch, (const BlockQ8_0*)W, nb);
+                y, (const BlockQ8_0*)q8_scratch, (const BlockQ8_0*)W, nb, stride_nb);
             break;
         case 64:
             proj_q8_0_q8_0_kernel<64><<<(unsigned)N, 64, 0, stream>>>(
-                y, (const BlockQ8_0*)q8_scratch, (const BlockQ8_0*)W, nb);
+                y, (const BlockQ8_0*)q8_scratch, (const BlockQ8_0*)W, nb, stride_nb);
             break;
         default:
             proj_q8_0_q8_0_kernel<BLOCK><<<(unsigned)N, BLOCK, 0, stream>>>(
-                y, (const BlockQ8_0*)q8_scratch, (const BlockQ8_0*)W, nb);
+                y, (const BlockQ8_0*)q8_scratch, (const BlockQ8_0*)W, nb, stride_nb);
             break;
     }
     return true;
+}
+
+bool k3_proj_ggml_f32(float* y, const float* x, const void* W, int wtype,
+                      int N, int K, void* q8_scratch, cudaStream_t stream) {
+    return proj_q8act_launch(y, x, W, wtype, N, K, K, q8_scratch, stream);
+}
+
+bool k3_proj_cols_ggml_f32(float* y, const float* x, const void* W, int wtype,
+                           int N, int k_off, int k_len, int K, void* q8_scratch,
+                           cudaStream_t stream) {
+    if (k_len <= 0 || k_off + k_len > K) return false;
+    size_t off = 0;
+    if (!proj_col_offset(wtype, k_off, &off)) return false;
+    return proj_q8act_launch(y, x + k_off, (const char*)W + off, wtype, N, k_len, K,
+                             q8_scratch, stream);
 }
 
 size_t k3_q8_0_bytes(int K) {
