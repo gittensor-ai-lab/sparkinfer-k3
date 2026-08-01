@@ -18,6 +18,7 @@
 #include <math.h>
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstdint>   // uintptr_t — the float4-alignment test in the MoE dispatch
 
 namespace sparkinfer {
@@ -1141,6 +1142,21 @@ constexpr int kMlaSplitBudget = 96 * kMlaMaxSplits;   // 6144 (head, slice) pair
 
 static inline int k3_mla_max_splits(int n_head) {
     if (n_head <= 0) return 1;
+
+    // SPARKINFER_K3_MLA_SPLIT_CAP pins the cap, and exists because the accuracy
+    // gate cannot see this change. The eval scores against llama.cpp on a SHORT
+    // reference prompt while timing at 128k, and splitting only engages above
+    // kMlaSplitMinCtx — so the gate runs splits=1 and reports a byte-identical
+    // KLD whatever this returns. Comparing two caps at long context on one
+    // binary is the only thing that actually exercises the wider combine.
+    static const int pinned = [] {
+        const char* e = std::getenv("SPARKINFER_K3_MLA_SPLIT_CAP");
+        if (!e) return 0;
+        const int v = std::atoi(e);
+        return v > 0 ? v : 0;
+    }();
+    if (pinned > 0) return pinned;
+
     const int by_budget = kMlaSplitBudget / n_head;
     // Never below the historical cap for a head count that already fit it, and
     // never so high that the combine's per-slice loop (and its shared-memory
