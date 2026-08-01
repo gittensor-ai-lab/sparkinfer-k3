@@ -743,10 +743,20 @@ class CiWorkflowTest(unittest.TestCase):
                                  f"{f.name}:{i} targets the upstream repo")
 
     def test_build_gate_targets_milestone_arches_not_sm120(self):
+        """sm_120 is Blackwell consumer/edge and nothing here runs on it — that was the
+        inherited workflow compile-checking an irrelevant architecture.
+
+        sm_100 (M2 · B200) was removed by request: this repo is Hopper-only in practice and
+        there is no Blackwell hardware, so the job asserted a scope the project does not
+        have. It is a real loss of coverage — the link chain reaches si_k3, so it did compile
+        the K3 kernels for Blackwell — and the workflow says so where the entry used to be,
+        so restoring it for M2 is a one-line change rather than an archaeology exercise."""
         text = (self.WF / "build-gate.yml").read_text()
         self.assertIn('arch: "90"', text)
-        self.assertIn('arch: "100"', text)
         self.assertNotIn('arch: "120"', text)
+        active = "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#"))
+        self.assertNotIn('arch: "100"', active, "sm_100 was removed from the CI gate")
+        self.assertIn("sm_100", text, "removing it silently loses why it went")
 
     def test_node_attestation_never_closes(self):
         # Deliberate severity change from the inherited rtx5090-required gate.

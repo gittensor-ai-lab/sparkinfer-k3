@@ -57,12 +57,21 @@ jobs:
         include:
           - arch: "90"
             node: M1 · H200 · Hopper
-          - arch: "100"
-            node: M2 · B200 · Blackwell
-          # sm_103 (M3 · B300) is deliberately absent. The installed CUDA toolkit must
-          # recognise the target or configure fails outright, and 103 is not in the
-          # top-level CMakeLists arch list yet — see bench/configs/b300.yaml. Add a matrix
-          # entry only once compute_cap is confirmed on real hardware.
+          # sm_100 (M2 · B200) was removed by request. This repo is Hopper-only in practice
+          # — CONTRIBUTING says so outright — and there is no Blackwell hardware to run on,
+          # so the job was compile-checking an architecture nothing here executes. It cost
+          # no PR latency (the matrix ran in parallel with sm_90) but it did assert a scope
+          # the project does not have.
+          #
+          # WHAT WENT WITH IT. The link chain is qwen3_gguf_bench -> sparkinfer_runtime ->
+          # sparkinfer_kernels -> si_k3, so that job did compile the real K3 kernels for
+          # Blackwell; it was the only thing that would have caught an MLA/MoE change
+          # breaking sm_100 before M2 hardware exists. Restore this entry when M2 starts.
+          #
+          # sm_103 (M3 · B300) is deliberately absent for a different reason. The installed
+          # CUDA toolkit must recognise the target or configure fails outright, and 103 is
+          # not in the top-level CMakeLists arch list yet — see bench/configs/b300.yaml. Add
+          # a matrix entry only once compute_cap is confirmed on real hardware.
     steps:
       - uses: actions/checkout@v4
 

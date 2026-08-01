@@ -31,7 +31,7 @@ $ KIMI_K3_MODEL=.../Kimi-K3-UD-IQ1_S-00001-of-00014.gguf \
 | ✅ **End to end** | text → ids → 93 layers × 8 GPUs → text ([`kimi_k3_run.sh`](bench/scripts/kimi_k3_run.sh)) |
 | ✅ **llama.cpp baseline** | **Measured on 8× H200**, pinned, backed by a committed sweep JSON |
 | ✅ **Eval + scoring** | Deterministic `eval:XS`..`eval:XL` from measured speed **and** KL/top-1 parity |
-| ⚠️ **Speed** | **5.2× slower than llama.cpp.** See below — this is the honest number, not a target |
+| ⚠️ **Speed** | **16.7× slower than llama.cpp at the scored 128k context** (1.9× at ctx 128). The honest number, not a target |
 | ❌ **Prefill** | No batched prefill. Prompt ingestion is one forward per token |
 | ❌ **Vision** | `mmproj` wired up, no image benchmark — M4 |
 
@@ -40,10 +40,18 @@ $ KIMI_K3_MODEL=.../Kimi-K3-UD-IQ1_S-00001-of-00014.gguf \
 | | decode tok/s |
 |---|---:|
 | llama.cpp (unsloth fork @ `efc8bc38`) | **18.32** |
-| sparkinfer, tensor-parallel tp=8 | **3.55** |
+| sparkinfer, tensor-parallel tp=8 | **10.34** |
 
-8× H200, UD-IQ1_S, ctx 128, same weights, same box. **sparkinfer is 5.2× slower than
-the reference it is trying to beat.** That is the expected shape for a
+8× H200, UD-IQ1_S, ctx 128, same weights, same box — but **ctx 128 is not what this repo
+scores on any more.** At the scored **128k** context the same box gives llama.cpp **16.70**
+and sparkinfer **1.00**: llama.cpp loses 8% going long, sparkinfer loses 90%.
+
+| decode tok/s | ctx 128 | ctx 131,072 |
+|---|--:|--:|
+| llama.cpp | 18.32 | **16.70** |
+| sparkinfer tp=8 | 10.34 | **1.00** |
+
+**So sparkinfer is 1.9× slower at short context and 16.7× slower where it counts.** That is the expected shape for a
 correctness-first fp32 executor against llama.cpp's mature CUDA path — integer dot
 products, fused ops, graph capture — and it is written here rather than buried because
 a repo that scores speedups has to be honest about starting behind.
@@ -245,7 +253,7 @@ cache in rather than assuming flat headroom.
 | node | per-GPU | total | arch | status |
 |---|---:|---:|---|---|
 | **`h200x8`** *(default)* | 141 GB | 1128 GiB | `sm_90` Hopper | **measured** |
-| `b200x8` | 180 GB | 1440 GiB | `sm_100` Blackwell | untested |
+| `b200x8` | 180 GB | 1440 GiB | `sm_100` Blackwell | untested — and no longer compile-gated in CI |
 | `b300x4` | 288 GB | 1152 GiB | `sm_103`* Ultra | untested |
 
 \* `sm_103` is unverified. `detect_arch` reads `compute_cap` at run time and wins, so a
@@ -304,11 +312,11 @@ BPE**, not a `tokenizer.json`, so the GGUF's own vocab is the only encoder that 
 correct by construction. The script finds it or tells you how to build it, rather than
 falling back to a tokenizer that would silently produce different ids.
 
-Tests need no GPU: `python3 bench/scripts/test_kimi_k3_baseline.py` (78).
+Tests need no GPU: `python3 bench/scripts/test_kimi_k3_baseline.py` (117).
 
 ## Powered by SN74 — moving at the speed of ⚡
 
-Contributors submit PRs; the eval verifies correctness and speed **on an 8x H200 node**; SN74 rewards verified marginal speedups. The Qwen3.6 track this forks from reached **+86% decode / +127% prefill @ 32k** that way. K3 starts further back — sparkinfer is currently **5.2x slower than llama.cpp** here, which is the whole opportunity.
+Contributors submit PRs; the eval verifies correctness and speed **on an 8x H200 node**; SN74 rewards verified marginal speedups. The Qwen3.6 track this forks from reached **+86% decode / +127% prefill @ 32k** that way. K3 starts further back — sparkinfer is **16.7x slower than llama.cpp at the scored 128k context**, which is the whole opportunity.
 
 1. Pick a narrow bottleneck in the Hopper decode path.
 2. Submit a PR with source changes and benchmark evidence.
@@ -324,12 +332,15 @@ Miner workflow: [`docs/miner-guide.md`](docs/miner-guide.md).
 Hopper first and Hopper properly. The Blackwell nodes are a later delta on a runtime
 that already works, not the thing that makes it work.
 
-### Now · 8× H200 — close the 5.2× gap to llama.cpp
+### Now · 8× H200 — close the 16.7× gap to llama.cpp at 128k
 
 `KIMI_K3_NODE=h200x8` · `PRIMARY_QUANT=UD-IQ1_S` — both defaults
 
 - Native runtime, multi-GPU, end-to-end generation, llama.cpp baseline, eval + tiers — **landed**
-- **Beat llama.cpp's 18.32 tok/s.** sparkinfer is at 3.55. Everything below serves this.
+- **Beat llama.cpp's 16.70 tok/s at 128k.** sparkinfer is at 1.00. Everything below serves this.
+- **Long-context attention is the lever.** MLA decode reduces over 576 f32 per token in a
+  kernel with one block per head — ~150× off the HBM roofline, and the entire reason the
+  gap widens from 1.9× to 16.7× with context.
 - **Shard attention.** `ShardPolicy::ExpertsOnly` shards the experts and replicates
   attention, so TP scaling collapsed to ~1.1× once the MoE got 3× faster. Attention is
   now the whole serial term — `ShardPolicy::Full` is the main lever.
