@@ -262,6 +262,58 @@ int main() {
         if (!qok || !(qrl2 < 5e-5)) ++g_fail;
         cudaFree(dq8);
 
+        // THE EXPERT BAND (tp_size > 1). Nothing else here passes a band, so every
+        // check above runs the tp=1 case where n_local is INT_MAX and the band test can
+        // never reject. That leaves the branch every rank but one actually takes
+        // unexercised: a rank evaluates only the selections whose weights it holds and
+        // contributes ZERO for the rest, and the all-reduce sums the bands back.
+        //
+        // expert_begin=0 with n_local=1 makes ids[0]=0 local and ids[1]=1 foreign, so
+        // the answer must be expert 0's contribution alone. Getting the band wrong in
+        // the direction that matters — evaluating a foreign expert against whatever the
+        // allocation holds past its end — produces a plausible number, not a fault.
+        //
+        // dscr is poisoned first. Foreign slots must not be read, and if that ever stops
+        // being true the poison surfaces as NaN rather than as a small quiet drift.
+        {
+            std::vector<double> bref(LAT, 0.0);
+            const int k = 0;                       // the only local expert under the band
+            std::vector<double> act(FFN);
+            for (int j = 0; j < FFN; ++j) {
+                double gv = 0, uv = 0;
+                for (int i = 0; i < LAT; ++i) {
+                    gv += (double)G [((size_t)k*FFN + j)*LAT + i] * x[i];
+                    uv += (double)Uw[((size_t)k*FFN + j)*LAT + i] * x[i];
+                }
+                const double a = beta * std::tanh(gv/beta) * (1.0/(1.0+std::exp(-gv)));
+                act[j] = a * (lb * std::tanh(uv/lb));
+            }
+            for (int o = 0; o < LAT; ++o) {
+                double s = 0;
+                for (int j = 0; j < FFN; ++j) s += (double)Dw[((size_t)k*LAT + o)*FFN + j] * act[j];
+                bref[o] = (double)w[k] * s;
+            }
+
+            std::vector<float> poison((size_t)TOPK*FFN, std::nanf(""));
+            CU(cudaMemcpy(dscr, poison.data(), poison.size()*4, cudaMemcpyHostToDevice));
+            const bool bok = moe_expert_ffn_f32_by_type(
+                dout, dscr, dx, did, dw, dg, du, dd, LAT, FFN, TOPK, beta, lb,
+                /*ggml_type=*/19, 0, /*expert_begin=*/0, /*n_local_experts=*/1);
+            CU(cudaDeviceSynchronize());
+            CU(cudaMemcpy(got.data(), dout, LAT*4, cudaMemcpyDeviceToHost));
+
+            double bnum=0, bden=0; int nonfinite=0;
+            for (int i = 0; i < LAT; ++i) {
+                if (!std::isfinite(got[i])) ++nonfinite;
+                const double d = got[i]-bref[i];
+                bnum += d*d; bden += bref[i]*bref[i];
+            }
+            const double brl2 = std::sqrt(bnum/(bden+1e-30));
+            std::printf("    expert band [0,1) of 2       : relL2 = %.3e  nonfinite = %d (%s)\n",
+                        brl2, nonfinite, bok ? "accepted" : "REFUSED");
+            if (!bok || !(brl2 < 2e-5) || !(bden > 0) || nonfinite) ++g_fail;
+        }
+
         // An unknown type must be REFUSED, not silently decoded with the wrong reader.
         const bool bad = moe_expert_ffn_f32_by_type(dout, dscr, dx, did, dw, dg, du, dd,
                                                     LAT, FFN, TOPK, beta, lb, 12, 0);
