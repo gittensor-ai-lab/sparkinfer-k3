@@ -717,9 +717,13 @@ struct KimiK3Forward::Scratch {
     int*   router_ids = nullptr;      // [top_k]
     float* routed_down_out = nullptr; // [expert_latent]
     float* moe_scratch = nullptr;     // [top_k*moe_ffn]
-    float* moe_out = nullptr;         // [expert_latent]
+    // [expert_latent + H], the only owned pointer of the three. moe_out and
+    // shexp_out are views into it so one collective reduces both — see the
+    // allocation in kimi_k3_forward_alloc_scratch.
+    float* moe_fused = nullptr;
+    float* moe_out = nullptr;         // = moe_fused,                 [expert_latent]
     float* dense_gate = nullptr, *dense_up = nullptr, *dense_situ = nullptr; // [dense_ffn]
-    float* shexp_out = nullptr;        // [H] — shared-expert output, H-wide
+    float* shexp_out = nullptr;        // = moe_fused + expert_latent, [H]
     // Softmax scratch for attn_res_mix_f32, [max_ckpt + 1]. Persistent because the
     // mix runs twice per layer: allocating it per call cost a cudaMallocAsync /
     // cudaFreeAsync pair ~185 times per token.
@@ -795,11 +799,25 @@ bool kimi_k3_forward_alloc_scratch(const KimiK3Config& cfg, KimiK3Forward& fwd) 
     ok &= alloc_i(s.router_ids, cfg.top_k);
     ok &= alloc_f(s.routed_down_out, cfg.expert_latent);
     ok &= alloc_f(s.moe_scratch, (size_t)cfg.top_k * cfg.moe_ffn);
-    ok &= alloc_f(s.moe_out, cfg.expert_latent);
+    // ONE ALLOCATION, TWO TENSORS, BECAUSE ONE COLLECTIVE COVERS BOTH.
+    //
+    // The expert accumulator (expert_latent) and the shared-expert partial (hidden)
+    // are both partial sums over the SAME rank band, produced in the same phase and
+    // reduced at the same point. Placing them adjacently lets the driver reduce
+    // expert_latent + hidden in a single call instead of issuing a second collective
+    // for the shared expert — see kimi_k3_partial_buffer, which reports the fused
+    // width, and weight_plan.cpp on why the shared expert is banded at all.
+    //
+    // moe_out MUST come first: the fused buffer's base is what the collective
+    // reduces from, and routed_norm/routed_up read the latent prefix in place.
+    ok &= alloc_f(s.moe_fused, (size_t)cfg.expert_latent + (size_t)H);
+    if (ok) {
+        s.moe_out   = s.moe_fused;
+        s.shexp_out = s.moe_fused + cfg.expert_latent;
+    }
     ok &= alloc_f(s.dense_gate, cfg.dense_ffn);
     ok &= alloc_f(s.dense_up, cfg.dense_ffn);
     ok &= alloc_f(s.dense_situ, cfg.dense_ffn);
-    ok &= alloc_f(s.shexp_out, H);
     // Same bound kimi_k3_alloc_state uses for max_ckpt, +1 for the current stream.
     // Sized from cfg rather than from the state so the scratch stays allocatable
     // without one; a mix that somehow saw more checkpoints than the bank can hold
@@ -851,8 +869,14 @@ float* kimi_k3_partial_buffer(KimiK3Forward& fwd, int layer, K3LayerPhase phase,
             if (count) *count = cfg.hidden;
             return s.ffn_out;
         }
-        if (count) *count = cfg.expert_latent;
-        return s.moe_out;
+        // FUSED: the expert accumulator AND the shared-expert partial, adjacent by
+        // construction (kimi_k3_forward_alloc_scratch). Both are partial sums over
+        // this rank's bands and both are consumed after the same reduce, so they are
+        // reduced as one payload rather than two collectives. The width is what makes
+        // that true — a caller that reduced only expert_latent here would leave the
+        // shared expert unreduced and every rank would add its own eighth of it.
+        if (count) *count = cfg.expert_latent + cfg.hidden;
+        return s.moe_fused;
     }
     if (count) *count = 0;
     return nullptr;
@@ -866,8 +890,13 @@ float* kimi_k3_swap_partial_buffer(KimiK3Forward& fwd, K3LayerPhase phase,
         old = s.attn_out;
         s.attn_out = buf;
     } else if (phase == K3LayerPhase::FfnPartial) {
-        old = s.moe_out;
-        s.moe_out = buf;
+        // The FUSED buffer moves, and both views move with it — they are offsets into
+        // one reduced payload, so repointing the base alone would leave the shared
+        // expert writing the old allocation while the collective reduced the new one.
+        old = s.moe_fused;
+        s.moe_fused = buf;
+        s.moe_out   = buf;
+        s.shexp_out = buf + fwd.cfg->expert_latent;
     }
     return old;
 }
@@ -1246,6 +1275,39 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             // This rank's PARTIAL expert sum: it legitimately differs per rank and
             // from the tp=1 value. dbg_moe_reduced below is the one that must match.
             if (fwd.debug) fwd.debug("dbg_moe_partial", layer, s.moe_out, cfg.expert_latent);
+
+            // THE SHARED EXPERT, IN THIS PHASE ON PURPOSE.
+            //
+            // It reads `normed2` and nothing downstream of the collective, so it can
+            // run here — and running here is what lets its partial ride the expert
+            // reduce instead of needing one of its own (weight_plan.cpp). gate/up are
+            // RowShard so this rank owns a band of the ffn width; situ is elementwise
+            // and preserves the band; down is ColShard over the same band, so what
+            // lands in shexp_out is a full-width PARTIAL, exactly like moe_out.
+            //
+            // Widths come from rank_ne, never from cfg: block_aligned_band hands a
+            // remainder to the low ranks, so a rank that derived n_ff_shexp/tp_size
+            // would be wrong on precisely the ranks that differ.
+            if (L.has_shared_experts) {
+                if (!L.ffn_gate_shexp.ok() || !L.ffn_up_shexp.ok() ||
+                    !L.ffn_down_shexp.ok()) return false;
+                const int shexp_band = (int)L.ffn_gate_shexp.rank_ne[1];
+                if (shexp_band <= 0 || (int)L.ffn_down_shexp.rank_ne[0] != shexp_band)
+                    return false;
+                if (!proj(s.dense_gate, s.normed2, L.ffn_gate_shexp, shexp_band, H))
+                    return false;
+                if (!proj(s.dense_up, s.normed2, L.ffn_up_shexp, shexp_band, H))
+                    return false;
+                k3k::situ_f32(s.dense_situ, s.dense_gate, s.dense_up, shexp_band,
+                             cfg.situ_beta, cfg.situ_linear_beta, stream);
+                if (!proj(s.shexp_out, s.dense_situ, L.ffn_down_shexp, H, shexp_band))
+                    return false;
+                if (fwd.debug) fwd.debug("dbg_shexp_partial", layer, s.shexp_out, H);
+            } else {
+                // The fused buffer is reduced whole, so a layer without a shared
+                // expert must still present a well-defined summand there.
+                cudaMemsetAsync(s.shexp_out, 0, (size_t)H * sizeof(float), stream);
+            }
         }
     }
 
@@ -1271,24 +1333,11 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
                 return false;
             if (fwd.debug) fwd.debug("dbg_routed_up", layer, s.ffn_out, H);
 
-            // Shared experts run on `normed2` directly (hidden width throughout, no
-            // latent detour) and add into the routed output AFTER ffn_routed_up — both
-            // contributions are at hidden width when combined. Reuses the dense-FFN
-            // scratch buffers: a layer is either the leading-dense branch or this MoE
-            // branch, never both, and dense_ffn (33792) comfortably covers n_ff_shexp
-            // (6144), so a dedicated buffer would be pure duplication.
+            // The shared expert was computed in phase FfnPartial and its partial has
+            // been reduced along with the expert accumulator, so what is left here is
+            // the add. Both contributions are at hidden width by this point:
+            // ffn_routed_up lifted the latent, shexp_out was already hidden-wide.
             if (L.has_shared_experts) {
-                if (!L.ffn_gate_shexp.ok() || !L.ffn_up_shexp.ok() || !L.ffn_down_shexp.ok())
-                    return false;
-                const int n_ff_shexp = cfg.moe_ffn * cfg.n_shared;
-                if (!proj(s.dense_gate, s.normed2, L.ffn_gate_shexp, n_ff_shexp, H))
-                    return false;
-                if (!proj(s.dense_up, s.normed2, L.ffn_up_shexp, n_ff_shexp, H))
-                    return false;
-                k3k::situ_f32(s.dense_situ, s.dense_gate, s.dense_up, n_ff_shexp,
-                             cfg.situ_beta, cfg.situ_linear_beta, stream);
-                if (!proj(s.shexp_out, s.dense_situ, L.ffn_down_shexp, H, n_ff_shexp))
-                    return false;
                 if (fwd.debug) fwd.debug("dbg_shexp", layer, s.shexp_out, H);
                 k3k::k3_add_f32(s.ffn_out, s.ffn_out, s.shexp_out, H, stream);
             }

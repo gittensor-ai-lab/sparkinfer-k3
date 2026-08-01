@@ -113,11 +113,16 @@ static void test_moe_rules() {
     // The router must see the whole hidden vector to score experts, and its output
     // is a per-expert scalar set rather than an activation.
     CHECK_RULE("blk.0.ffn_gate_inp.weight", Rule::Replicate);
-    // Shared expert runs for every token on every rank; replicating avoids adding
-    // a third all-reduce per layer for a tensor that is small next to the routed set.
-    CHECK_RULE("blk.0.ffn_gate_shexp.weight", Rule::Replicate);
-    CHECK_RULE("blk.0.ffn_up_shexp.weight", Rule::Replicate);
-    CHECK_RULE("blk.0.ffn_down_shexp.weight", Rule::Replicate);
+    // Shared expert is banded across the ffn width: gate/up own a band of it,
+    // situ is elementwise and preserves the band, down contracts over the same band
+    // and so leaves a full-width partial. That partial rides the expert reduce
+    // rather than needing one of its own — the two are adjacent in one buffer, so
+    // the layer still issues exactly ONE collective. RowShard/RowShard/ColShard is
+    // what makes that hold; a Replicate here would have every rank add a complete
+    // shared-expert output into a sum that then multiplies it by tp_size.
+    CHECK_RULE("blk.0.ffn_gate_shexp.weight", Rule::RowShard);
+    CHECK_RULE("blk.0.ffn_up_shexp.weight", Rule::RowShard);
+    CHECK_RULE("blk.0.ffn_down_shexp.weight", Rule::ColShard);
 }
 
 static void test_model_level_rules() {

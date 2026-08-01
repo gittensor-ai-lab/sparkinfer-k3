@@ -351,12 +351,17 @@ bool kimi_k3_tp_init(const GGUF& g, const KimiK3Config& cfg, const K3PlanOptions
     if (!why.empty()) std::fprintf(stderr, "[k3-tp] %s\n", why.c_str());
 
     std::string err;
-    out.coll = tp::make_collective(devices, requested, &err,
-                                   // hidden (7168) > expert_latent (3584): the KDA
-                                   // reduce is the wider payload, and a collective
-                                   // sized to the narrower one would truncate it.
-                                   /*max_count=*/(size_t)(cfg.hidden > cfg.expert_latent
-                                                          ? cfg.hidden : cfg.expert_latent),
+    // The widest payload any reduce in the token will carry, and the two candidates
+    // are not the ones they used to be:
+    //   attention (sharded bands) reduces at hidden                       = 7168
+    //   the MoE layer reduces the expert accumulator AND the shared-expert
+    //   partial as ONE fused payload (kimi_k3_partial_buffer)             = 10752
+    // Sizing to the attention reduce alone would fail every MoE layer at run time,
+    // after a two-minute weight load.
+    const size_t attn_count = (size_t)cfg.hidden;
+    const size_t moe_count  = (size_t)cfg.expert_latent + (size_t)cfg.hidden;
+    const size_t max_count  = attn_count > moe_count ? attn_count : moe_count;
+    out.coll = tp::make_collective(devices, requested, &err, max_count,
                                    /*need_f32=*/true);
     if (!out.coll) {
         std::fprintf(stderr, "[k3-tp] no collective: %s\n", err.c_str());
@@ -383,7 +388,7 @@ bool kimi_k3_tp_init(const GGUF& g, const KimiK3Config& cfg, const K3PlanOptions
         return e && e[0] == '1';
     }();
     if (out.coll->owns_buffers() && !host_reduce_dbg &&
-        out.coll->max_count() >= (size_t)cfg.expert_latent) {
+        out.coll->max_count() >= max_count) {
         const int n = (int)out.ranks.size();
         out.zc_in.resize((size_t)n);
         out.zc_out.resize((size_t)n);

@@ -62,8 +62,31 @@ const std::unordered_map<std::string, Rule>& table() {
         {"ffn_up_exps.weight",      Rule::ExpertShard},
         {"ffn_down_exps.weight",    Rule::ExpertShard},
 
-        // --- shared expert: REPLICATED for now. This is a context-budget call,
-        // not a correctness one, and it is revisited at 512k.
+        // --- shared expert: SHARDED across the ffn width.
+        //
+        // This was Replicate, deferred with the note below on the grounds that the
+        // ordering constraint it imposes could not be verified against a forward that
+        // did not exist yet. That forward exists (kimi_k3_tp.cpp), so the deferral is
+        // spent and the trade is now measurable rather than hypothetical.
+        //
+        // WHAT IT COSTS PER TOKEN, not just per rank of residency. The three tensors
+        // are Q8_0 7168x6144 (two) and 6144x7168 (one) = 132.1 M weights = 140.4 MB
+        // per MoE layer, and every rank read all of it every token to compute the
+        // IDENTICAL result: 12.9 GB per token per rank across 92 MoE layers. Banding
+        // the ffn width by tp_size drops that to 1.6 GB.
+        //
+        // NO NEW COLLECTIVE. gate/up are RowShard so a rank owns a band of the ffn
+        // width; situ is elementwise, so the band stays a band through it; down is
+        // ColShard over the same band and therefore lands a FULL-WIDTH PARTIAL at
+        // hidden. That partial is reduced by the collective the MoE dispatch already
+        // needs — kimi_k3_alloc_state places the shared-expert partial immediately
+        // after the expert accumulator, so one all-reduce of expert_latent + hidden
+        // covers both. The payload grows 3584 -> 10752 floats; at these sizes the
+        // reduce is latency-bound, not bandwidth-bound (14 KiB and 28 KiB measure
+        // 57.06 and 55.50 us/call), so the extra bytes are close to free.
+        //
+        // The original note, kept because its residency arithmetic is still the
+        // reason this is worth doing at long context:
         //
         // MEASURED on the real UD-Q2_K_XL: the three shexp tensors are 12.0 GiB
         // replicated = 10.5 GiB per rank of the 32.9 GiB total duplication, putting
@@ -81,13 +104,14 @@ const std::unordered_map<std::string, Rule>& table() {
         // gate/up become RowShard (split the ffn width), down becomes ColShard,
         // and a rank drops to 118.5 GiB, which clears 512k.
         //
-        // Not doing it yet, because it imposes an ordering constraint (the shexp
-        // add MUST precede the reduce) on a forward that does not exist to verify
-        // it. Replicated is provably correct regardless of ordering; switch when
-        // the forward exists and 512k is the target.
-        {"ffn_gate_shexp.weight",   Rule::Replicate},
-        {"ffn_up_shexp.weight",     Rule::Replicate},
-        {"ffn_down_shexp.weight",   Rule::Replicate},
+        // The ordering constraint that note names — the shexp add MUST precede the
+        // reduce — is now satisfied structurally rather than by convention: the
+        // shared expert is computed in phase FfnPartial (it reads only ffn_norm's
+        // output, never the reduced latent), so it CANNOT be ordered after the
+        // collective without moving it to a phase where its input does not exist.
+        {"ffn_gate_shexp.weight",   Rule::RowShard},
+        {"ffn_up_shexp.weight",     Rule::RowShard},
+        {"ffn_down_shexp.weight",   Rule::ColShard},
 
         // --- router: must see the whole hidden vector to score experts, and its
         // output is a per-expert scalar set rather than an activation.
