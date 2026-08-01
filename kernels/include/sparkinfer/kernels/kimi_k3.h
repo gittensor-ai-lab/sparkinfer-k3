@@ -400,6 +400,14 @@ void mla_absorb_q_f32(float* out, const float* q_nope, const float* q_pe,
 // 1/sqrt(192), NOT 1/sqrt(key_length=576). Scaling by the cached key width is
 // the natural wrong guess and shifts every attention distribution.
 //
+// SHARED MEMORY IS O(1) IN n_ctx, AND THAT IS A CONTRACT, NOT AN IMPLEMENTATION
+// DETAIL. The softmax is online (running max + running exp-sum over tiles), so a
+// 1M-token context asks for exactly as much shared memory as a 128-token one. The
+// earlier two-pass version staged the whole score vector and therefore stopped
+// launching at n_ctx 11,767 — with nothing checking the launch, every MLA layer
+// past that quietly reused the previous token's output. Any future rewrite that
+// reintroduces an n_ctx-sized shared buffer reintroduces that.
+//
 // q:       [key_length, n_head]     (output of mla_absorb_q_f32)
 // k_cache: [key_length, n_ctx]      token-major rows; MQA (one K shared by heads)
 // wv_b:    [kv_lora, v_dim, n_head]  kv_lora fastest

@@ -297,6 +297,152 @@ static double test_argmax_twopass(int vocab, int nblocks, bool ties) {
     return (double)std::abs(ri - gi);   // expect 0: same index as serial argmax
 }
 
+// ---------------------------------------------------------------------------
+// 9. Kimi K3 MLA NoPE decode attention: TILED ONLINE SOFTMAX vs a two-pass
+//    double-precision reference.
+// ---------------------------------------------------------------------------
+// This models mla_decode_attn_kernel (kernels/csrc/cuda/kimi_k3/k3_kernels.cu)
+// structurally, not just formulaically: BLOCK 256 / 8 warps / kMlaCtxTile 128,
+// one warp per scored token with lanes striding over d, the __shfl_down_sync
+// reduction tree, and the shared-memory block reductions in warp order. So the
+// SUMMATION ORDER matches the device kernel, and the check is on the algorithm
+// as scheduled rather than on the algebra alone.
+//
+// Why it earns a slot here. The GPU coherence test (kimi_k3_numeric_test.cu)
+// runs n_ctx 48 — one tile — which is exactly the case where an online softmax
+// degenerates to the two-pass one it replaced. The interesting states (a running
+// max that a later tile raises, an accumulator rescaled by corr) only appear at
+// n_ctx > 128, and they are reachable with no GPU at all.
+static const int MLA_BLOCK = 256;
+static const int MLA_NWARP = MLA_BLOCK / 32;
+static const int MLA_TILE  = 128;
+
+// __shfl_down_sync(0xffffffff, v, off) for off = 16..1: lane 0 ends with the sum.
+static float mla_warp_sum(vector<float> v) {
+    for (int off = 16; off > 0; off >>= 1)
+        for (int i = 0; i < off; i++) v[i] += v[i + off];
+    return v[0];
+}
+static float mla_warp_max(vector<float> v) {
+    for (int off = 16; off > 0; off >>= 1)
+        for (int i = 0; i < off; i++) v[i] = std::fmax(v[i], v[i + off]);
+    return v[0];
+}
+// block_sum<BLOCK> / block_max<BLOCK>: warp reduce, then thread 0 folds the
+// per-warp partials in warp order.
+static float mla_block_sum(const vector<float>& per_thread) {
+    float s = 0.f;
+    for (int w = 0; w < MLA_NWARP; w++)
+        s += mla_warp_sum(vector<float>(per_thread.begin() + w * 32,
+                                        per_thread.begin() + w * 32 + 32));
+    return s;
+}
+static float mla_block_max(const vector<float>& per_thread) {
+    float s = -1e30f;
+    for (int w = 0; w < MLA_NWARP; w++)
+        s = std::fmax(s, mla_warp_max(vector<float>(per_thread.begin() + w * 32,
+                                                    per_thread.begin() + w * 32 + 32)));
+    return s;
+}
+
+static double test_mla_decode_attn(int key_length, int kv_lora, int v_dim,
+                                   int n_ctx, int n_head) {
+    const int rope = key_length - kv_lora;
+    (void)rope;
+    // Scale is the caller's business (1/sqrt(qk_nope+rope), NOT 1/sqrt(key_length)
+    // — see the trap in kernels/include/sparkinfer/kernels/kimi_k3.h); the kernel
+    // just multiplies by it, so any positive value exercises the same code.
+    const float scale = 1.f / std::sqrt((float)key_length);
+
+    vector<float> q((size_t)key_length * n_head), K((size_t)key_length * n_ctx),
+                  wv((size_t)kv_lora * v_dim * n_head);
+    for (auto& x : q) x = frand();
+    for (auto& x : K) x = frand();
+    for (auto& x : wv) x = 0.2f * frand();
+
+    double worst = 0.0;
+    for (int h = 0; h < n_head; h++) {
+        // ---- ground truth: two-pass softmax in double ----
+        vector<double> sc(n_ctx);
+        double mx = -1e300;
+        for (int t = 0; t < n_ctx; t++) {
+            double d = 0;
+            for (int i = 0; i < key_length; i++)
+                d += (double)q[(size_t)h * key_length + i] * K[(size_t)t * key_length + i];
+            sc[t] = d * scale;
+            mx = std::max(mx, sc[t]);
+        }
+        double sum = 0;
+        for (int t = 0; t < n_ctx; t++) { sc[t] = std::exp(sc[t] - mx); sum += sc[t]; }
+        vector<double> latent(kv_lora, 0.0);
+        for (int r = 0; r < kv_lora; r++) {
+            double a = 0;
+            for (int t = 0; t < n_ctx; t++) a += sc[t] * K[(size_t)t * key_length + r];
+            latent[r] = a / sum;
+        }
+        vector<double> want(v_dim);
+        for (int v = 0; v < v_dim; v++) {
+            double a = 0;
+            for (int r = 0; r < kv_lora; r++)
+                a += (double)wv[((size_t)h * v_dim + v) * kv_lora + r] * latent[r];
+            want[v] = a;
+        }
+
+        // ---- kernel algorithm ----
+        vector<float> s_q(q.begin() + (size_t)h * key_length,
+                          q.begin() + (size_t)h * key_length + key_length);
+        vector<float> s_acc(kv_lora, 0.f), s_p(MLA_TILE, 0.f);
+        float m = -1e30f, l = 0.f;
+
+        for (int t0 = 0; t0 < n_ctx; t0 += MLA_TILE) {
+            const int tn = std::min(MLA_TILE, n_ctx - t0);
+
+            for (int t = 0; t < tn; t++) {          // one warp per token
+                vector<float> part(32, 0.f);
+                for (int lane = 0; lane < 32; lane++)
+                    for (int d = lane; d < key_length; d += 32)
+                        part[lane] += s_q[d] * K[(size_t)(t0 + t) * key_length + d];
+                s_p[t] = mla_warp_sum(part) * scale;
+            }
+
+            vector<float> tv(MLA_BLOCK, -1e30f);
+            for (int tid = 0; tid < MLA_BLOCK; tid++)
+                for (int t = tid; t < tn; t += MLA_BLOCK) tv[tid] = std::fmax(tv[tid], s_p[t]);
+            const float m_new = std::fmax(m, mla_block_max(tv));
+            const float corr = std::exp(m - m_new);   // 0 on the first tile
+
+            vector<float> lv(MLA_BLOCK, 0.f);
+            for (int tid = 0; tid < MLA_BLOCK; tid++)
+                for (int t = tid; t < tn; t += MLA_BLOCK) {
+                    const float e = std::exp(s_p[t] - m_new);
+                    s_p[t] = e;
+                    lv[tid] += e;
+                }
+            l = l * corr + mla_block_sum(lv);
+            m = m_new;
+
+            for (int r = 0; r < kv_lora; r++) {
+                float a = s_acc[r] * corr;
+                for (int t = 0; t < tn; t++)
+                    a += s_p[t] * K[(size_t)(t0 + t) * key_length + r];
+                s_acc[r] = a;
+            }
+        }
+
+        const float inv = l > 0.f ? 1.f / l : 0.f;
+        for (int r = 0; r < kv_lora; r++) s_acc[r] *= inv;
+
+        for (int v = 0; v < v_dim; v++) {           // one warp per output element
+            vector<float> part(32, 0.f);
+            for (int lane = 0; lane < 32; lane++)
+                for (int r = lane; r < kv_lora; r += 32)
+                    part[lane] += wv[((size_t)h * v_dim + v) * kv_lora + r] * s_acc[r];
+            worst = std::max(worst, std::abs((double)mla_warp_sum(part) - want[v]));
+        }
+    }
+    return worst;
+}
+
 int main() {
     printf("sparkinfer kernel algorithm correctness (CPU reference)\n");
     check("attention hd128 kv1",   test_attention(128, 1),    1e-4);
@@ -317,6 +463,13 @@ int main() {
     check("argmax 2pass qwen vocab",test_argmax_twopass(151936, 512, false), 0.0);
     check("argmax 2pass gemma vocab",test_argmax_twopass(262144, 512, false), 0.0);
     check("argmax 2pass tie-break",  test_argmax_twopass(151936, 512, true),  0.0);
+    // Kimi K3 MLA decode. First case is one tile (the shape the GPU coherence
+    // test covers); the rest cross tile boundaries, including a ragged tail and
+    // a context that the pre-online-softmax kernel could not have launched at.
+    check("mla decode ctx96 (1 tile)", test_mla_decode_attn(576, 512, 128, 96, 2),   2e-4);
+    check("mla decode ctx128 (exact)", test_mla_decode_attn(576, 512, 128, 128, 2),  2e-4);
+    check("mla decode ctx1000",        test_mla_decode_attn(576, 512, 128, 1000, 2), 2e-4);
+    check("mla decode ctx16384",       test_mla_decode_attn(576, 512, 128, 16384, 1), 2e-4);
     printf("%s (%d failures)\n", g_fail ? "FAILED" : "ALL PASSED", g_fail);
     return g_fail ? 1 : 0;
 }

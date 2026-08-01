@@ -581,15 +581,22 @@ static void test_mla_absorb_q() {
 // 10. MLA NoPE decode attention
 // ---------------------------------------------------------------------------
 
-static void test_mla_decode_attn() {
-    std::printf("MLA NoPE decode attn (MQA K-cache + wv_b; scale=1/sqrt(192))\n");
+// n_ctx is a parameter because the shared-memory footprint used to scale with it.
+// The kernel staged one float per cached token, so the launch crossed the 48 KB
+// dynamic-shared limit at n_ctx = (49152/4) - kv_lora - 9 and returned
+// cudaErrorInvalidValue — silently, since the launcher returns void and the caller
+// never polls. At the 48-token shape this test used to run at, that is unreachable.
+// The long case below is above the old ceiling for these dims (12,215) and is the
+// regression guard: it fails at the LAUNCH, not on a tolerance, if the score vector
+// ever goes back into shared memory.
+static void test_mla_decode_attn(int n_ctx, int H) {
+    std::printf("MLA NoPE decode attn (MQA K-cache + wv_b; scale=1/sqrt(192)), "
+                "n_ctx=%d heads=%d\n", n_ctx, H);
     std::mt19937 rng(77);
     const int kv_lora = 64;     // shrunk from 512 so the float64 ref stays cheap
     const int rope = 16;        // shrunk from 64; ratio preserved
     const int v_dim = 32;       // shrunk from 128
     const int key_length = kv_lora + rope;
-    const int H = 4;
-    const int n_ctx = 48;
     // Correct K3 scale uses n_embd_head_k_mla = qk_nope+rope, NOT key_length.
     const int qk_nope = 32;     // stand-in for 128
     const float scale = 1.0f / std::sqrt((float)(qk_nope + rope));
@@ -771,7 +778,12 @@ int main() {
     test_kda_decay_gate();     std::printf("\n");
     test_l2_norm_heads();      std::printf("\n");
     test_mla_absorb_q();       std::printf("\n");
-    test_mla_decode_attn();    std::printf("\n");
+    test_mla_decode_attn(48, 4);       std::printf("\n");
+    // Above the 48 KB shared-memory ceiling the pre-online-softmax kernel had at
+    // these dims (12,215 tokens). It launched with cudaErrorInvalidValue and left
+    // the output buffer untouched — which, on the real forward, means the previous
+    // layer's attention output survives into this one.
+    test_mla_decode_attn(20000, 2);    std::printf("\n");
     test_moe_router_noaux_tc(); std::printf("\n");
 
     std::printf("%d cases, %d failure(s)\n", g_case, g_fail);
