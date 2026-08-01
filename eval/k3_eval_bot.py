@@ -107,13 +107,16 @@ def evaluate(pr, repo, seal=False):
         #   what it started over ssh, so an interrupted run leaves 8-125 GiB resident per
         #   device and the next load dies in cudaMalloc partway through layer 92 -- which
         #   reads like an OOM bug in the PR under test rather than leftover state.
-        #   Matched on the built path so the build's own "--target kimi_k3_tp_bench" is not
-        #   caught by its own cleanup.
+        #   NOT pkill -f. The pattern would appear in this very command line, so pkill
+        #   matches the remote shell running it and the cleanup kills itself -- the && chain
+        #   dies before the build and the PR is reported as "build failed" with no output
+        #   at all. Killing exactly what holds GPU memory cannot match a shell.
         #
         #   A dirty tree. Restoring the protected harness stages bench/scripts, so the next
         #   git checkout --detach aborts with "local changes would be overwritten" and the
         #   PR is reported as a build failure it had nothing to do with.
-        f"pkill -f '{BOX_REPO_DIR}/build/runtime/kimi_k3_tp_bench' 2>/dev/null || true",
+        "for p in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null); "
+        "do kill -9 $p 2>/dev/null || true; done",
         "git reset -q --hard",
         "git clean -qfd",
         "git fetch -q origin +refs/pull/*/head:refs/remotes/origin/pr/* --force",
@@ -147,7 +150,15 @@ def evaluate(pr, repo, seal=False):
     ])
     r = sh(f"{steps} && echo K3_BUILD_OK", timeout=5400)
     if "K3_BUILD_OK" not in (r.stdout or ""):
-        raise RuntimeError(f"build failed for #{num} @ {sha[:8]}\n{(r.stderr or r.stdout)[-1500:]}")
+        # An empty failure is worse than a wrong one: it says nothing about where the chain
+        # stopped. Report the exit status too, since a setup step that kills the shell
+        # produces no output at all and that is exactly the case worth recognising.
+        tail = ((r.stderr or "") + (r.stdout or "")).strip()
+        tail = "\n".join(l for l in tail.splitlines() if "setlocale" not in l)[-1500:]
+        raise RuntimeError(
+            f"build failed for #{num} @ {sha[:8]} (ssh exit {r.returncode})"
+            + (f"\n{tail}" if tail else " — no output at all, so a setup step aborted the "
+                                        "chain before cmake ran"))
 
     seal_flag = " --seal" if seal else ""
     # POLARIS_API_KEY lives in a 0600 file on the box, not in this command line and not in
