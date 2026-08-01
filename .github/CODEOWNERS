@@ -29,6 +29,8 @@
 # receipt -- guarding eval.sh while leaving those writable was a bypass, not a narrower
 # guard. The two test files are here because a weakened test passes CI silently.
 /bench/scripts/reference.lock        @ai-hpc
+/bench/scripts/_common.sh            @ai-hpc
+/bench/scripts/_eval_speed.sh        @ai-hpc
 /bench/scripts/label.py              @ai-hpc
 /bench/scripts/compare_logits.py     @ai-hpc
 /bench/scripts/check_reference_lock.py @ai-hpc
@@ -40,6 +42,10 @@
 /bench/scripts/test_label.py         @ai-hpc
 /bench/scripts/kimi_k3_*.sha256      @ai-hpc
 /bench/results/                      @ai-hpc
+
+# The accuracy answer key. compare_logits.py scores the build against these bytes, so a
+# contributor able to edit them can hand themselves top1=1.0 / kl=0.0.
+/bench/refdata/                      @ai-hpc
 
 # The PR-evaluation pipeline inherited from sparkinfer
 /eval/                               @ai-hpc
