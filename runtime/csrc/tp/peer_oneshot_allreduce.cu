@@ -16,6 +16,7 @@ using tpar::RankSignals;
 using tpar::kMaxBlocks;
 using tpar::array_t;
 using tpar::packed_reduce_bf16;
+using tpar::packed_reduce_f32;
 using tpar::barrier_at_start;
 using tpar::barrier_at_end;
 
@@ -45,6 +46,33 @@ __global__ void __launch_bounds__(512, 1)
     for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < n_vec;
          idx += gridDim.x * blockDim.x) {
         reinterpret_cast<P*>(out)[idx] = packed_reduce_bf16<N>(ptrs, idx);
+    }
+    barrier_at_end<N, true>(sg, self_sg, rank);
+}
+
+// f32 one-shot, a strict mirror of the bf16 kernel above: pack is 4 floats
+// (same 128-bit width), barriers identical. Exists because Kimi K3 keeps its
+// residual stream f32 by design, so the bf16-only entry points made every K3
+// reduce fall back to NCCL.
+template <int N>
+struct PeerInputsF32 {
+    const float* p[N];
+};
+
+template <int N>
+__global__ void __launch_bounds__(512, 1)
+    peer_oneshot_allreduce_f32_kernel(PeerInputsF32<N> peers, RankSignals<N> sg,
+                                      Signal* self_sg, int rank,
+                                      float* __restrict__ out, int n_vec) {
+    using P = array_t<float, 4>;
+    const P* ptrs[N];
+#pragma unroll
+    for (int r = 0; r < N; r++) ptrs[r] = reinterpret_cast<const P*>(peers.p[r]);
+
+    barrier_at_start<N>(sg, self_sg, rank);
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < n_vec;
+         idx += gridDim.x * blockDim.x) {
+        reinterpret_cast<P*>(out)[idx] = packed_reduce_f32<N>(ptrs, idx);
     }
     barrier_at_end<N, true>(sg, self_sg, rank);
 }
@@ -149,6 +177,26 @@ void launch_in_kernel(PeerOneShotAllreduce::Impl* s, int n_vec,
     }
 }
 
+template <int N>
+void launch_in_kernel_f32(PeerOneShotAllreduce::Impl* s, int n_vec,
+                          const std::vector<void*>& streams) {
+    PeerInputsF32<N> peers{};
+    RankSignals<N> sg{};
+    for (int r = 0; r < N; r++) {
+        peers.p[r] = reinterpret_cast<const float*>(s->in_buf[r]);
+        sg.sg[r] = s->sig[r];
+    }
+    const int block = 512;
+    const int grid = grid_for(n_vec, block);
+    for (int r = 0; r < N; r++) {
+        SPARKINFER_TP_CUDA_CHECK(cudaSetDevice(s->devices[r]));
+        peer_oneshot_allreduce_f32_kernel<N><<<grid, block, 0,
+            reinterpret_cast<cudaStream_t>(streams[r])>>>(
+            peers, sg, s->sig[r], r, reinterpret_cast<float*>(s->out_buf[r]), n_vec);
+        SPARKINFER_TP_CUDA_CHECK(cudaGetLastError());
+    }
+}
+
 // A/B baseline: host-event 8-way cross-stream barrier + reduce-only kernel.
 template <int N>
 void launch_host_barrier(PeerOneShotAllreduce::Impl* s, int n_vec,
@@ -223,7 +271,9 @@ PeerOneShotAllreduce::PeerOneShotAllreduce(const std::vector<int>& devices,
     impl_->out_buf.assign(N, nullptr);
     impl_->tmp_buf.assign(N, nullptr);
     impl_->sig.assign(N, nullptr);
-    const std::size_t bytes = count * sizeof(__nv_bfloat16);
+    // Sized for f32, the wider of the two element types this class now
+    // reduces; bf16 uses the front half. One allocation serves both.
+    const std::size_t bytes = count * sizeof(float);
     for (int r = 0; r < N; r++) {
         if (cudaSetDevice(devices[r]) != cudaSuccess) return;
         // Enable peer access from devices[r] to every other rank.
@@ -283,6 +333,19 @@ void PeerOneShotAllreduce::allreduce_bf16(std::size_t count,
         case 2: detail::launch_in_kernel<2>(impl_, n_vec, streams); break;
         case 4: detail::launch_in_kernel<4>(impl_, n_vec, streams); break;
         case 8: detail::launch_in_kernel<8>(impl_, n_vec, streams); break;
+        default: break;
+    }
+}
+
+void PeerOneShotAllreduce::allreduce_f32(std::size_t count,
+                                         const std::vector<void*>& streams) {
+    if (!ok_) return;
+    const int N = static_cast<int>(impl_->devices.size());
+    const int n_vec = static_cast<int>(count / 4);   // 128-bit packs of 4 floats
+    switch (N) {
+        case 2: detail::launch_in_kernel_f32<2>(impl_, n_vec, streams); break;
+        case 4: detail::launch_in_kernel_f32<4>(impl_, n_vec, streams); break;
+        case 8: detail::launch_in_kernel_f32<8>(impl_, n_vec, streams); break;
         default: break;
     }
 }

@@ -27,6 +27,9 @@ namespace sparkinfer::tp {
 // read-after-write race (matches vLLM's out-of-place custom_all_reduce).
 class PeerOneShotAllreduce {
 public:
+    // Consulted by the collective adapter at compile time; multimem stays false
+    // until its own f32 path exists, so only this backend accepts K3's stream.
+    static constexpr bool kSupportsF32 = true;
     // `count` = max elements (hidden_size); must be a multiple of 8 (128-bit
     // packed). Enables peer access across all device pairs. Check ok().
     PeerOneShotAllreduce(const std::vector<int>& devices, std::size_t count);
@@ -46,6 +49,13 @@ public:
     // rank; the in-kernel flag barrier replaces any host-side barrier. streams
     // size must equal the device count. NO barrier events — that's the point.
     void allreduce_bf16(std::size_t count, const std::vector<void*>& streams);
+
+    // f32 mirror of allreduce_bf16 — same one-shot kernel shape, 128-bit packs of
+    // 4 floats instead of 8 bf16. `count` must be a multiple of 4 (the ctor's
+    // multiple-of-8 gate already guarantees it). Exists because Kimi K3 keeps its
+    // residual stream f32 by design, so the bf16-only surface made every K3
+    // collective fall back to NCCL.
+    void allreduce_f32(std::size_t count, const std::vector<void*>& streams);
 
     // A/B baseline: the SAME packed reduce but synchronized with a host-event
     // 8-way cross-stream barrier (cudaEventRecord + cudaStreamWaitEvent), i.e.

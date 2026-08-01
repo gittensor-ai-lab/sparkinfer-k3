@@ -62,6 +62,11 @@ bool multimem_allreduce_supported(const std::vector<int>& devices) noexcept;
 // at startup) and that callers serialize concurrent all-reduces on the buffers.
 class MultimemAllreduce {
 public:
+    // No f32 path yet: multimem.ld_reduce does support .f32 on sm_90, but the
+    // vendored kernels are bf16-typed throughout. Kept false so the adapter
+    // refuses rather than quietly casting K3's f32 stream.
+    static constexpr bool kSupportsF32 = false;
+
     // Unusable instance if unsupported; check ok() before use. `count` = max
     // elements (e.g. hidden_size); buffers are sized for this.
     MultimemAllreduce(const std::vector<int>& devices, std::size_t count);

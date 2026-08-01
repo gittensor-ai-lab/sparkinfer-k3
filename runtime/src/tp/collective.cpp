@@ -235,8 +235,10 @@ private:
 template <class Impl>
 class OwnedBufferCollective final : public Collective {
 public:
-    OwnedBufferCollective(std::unique_ptr<Impl> impl, Backend b, int n, std::size_t max_count)
-        : impl_(std::move(impl)), backend_(b), n_(n), max_count_(max_count) {}
+    OwnedBufferCollective(std::unique_ptr<Impl> impl, Backend b,
+                          std::vector<int> devices, std::size_t max_count)
+        : impl_(std::move(impl)), backend_(b), devices_(std::move(devices)),
+          n_(static_cast<int>(devices_.size())), max_count_(max_count) {}
 
     Backend backend() const override { return backend_; }
     int size() const override { return n_; }
@@ -261,6 +263,44 @@ public:
     bool allreduce_bf16_group(const std::vector<void*>&, std::size_t count,
                               const std::vector<cudaStream_t>& streams) override {
         return allreduce_group(count, streams);
+    }
+
+    bool supports_f32() const override { return T::kSupportsF32; }
+
+    // Mode-A surface over mode-B buffers: stage the caller's f32 buffers through
+    // the collective-owned, peer-registered ones. Two D2D copies of ~14 KB per
+    // rank per collective (~2 us each at HBM rates), stream-ordered on the same
+    // stream as the reduce, no host sync. Against the ~50-200 us an LL-ring
+    // reduce costs at this payload, the staging is noise — the "copies would
+    // erase the reason" concern in the forward's old refusal priced them wrong.
+    bool allreduce_f32_group(const std::vector<void*>& bufs, std::size_t count,
+                             const std::vector<cudaStream_t>& streams) override {
+        if constexpr (T::kSupportsF32) {
+            if (static_cast<int>(bufs.size()) != n_ ||
+                static_cast<int>(streams.size()) != n_) return false;
+            if (count == 0) return true;
+            if (count > max_count_) return false;
+            const std::size_t bytes = count * sizeof(float);
+            for (int r = 0; r < n_; ++r) {
+                if (cudaSetDevice(r_dev(r)) != cudaSuccess) return false;
+                if (cudaMemcpyAsync(impl_->rank_buffer(r), bufs[(std::size_t)r], bytes,
+                                    cudaMemcpyDeviceToDevice, streams[(std::size_t)r])
+                    != cudaSuccess) return false;
+            }
+            std::vector<void*> raw(streams.size());
+            for (std::size_t i = 0; i < streams.size(); ++i) raw[i] = (void*)streams[i];
+            impl_->allreduce_f32(count, raw);
+            for (int r = 0; r < n_; ++r) {
+                if (cudaSetDevice(r_dev(r)) != cudaSuccess) return false;
+                if (cudaMemcpyAsync(bufs[(std::size_t)r], impl_->rank_result(r), bytes,
+                                    cudaMemcpyDeviceToDevice, streams[(std::size_t)r])
+                    != cudaSuccess) return false;
+            }
+            return true;
+        } else {
+            (void)bufs; (void)count; (void)streams;
+            return false;
+        }
     }
 
     bool allreduce_group(std::size_t count,
@@ -292,8 +332,11 @@ public:
     }
 
 private:
+    int r_dev(int rank) const { return devices_[static_cast<std::size_t>(rank)]; }
+
     std::unique_ptr<Impl> impl_;
     Backend backend_;
+    std::vector<int> devices_;
     int n_;
     std::size_t max_count_;
 };
@@ -343,7 +386,7 @@ std::unique_ptr<Collective> make_peer_oneshot_collective(const std::vector<int>&
         return nullptr;
     }
     return std::unique_ptr<Collective>(new OwnedBufferCollective<PeerOneShotAllreduce>(
-        std::move(impl), Backend::PeerOneShot, static_cast<int>(devices.size()), max_count));
+        std::move(impl), Backend::PeerOneShot, devices, max_count));
 #else
     (void)devices; (void)max_count;
     if (error) *error = "fast collectives not compiled in — configure with -DSPARKINFER_TP=ON";
@@ -370,7 +413,7 @@ std::unique_ptr<Collective> make_multimem_collective(const std::vector<int>& dev
         return nullptr;
     }
     return std::unique_ptr<Collective>(new OwnedBufferCollective<MultimemAllreduce>(
-        std::move(impl), Backend::Multimem, static_cast<int>(devices.size()), max_count));
+        std::move(impl), Backend::Multimem, devices, max_count));
 #else
     (void)devices; (void)max_count;
     if (error) *error = "fast collectives not compiled in — configure with -DSPARKINFER_TP=ON";
@@ -461,11 +504,12 @@ std::unique_ptr<Collective> make_collective(const std::vector<int>& devices,
     // than after construction: K3 spends ~20 minutes loading weights, and finding out
     // at the first collective that the chosen backend cannot reduce f32 wastes all of
     // it. NCCL reduces both, so the downgrade always has somewhere to land.
-    if (need_f32 && (requested == Backend::PeerOneShot || requested == Backend::Multimem)) {
+    // peer-oneshot now carries an f32 mirror of its bf16 path, so only multimem —
+    // whose vendored kernels are still bf16-typed — is downgraded for an f32 stream.
+    if (need_f32 && requested == Backend::Multimem) {
         std::fprintf(stderr,
-                     "[tp] %s reduces bf16 only; f32 was requested (Kimi K3 runs an f32 "
-                     "residual stream) — using nccl\n",
-                     backend_name(requested));
+                     "[tp] multimem reduces bf16 only; f32 was requested (Kimi K3 runs an f32 "
+                     "residual stream) — using nccl\n");
         requested = Backend::Nccl;
     }
 

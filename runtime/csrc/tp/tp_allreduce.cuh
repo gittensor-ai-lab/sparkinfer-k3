@@ -159,6 +159,24 @@ __device__ __forceinline__ array_t<__nv_bfloat16, N> downcast_bf16(array_t<float
 // Sum the same packed index across all N ranks in FP32. Note: peers are read in
 // a fixed order (NOT rank-rotated) so every rank accumulates in the same order
 // and produces bitwise-identical results — matching vLLM's one-shot.
+// f32 mirror of packed_reduce_bf16 below: a 128-bit pack is 4 floats and there is
+// no up/downcast. The accumulation ORDER is identical — rank 0's pack first, then
+// ranks 1..N-1 in index order — so the two dtypes differ in precision, never in the
+// reduction tree. (Deterministic across calls; NOT the same rounding as NCCL's ring,
+// which is why a backend switch moves logits in the last bits.)
+template <int N>
+__device__ __forceinline__ array_t<float, 4>
+packed_reduce_f32(const array_t<float, 4>* const ptrs[N], int idx) {
+    array_t<float, 4> acc = ptrs[0][idx];
+#pragma unroll
+    for (int r = 1; r < N; r++) {
+        const array_t<float, 4> v = ptrs[r][idx];
+#pragma unroll
+        for (int i = 0; i < 4; i++) acc.data[i] += v.data[i];
+    }
+    return acc;
+}
+
 template <int N>
 __device__ __forceinline__ array_t<__nv_bfloat16, 8>
 packed_reduce_bf16(const array_t<__nv_bfloat16, 8>* const ptrs[N], int idx) {

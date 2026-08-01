@@ -374,16 +374,11 @@ bool kimi_k3_tp_init(const GGUF& g, const KimiK3Config& cfg, const K3PlanOptions
                      tp::backend_name(out.coll->backend()));
         return false;
     }
-    if (out.coll->owns_buffers()) {
-        // Mode B needs the caller to stage through reduce_in/reduce_out. The forward
-        // reduces a buffer the executor owns, so that path would need a copy in and
-        // out per collective — not wired, and silently staging it would erase the
-        // reason to use those backends. need_f32 already steers away from them.
-        std::fprintf(stderr, "[k3-tp] FATAL: %s uses collective-owned buffers, which "
-                             "this forward does not stage through\n",
-                     tp::backend_name(out.coll->backend()));
-        return false;
-    }
+    // Owned-buffer backends are no longer refused: allreduce_f32_group on the
+    // adapter stages the caller's buffers through the collective-owned ones
+    // itself (two stream-ordered ~14 KB D2D copies per rank, ~2 us each), so
+    // from this forward's point of view the call is Mode A. supports_f32 above
+    // remains the gate that matters; a backend that passes it can be driven.
     return true;
 }
 
