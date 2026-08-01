@@ -55,9 +55,16 @@ jobs:
             const EXEMPT_ASSOC = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
 
             // All open PRs (author_association is included on each item).
-            const all = await github.paginate(github.rest.pulls.list, {
+            const allOpen = await github.paginate(github.rest.pulls.list, {
               owner, repo, state: 'open', per_page: 100,
             });
+            // Drafts are explicitly unfinished work. Counting one toward the cap means a
+            // contributor who opens a draft to park an idea has it auto-closed, and the
+            // cap exists to keep the marginal-gain measurement meaningful -- a draft is
+            // not being measured, so it cannot distort anything.
+            const all = allOpen.filter(p => !p.draft);
+            const skipped = allOpen.length - all.length;
+            if (skipped) core.info(`ignoring ${skipped} draft PR(s) — drafts do not count toward the cap`);
 
             // Which authors to enforce this run.
             const authors = isSweep

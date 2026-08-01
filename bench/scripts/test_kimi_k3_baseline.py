@@ -962,6 +962,53 @@ class CiWorkflowTest(unittest.TestCase):
             self.assertNotIn("::", line, f"annotation leaked into GITHUB_OUTPUT: {line}")
             self.assertIn("=", line)
 
+    def test_destructive_workflows_skip_drafts(self):
+        """A draft is work someone has explicitly marked unfinished. CI running on it is
+        useful; closing it, denylisting its author, or attaching a payout tier to it is not.
+        These three took destructive action on drafts: cap-open-prs auto-closed them,
+        copycat-guard could permanently denylist the author of one, and eval-label would
+        label one. The bot had a draft gate all along -- but the bot does not run, so it
+        protected nothing."""
+        import yaml as _y
+        wf = ROOT / ".github" / "workflows"
+        cap = (wf / "cap-open-prs.yml").read_text()
+        self.assertIn("!p.draft", cap, "cap-open-prs counts drafts toward the cap")
+        cop = _y.safe_load((wf / "copycat-guard.yml").read_text())
+        self.assertIn("draft != true", str(cop["jobs"]["guard"].get("if", "")),
+                      "copycat-guard can denylist the author of a draft")
+        self.assertIn("ready_for_review", str(cop.get(True) or cop.get("on")),
+                      "a PR opened as a draft would never be rescanned once ready")
+        self.assertIn("IS_DRAFT", (wf / "eval-label.yml").read_text(),
+                      "/eval would attach a payout tier to a draft")
+
+    def test_qwen_bot_refuses_to_run_against_k3(self):
+        """eval/pr_eval_bot.py is the inherited Qwen evaluator and contains zero K3 code. Its
+        greenlight matches the literal substring "5090", which the K3 template cannot
+        contain, and the unchecked-box gate then CLOSES the PR -- so pointing it at this repo
+        auto-closes every K3 pull request. A commented-out crontab line is not a safe place
+        to keep that. Asserted by running it, including the exit code, because main() was
+        called bare and swallowed its own return value."""
+        import subprocess as sp
+        for bot in ("eval/pr_eval_bot.py", "eval/pr_dflash_bot.py"):
+            path = ROOT / bot
+            if not path.exists():
+                continue
+            r = sp.run([sys.executable, str(path), "--repo", "gittensor-ai-lab/sparkinfer-k3",
+                        "--dry-run"], capture_output=True, text=True, cwd=str(ROOT))
+            self.assertEqual(r.returncode, 2, f"{bot} did not refuse a -k3 repo (exit "
+                                              f"{r.returncode}); output: {r.stdout[-300:]}")
+            self.assertIn("refusing to run", r.stderr)
+
+    def test_automerge_does_not_silently_bypass_protection(self):
+        """Enabling auto-merge must not also mean 'and bypass branch protection'. The admin
+        escalation defaulted to on, so a bot run under an admin token would have walked
+        through the required-review rule."""
+        for bot in ("eval/pr_eval_bot.py", "eval/pr_dflash_bot.py"):
+            path = ROOT / bot
+            if path.exists():
+                self.assertNotIn('SPARKINFER_AUTOMERGE_ADMIN", "1"', path.read_text(),
+                                 f"{bot} defaults to bypassing branch protection")
+
     def test_baseline_results_are_committable(self):
         """The `lock` job requires a committed bench/results JSON to back any pinned
         baseline. bench/.gitignore ignores results/ wholesale, so without an explicit
