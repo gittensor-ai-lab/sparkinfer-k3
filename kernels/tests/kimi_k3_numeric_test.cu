@@ -784,6 +784,18 @@ int main() {
     // the output buffer untouched — which, on the real forward, means the previous
     // layer's attention output survives into this one.
     test_mla_decode_attn(20000, 2);    std::printf("\n");
+    // Head count divisible by kMlaHeadsPerBlock and a context past kMlaSplitMinCtx:
+    // the only shape that reaches mla_decode_attn_hbatch_kernel, where one block owns
+    // 12 heads and the per-tile softmax is reduced over a warp instead of the block.
+    // The two cases above take the per-head kernels (H=2 does not divide), so without
+    // this one the batched path ships unexercised on a device.
+    test_mla_decode_attn(20000, 12);   std::printf("\n");
+    // Ragged final slice: 12,289 is one token past a multiple of the tile, so the last
+    // slice ends mid-tile and the online rescale has to fold a short tail.
+    test_mla_decode_attn(12289, 12);   std::printf("\n");
+    // 8 does not divide 12, so k3_mla_heads_per_block falls back to the 8-head
+    // instantiation — the branch a non-K3 head count would take.
+    test_mla_decode_attn(20000, 8);    std::printf("\n");
     test_moe_router_noaux_tc(); std::printf("\n");
 
     std::printf("%d cases, %d failure(s)\n", g_case, g_fail);
