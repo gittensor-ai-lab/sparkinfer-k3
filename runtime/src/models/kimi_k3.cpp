@@ -113,9 +113,7 @@ bool upload_sliced(const GGUF& g, const std::string& name, KimiK3Weights& w,
     // the rule is deliberate: attn_k_b/attn_v_b also carry Rule::ExpertShard (they
     // band the head axis), and banding those without teaching the MLA kernels their
     // per-rank head count would silently drop 7/8 of the attention heads.
-    if (w.policy == KimiK3Weights::ShardPolicy::ExpertsOnly ||
-        w.policy == KimiK3Weights::ShardPolicy::ExpertsAndKda ||
-        w.policy == KimiK3Weights::ShardPolicy::ExpertsAndMla) {
+    if (w.policy != KimiK3Weights::ShardPolicy::Full) {
         auto ends_with = [&](const char* suf) {
             const std::size_t n = std::strlen(suf);
             return name.size() >= n && name.compare(name.size() - n, n, suf) == 0;
@@ -137,7 +135,7 @@ bool upload_sliced(const GGUF& g, const std::string& name, KimiK3Weights& w,
         // this look like it works while each rank attended to an eighth of the
         // context.
         const bool mla_sharded =
-            w.policy == KimiK3Weights::ShardPolicy::ExpertsAndMla && !kda_layer &&
+            KimiK3Weights::shards_mla(w.policy) && !kda_layer &&
             (ends_with("attn_q_b.weight")  || ends_with("attn_k_b.weight") ||
              ends_with("attn_v_b.weight")  || ends_with("attn_gate.weight") ||
              ends_with("attn_q.weight")    || ends_with("attn_output.weight"));
@@ -154,7 +152,7 @@ bool upload_sliced(const GGUF& g, const std::string& name, KimiK3Weights& w,
         // fluent wrong answer. Same trap for attn_q.weight, which MLA reuses as its
         // dense-q fallback.
         const bool kda_sharded =
-            w.policy == KimiK3Weights::ShardPolicy::ExpertsAndKda && kda_layer &&
+            KimiK3Weights::shards_kda(w.policy) && kda_layer &&
             (ends_with("attn_q.weight")  || ends_with("attn_k.weight") ||
              ends_with("attn_v.weight")  || ends_with("ssm_g.weight")  ||
              ends_with("ssm_f_b.weight") || ends_with("attn_output.weight"));
@@ -422,7 +420,7 @@ bool kimi_k3_load_weights_scoped(const GGUF& g, const KimiK3Config& cfg,
     // it stays the tp=1 identity: full width, zero offsets.
     {
         tp::Config tcfg;
-        tcfg.tp_size = (out.policy == KimiK3Weights::ShardPolicy::ExpertsAndKda)
+        tcfg.tp_size = KimiK3Weights::shards_kda(out.policy)
                      ? (out.shard.tp_size > 0 ? out.shard.tp_size : 1) : 1;
         tp::KdaShape ks;
         ks.hidden = cfg.hidden;
@@ -443,7 +441,7 @@ bool kimi_k3_load_weights_scoped(const GGUF& g, const KimiK3Config& cfg,
     // the full 96 from the same field rather than from a different code path.
     {
         tp::Config tcfg;
-        tcfg.tp_size = (out.policy == KimiK3Weights::ShardPolicy::ExpertsAndMla)
+        tcfg.tp_size = KimiK3Weights::shards_mla(out.policy)
                      ? (out.shard.tp_size > 0 ? out.shard.tp_size : 1) : 1;
         tp::MlaShape ms;
         ms.hidden = cfg.hidden;

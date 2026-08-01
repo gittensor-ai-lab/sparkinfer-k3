@@ -172,8 +172,32 @@ struct KimiK3Weights {
     //
     // ExpertsAndKda therefore stays available and stays OFF; it is kept because
     // the arithmetic above is only obvious once both branches exist to compare.
-    enum class ShardPolicy { ExpertsOnly, ExpertsAndKda, ExpertsAndMla, Full };
+    //   ExpertsAndAttn Both attention bands. One all-reduce per layer, 93 of them
+    //                on top of the 92 MoE ones.
+    //
+    // WHY BOTH, AFTER THE ARITHMETIC SAID KDA ALONE LOSES MONEY. That estimate
+    // priced a collective at ~0.088% of GPU time, taken from a profile whose
+    // NCCL time was inflated by rank-arrival skew (35 ms max against a 71 us
+    // mean). With submission parallelised that skew is gone and a reduce is far
+    // cheaper than the estimate, so the 5.8% of KDA compute is worth its 69
+    // extra reduces after all. Measured head-to-head on this box: an all-93
+    // shard (PR #64) runs 63.6 ms against this tree's MLA-only 70.3.
+    //
+    // The narrower policies stay because they are the evidence: ExpertsAndMla is
+    // what isolates the MLA band's contribution, and ExpertsAndKda the KDA one.
+    enum class ShardPolicy { ExpertsOnly, ExpertsAndKda, ExpertsAndMla, ExpertsAndAttn, Full };
     ShardPolicy policy = ShardPolicy::ExpertsOnly;
+
+    // Which bands a policy shards. Every site that used to compare the enum
+    // directly asks through these instead — adding ExpertsAndAttn by hand at
+    // each `== ExpertsAndKda` would have been six chances to miss one, and a
+    // missed site shards weights the forward still indexes at full width.
+    static bool shards_kda(ShardPolicy p) {
+        return p == ShardPolicy::ExpertsAndKda || p == ShardPolicy::ExpertsAndAttn;
+    }
+    static bool shards_mla(ShardPolicy p) {
+        return p == ShardPolicy::ExpertsAndMla || p == ShardPolicy::ExpertsAndAttn;
+    }
 
     // WHICH SLICE OF EACH TENSOR THIS RANK HOLDS. Set BEFORE calling the loader;
     // the default (tp_size 1) makes every rule degenerate to Replicate, so the

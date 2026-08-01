@@ -215,30 +215,43 @@ bool kimi_k3_tp_init(const GGUF& g, const KimiK3Config& cfg, const K3PlanOptions
         }
         out.streams[(size_t)r] = R.stream;
 
-        // Which attention band to shard, and why it is MLA rather than KDA.
+        // Which attention bands to shard.
         //
-        // Measured on the shipped build (nsys, ctx 131072), as a share of GPU
-        // kernel time: MLA attention 36.9% over 24 layers, KDA 6.6% over 69.
-        // Both cost one all-reduce per layer at ~0.088% each, so:
+        // MLA first, because it is where the time is: profiled at ctx 131072,
+        // MLA attention is 36.9% of GPU kernel time over 24 layers against KDA's
+        // 6.6% over 69 — 16x more per layer.
         //
-        //     shard KDA:  +5.8% compute, -6.1% collectives  =  -0.3%  REGRESSION
-        //     shard MLA: +32.3% compute, -2.1% collectives  = +30.2%
+        // KDA WAS OFF HERE, ON AN ARITHMETIC THAT WAS WRONG. The estimate priced
+        // a collective at ~0.088% of GPU time and concluded:
         //
-        // Sharding the 69 KDA layers costs more in collectives than it saves in
-        // compute. SPARKINFER_K3_SHARD_KDA=1 keeps that branch reachable because
-        // the comparison is the evidence for this choice, but it stays OFF.
+        //     shard KDA: +5.8% compute, -6.1% collectives = -0.3%, a regression
+        //
+        // That per-collective figure came from a profile whose NCCL time was
+        // inflated by rank-arrival skew — 35 ms max against a 71 us mean — i.e.
+        // it priced the stall, not the reduce. With submission parallelised the
+        // stall is gone and a reduce costs a fraction of that, so the 5.8% is
+        // worth its 69 extra collectives.
+        //
+        // What settled it was measuring the competitor rather than arguing with
+        // them: PR #64 shards all 93 layers and runs 63.6 ms/token on this box,
+        // against 70.3 for the MLA-only build here. Sharding both bands is the
+        // better trade once the skew that made collectives look expensive is
+        // fixed — and this tree is the one that fixed it.
         static const bool shard_kda = [] {
             const char* e = std::getenv("SPARKINFER_K3_SHARD_KDA");
-            return e && e[0] == '1';
+            return !(e && e[0] == '0');          // ON unless explicitly disabled
         }();
         static const bool shard_mla = [] {
             const char* e = std::getenv("SPARKINFER_K3_SHARD_MLA");
             return !(e && e[0] == '0');          // ON unless explicitly disabled
         }();
+        const bool k = shard_kda && tp_size > 1;
+        const bool m = shard_mla && tp_size > 1;
         R.weights.policy =
-            (shard_kda && tp_size > 1) ? KimiK3Weights::ShardPolicy::ExpertsAndKda :
-            (shard_mla && tp_size > 1) ? KimiK3Weights::ShardPolicy::ExpertsAndMla :
-                                         KimiK3Weights::ShardPolicy::ExpertsOnly;
+            (k && m) ? KimiK3Weights::ShardPolicy::ExpertsAndAttn :
+            k        ? KimiK3Weights::ShardPolicy::ExpertsAndKda  :
+            m        ? KimiK3Weights::ShardPolicy::ExpertsAndMla  :
+                       KimiK3Weights::ShardPolicy::ExpertsOnly;
         R.weights.shard.tp_size = tp_size;
         R.weights.shard.rank = r;
         R.weights.shard.hidden = cfg.hidden;
@@ -453,9 +466,9 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
         // applied to a partial sum. Exactly one of these can be true, because the
         // two policies are mutually exclusive and a layer is either KDA or MLA.
         const bool kda_reduce = tp_size > 1 && cfg.is_kda_layer(layer) &&
-            p.ranks[0].weights.policy == KimiK3Weights::ShardPolicy::ExpertsAndKda;
+            KimiK3Weights::shards_kda(p.ranks[0].weights.policy);
         const bool mla_reduce = tp_size > 1 && !cfg.is_kda_layer(layer) &&
-            p.ranks[0].weights.policy == KimiK3Weights::ShardPolicy::ExpertsAndMla;
+            KimiK3Weights::shards_mla(p.ranks[0].weights.policy);
         const bool attn_reduce = kda_reduce || mla_reduce;
 
         const IClock::time_point t_p12 = ip.on ? IClock::now() : IClock::time_point{};
