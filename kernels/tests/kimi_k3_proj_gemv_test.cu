@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstring>
 #include <random>
+#include <utility>   // std::pair — the widened-path shape table
 #include <vector>
 
 using namespace sparkinfer::kernels::k3;
@@ -177,6 +178,88 @@ int main() {
                     N, K, N % 4, ok ? "yes" : "NO", rl2, worst_n);
         if (!ok || rl2 > 1e-5 || !(den > 0)) ++fail;
         cudaFree(dW); cudaFree(dx); cudaFree(dy);
+    }
+
+    // ---- Q8_0 x Q8_0 through the WIDENED (multirow) dp4a path ----
+    //
+    // k3_proj_ggml_f32 now picks ROWS 16/8/4 at N >= 4096 / 2048 / 1024. Every
+    // quantised-activation case above is N = 300 or 200, so all of them take the
+    // single-row fallback and the widened kernel — the one that actually runs for
+    // K3's real projections (attn_q/k/v/output are N = 12288) — had no coverage.
+    //
+    // Each N is deliberately NOT a multiple of its ROWS, so the last block runs
+    // partly out of range. The kernel guards every row with
+    // `if (n0 + r >= n_rows) continue;`, and an off-by-one there reads a row that
+    // does not exist but IS in bounds of the allocation — a plausible wrong number
+    // rather than a fault, which is exactly what a shape test is for.
+    for (const auto& shape : {std::pair<int,int>{4098, 1024},    // ROWS 16, N%16 = 2
+                              std::pair<int,int>{2050, 1024},    // ROWS  8, N%8  = 2
+                              std::pair<int,int>{1026, 1024}}) { // ROWS  4, N%4  = 2
+        const int N = shape.first, K = shape.second;
+        const int bpr = K / 32;
+        std::vector<BlockQ8_0> W((size_t)N * bpr);
+        for (auto& b : W) {
+            const uint16_t exp = (uint16_t)(9 + (rng() % 8));
+            b.d = (uint16_t)(((rng() & 1) << 15) | (exp << 10) | (rng() % 1024));
+            for (auto& q : b.qs) q = (int8_t)((int)(rng() % 256) - 128);
+        }
+        std::vector<float> x(K); for (auto& v : x) v = U(rng);
+
+        // Reference is the llama.cpp CPU contract: quantise x to block_q8_0 with an
+        // fp16 scale, then an exact integer dot. The kernel must reproduce THAT, not
+        // the f32 dot — the two differ by the activation quantisation itself.
+        std::vector<BlockQ8_0> Xq(bpr);
+        for (int b = 0; b < bpr; ++b) {
+            float amax = 0.0f;
+            for (int j = 0; j < 32; ++j) amax = std::fmax(amax, std::fabs(x[32*b+j]));
+            const float d = amax / 127.0f;
+            Xq[b].d = __half_as_ushort(__float2half_rn(d));
+            const float id = amax != 0.0f ? 127.0f / amax : 0.0f;
+            for (int j = 0; j < 32; ++j)
+                Xq[b].qs[j] = (int8_t)std::nearbyint(x[32*b+j] * id);
+        }
+        std::vector<double> qref(N, 0.0);
+        for (int n = 0; n < N; ++n) {
+            float sum = 0.0f;
+            for (int b = 0; b < bpr; ++b) {
+                int sumi = 0;
+                const auto& wb = W[(size_t)n * bpr + b];
+                for (int j = 0; j < 32; ++j) sumi += (int)wb.qs[j] * (int)Xq[b].qs[j];
+                sum += (float)sumi * (h2f(wb.d) * h2f(Xq[b].d));
+            }
+            qref[n] = sum;
+        }
+
+        void *dW, *dx, *dy, *dq;
+        CU(cudaMalloc(&dW, W.size() * sizeof(BlockQ8_0)));
+        CU(cudaMalloc(&dx, K * sizeof(float)));
+        CU(cudaMalloc(&dy, N * sizeof(float)));
+        CU(cudaMalloc(&dq, k3_q8_0_bytes(K)));
+        CU(cudaMemcpy(dW, W.data(), W.size() * sizeof(BlockQ8_0), cudaMemcpyHostToDevice));
+        CU(cudaMemcpy(dx, x.data(), K * sizeof(float), cudaMemcpyHostToDevice));
+        const bool ok = k3_proj_ggml_f32((float*)dy, (const float*)dx, dW, 8, N, K, dq, 0);
+        CU(cudaDeviceSynchronize());
+        CU(cudaGetLastError());
+        std::vector<float> got(N);
+        CU(cudaMemcpy(got.data(), dy, N * sizeof(float), cudaMemcpyDeviceToHost));
+
+        double num = 0, den = 0, worst = 0; int worst_n = -1;
+        for (int n = 0; n < N; ++n) {
+            const double d = got[n] - qref[n];
+            num += d*d; den += qref[n]*qref[n];
+            const double rel = std::fabs(d) / (std::fabs(qref[n]) + 1e-12);
+            if (rel > worst) { worst = rel; worst_n = n; }
+        }
+        const double rl2 = std::sqrt(num / (den + 1e-30));
+        const int rows = N >= 4096 ? 16 : (N >= 2048 ? 8 : 4);
+        std::printf("[Q8_0 x Q8_0] N=%d K=%d multirow ROWS=%d (N%%ROWS=%d) accepted=%s "
+                    "relL2=%.3e worst_row=%d\n",
+                    N, K, rows, N % rows, ok ? "yes" : "NO", rl2, worst_n);
+        // The integer dot is EXACT, so this path should be bit-identical to the
+        // reference, not merely close. 1e-6 leaves room for the f32 scale multiply
+        // and nothing else.
+        if (!ok || rl2 > 1e-6 || !(den > 0)) ++fail;
+        cudaFree(dq); cudaFree(dW); cudaFree(dx); cudaFree(dy);
     }
 
     // ---- F32 dense case ----
