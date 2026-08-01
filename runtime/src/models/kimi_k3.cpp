@@ -157,7 +157,20 @@ bool upload_sliced(const GGUF& g, const std::string& name, KimiK3Weights& w,
              ends_with("attn_v.weight")  || ends_with("ssm_g.weight")  ||
              ends_with("ssm_f_b.weight") || ends_with("attn_output.weight"));
 
-        if (!routed_expert_stack && !kda_sharded && !mla_sharded) {
+        // The shared expert is banded too (weight_plan.cpp: RowShard/RowShard/
+        // ColShard over the ffn width). It has to be listed HERE as well: this
+        // short-circuit is what decides whether the rule table is consulted at all,
+        // so a rule added there and not here is silently inert — the tensor loads
+        // full width, rank_ne reports the full width, and every rank computes a
+        // complete shared-expert output that the fused reduce then sums tp_size
+        // times. That is not hypothetical; it shipped once and was caught only by
+        // reading the loader rather than the plan.
+        const bool shared_expert_stack = ends_with("ffn_gate_shexp.weight") ||
+                                         ends_with("ffn_up_shexp.weight")   ||
+                                         ends_with("ffn_down_shexp.weight");
+
+        if (!routed_expert_stack && !shared_expert_stack &&
+            !kda_sharded && !mla_sharded) {
             void* d = nullptr;
             if (cudaMalloc(&d, (size_t)t->n_bytes) != cudaSuccess) {
                 std::fprintf(stderr, "[k3] cudaMalloc failed for %s (%ld bytes)\n",
@@ -1294,6 +1307,25 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
                 const int shexp_band = (int)L.ffn_gate_shexp.rank_ne[1];
                 if (shexp_band <= 0 || (int)L.ffn_down_shexp.rank_ne[0] != shexp_band)
                     return false;
+                // THE BAND MUST BE REAL, AND THIS IS WHERE THAT IS PROVEN.
+                //
+                // shexp_out is a view into the buffer the driver reduces, so a rank
+                // holding the FULL tensor here computes a complete shared-expert
+                // output and the collective sums tp_size copies of it — fluent output,
+                // silently wrong, invisible to any timing benchmark. That is exactly
+                // what happens if the loader's ExpertsOnly short-circuit
+                // (upload_sliced, this file) is not kept in step with weight_plan.cpp.
+                // Refuse instead: a load that cannot band is a bug, not a fallback.
+                const int tp_size = fwd.w->shard.tp_size;
+                if (tp_size > 1 && shexp_band * tp_size != cfg.moe_ffn * cfg.n_shared) {
+                    std::fprintf(stderr,
+                                 "[k3] layer %d: shared expert not banded — rank width "
+                                 "%d x tp_size %d != %d. The reduce would sum %d copies "
+                                 "of a complete shared-expert output.\n",
+                                 layer, shexp_band, tp_size,
+                                 cfg.moe_ffn * cfg.n_shared, tp_size);
+                    return false;
+                }
                 if (!proj(s.dense_gate, s.normed2, L.ffn_gate_shexp, shexp_band, H))
                     return false;
                 if (!proj(s.dense_up, s.normed2, L.ffn_up_shexp, shexp_band, H))
