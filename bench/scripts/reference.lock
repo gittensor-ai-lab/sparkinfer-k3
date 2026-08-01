@@ -130,7 +130,8 @@ KIMI_K3_LLAMACPP_BASE_COMMIT="${KIMI_K3_LLAMACPP_BASE_COMMIT:-cf67f0d24511864d2d
 # K3 frontier starts far behind, and every tier below is anchored to 18.32.
 KIMI_K3_H200X8_IQ1S_LLAMA_128="${KIMI_K3_H200X8_IQ1S_LLAMA_128:-18.3210}"
 # sparkinfer's own first verified entry on the same node/quant (tensor-parallel, tp=8).
-KIMI_K3_H200X8_IQ1S_SPARKINFER_128="${KIMI_K3_H200X8_IQ1S_SPARKINFER_128:-3.55}"
+# frontier: measured by eval/k3_eval_bot.py on main @ ddb3f04b8cad (h200x8, UD-IQ1_S). Do not hand-edit — the bot rewrites this each round.
+KIMI_K3_H200X8_IQ1S_SPARKINFER_128="${KIMI_K3_H200X8_IQ1S_SPARKINFER_128:-9.63}"
 
 KIMI_K3_H200X8_LLAMA_128="${KIMI_K3_H200X8_LLAMA_128:-0}"
 KIMI_K3_H200X8_LLAMA_512="${KIMI_K3_H200X8_LLAMA_512:-0}"
