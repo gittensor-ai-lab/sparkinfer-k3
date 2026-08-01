@@ -104,7 +104,12 @@ def evaluate(pr, repo, seal=False):
         f"git fetch -q origin {sha} || true",
         f"git checkout -q --detach {sha}",
         "export PATH=/usr/local/cuda/bin:$PATH",
-        "cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=90 >/dev/null",
+        # -DSPARKINFER_TP=ON is not optional here. Without it the runtime has no NCCL
+        # collective, and kimi_k3_tp_bench refuses to run sharded rather than silently
+        # producing a wrong number -- correct behaviour, but it means a build configured
+        # without this flag fails at eval time with no hint that configure was the cause.
+        "cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=90 "
+        "-DSPARKINFER_TP=ON >/dev/null",
         f"cmake --build build -j{BUILD_JOBS} --target kimi_k3_tp_bench >/dev/null",
     ])
     r = sh(f"{steps} && echo K3_BUILD_OK", timeout=5400)
@@ -114,14 +119,21 @@ def evaluate(pr, repo, seal=False):
     seal_flag = " --seal" if seal else ""
     evalcmd = (
         f"cd {BOX_REPO_DIR} && "
-        f"KIMI_K3_MODELS_DIR={BOX_MODELS_DIR} SPARKINFER_BUILD={BOX_REPO_DIR}/build "
+        # CMake emits executables under build/runtime/, not build/. The harness resolves
+        # $SPARKINFER_BUILD/kimi_k3_tp_bench, so pointing this at build/ makes it exit 2 with
+        # "not built" immediately after a build that in fact succeeded.
+        f"KIMI_K3_MODELS_DIR={BOX_MODELS_DIR} SPARKINFER_BUILD={BOX_REPO_DIR}/build/runtime "
         f"bash bench/scripts/kimi_k3_eval.sh --node {NODE} --devices {DEVICES}{seal_flag}"
     )
     r = sh(evalcmd, timeout=7200)
     out = (r.stdout or "") + "\n" + (r.stderr or "")
     line = next((l for l in out.splitlines() if l.strip().startswith("RESULT_JSON")), None)
     if not line:
-        raise RuntimeError(f"no RESULT_JSON from the harness for #{num}\n{out[-1500:]}")
+        detail = (r.stderr or "").strip().splitlines()
+        why = next((l for l in reversed(detail) if l.strip() and "setlocale" not in l), "")
+        raise RuntimeError(
+            f"no RESULT_JSON from the harness for #{num}"
+            + (f" — {why}" if why else "") + f"\n{out[-1200:]}")
     res = json.loads(line.split("RESULT_JSON", 1)[1].strip())
 
     # Bind the measurement to the commit we asked for. eval-label.yml refuses a payload
@@ -136,7 +148,19 @@ def evaluate(pr, repo, seal=False):
     return res
 
 
+# Fields eval-label.yml derives itself from reference.lock on the PROTECTED branch. The bot
+# must not post them. It runs the harness from the PR's own checkout, so these come out of
+# whatever reference.lock that branch happens to carry -- which for an older branch is the
+# pre-#24 lookup that resolves the frontier to 0 and labels everything BASELINE. Posting a
+# label computed that way makes eval-label hard-error "reported label != re-derived" on a
+# perfectly good run, and posting a frontier at all invites the exact substitution #35
+# closed. Strip them and let the trusted side compute the verdict.
+DERIVED_BY_CI = ("label", "speed_label", "frontier_tps", "note", "pct_over_frontier",
+                 "pct_of_llama", "delta_tps", "tier_basis", "pass")
+
+
 def post(repo, num, res, dry_run):
+    res = {k: v for k, v in res.items() if k not in DERIVED_BY_CI}
     body = (
         "/eval RESULT_JSON " + json.dumps(res, separators=(",", ":")) + "\n\n"
         "<sub>Measured on the pinned 8x H200 node by `eval/k3_eval_bot.py`. The tier is "
@@ -198,7 +222,7 @@ def main():
             print(f"#{num}: eval failed — {exc}", file=sys.stderr)
             continue
         print(f"#{num}: tps={res.get('tps')} top1={res.get('top1')} kl={res.get('kl')} "
-              f"label={res.get('label')}")
+              f"ms/token={res.get('ms_per_token')} — tier is eval-label.yml's to derive")
         post(args.repo, num, res, args.dry_run)
         evaluated += 1
 
