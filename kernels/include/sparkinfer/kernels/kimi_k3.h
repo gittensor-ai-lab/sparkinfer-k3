@@ -123,9 +123,14 @@ void kda_gate_out_f32(float* out, const float* o, const float* norm_w,
 // layers. The reference comments this explicitly; it is transcribed, not chosen.
 //
 // ckpts is [n_embd, n_ckpt] with n_embd fastest; cur and out are [n_embd].
+//
+// `scores` is optional scratch of at least (n_ckpt + 1) floats, owned by the caller
+// and live until the launches complete. Pass it on a hot path: the mix runs ~185
+// times per token, and without it each call makes a cudaMallocAsync/cudaFreeAsync
+// pair. Passing nullptr keeps that older behaviour and is correct, just not free.
 void attn_res_mix_f32(float* out, const float* ckpts, const float* cur,
                       const float* score_w, int n_embd, int n_ckpt,
-                      float eps, cudaStream_t stream);
+                      float eps, cudaStream_t stream, float* scores = nullptr);
 
 // ---------------------------------------------------------------------------
 // 6. KDA causal short conv, decode step
