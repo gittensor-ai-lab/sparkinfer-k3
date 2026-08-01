@@ -13,6 +13,8 @@ commits and only spin the GPU when there's new work.
 
 Needs: `gh` authenticated, VAST_API_KEY saved (vastai), and the eval:* labels (eval/setup_labels.sh).
 """
+import sys
+import re
 import argparse, datetime, hashlib, json, os, re, shutil, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -2242,7 +2244,7 @@ def try_auto_merge(repo, num):
     if not ok:
         print(f">> auto-merge SKIP #{num}: {reason}"); return False
     r = gh(["pr", "merge", str(num), "-R", repo, "--squash"])
-    if r.returncode != 0 and os.environ.get("SPARKINFER_AUTOMERGE_ADMIN", "1") == "1":
+    if r.returncode != 0 and os.environ.get("SPARKINFER_AUTOMERGE_ADMIN", "0") == "1":
         err = ((r.stderr or "") + (r.stdout or "")).lower()
         if "not mergeable" in err or "branch policy" in err or "required" in err or "prohibited" in err:
             print(">> auto-merge: branch policy blocked squash — retrying with --admin")
@@ -2347,6 +2349,21 @@ def main():
     ap.add_argument("--reeval", action="store_true",
                     help="re-run eval even if this commit was already graded (use with --only-pr)")
     args = ap.parse_args()
+
+    # This bot is the inherited sparkinfer (Qwen3-MoE) evaluator. It contains no K3 code at
+    # all -- it runs bench/scripts/evaluate.sh against Qwen GGUFs, rejects IQ1_S as a quant,
+    # and greenlights on the literal substring "5090", which the K3 PR template cannot
+    # contain. Gate 3 then CLOSES any PR whose box is unchecked, so pointing it at a K3 repo
+    # would auto-close every K3 pull request with a comment telling the author to tick
+    # "Tested on RTX 5090". That is not a degraded result, it is a destructive one, and a
+    # commented-out crontab line is not a safe place to keep it. Refuse explicitly.
+    if re.search(r"-k3(/|$)", (args.repo or "")):
+        sys.stderr.write(
+            f"pr_eval_bot: refusing to run against {args.repo!r}.\n"
+            "This is the Qwen3-MoE evaluator; it has no Kimi K3 support and its unchecked-box\n"
+            "gate would auto-close every K3 PR. K3 scoring runs through\n"
+            ".github/workflows/eval-label.yml + bench/scripts/kimi_k3_eval.sh instead.\n")
+        return 2
     if args.triple or args.dual:
         args.bidir = True
     if os.environ.get("BIDIR", "1") != "0" and not any(
@@ -2902,4 +2919,6 @@ def main():
     print("done — no merges (manual).")
 
 if __name__ == "__main__":
-    main()
+    # propagate main()'s return code: the K3 refusal returns 2, and a wrapper that
+    # checks $? must see it rather than a bare-call exit 0.
+    sys.exit(main() or 0)

@@ -53,7 +53,15 @@ jobs:
         if: github.event_name == 'issue_comment'
         env:
           ASSOC: ${{ github.event.comment.author_association }}
+          IS_DRAFT: ${{ github.event.issue.draft }}
         run: |
+          # A tier is a payout. Labelling a draft contradicts the rule everywhere else that
+          # unfinished work is not evaluated, and it would let a verdict attach to a branch
+          # that can still change freely afterwards.
+          if [ "$IS_DRAFT" = "true" ]; then
+            echo "::error::this PR is a draft — mark it ready for review before running /eval"
+            exit 1
+          fi
           case "$ASSOC" in
             OWNER|MEMBER|COLLABORATOR) echo "authorized ($ASSOC)" ;;
             *) echo "::error::/eval from $ASSOC is not authorized — the tier decides payout, "\

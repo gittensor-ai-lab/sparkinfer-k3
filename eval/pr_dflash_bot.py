@@ -381,7 +381,7 @@ def try_auto_merge_dflash(repo, num):
         print(f">> dflash auto-merge SKIP #{num}: {reason}")
         return False
     r = arb.gh(["pr", "merge", str(num), "-R", repo, "--squash"])
-    if r.returncode != 0 and os.environ.get("SPARKINFER_AUTOMERGE_ADMIN", "1") == "1":
+    if r.returncode != 0 and os.environ.get("SPARKINFER_AUTOMERGE_ADMIN", "0") == "1":
         err = ((r.stderr or "") + (r.stdout or "")).lower()
         if "not mergeable" in err or "branch policy" in err or "required" in err or "prohibited" in err:
             print(">> dflash auto-merge: branch policy blocked — retrying with --admin")
@@ -489,6 +489,21 @@ def main():
                     help="with --only-prs, evaluate even if paths do not match dflash filter")
     args = ap.parse_args()
 
+    # This bot is the inherited sparkinfer (Qwen3-MoE) evaluator. It contains no K3 code at
+    # all -- it runs bench/scripts/evaluate.sh against Qwen GGUFs, rejects IQ1_S as a quant,
+    # and greenlights on the literal substring "5090", which the K3 PR template cannot
+    # contain. Gate 3 then CLOSES any PR whose box is unchecked, so pointing it at a K3 repo
+    # would auto-close every K3 pull request with a comment telling the author to tick
+    # "Tested on RTX 5090". That is not a degraded result, it is a destructive one, and a
+    # commented-out crontab line is not a safe place to keep it. Refuse explicitly.
+    if re.search(r"-k3(/|$)", (args.repo or "")):
+        sys.stderr.write(
+            f"pr_eval_bot: refusing to run against {args.repo!r}.\n"
+            "This is the Qwen3-MoE evaluator; it has no Kimi K3 support and its unchecked-box\n"
+            "gate would auto-close every K3 PR. K3 scoring runs through\n"
+            ".github/workflows/eval-label.yml + bench/scripts/kimi_k3_eval.sh instead.\n")
+        return 2
+
     only = {int(x) for x in args.only_prs.split(",") if x.strip().isdigit()}
 
     print(f">> dflash eval transport: "
@@ -589,4 +604,6 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # propagate main()'s return code: the K3 refusal returns 2, and a wrapper that
+    # checks $? must see it rather than a bare-call exit 0.
+    sys.exit(main() or 0)

@@ -19,7 +19,8 @@ name: copycat-guard
 
 on:
   pull_request_target:
-    types: [opened]
+    # ready_for_review so a PR opened as a draft is still scanned once it is real.
+    types: [opened, ready_for_review]
 
 permissions:
   contents: write          # push policy files
@@ -30,8 +31,15 @@ jobs:
   guard:
     name: copycat-guard
     runs-on: ubuntu-latest
-    # Skip maintainer PRs
-    if: github.event.pull_request.author_association != 'OWNER' && github.event.pull_request.author_association != 'MEMBER' && github.event.pull_request.author_association != 'COLLABORATOR'
+    # Skip maintainer PRs, and skip drafts. A draft is unfinished work, and the >=90% tier
+    # of this guard adds the author to the denylist permanently -- taking that action on a
+    # branch someone has explicitly marked not-ready is the one mistake here that cannot be
+    # walked back. It is re-checked when the PR is marked ready_for_review.
+    if: >-
+      github.event.pull_request.draft != true &&
+      github.event.pull_request.author_association != 'OWNER' &&
+      github.event.pull_request.author_association != 'MEMBER' &&
+      github.event.pull_request.author_association != 'COLLABORATOR'
     steps:
       - name: Check for the LLM key
         id: key
