@@ -1193,6 +1193,18 @@ class CiWorkflowTest(unittest.TestCase):
                          "gh pr edit --add-label exits 1 on the projectCards deprecation")
         self.assertIn("issues/{num}/labels", src, "labels must go through the REST endpoint")
 
+    def test_receipt_is_located_by_id_not_by_mtime(self):
+        """Receipt filenames are timestamp-based and carry no receipt id, so a glob on the
+        id never matches. Any fallback to "newest file" publishes whichever run finished
+        last -- with two PRs evaluated back to back that is a coin flip on the second, and
+        it would attach one PR's signed receipt to the other PR's numbers."""
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        code = [l for l in src.split("\n") if not l.strip().startswith("#")]
+        self.assertFalse([l for l in code if "ls -t" in l and "receipt" in l],
+                         "receipt selected by modification time")
+        self.assertTrue([l for l in code if "grep -l" in l and "rid" in l],
+                        "receipt must be matched by the id inside the file")
+
     def test_baseline_results_are_committable(self):
         """The `lock` job requires a committed bench/results JSON to back any pinned
         baseline. bench/.gitignore ignores results/ wholesale, so without an explicit
