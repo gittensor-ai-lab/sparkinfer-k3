@@ -2903,15 +2903,33 @@ bool k3_proj_f32_x4(float* y0, float* y1, float* y2, float* y3, const float* x,
 }
 
 bool k3_proj_ggml_f32(float* y, const float* x, const void* W, int wtype,
-                      int N, int K, void* q8_scratch, cudaStream_t stream) {
+                      int N, int K, void* q8_scratch, cudaStream_t stream,
+                      bool reuse_quantized) {
     if (N <= 0 || K <= 0) return false;
     if (wtype == 0)
         return k3_proj_f32(y, x, W, wtype, N, K, stream);
     if (wtype != 8 || !q8_scratch || K % 32 != 0) return false;
     const int nb = K / 32;
     constexpr int QT = 128;
-    quantize_q8_0_kernel<<<(nb + QT - 1) / QT, QT, 0, stream>>>(
-        (BlockQ8_0*)q8_scratch, x, nb);
+    // REUSE THE QUANTISED ACTIVATION when the caller knows x is unchanged since
+    // the last call that quantised it into this same scratch.
+    //
+    // K3 fans one activation out to several projections -- s.normed feeds
+    // attn_q/attn_k/attn_v/ssm_g on every KDA layer, and q_a/kv_a/gate on every
+    // MLA one -- and quantising it once per CONSUMER made quantize_q8_0 the
+    // 59,696-launch, 7.3%-of-GPU-time item in the profile. Each launch moves
+    // ~36 KB and takes ~4.9 us, i.e. ~7 GB/s on a 4.8 TB/s part: it is not doing
+    // work, it is paying launch overhead.
+    //
+    // The flag is opt-in per call rather than a pointer-keyed cache on purpose.
+    // A cache keyed on (x, K) would be WRONG here: s.normed is the same address
+    // every layer and holds different values each time, so the hit would be
+    // silent and the model would stay fluent. The caller asserting "I have not
+    // written x since" is checkable by reading one block of the forward; a cache
+    // that guesses is not.
+    if (!reuse_quantized)
+        quantize_q8_0_kernel<<<(nb + QT - 1) / QT, QT, 0, stream>>>(
+            (BlockQ8_0*)q8_scratch, x, nb);
     // Same idle-thread sizing as the f32-activation path above.
     constexpr int BLOCK = 128;
     const int TB = proj_block_for(nb);

@@ -945,11 +945,55 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
     const bool ggml_qact_proj = qact_proj();
     const bool ggml_qact_moe = qact_moe();
 
+    // What s.proj_q8 currently holds. Host-side, so it costs nothing, and it is
+    // what makes the reuse below CHECKED rather than reasoned: a stale reuse
+    // produces fluent wrong tokens, which is the one failure this file keeps
+    // saying it will not accept on the strength of an argument.
+    const float* q8_holds_x = nullptr;
+    int          q8_holds_K = 0;
+
     auto proj = [&](float* y, const float* x, const KimiK3Tensor& W, int N, int K) {
         if (!W.ok()) return false;
-        if (ggml_qact_proj)
+        if (ggml_qact_proj) {
+            q8_holds_x = x;
+            q8_holds_K = K;
             return k3k::k3_proj_ggml_f32(y, x, W.data, W.type, N, K,
                                          s.proj_q8, stream);
+        }
+        return k3k::k3_proj_f32(y, x, W.data, W.type, N, K, stream);
+    };
+
+    // Same projection, but for the SECOND and later consumers of one activation.
+    //
+    // K3 fans s.normed out to four projections on every KDA layer and three on
+    // every MLA one. `proj` quantises its input on each call, so the identical
+    // vector was being re-quantised once per consumer -- that is what made
+    // quantize_q8_0 59,696 launches and 7.3% of GPU time, at ~7 GB/s apiece.
+    //
+    // CALL THIS ONLY WHERE x IS PROVABLY UNCHANGED SINCE THE MATCHING proj().
+    // Every use below is guarded by that: s.normed is written once by attn_norm
+    // and, as the comment on the fused path already states, "is not touched again
+    // anywhere in this block". K must match too, since the scratch holds K/32
+    // blocks -- a shorter reuse would read stale tail blocks rather than fail.
+    auto proj_again = [&](float* y, const float* x, const KimiK3Tensor& W, int N, int K) {
+        if (!W.ok()) return false;
+        if (ggml_qact_proj) {
+            // FAIL rather than compute against someone else's activation. The
+            // scratch is clobbered mid-layer (ssm_f_b consumes s.f_a_out at a
+            // different K), so "nothing wrote x in between" is a claim about the
+            // intervening code, and claims about intervening code rot when the
+            // code moves. This turns that rot into a hard error instead of a
+            // plausible-looking distribution shift.
+            if (x != q8_holds_x || K != q8_holds_K) {
+                std::fprintf(stderr,
+                    "[k3] proj_again: scratch holds a different activation "
+                    "(have x=%p K=%d, want x=%p K=%d) — refusing to reuse\n",
+                    (const void*)q8_holds_x, q8_holds_K, (const void*)x, K);
+                return false;
+            }
+            return k3k::k3_proj_ggml_f32(y, x, W.data, W.type, N, K,
+                                         s.proj_q8, stream, /*reuse_quantized=*/true);
+        }
         return k3k::k3_proj_f32(y, x, W.data, W.type, N, K, stream);
     };
 
@@ -1018,9 +1062,13 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
                                     L.attn_q.data, L.attn_k.data, L.attn_v.data,
                                     L.ssm_g.data, L.attn_q.type, qkv, H, stream);
             if (!fused_qkvg) {
+                // One quantisation of s.normed, three consumers. The fused x4 path
+                // above is the f32-activation route and is disabled under qact, so
+                // this IS the qact path for all 69 KDA layers — it was re-quantising
+                // the same vector three times here and a fourth for ssm_g below.
                 if (!proj(s.qkv_q, s.normed, L.attn_q, qkv, H)) return false;
-                if (!proj(s.qkv_k, s.normed, L.attn_k, qkv, H)) return false;
-                if (!proj(s.qkv_v, s.normed, L.attn_v, qkv, H)) return false;
+                if (!proj_again(s.qkv_k, s.normed, L.attn_k, qkv, H)) return false;
+                if (!proj_again(s.qkv_v, s.normed, L.attn_v, qkv, H)) return false;
             }
 
             if (!L.ssm_conv1d_q.ok() || !L.ssm_conv1d_k.ok() || !L.ssm_conv1d_v.ok())
@@ -1044,7 +1092,9 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             k3k::l2_norm_heads_f32(s.conv_k, s.conv_k, head_dim, n_head, 1.0f, eps, stream);
             if (fwd.debug) fwd.debug("dbg_l2_q", layer, s.conv_q, qkv);
 
-            if (!proj(s.f_a_out, s.normed, L.ssm_f_a, head_dim, H)) return false;
+            // s.normed again, still quantised in the scratch from attn_q above:
+            // only conv/l2 kernels ran in between and none touch s.proj_q8.
+            if (!proj_again(s.f_a_out, s.normed, L.ssm_f_a, head_dim, H)) return false;
             if (!proj(s.g_raw, s.f_a_out, L.ssm_f_b, qkv, head_dim)) return false;
             if (!L.ssm_dt_bias.ok()) return false;
             k3k::k3_add_f32(s.g_raw, s.g_raw, w_dt, qkv, stream);
@@ -1074,7 +1124,9 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             if (fwd.debug) fwd.debug("dbg_delta_out", layer, s.delta_out, qkv);
 
             // Already computed above when the q/k/v/g fusion took the fast path.
-            if (!fused_qkvg && !proj(s.g_proj_out, s.normed, L.ssm_g, qkv, H)) return false;
+            // ssm_beta above re-quantised s.normed (ssm_f_b had clobbered the
+            // scratch with s.f_a_out at a different K), so this reuses that.
+            if (!fused_qkvg && !proj_again(s.g_proj_out, s.normed, L.ssm_g, qkv, H)) return false;
             if (!L.ssm_norm.ok()) return false;
             k3k::kda_gate_out_f32(s.gate_out, s.delta_out, (const float*)L.ssm_norm.data,
                                   s.g_proj_out, head_dim, n_head, eps, stream);
