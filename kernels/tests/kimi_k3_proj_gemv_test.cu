@@ -262,6 +262,87 @@ int main() {
         cudaFree(dq); cudaFree(dW); cudaFree(dx); cudaFree(dy);
     }
 
+    // ---- Q8 activation x FOUR Q8_0 weights, fused ----
+    //
+    // Pins k3_proj_ggml_f32_x4 against the per-projection path it replaces. The
+    // fused kernel must agree EXACTLY: it stages the same quantised activation
+    // and accumulates each row over b in the same order, so the only difference
+    // is how many tensors share the staging. Anything but bit-agreement means
+    // the fusion changed the arithmetic, not just the launch count.
+    //
+    // This case exists because the previous attempt at removing the redundant
+    // quantisation shipped with no kernel-level test, passed a ctest that never
+    // touched it, and broke the model end to end (top1 0.0).
+    {
+        const int N = 4096, K = 7168;          // K3's KDA qkv shape, one rank's band
+        const int bpr = K / 32;
+        std::vector<BlockQ8_0> W0((size_t)N * bpr), W1((size_t)N * bpr),
+                               W2((size_t)N * bpr), W3((size_t)N * bpr);
+        std::vector<float> x(K);
+        auto fillW = [&](std::vector<BlockQ8_0>& W) {
+            for (auto& b : W) {
+                b.d = __half_as_ushort(__float2half_rn(0.002f + 0.004f * U(rng)));
+                for (int j = 0; j < 32; ++j) b.qs[j] = (int8_t)(int)(127.0f * U(rng));
+            }
+        };
+        fillW(W0); fillW(W1); fillW(W2); fillW(W3);
+        for (auto& v : x) v = U(rng);
+
+        void *dW0, *dW1, *dW2, *dW3, *dx, *dq;
+        void *dy[4], *dref[4];
+        CU(cudaMalloc(&dW0, W0.size()*sizeof(BlockQ8_0)));
+        CU(cudaMalloc(&dW1, W1.size()*sizeof(BlockQ8_0)));
+        CU(cudaMalloc(&dW2, W2.size()*sizeof(BlockQ8_0)));
+        CU(cudaMalloc(&dW3, W3.size()*sizeof(BlockQ8_0)));
+        CU(cudaMalloc(&dx, K*sizeof(float)));
+        CU(cudaMalloc(&dq, k3_q8_0_bytes(K)));
+        for (int t = 0; t < 4; ++t) {
+            CU(cudaMalloc(&dy[t],   N*sizeof(float)));
+            CU(cudaMalloc(&dref[t], N*sizeof(float)));
+        }
+        CU(cudaMemcpy(dW0, W0.data(), W0.size()*sizeof(BlockQ8_0), cudaMemcpyHostToDevice));
+        CU(cudaMemcpy(dW1, W1.data(), W1.size()*sizeof(BlockQ8_0), cudaMemcpyHostToDevice));
+        CU(cudaMemcpy(dW2, W2.data(), W2.size()*sizeof(BlockQ8_0), cudaMemcpyHostToDevice));
+        CU(cudaMemcpy(dW3, W3.data(), W3.size()*sizeof(BlockQ8_0), cudaMemcpyHostToDevice));
+        CU(cudaMemcpy(dx, x.data(), K*sizeof(float), cudaMemcpyHostToDevice));
+
+        // Reference: the four separate calls this fusion replaces.
+        const void* Wp[4] = {dW0, dW1, dW2, dW3};
+        bool refok = true;
+        for (int t = 0; t < 4; ++t)
+            refok &= k3_proj_ggml_f32((float*)dref[t], (const float*)dx, Wp[t], 8, N, K, dq, 0);
+        CU(cudaDeviceSynchronize());
+
+        const bool ok = k3_proj_ggml_f32_x4((float*)dy[0], (float*)dy[1], (float*)dy[2],
+                                            (float*)dy[3], (const float*)dx,
+                                            dW0, dW1, dW2, dW3, 8, N, K, dq, 0);
+        CU(cudaDeviceSynchronize());
+        CU(cudaGetLastError());
+
+        double worst = 0; int worst_t = -1; bool anynz = false;
+        for (int t = 0; t < 4; ++t) {
+            std::vector<float> a(N), b(N);
+            CU(cudaMemcpy(a.data(), dy[t],   N*sizeof(float), cudaMemcpyDeviceToHost));
+            CU(cudaMemcpy(b.data(), dref[t], N*sizeof(float), cudaMemcpyDeviceToHost));
+            double num = 0, den = 0;
+            for (int n = 0; n < N; ++n) {
+                const double d = a[n] - b[n];
+                num += d*d; den += (double)b[n]*b[n];
+            }
+            if (den > 0) anynz = true;
+            const double rl2 = std::sqrt(num / (den + 1e-30));
+            if (rl2 > worst) { worst = rl2; worst_t = t; }
+        }
+        std::printf("[Q8_0 x Q8_0 fused4] N=%d K=%d accepted=%s (ref=%s) "
+                    "worst relL2 vs 4 separate calls=%.3e (tensor %d)\n",
+                    N, K, ok ? "yes" : "NO", refok ? "yes" : "NO", worst, worst_t);
+        // Bit-identical, not merely close: same staging, same order, same scales.
+        if (!ok || !refok || !anynz || worst != 0.0) ++fail;
+        cudaFree(dW0); cudaFree(dW1); cudaFree(dW2); cudaFree(dW3);
+        cudaFree(dx); cudaFree(dq);
+        for (int t = 0; t < 4; ++t) { cudaFree(dy[t]); cudaFree(dref[t]); }
+    }
+
     // ---- F32 dense case ----
     {
         const int N = 200, K = 384;

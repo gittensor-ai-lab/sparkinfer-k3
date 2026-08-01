@@ -2145,6 +2145,86 @@ __global__ void proj_q8_0_q8_0_multirow_kernel(float* __restrict__ y,
 }
 
 
+// Q8 ACTIVATION x FOUR Q8_0 WEIGHT MATRICES, one launch.
+//
+// attn_q / attn_k / attn_v / ssm_g all read the SAME s.normed at the same
+// [qkv, H] shape on every one of the 69 KDA layers. The f32-activation path has
+// had proj_q8_0_fused4_kernel for exactly this; the Q8-activation path did not,
+// so turning on quantised activations silently dropped those layers to four
+// separate projections -- and k3_proj_ggml_f32 quantises its input per call, so
+// the identical vector was quantised four times per layer per rank.
+//
+// That is what made quantize_q8_0 59,696 launches and 8.7% of GPU time at
+// ~4.9 us for ~36 KB apiece -- roughly 7 GB/s on a 4.8 TB/s part. It was not
+// doing work; it was paying launch overhead.
+//
+// The obvious fix -- quantise once and let the other three reuse the scratch --
+// was tried and REVERTED: it needed the caller to promise the activation had not
+// changed, the guard I wrote checked the wrong thing (which pointer the scratch
+// was last written from, not whether the bytes behind it still matched), and the
+// model emitted top1 0.0 while getting faster. This shape needs no promise. One
+// kernel stages one activation block and consumes it four times before it can go
+// anywhere, so there is no window in which it can go stale.
+template <int BLOCK, int ROWS>
+__global__ void proj_q8_0_q8_0_fused4_kernel(float* __restrict__ y0,
+                                             float* __restrict__ y1,
+                                             float* __restrict__ y2,
+                                             float* __restrict__ y3,
+                                             const BlockQ8_0* __restrict__ x,
+                                             const BlockQ8_0* __restrict__ W0,
+                                             const BlockQ8_0* __restrict__ W1,
+                                             const BlockQ8_0* __restrict__ W2,
+                                             const BlockQ8_0* __restrict__ W3,
+                                             int blocks_per_row, int n_rows) {
+    const int n0 = blockIdx.x * ROWS;
+    __shared__ float shm[BLOCK / 32 + 1];
+
+    const BlockQ8_0* const Wt[4] = {W0, W1, W2, W3};
+    float* const Yt[4] = {y0, y1, y2, y3};
+
+    float acc[4][ROWS];
+#pragma unroll
+    for (int t = 0; t < 4; ++t)
+#pragma unroll
+        for (int r = 0; r < ROWS; ++r) acc[t][r] = 0.0f;
+
+    for (int b = threadIdx.x; b < blocks_per_row; b += BLOCK) {
+        // ONE staged activation block, consumed by 4 tensors x ROWS rows. The
+        // separate-launch path re-read (and re-quantised) this per tensor.
+        int xq[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) xq[i] = get_int_b2(x[b].qs, i);
+        const float dx = __half2float(__ushort_as_half(x[b].d));
+
+#pragma unroll
+        for (int t = 0; t < 4; ++t) {
+#pragma unroll
+            for (int r = 0; r < ROWS; ++r) {
+                if (n0 + r >= n_rows) continue;
+                const BlockQ8_0* row = Wt[t] + (size_t)(n0 + r) * blocks_per_row;
+                int sumi = 0;
+#pragma unroll
+                for (int i = 0; i < 8; ++i)
+                    sumi = __dp4a(get_int_b2(row[b].qs, i), xq[i], sumi);
+                const float dw = __half2float(__ushort_as_half(row[b].d));
+                acc[t][r] += (float)sumi * (dw * dx);
+            }
+        }
+    }
+
+    // block_sum contains __syncthreads(), so every thread must reach every call;
+    // only the store is guarded. Same contract as the multirow kernel.
+#pragma unroll
+    for (int t = 0; t < 4; ++t) {
+#pragma unroll
+        for (int r = 0; r < ROWS; ++r) {
+            const float v = block_sum<BLOCK>(acc[t][r], shm);
+            if (threadIdx.x == 0 && n0 + r < n_rows) Yt[t][n0 + r] = v;
+        }
+    }
+}
+
+
 // product. Shares the same block layouts.
 __global__ void dequant_q8_0_kernel(float* __restrict__ out,
                                     const BlockQ8_0* __restrict__ blocks,
@@ -2863,6 +2943,44 @@ bool k3_proj_f32(float* y, const float* x, const void* W, int wtype,
         default:
             return false;
     }
+}
+
+bool k3_proj_ggml_f32_x4(float* y0, float* y1, float* y2, float* y3, const float* x,
+                         const void* W0, const void* W1, const void* W2, const void* W3,
+                         int wtype, int N, int K, void* q8_scratch,
+                         cudaStream_t stream) {
+    // Same narrow contract as the f32-activation x4 below: Q8_0 weights, four
+    // identical shapes, false means "use the slow path" rather than an error.
+    if (N <= 0 || K <= 0 || wtype != 8 || K % 32 != 0) return false;
+    if (!y0 || !y1 || !y2 || !y3 || !W0 || !W1 || !W2 || !W3 || !q8_scratch) return false;
+
+    constexpr int ROWS = 4;
+    if (N < ROWS) return false;
+    const int nb = K / 32;
+
+    // ONE quantisation for all four projections. This is the whole point: the
+    // per-call path quantised the identical activation four times per layer per
+    // rank, which is 8.7% of GPU time in 59,696 launches. The quantise and the
+    // consumer go out back-to-back on one stream, so no caller has to promise
+    // anything about the activation's lifetime -- the reuse cannot outlive the
+    // launch that produced it.
+    constexpr int QT = 128;
+    quantize_q8_0_kernel<<<(nb + QT - 1) / QT, QT, 0, stream>>>(
+        (BlockQ8_0*)q8_scratch, x, nb);
+
+    const unsigned grid = (unsigned)((N + ROWS - 1) / ROWS);
+    const BlockQ8_0* xq = (const BlockQ8_0*)q8_scratch;
+#define K3_QQ4_LAUNCH(BS)                                                        \
+    proj_q8_0_q8_0_fused4_kernel<BS, ROWS><<<grid, BS, 0, stream>>>(             \
+        y0, y1, y2, y3, xq, (const BlockQ8_0*)W0, (const BlockQ8_0*)W1,          \
+        (const BlockQ8_0*)W2, (const BlockQ8_0*)W3, nb, N)
+    switch (proj_block_for(nb)) {
+        case 32:  K3_QQ4_LAUNCH(32);  break;
+        case 64:  K3_QQ4_LAUNCH(64);  break;
+        default:  K3_QQ4_LAUNCH(128); break;
+    }
+#undef K3_QQ4_LAUNCH
+    return true;
 }
 
 bool k3_proj_f32_x4(float* y0, float* y1, float* y2, float* y3, const float* x,
