@@ -31,8 +31,8 @@ KNOWN_NODES = {"h200x8", "b200x8", "b300x4"}
 
 # reference.lock suffix -> the context key kimi_k3_baseline.sh writes into the JSON.
 CTX_OF_SUFFIX = {
-    "128": 128, "512": 512, "4K": 4096, "32K": 32768, "1M": 1048576,
-    "4K_PP": 4096, "32K_PP": 32768, "1M_PP": 1048576,
+    "128": 128, "512": 512, "4K": 4096, "32K": 32768, "128K": 131072, "1M": 1048576,
+    "4K_PP": 4096, "32K_PP": 32768, "128K_PP": 131072, "1M_PP": 1048576,
 }
 FLOAT_TOL = 0.01     # the lock stores 2dp of what the sweep measured
 

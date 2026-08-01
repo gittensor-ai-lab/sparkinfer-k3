@@ -1,0 +1,27 @@
+{
+  "node_profile": "h200x8",
+  "quant": "UD-IQ1_S",
+  "engine": "llama.cpp (unsloth fork)",
+  "llamacpp_commit": "efc8bc38f0a9950cbb10ccef2cf48b951c39d3b2",
+  "llamacpp_ref": "refs/pull/48/head",
+  "gpu": "8x NVIDIA H200",
+  "cpu": "INTEL(R) XEON(R) PLATINUM 8562Y+",
+  "model_size_bytes": 593990834560,
+  "measured_utc": "2026-08-01T10:38:18Z",
+  "command": "llama-bench -m Kimi-K3-UD-IQ1_S-00001-of-00014.gguf -p 0 -n 64 -d 0,131072 -r 1 -ngl 99 --split-mode layer --load-mode none -b 2048 -ub 512 -o json",
+  "note": "Decode at depth, via llama-bench -d. -d prefills the KV cache to that depth with real tokens and then times generation; -p/-n alone would time generation from an EMPTY cache regardless of -p, which is what the ctx-128 slot records. The depth-0 sample reproduces the pinned KIMI_K3_H200X8_IQ1S_LLAMA_128 (18.3210) to within 0.67%, which is what makes this run comparable to it.",
+  "contexts": {
+    "128": {
+      "prefill_pp": 0.0,
+      "decode_tps": 18.1983,
+      "kind": "reference",
+      "reps": 1
+    },
+    "131072": {
+      "prefill_pp": 0.0,
+      "decode_tps": 16.7026,
+      "kind": "scored",
+      "reps": 1
+    }
+  }
+}

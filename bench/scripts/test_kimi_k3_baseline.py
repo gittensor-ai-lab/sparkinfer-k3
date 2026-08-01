@@ -743,10 +743,20 @@ class CiWorkflowTest(unittest.TestCase):
                                  f"{f.name}:{i} targets the upstream repo")
 
     def test_build_gate_targets_milestone_arches_not_sm120(self):
+        """sm_120 is Blackwell consumer/edge and nothing here runs on it — that was the
+        inherited workflow compile-checking an irrelevant architecture.
+
+        sm_100 (M2 · B200) was removed by request: this repo is Hopper-only in practice and
+        there is no Blackwell hardware, so the job asserted a scope the project does not
+        have. It is a real loss of coverage — the link chain reaches si_k3, so it did compile
+        the K3 kernels for Blackwell — and the workflow says so where the entry used to be,
+        so restoring it for M2 is a one-line change rather than an archaeology exercise."""
         text = (self.WF / "build-gate.yml").read_text()
         self.assertIn('arch: "90"', text)
-        self.assertIn('arch: "100"', text)
         self.assertNotIn('arch: "120"', text)
+        active = "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#"))
+        self.assertNotIn('arch: "100"', active, "sm_100 was removed from the CI gate")
+        self.assertIn("sm_100", text, "removing it silently loses why it went")
 
     def test_node_attestation_never_closes(self):
         # Deliberate severity change from the inherited rtx5090-required gate.
@@ -1272,6 +1282,71 @@ class CiWorkflowTest(unittest.TestCase):
             self.assertIn(p, bot.NEVER_MERGE_PATHS,
                           f"{p} decides payouts and must block an unreviewed merge")
 
+    def test_scored_context_is_128k_everywhere(self):
+        """The scored context is 131,072, and THREE places have to agree on the slot suffix:
+        the harness that measures, the workflow that re-derives the tier, and the bot that
+        writes the frontier back. A mismatch means the bot updates one slot while CI scores
+        from another, and nothing fails loudly -- the tier is just computed over unrelated
+        numbers.
+
+        This is not hypothetical. The harness used to read _128 while kimi_k3_tp_bench
+        hardcoded max_ctx=64, so the slot name, the documented context and the measured
+        context were three different things, and 128k -- the configuration CONTRIBUTING says
+        this repo runs -- was never scored at all."""
+        bot = self._bot()
+        self.assertEqual(bot.CTX_SUFFIX, "128K")
+        self.assertTrue(bot._frontier_slot("h200x8", "UD-IQ1_S").endswith("_128K"))
+        ev = (ROOT / "bench/scripts/kimi_k3_eval.sh").read_text()
+        self.assertIn('SCORED_CTX="${KIMI_K3_SCORED_CTX:-131072}"', ev)
+        self.assertIn('CTX_SUFFIX="${KIMI_K3_CTX_SUFFIX:-128K}"', ev)
+        self.assertIn('--ctx "$SCORED_CTX" --seek', ev,
+                      "the speed pass must run at the scored context")
+        self.assertIn('SPARKINFER_SCORED_CONTEXT="$SCORED_CTX"', ev,
+                      "the verdict must record which context earned it")
+        wf = (ROOT / ".github/workflows/eval-label.yml").read_text()
+        self.assertIn('{kind}_128K', wf,
+                      "the trusted re-derivation must read the same slot the bot writes")
+        # 128K has to resolve to a context, or a pinned llama reference at it is unverifiable
+        import importlib.util as _u
+        spec = _u.spec_from_file_location("crl", ROOT / "bench/scripts/check_reference_lock.py")
+        crl = _u.module_from_spec(spec)
+        spec.loader.exec_module(crl)
+        self.assertEqual(crl.CTX_OF_SUFFIX.get("128K"), 131072)
+
+    def test_accuracy_is_not_measured_at_the_scored_context(self):
+        """--seek attends over a ZEROED cache. That is faithful for TIMING (the MLA reduction
+        is dense and value-independent) and meaningless for CORRECTNESS -- the logits are
+        garbage by construction.
+
+        So the accuracy pass must run WITHOUT those flags, against the llama.cpp capture at
+        the context that capture was taken at. Scoring speed at 128k and correctness at 4
+        tokens is the intended split, not an oversight; using the seeked run for top-1 would
+        hand every PR a perfect score on noise."""
+        ev = (ROOT / "bench/scripts/kimi_k3_eval.sh").read_text()
+        acc = ev[ev.index("# ---- 2. correctness"):ev.index("# ---- 3. label")]
+        self.assertIn("--ids", acc)
+        self.assertNotIn("--seek", acc,
+                         "accuracy measured over a zeroed cache is not accuracy")
+        self.assertNotIn("--ctx", acc)
+
+    def test_bench_must_prove_it_seeked(self):
+        """kimi_k3_tp_bench is built from the PR's OWN runtime/ -- only bench/scripts and
+        bench/refdata are restored from the protected branch. So the flags that select the
+        scored context live in code the PR controls, and the arg loop IGNORES unknown flags
+        rather than rejecting them, which makes a silent stub the easiest possible edit.
+
+        A --seek that does nothing measures ctx 64 and reports it as 128k: 10.34 vs 1.00
+        tok/s measured, so roughly 10x the score. The harness therefore requires the bench to
+        announce the seek AND to name the context it was asked for."""
+        ev = (ROOT / "bench/scripts/kimi_k3_eval.sh").read_text()
+        self.assertIn('grep -q "seek: position -> .*(ctx alloc $SCORED_CTX)"', ev,
+                      "a stubbed --seek would score short-context decode as 128k")
+        guard = ev[ev.index("seek: position -> .*(ctx alloc"):]
+        self.assertIn("exit 1", guard[:600], "the guard must refuse, not warn")
+        # and the bench must actually emit that line
+        cpp = (ROOT / "runtime/examples/kimi_k3_tp_bench.cpp").read_text()
+        self.assertIn('"seek: position -> %d (ctx alloc %d)\\n"', cpp)
+
     def test_frontier_is_measured_not_pinned(self):
         """main is benchmarked every round and THAT is what PRs are scored against.
 
@@ -1311,7 +1386,7 @@ class CiWorkflowTest(unittest.TestCase):
                            "every commit to main costs every open PR a rebase")
         # only the one node+quant frontier slot is ever addressed
         self.assertEqual(bot._frontier_slot("h200x8", "UD-IQ1_S"),
-                         "KIMI_K3_H200X8_IQ1S_SPARKINFER_128")
+                         "KIMI_K3_H200X8_IQ1S_SPARKINFER_128K")
         self.assertNotIn("LLAMA", bot._frontier_slot("h200x8", "UD-IQ1_S"),
                          "the llama reference is a real external constant — never rewritten")
         rec = src[src.index("def reconcile_lock("):src.index("def evaluate(")]
