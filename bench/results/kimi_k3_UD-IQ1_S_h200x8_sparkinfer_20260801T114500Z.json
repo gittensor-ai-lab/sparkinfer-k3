@@ -1,0 +1,29 @@
+{
+  "node_profile": "h200x8",
+  "quant": "UD-IQ1_S",
+  "engine": "sparkinfer/kimi_k3_tp_bench",
+  "tp_size": 8,
+  "layers": 93,
+  "gpu": "8x NVIDIA H200",
+  "measured_utc": "2026-08-01T11:45:00Z",
+  "command": "kimi_k3_eval.sh --node h200x8 --devices 0,1,2,3,4,5,6,7   (bench: kimi_k3_tp_bench <gguf> 8 93 8 --ctx 131072 --seek)",
+  "note": "Frontier at the scored 128k context, measured through the committed --ctx/--seek path. K3 has no prefill, so the KV cache is allocated at 131,072, left ZEROED, and position is seeked -- faithful for decode TIMING (the MLA reduction is dense and value-independent) and meaningless for correctness, which is gated separately at short context against bench/refdata. The ctx-128 entry is the same box and build with no flags, kept so the collapse with context is legible rather than asserted. SPARKINFER_* slots are not enforced by check_reference_lock.py (its VAR_RE matches LLAMA only), so this file is provenance by convention, not by gate.",
+  "commits": {
+    "37d4219": "main when 1.00 was measured and pinned (post-#20, post-#33)",
+    "aa27aee": "main at the following round; re-measured 1.01, inside the 2% band"
+  },
+  "contexts": {
+    "128": {
+      "prefill_pp": 0.0,
+      "decode_tps": 10.34,
+      "kind": "historical",
+      "reps": 1
+    },
+    "131072": {
+      "prefill_pp": 0.0,
+      "decode_tps": 1.00,
+      "kind": "scored",
+      "reps": 1
+    }
+  }
+}

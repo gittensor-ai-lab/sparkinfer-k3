@@ -1453,11 +1453,39 @@ class CiWorkflowTest(unittest.TestCase):
         self.assertIn("sys.stdout, sys.stderr = _Tee(", main_fn,
                       "stderr must be captured too, or a failed round publishes a clean log")
         # Published last, so the artefact covers the whole round rather than its opening.
-        # rindex, not index: --publish-log backfills an existing receipt and returns early,
-        # so it calls publish_log() near the top of main(). The AUTOMATIC publish is the last
-        # call site, and that is the one that has to follow the merge decision.
-        self.assertLess(main_fn.index("merge_winner("), main_fn.rindex("publish_log("),
+        # The AUTOMATIC publish is publish_round_log(); publish_log() also appears earlier in
+        # main() for the --publish-log backfill, which returns before any round runs.
+        self.assertLess(main_fn.index("merge_winner("), main_fn.rindex("publish_round_log("),
                         "the log must include the merge decision it explains")
+
+    def test_every_round_publishes_a_log_even_when_nothing_seals(self):
+        """The rule is ALWAYS, and receipt-indexing alone cannot satisfy it.
+
+        publish_log used to be driven off `results`, so only a round that SEALED left a
+        record. That lost exactly the rounds worth reading: the one that died on GPU
+        contention mid-load minted no receipt and vanished, and a correctness fix scores
+        `none`, is never sealed, and so was permanently unauditable.
+
+        So a round that seals nothing falls back to rounds/<main_sha>/eval.log, and the
+        early returns -- a frontier that would not measure, a lock that would not reconcile
+        -- route through the same publish instead of returning past it. Those are the FAILED
+        rounds; they must not be the ones that silently never land."""
+        bot = self._bot()
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        self.assertIn("def publish_round_log(", src)
+        self.assertIn('f"rounds/{main_sha[:12]}/eval.log"', src,
+                      "a round that sealed nothing still needs a path")
+        prl = src[src.index("def publish_round_log("):src.index("def merge_blockers(")]
+        # sealed runs still get the log beside their receipt, and that is preferred
+        self.assertLess(prl.index('f"runs/{rid}/eval.log"'), prl.index('f"rounds/'),
+                        "a sealed run's log belongs with its receipt, not in the fallback")
+        self.assertIn("if n:", prl, "the fallback must not double-publish a sealed round")
+        main_fn = src[src.index("def main("):]
+        self.assertIn("def _bail(", main_fn)
+        for code in ("_bail(1", "_bail(3", "_bail(0"):
+            self.assertIn(code, main_fn, f"an early return bypasses the log publish ({code})")
+        # and the operator is told when it did not land, rather than it passing silently
+        self.assertIn("this round is unauditable outside this", main_fn)
 
     def test_backfilled_log_needs_a_real_receipt(self):
         """--publish-log files a log somebody hands it rather than one the round produced,
