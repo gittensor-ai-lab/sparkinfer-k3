@@ -197,5 +197,113 @@ std::size_t reduce_elems(ReducePoint point, const ShardDims& d, int n_tokens);
 // Total collectives per forward pass over `n_layers` layers.
 int reduce_count_per_token(int n_layers);
 
+// ---------------------------------------------------------------------------
+// Kimi K3's KDA (gated delta net) attention — head-parallel shard math
+// ---------------------------------------------------------------------------
+//
+// WHY THIS IS A SEPARATE PLAN AND NOT ShardDims.
+//
+// K3 is a HYBRID: 69 of its 93 layers are KDA (recurrent, context-independent)
+// and 24 are MLA (full attention). ShardDims models one attention shape per
+// model, which is exactly right for Qwen-style stacks and cannot express "shard
+// the KDA layers, replicate the MLA ones".
+//
+// And that split is deliberate, not an implementation shortcut:
+//
+//   KDA  every head owns a private recurrent state (conv window + delta matrix)
+//        and never reads another head's, so both the weights AND the state
+//        divide by tp_size. One all-reduce at hidden after attn_output.
+//
+//   MLA  is MQA: all n_q_heads attend over ONE shared latent KV cache. Sharding
+//        query heads divides the FLOPs but NOT the cache read, because every
+//        rank still walks the whole cache. It buys a fraction of the cost and
+//        pays a full collective for it. LEAVE MLA REPLICATED.
+//
+// Under ShardPolicy::ExpertsOnly the KDA projections are replicated, so at
+// tp_size 8 all eight ranks read the same ~468 MB of Q8_0 attention weights per
+// KDA layer every token. That is the redundancy this plan removes.
+
+struct KdaShape {
+    int hidden = 0;         // KimiK3Config::hidden
+    int n_heads = 0;        // KimiK3Config::n_q_heads
+    int head_dim = 0;       // KimiK3Config::kda_head_dim
+    int conv_kernel = 0;    // KimiK3Config::kda_conv_kernel
+};
+
+// One rank's slice of a KDA layer. Every extent here is PER RANK; the _total
+// fields keep the full dimension so a caller can assert it did not lose any.
+struct KdaShardDims {
+    int tp_size = 1;
+    int rank = 0;
+
+    int hidden = 0;         // NEVER sharded — it is the collective's width
+    int head_dim = 0;       // NEVER sharded — a head is the atomic unit
+
+    int n_heads_total = 0;
+    int n_heads = 0;
+    Band head_band;         // this rank's heads, in head units
+
+    int qkv_total = 0;      // n_heads_total * head_dim
+    int qkv = 0;            // n_heads * head_dim
+    Band qkv_band;          // head_band scaled by head_dim — the INVARIANT below
+
+    int conv_kernel = 0;
+    // Per-rank recurrent state, in floats. These are the sizes kimi_k3_alloc_state
+    // must use once the layer is sharded; allocating the full-width version and
+    // indexing it with a rank-local head id reads another rank's state and returns
+    // fluent garbage, which is why they are derived here and not inline.
+    long conv_state_elems = 0;    // (conv_kernel - 1) * qkv, per conv stream (q/k/v)
+    long delta_state_elems = 0;   // head_dim * head_dim * n_heads
+};
+
+// THE INVARIANT: qkv_band == head_band scaled by head_dim.
+//
+// The KDA branch addresses the same rank slice two ways — by head (l2_norm_heads,
+// kda_decay_gate, kda_decode_step, kda_gate_out) and by qkv row (the four
+// projections, the conv window, ssm_dt_bias). If those two disagree by even one
+// head the layer still runs at full speed and emits subtly wrong tokens, because
+// nothing bounds-checks a head id against a qkv offset. Checked in
+// kda_shard_dims and asserted directly in the CPU test.
+ShardError kda_shard_dims(const KdaShape& shape, const Config& cfg, int rank,
+                          KdaShardDims* out);
+
+// WHICH TENSOR TAKES WHICH RULE IS **NOT** DECLARED HERE.
+//
+// That belongs to weight_plan.h — "the rule for every tensor is declared in one
+// table", and a second table in this header would be free to disagree with it,
+// which is the precise failure both files exist to prevent. The KDA rows of that
+// table are the plan; this header only supplies the per-rank extents and offsets
+// they imply.
+//
+// REPLICATE-AND-OFFSET, for the small per-channel vectors.
+//
+// Four KDA tensors stay REPLICATED at full width even under a head-parallel
+// shard, and the forward indexes them at this rank's band instead:
+//
+//   ssm_dt.bias      f32 [qkv]                  + qkv_band.offset
+//   ssm_a            f32 [n_heads]              + head_band.offset
+//   ssm_conv1d_{q,k,v}  f32 [conv_kernel,1,qkv] + qkv_band.offset * conv_kernel
+//   ssm_f_a.weight   [head_dim, hidden]         no offset — needed WHOLE
+//
+// The first three are channel-major (kda_conv_step_kernel reads
+// `w + c * d_conv`), so a channel band is contiguous and a pointer offset is the
+// whole of the change. Together they are ~250 KB per layer against the ~468 MB of
+// projections, so sharding them would buy nothing and cost a rule that does not
+// fit any existing axis. ssm_f_a is different in kind: its OUTPUT is the shared
+// head_dim-wide vector every rank's ssm_f_b shard consumes, so it must stay whole.
+//
+// What makes this safe rather than a landmine is that the offsets come from the
+// bands above, which are the SAME bands the projections were sharded with. A
+// forward that offsets by anything else reads another rank's heads and the model
+// stays fluent — so the offsets are pinned in the CPU test, not left to the
+// call site.
+
+// Collectives per token under K3's hybrid plan.
+//
+// ExpertsOnly today: one per MoE layer (the expert partial at expert_latent).
+// With KDA sharded: that, plus one per KDA layer (the attn_output partial at
+// hidden). MLA layers add none — they stay replicated.
+int k3_reduce_count_per_token(int n_kda_layers, int n_moe_layers, bool kda_sharded);
+
 }  // namespace tp
 }  // namespace sparkinfer

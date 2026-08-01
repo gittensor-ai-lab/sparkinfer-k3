@@ -336,6 +336,197 @@ static void test_even_band_edges() {
     CHECK(!divisible(0, 8), "zero total");
 }
 
+// ---------------------------------------------------------------------------
+// Kimi K3 KDA — head-parallel shard math
+// ---------------------------------------------------------------------------
+
+// K3's real KDA dimensions, from KimiK3Config.
+static KdaShape k3_kda() {
+    KdaShape s;
+    s.hidden = 7168; s.n_heads = 96; s.head_dim = 128; s.conv_kernel = 4;
+    return s;
+}
+
+static void test_kda_tp8_real_dims() {
+    std::printf("kda_tp8_real_dims\n");
+    KdaShardDims d;
+    KdaShape sh = k3_kda();
+    ShardError e = kda_shard_dims(sh, cfg_of(8), 3, &d);
+    CHECK(e.ok(), "unexpected error: %s", e.message.c_str());
+    CHECK_EQ(d.n_heads_total, 96);
+    CHECK_EQ(d.n_heads, 12);                  // 96 / 8
+    CHECK_EQ(d.head_band.offset, 36);         // rank 3 * 12
+    CHECK_EQ(d.qkv_total, 12288);             // 96 * 128
+    CHECK_EQ(d.qkv, 1536);                    // 12 * 128
+    CHECK_EQ(d.qkv_band.offset, 4608);        // 36 * 128
+    CHECK_EQ(d.head_dim, 128);                // never sharded
+    CHECK_EQ(d.hidden, 7168);                 // never sharded
+    // Per-rank recurrent state. Allocating the full-width version and indexing it
+    // with a rank-local head id is the silent-corruption failure this pins.
+    CHECK_EQ(d.conv_state_elems, 3 * 1536);           // (4-1) * qkv
+    CHECK_EQ(d.delta_state_elems, 128 * 128 * 12);    // head_dim^2 * n_heads
+}
+
+static void test_kda_bands_tile_and_hold_the_invariant() {
+    std::printf("kda_bands_tile_and_hold_the_invariant\n");
+    const int tp = 8;
+    KdaShape sh = k3_kda();
+    int heads_seen = 0, qkv_seen = 0;
+    int next_head = 0, next_qkv = 0;
+    long conv_total = 0, delta_total = 0;
+    for (int r = 0; r < tp; ++r) {
+        KdaShardDims d;
+        CHECK(kda_shard_dims(sh, cfg_of(tp), r, &d).ok(), "rank %d", r);
+        // Contiguous, gapless, non-overlapping — checked by walking the seam
+        // rather than by set membership, so an overlap cannot hide as a duplicate.
+        CHECK_EQ(d.head_band.offset, next_head);
+        CHECK_EQ(d.qkv_band.offset, next_qkv);
+        next_head = d.head_band.end();
+        next_qkv = d.qkv_band.end();
+        heads_seen += d.n_heads;
+        qkv_seen += d.qkv;
+        conv_total += d.conv_state_elems;
+        delta_total += d.delta_state_elems;
+        // THE INVARIANT the header names: the two addressings agree exactly.
+        CHECK_EQ(d.qkv_band.offset, d.head_band.offset * sh.head_dim);
+        CHECK_EQ(d.qkv_band.extent, d.head_band.extent * sh.head_dim);
+    }
+    CHECK_EQ(next_head, 96);
+    CHECK_EQ(next_qkv, 12288);
+    CHECK_EQ(heads_seen, 96);
+    CHECK_EQ(qkv_seen, 12288);
+    // The state divides exactly too: no rank carries a remainder, so every rank
+    // gets the identical launch geometry.
+    CHECK_EQ(conv_total, 3L * 12288);
+    CHECK_EQ(delta_total, 128L * 128 * 96);
+}
+
+static void test_kda_tp1_is_the_identity_shard() {
+    std::printf("kda_tp1_is_the_identity_shard\n");
+    KdaShardDims d;
+    CHECK(kda_shard_dims(k3_kda(), cfg_of(1), 0, &d).ok(), "tp1");
+    CHECK_EQ(d.n_heads, 96);
+    CHECK_EQ(d.qkv, 12288);
+    CHECK_EQ(d.head_band.offset, 0);
+    CHECK_EQ(d.head_band.extent, 96);
+    CHECK_EQ(d.qkv_band.extent, 12288);
+    CHECK_EQ(d.conv_state_elems, 3L * 12288);
+    CHECK_EQ(d.delta_state_elems, 128L * 128 * 96);
+}
+
+static void test_kda_rejects_what_it_cannot_split() {
+    std::printf("kda_rejects_what_it_cannot_split\n");
+    KdaShardDims d;
+    // 96 % 7 != 0. A KDA head owns a private recurrent state, so there is no
+    // replicate-the-remainder fallback the way there is for kv heads.
+    ShardError e = kda_shard_dims(k3_kda(), cfg_of(7), 0, &d);
+    CHECK(!e.ok(), "96 heads over 7 ranks must be rejected");
+    CHECK(e.message.find("recurrent state") != std::string::npos,
+          "the reason must name why a head is atomic, got: %s", e.message.c_str());
+
+    // A zeroed shape must report the SHAPE problem, not a divisibility one —
+    // "0 not divisible by 8" reads like a config error when it is plumbing.
+    KdaShape empty;
+    ShardError z = kda_shard_dims(empty, cfg_of(8), 0, &d);
+    CHECK(!z.ok(), "default-constructed shape must be rejected");
+    CHECK(z.message.find("n_heads must be > 0") != std::string::npos,
+          "got: %s", z.message.c_str());
+
+    CHECK(!kda_shard_dims(k3_kda(), cfg_of(8), 8, &d).ok(), "rank == tp_size");
+    CHECK(!kda_shard_dims(k3_kda(), cfg_of(8), -1, &d).ok(), "negative rank");
+    CHECK(!kda_shard_dims(k3_kda(), cfg_of(8), 0, nullptr).ok(), "null out");
+}
+
+static void test_kda_replicate_and_offset_bands() {
+    std::printf("kda_replicate_and_offset_bands\n");
+    // Four KDA tensors stay REPLICATED at full width and are indexed at this
+    // rank's band instead (see the header). The offsets are pinned HERE rather
+    // than left to the call site, because a forward that offsets by anything else
+    // reads another rank's heads and the model stays fluent.
+    const int tp = 8;
+    KdaShape sh = k3_kda();
+    for (int r = 0; r < tp; ++r) {
+        KdaShardDims d;
+        CHECK(kda_shard_dims(sh, cfg_of(tp), r, &d).ok(), "rank %d", r);
+
+        // ssm_dt.bias, f32 [qkv] -> + qkv_band.offset
+        CHECK_EQ(d.qkv_band.offset, r * 1536);
+        // ssm_a, f32 [n_heads] -> + head_band.offset
+        CHECK_EQ(d.head_band.offset, r * 12);
+        // ssm_conv1d_{q,k,v}, f32 [conv_kernel, 1, qkv], CHANNEL-MAJOR:
+        // kda_conv_step_kernel reads w + c * d_conv, so a channel band is
+        // contiguous and the offset scales by conv_kernel.
+        CHECK_EQ((long)d.qkv_band.offset * d.conv_kernel, (long)r * 1536 * 4);
+        // The recurrent state uses rank-LOCAL channel ids against a per-rank
+        // allocation, so it carries no offset at all — only a smaller size.
+        CHECK_EQ(d.conv_state_elems, 3L * 1536);
+
+        // The offset must land on this rank's OWN heads, not a neighbour's:
+        // the last channel of the band is one short of the next band's first.
+        CHECK_EQ(d.qkv_band.end(), (r + 1) * 1536);
+        CHECK_EQ(d.head_band.end(), (r + 1) * 12);
+    }
+    // At tp=1 every offset is zero, so the replicate-and-offset path is a no-op
+    // and the single-GPU forward is byte-identical to the pre-shard one.
+    KdaShardDims one;
+    CHECK(kda_shard_dims(sh, cfg_of(1), 0, &one).ok(), "tp1");
+    CHECK_EQ(one.qkv_band.offset, 0);
+    CHECK_EQ(one.head_band.offset, 0);
+}
+
+static void test_kda_q8_0_traffic_divides_by_eight() {
+    std::printf("kda_q8_0_traffic_divides_by_eight\n");
+    // The claim this shard exists to make good on, in bytes, checkable with no GPU.
+    //
+    // Under ShardPolicy::ExpertsOnly the KDA projections are REPLICATED, so all
+    // eight ranks stream the identical Q8_0 weights every token. These are the two
+    // kernels nsys puts at 25.9% of a 221 ms token at ctx 128k on main
+    // (proj_q8_0_multirow 17.0% + proj_q8_0_fused4 8.9%).
+    auto q8_0_bytes = [](long rows, long cols) -> long {
+        return rows * (cols / 32) * 34;      // 34 bytes per 32 weights
+    };
+    const long H = 7168, QKV = 12288;
+    const long full_layer = 4 * q8_0_bytes(QKV, H)      // attn_q/k/v + ssm_g
+                          + q8_0_bytes(H, QKV);          // attn_output
+    CHECK_EQ(full_layer, 467927040L);                    // 468 MB per KDA layer
+
+    KdaShardDims d;
+    CHECK(kda_shard_dims(k3_kda(), cfg_of(8), 5, &d).ok(), "shard");
+    const long shard_layer = 4 * q8_0_bytes(d.qkv, H)    // rows split
+                           + q8_0_bytes(H, d.qkv);        // cols split
+    // Exact, not approximate: 96 heads over 8 ranks leaves no remainder, so no
+    // rank reads a byte more than any other.
+    CHECK_EQ(shard_layer * 8, full_layer);
+    CHECK_EQ(shard_layer, 58490880L);
+
+    const long kda_layers = 69;                          // 93 - 24 MLA
+    CHECK_EQ(full_layer * kda_layers, 32286965760L);     // 32.3 GB per rank per token
+    CHECK_EQ(shard_layer * kda_layers, 4035870720L);     // 4.04 GB after sharding
+}
+
+static void test_kda_collective_accounting() {
+    std::printf("kda_collective_accounting\n");
+    // K3 today (ExpertsOnly): one all-reduce per MoE layer, at expert_latent.
+    CHECK_EQ(k3_reduce_count_per_token(69, 92, false), 92);
+    // With KDA sharded: one more per KDA layer, at hidden, after attn_output.
+    CHECK_EQ(k3_reduce_count_per_token(69, 92, true), 161);
+    // The COST of the change is exactly the KDA layer count — the number that has
+    // to be multiplied by the measured per-collective latency to price it.
+    CHECK_EQ(k3_reduce_count_per_token(69, 92, true) -
+             k3_reduce_count_per_token(69, 92, false), 69);
+    // MLA layers contribute none: they stay replicated. 69 + 24 = 93, and the
+    // sharded count must not move when the MLA count changes.
+    CHECK_EQ(k3_reduce_count_per_token(69, 0, true), 69);
+    CHECK_EQ(k3_reduce_count_per_token(0, 0, true), 0);
+    CHECK_EQ(k3_reduce_count_per_token(-1, -1, true), 0);
+
+    // The payload is full hidden width — a col-shard yields a partial sum over the
+    // WHOLE output, which is what makes it an all-reduce and not an all-gather.
+    ShardDims sd;
+    CHECK(shard_dims(kimi_k3(), cfg_of(8), 0, &sd).ok(), "shard");
+    CHECK_EQ(reduce_elems(ReducePoint::AfterAttnOut, sd, 1), 7168u);
+}
+
 int main() {
     test_tp1_is_the_identity_shard();
     test_qwen36_tp8();
@@ -352,6 +543,14 @@ int main() {
     test_row_and_col_shard_compose();
     test_reduce_accounting();
     test_even_band_edges();
+
+    test_kda_tp8_real_dims();
+    test_kda_bands_tile_and_hold_the_invariant();
+    test_kda_tp1_is_the_identity_shard();
+    test_kda_rejects_what_it_cannot_split();
+    test_kda_replicate_and_offset_bands();
+    test_kda_q8_0_traffic_divides_by_eight();
+    test_kda_collective_accounting();
 
     std::printf("\n%d checks, %d failure(s)\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
