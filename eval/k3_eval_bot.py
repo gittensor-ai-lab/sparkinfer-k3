@@ -628,27 +628,68 @@ class _Tee:
         return self._s.isatty()
 
 
-def publish_log(repo_log, rid, text, dry_run):
-    """Put the round's own output next to the receipt it produced.
+def publish_log(repo_log, path, text, dry_run, label=""):
+    """Publish a round log to the immutable log repo at `path`.
 
     Append-only, like the receipt itself: an existing path is a refusal, not something to
-    force. Publishing the log under the receipt id keeps a run self-describing -- the
-    measurement, the verdict and the session that produced them arrive together.
+    force.
+
+    Two shapes of path, and the second exists because the first cannot cover every round:
+
+      runs/<receipt_id>/eval.log   a round that SEALED. The measurement, the verdict and
+                                   the session that produced them arrive together, so a
+                                   receipt is self-describing.
+      rounds/<main_sha>/eval.log   a round that sealed NOTHING. Indexing only by receipt id
+                                   meant exactly the rounds worth reading vanished: the one
+                                   that died on GPU contention mid-load left no trace,
+                                   because a failed round mints no receipt. Same for a
+                                   correctness fix, which scores `none`, is never sealed,
+                                   and so was permanently unauditable.
     """
-    if not rid or not text.strip():
+    if not path or not text.strip():
         return False
+    what = label or path
     if dry_run:
-        print(f"--- dry-run: would publish runs/{rid}/eval.log to {repo_log}")
+        print(f"--- dry-run: would publish {path} to {repo_log}")
         return True
-    q = gh(["api", "-X", "PUT", f"repos/{repo_log}/contents/runs/{rid}/eval.log",
-            "-f", f"message=eval {rid}: round log",
+    q = gh(["api", "-X", "PUT", f"repos/{repo_log}/contents/{path}",
+            "-f", f"message=eval {what}: round log",
             "-f", f"content={base64.b64encode(text.encode()).decode()}"], timeout=180)
     if q.returncode != 0:
-        print(f"!! could not publish runs/{rid}/eval.log: {q.stderr.strip()[:160]}",
-              file=sys.stderr)
+        print(f"!! could not publish {path}: {q.stderr.strip()[:160]}", file=sys.stderr)
         return False
-    print(f">> published runs/{rid}/eval.log to {repo_log}")
+    print(f">> published {path} to {repo_log}")
     return True
+
+
+def publish_round_log(repo_log, main_sha, results, text, dry_run):
+    """EVERY round leaves a record. Sealed runs get the log beside their receipt; a round
+    that sealed nothing still gets one under rounds/<main_sha>/.
+
+    The rule this enforces: a receipt proves a number was signed, and says nothing about
+    what the round did to produce it. That context used to exist only in the operator's
+    terminal, which is precisely where someone auditing a payout-bearing number cannot look.
+    A round that FAILED is the most informative of all and was the one guaranteed to be lost.
+
+    Returns the number of paths written.
+    """
+    n = 0
+    for num, r in results:
+        rid = r.get("receipt_id")
+        if rid and publish_log(repo_log, f"runs/{rid}/eval.log", text, dry_run, rid):
+            n += 1
+    if n:
+        return n
+    # Nothing sealed. Fall back to a round-level path so the log still lands. Keyed by the
+    # main commit the round measured against, which is the only identifier a failed round
+    # reliably has -- and a stable one, so a re-run against the same main is a refusal rather
+    # than a silent overwrite of the first attempt's evidence.
+    if not main_sha:
+        print("!! round sealed nothing and main is unknown — no log path to publish under",
+              file=sys.stderr)
+        return 0
+    return 1 if publish_log(repo_log, f"rounds/{main_sha[:12]}/eval.log", text, dry_run,
+                            f"round @ {main_sha[:8]}") else 0
 
 
 def merge_blockers(repo, num, pr, waiting_is_blocking=True, mode="strict"):
@@ -957,7 +998,8 @@ def main():
         except OSError as exc:
             sys.stderr.write(f"k3_eval_bot: cannot read {args.log_file}: {exc}\n")
             return 1
-        return 0 if publish_log(LOG_REPO, rid, text, args.dry_run) else 1
+        return 0 if publish_log(LOG_REPO, f"runs/{rid}/eval.log", text,
+                                args.dry_run, rid) else 1
 
     prs = list_prs(args.repo)
     if args.only_pr:
@@ -990,6 +1032,15 @@ def main():
         print("nothing eligible — not booking the node for a frontier measurement")
         return 0
 
+    # Every exit from here on has booked the node, so every one of them owes a published log.
+    # The early returns below are the FAILED rounds -- a frontier that would not measure, a
+    # lock that would not reconcile -- and those are the logs most worth reading, so they must
+    # not be the ones that silently never land.
+    def _bail(code, sha=""):
+        sys.stdout, sys.stderr = _real_out, _real_err
+        publish_round_log(LOG_REPO, sha, [], log_buf.getvalue(), args.dry_run)
+        return code
+
     # THE FRONTIER IS MEASURED, NOT PINNED. Do this before anything is posted: eval-label.yml
     # reads reference.lock at comment time, so a comment posted before the lock is reconciled
     # gets a tier derived from the old frontier -- which is the whole failure being fixed.
@@ -1004,7 +1055,9 @@ def main():
             main_sha, main_tps, quant = measure_frontier(args.repo)
     except RuntimeError as exc:
         print(f"frontier measurement failed — {exc}", file=sys.stderr)
-        return 1
+        # main_sha may be blank here (the resolve itself can fail); publish_round_log says
+        # so loudly rather than inventing a path.
+        return _bail(1, locals().get("main_sha", ""))
 
     if args.no_lock_update:
         print(">> --no-lock-update: reference.lock untouched; the applied tier will come "
@@ -1013,7 +1066,7 @@ def main():
     else:
         frontier = reconcile_lock(args.repo, NODE, quant, main_tps, main_sha, args.dry_run)
         if frontier is None:
-            return 3
+            return _bail(3, main_sha)
 
     # main may have just moved under these branches -- and if reconcile_lock committed, it
     # moved BECAUSE of this round. Bring them onto it before measuring rather than labelling
@@ -1038,7 +1091,7 @@ def main():
 
     if not eligible:
         print("nothing left to evaluate after reconciling branches")
-        return 0
+        return _bail(0, main_sha)
 
     evaluated = 0
     results = []
@@ -1104,10 +1157,9 @@ def main():
     # reason for it. Restore the real streams first -- the publish output describes the
     # publish and belongs on the terminal, not recursively inside the artefact.
     sys.stdout, sys.stderr = _real_out, _real_err
-    body = log_buf.getvalue()
-    for num, r in results:
-        if r.get("receipt_id"):
-            publish_log(LOG_REPO, r["receipt_id"], body, args.dry_run)
+    if not publish_round_log(LOG_REPO, main_sha, results, log_buf.getvalue(), args.dry_run):
+        print("!! the round log was NOT published — this round is unauditable outside this "
+              "terminal", file=sys.stderr)
     return 0
 
 
