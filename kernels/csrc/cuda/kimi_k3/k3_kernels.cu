@@ -849,6 +849,44 @@ __device__ __forceinline__ float block_max(float v, float* shm) {
 // ---------------------------------------------------------------------------
 // One block per head. Scores vs shared K-cache (MQA), softmax, attend over the
 // leading kv_lora of K as V, then decompress with wv_b.
+//
+// THE SHARED-MEMORY FOOTPRINT MUST NOT SCALE WITH CONTEXT.
+//
+// This kernel previously staged the whole score vector — one float per cached
+// token — in dynamic shared memory, so the launch asked for
+// (n_ctx + kv_lora + BLOCK/32 + 1) * 4 bytes. With K3's kv_lora 512 that crosses
+// the 48 KB default dynamic-shared limit at n_ctx = 11,767, and the 227 KB
+// Hopper opt-in ceiling (which this file never requested) at 57,573. Past that
+// the launch returns cudaErrorInvalidValue.
+//
+// Nothing catches it. mla_decode_attn_f32 returns void, the forward does not
+// poll cudaGetLastError, and s.mla_attn_out is a reused scratch buffer — so a
+// failed launch leaves the PREVIOUS layer's attention output in place and the
+// model keeps emitting fluent text. Every MLA layer past ~11.7k context silently
+// contributes a stale tensor. That is the same failure class as the 1-indexed
+// full_attn_layers trap and the KDA decay axis: wrong output, not an error.
+//
+// The numeric test could not see it either — test_mla_decode_attn runs n_ctx 48.
+//
+// So the softmax is now ONLINE (running max + running exp-sum, rescaled per
+// tile) over tiles of kMlaCtxTile tokens, and the score tile is the only
+// context-dependent buffer. Shared memory is
+// (key_length + kv_lora + kMlaCtxTile + BLOCK/32 + 1) floats — 4.8 KB at K3's
+// real dims, INDEPENDENT of n_ctx, so the kernel launches at 1M context.
+//
+// Two access patterns changed with it, both because the tiling makes the better
+// one natural rather than as a separate optimisation:
+//
+//   - Scores are now ONE WARP PER TOKEN with lanes striding over d. The old loop
+//     gave one THREAD a whole 576-float cache row, so the 32 lanes of a warp
+//     read addresses 2304 B apart — 32 distinct sectors per load instruction,
+//     4 useful bytes each.
+//   - q is staged in shared memory once instead of being re-read from global by
+//     every thread for every token it scores.
+//
+// The latent accumulation keeps the old r-major loop, which was already
+// coalesced; it just gains the online-softmax rescale.
+constexpr int kMlaCtxTile = 128;
 
 template <int BLOCK>
 __global__ void mla_decode_attn_kernel(float* __restrict__ out,
@@ -857,58 +895,92 @@ __global__ void mla_decode_attn_kernel(float* __restrict__ out,
                                        const float* __restrict__ wv_b,
                                        int key_length, int kv_lora, int v_dim,
                                        int n_ctx, float scale) {
-    const int h = blockIdx.x;
+    constexpr int NWARP = BLOCK / 32;
+    const int h    = blockIdx.x;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+
     const float* qh = q + (size_t)h * key_length;
     const float* wh = wv_b + (size_t)h * (size_t)kv_lora * v_dim;
 
     extern __shared__ float smem[];
-    float* scores = smem;                     // n_ctx
-    float* latent = scores + n_ctx;           // kv_lora
-    float* red    = latent + kv_lora;         // BLOCK/32 + 1
+    float* s_q   = smem;                      // key_length
+    float* s_acc = s_q + key_length;          // kv_lora   (unnormalised latent)
+    float* s_p   = s_acc + kv_lora;           // kMlaCtxTile
+    float* red   = s_p + kMlaCtxTile;         // BLOCK/32 + 1
 
-    for (int t = threadIdx.x; t < n_ctx; t += BLOCK) {
-        const float* kt = k_cache + (size_t)t * key_length;
-        float s = 0.0f;
-#pragma unroll 4
-        for (int d = 0; d < key_length; ++d) s += qh[d] * kt[d];
-        scores[t] = s * scale;
-    }
+    for (int d = threadIdx.x; d < key_length; d += BLOCK) s_q[d] = qh[d];
+    for (int r = threadIdx.x; r < kv_lora;    r += BLOCK) s_acc[r] = 0.0f;
     __syncthreads();
 
-    float mx = -1e30f;
-    for (int t = threadIdx.x; t < n_ctx; t += BLOCK)
-        mx = fmaxf(mx, scores[t]);
-    mx = block_max<BLOCK>(mx, red);
+    // Running softmax state. Uniform across the block: both block_max and
+    // block_sum broadcast, so every thread carries the same m and l.
+    float m = -1e30f;
+    float l = 0.0f;
 
-    float sum = 0.0f;
-    for (int t = threadIdx.x; t < n_ctx; t += BLOCK) {
-        const float e = __expf(scores[t] - mx);
-        scores[t] = e;
-        sum += e;
+    for (int t0 = 0; t0 < n_ctx; t0 += kMlaCtxTile) {
+        const int tn = min(kMlaCtxTile, n_ctx - t0);
+
+        // --- score the tile: one warp per token, lanes stride over d ---
+        for (int t = warp; t < tn; t += NWARP) {
+            const float* kt = k_cache + (size_t)(t0 + t) * key_length;
+            float s = 0.0f;
+            for (int d = lane; d < key_length; d += 32) s += s_q[d] * kt[d];
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                s += __shfl_down_sync(0xffffffff, s, off);
+            if (lane == 0) s_p[t] = s * scale;
+        }
+        __syncthreads();
+
+        // --- online rescale: fold this tile into (m, l) ---
+        float tm = -1e30f;
+        for (int t = threadIdx.x; t < tn; t += BLOCK) tm = fmaxf(tm, s_p[t]);
+        tm = block_max<BLOCK>(tm, red);
+        const float m_new = fmaxf(m, tm);
+        // First tile: m is -1e30 and corr underflows to 0, which is exactly the
+        // right multiplier for an accumulator that is still zero.
+        const float corr = __expf(m - m_new);
+
+        float ls = 0.0f;
+        for (int t = threadIdx.x; t < tn; t += BLOCK) {
+            const float e = __expf(s_p[t] - m_new);
+            s_p[t] = e;
+            ls += e;
+        }
+        ls = block_sum<BLOCK>(ls, red);
+        l = l * corr + ls;
+        m = m_new;
+        __syncthreads();
+
+        // latent[r] += sum_t p[t] * k_cache[t, r]   (V = leading kv_lora of K).
+        // r-major: consecutive threads read consecutive floats of the same row.
+        for (int r = threadIdx.x; r < kv_lora; r += BLOCK) {
+            float a = s_acc[r] * corr;
+            for (int t = 0; t < tn; ++t)
+                a += s_p[t] * k_cache[(size_t)(t0 + t) * key_length + r];
+            s_acc[r] = a;
+        }
+        __syncthreads();
     }
-    sum = block_sum<BLOCK>(sum, red);
-    const float inv = 1.0f / sum;
-    for (int t = threadIdx.x; t < n_ctx; t += BLOCK)
-        scores[t] *= inv;
+
+    // Deferring the 1/sum to here is what makes the pass single: the old kernel
+    // normalised the score vector before touching the cache, which needs the
+    // whole vector resident first.
+    const float inv = l > 0.0f ? 1.0f / l : 0.0f;
+    for (int r = threadIdx.x; r < kv_lora; r += BLOCK) s_acc[r] *= inv;
     __syncthreads();
 
-    // latent[r] = sum_t p[t] * k_cache[t, r]   (V = leading kv_lora of K)
-    for (int r = threadIdx.x; r < kv_lora; r += BLOCK) {
-        float acc = 0.0f;
-        for (int t = 0; t < n_ctx; ++t)
-            acc += scores[t] * k_cache[(size_t)t * key_length + r];
-        latent[r] = acc;
-    }
-    __syncthreads();
-
-    // out[v] = sum_r wv_b[r, v, h] * latent[r]
+    // out[v] = sum_r wv_b[r, v, h] * latent[r] — one warp per v, lanes over r.
     float* oh = out + (size_t)h * v_dim;
-    for (int v = threadIdx.x; v < v_dim; v += BLOCK) {
+    for (int v = warp; v < v_dim; v += NWARP) {
         const float* wr = wh + (size_t)v * kv_lora;
         float acc = 0.0f;
-#pragma unroll 4
-        for (int r = 0; r < kv_lora; ++r) acc += wr[r] * latent[r];
-        oh[v] = acc;
+        for (int r = lane; r < kv_lora; r += 32) acc += wr[r] * s_acc[r];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            acc += __shfl_down_sync(0xffffffff, acc, off);
+        if (lane == 0) oh[v] = acc;
     }
 }
 
@@ -1616,7 +1688,11 @@ void mla_decode_attn_f32(float* out, const float* q, const float* k_cache,
                          cudaStream_t stream) {
     if (n_head <= 0 || n_ctx <= 0 || key_length <= 0 || kv_lora <= 0 || v_dim <= 0) return;
     constexpr int BLOCK = 256;
-    const size_t shm = ((size_t)n_ctx + (size_t)kv_lora + BLOCK / 32 + 1) * sizeof(float);
+    // O(key_length + kv_lora + tile) and NOT O(n_ctx) — 4.8 KB at K3's real dims,
+    // the same at 128 tokens of context and at 1M. See the kernel's header note on
+    // what the n_ctx-proportional version did past 11,767 tokens.
+    const size_t shm = ((size_t)key_length + (size_t)kv_lora + kMlaCtxTile +
+                        BLOCK / 32 + 1) * sizeof(float);
     mla_decode_attn_kernel<BLOCK><<<(unsigned)n_head, BLOCK, shm, stream>>>(
         out, q, k_cache, wv_b, key_length, kv_lora, v_dim, n_ctx, scale);
 }
