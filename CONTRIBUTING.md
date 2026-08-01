@@ -176,7 +176,7 @@ branch, so editing it in a PR never affects that PR's own score.
 ### What `main` requires
 
 Six checks must pass: `sensitive-paths-guard`, `shell syntax`, `python compile + unit tests`,
-`configs + docs`, `baseline --dry-run (all nodes)`, and `reference.lock provenance`. Branches
+`configs + docs`, `harness pins`, and `reference.lock provenance`. Branches
 must also be **up to date with `main`** before merging — your gain is scored as marginal over
 the current frontier, so it has to be measured against current `main`.
 
