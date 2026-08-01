@@ -40,6 +40,8 @@ NODE = os.environ.get("KIMI_K3_NODE", "h200x8")
 DEVICES = os.environ.get("K3_DEVICES", "0,1,2,3,4,5,6,7")
 BUILD_JOBS = os.environ.get("K3_BUILD_JOBS", "48")
 POLARIS_ENV = os.environ.get("K3_POLARIS_ENV", "/root/.polaris_env")
+LOG_REPO = os.environ.get("K3_LOG_REPO", "gittensor-ai-lab/sparkinfer-k3-log")
+BOX_RECEIPTS = os.environ.get("K3_BOX_RECEIPTS", f"{BOX_REPO_DIR}/bench/results/receipts")
 
 # The PR template's hardware attestation. Matched loosely on purpose -- the template uses a
 # multiplication sign (8x H200) that is easy to retype as an ASCII x, and failing a real
@@ -186,8 +188,17 @@ def evaluate(pr, repo, seal=False):
     # payload: eval-label.yml looks it up there when REQUIRE_EVAL_RECEIPT is on, and
     # without it a sealed run is indistinguishable from an unsealed one.
     if seal:
+        # kimi_k3_eval.sh prints RESULT_JSON and THEN seals, exiting 1 if the publish fails.
+        # Scraping stdout and ignoring the exit status is how a run got reported as sealed
+        # while the log stayed empty: the harness said "FAILED to seal/publish" and nothing
+        # listened.
         rid = re.search(r"receipt[_ ]?id[\"'\s:=]+([0-9a-f]{8,})", out, re.I)
-        if rid:
+        if r.returncode != 0:
+            why = next((l for l in reversed((r.stderr or "").splitlines())
+                        if "seal" in l.lower() or "publish" in l.lower()), "")
+            print(f"#{num}: NOT sealed — the harness failed to publish"
+                  + (f": {why.strip()}" if why else "") , file=sys.stderr)
+        elif rid:
             res["receipt_id"] = rid.group(1)
         else:
             print(f"#{num}: warning — --seal was requested but no receipt id appeared in "
@@ -213,7 +224,11 @@ def evaluate(pr, repo, seal=False):
 # perfectly good run, and posting a frontier at all invites the exact substitution #35
 # closed. Strip them and let the trusted side compute the verdict.
 DERIVED_BY_CI = ("label", "speed_label", "frontier_tps", "note", "pct_over_frontier",
-                 "pct_of_llama", "delta_tps", "tier_basis", "pass")
+                 "pct_of_llama", "delta_tps", "tier_basis", "pass",
+                 # label.py grew these after the list was written, and a
+                 # hand-maintained denylist silently misses whatever is added
+                 # next. Asserted against label.py's real output by a test.
+                 "pct_of_ceiling", "effective_pct")
 
 
 def post(repo, num, res, dry_run):
@@ -255,6 +270,47 @@ def post(repo, num, res, dry_run):
     return True
 
 
+def publish_receipt(repo_log, num, res, box_out, dry_run):
+    """Push the sealed run into the log FROM HERE, not from the box.
+
+    kimi_k3_attest.py --publish clones the log and git-pushes, which needs write credentials
+    wherever it runs. The eval box is rented and shared, so giving it a token that can write
+    the ledger it is being judged against is the wrong trade -- a Polaris key that can only
+    sign is a much smaller thing to leave lying around than one that can rewrite history.
+
+    So the box seals (mints and signs) and the controller publishes, using credentials that
+    never leave this machine. The Contents API also avoids cloning an ever-growing log just
+    to append one directory.
+    """
+    rid = res.get("receipt_id")
+    if not rid:
+        return False
+    got = sh(f"cat {box_out}/*{rid[:8]}*.receipt.json 2>/dev/null || "
+             f"ls -t {box_out}/*.receipt.json 2>/dev/null | head -1 | xargs cat", timeout=120)
+    body = (got.stdout or "").strip()
+    if not body.startswith("{"):
+        print(f"#{num}: sealed but the receipt could not be read back from the box — "
+              f"not publishing a run I cannot show", file=sys.stderr)
+        return False
+    if dry_run:
+        print(f"--- dry-run: would publish runs/{rid} to {repo_log}")
+        return True
+    import base64
+    for name, payload in (("receipt.json", body),
+                          ("result.json", json.dumps(res, indent=2, sort_keys=True))):
+        enc = base64.b64encode(payload.encode()).decode()
+        q = gh(["api", "-X", "PUT", f"repos/{repo_log}/contents/runs/{rid}/{name}",
+                "-f", f"message=eval {rid}: tps={res.get('tps')} (PR #{num})",
+                "-f", f"content={enc}"])
+        if q.returncode != 0:
+            # Append-only: an existing path is a refusal, not a failure to fix by forcing.
+            print(f"#{num}: could not publish {name}: {q.stderr.strip()[:160]}",
+                  file=sys.stderr)
+            return False
+    print(f">> #{num}: published runs/{rid} to {repo_log}")
+    return True
+
+
 def mark_merge_first(repo, results, dry_run, queue_auto_merge=False):
     """Label the round's biggest verified gain `merge-first`, and clear it from the rest.
 
@@ -283,7 +339,18 @@ def mark_merge_first(repo, results, dry_run, queue_auto_merge=False):
         if has:
             gh(["label", "create", "merge-first", "-R", repo, "--color", "0E8A16",
                 "--description", "round's largest verified gain — merge this one first"])
-        gh(["pr", "edit", str(num), "-R", repo, act, "merge-first"])
+        # NOT `gh pr edit --add-label`: it queries projectCards, which GitHub has
+        # deprecated, so it exits 1 even when the repo has no projects. The bot printed
+        # ">> merge-first: #25" while the label never landed, because nothing checked the
+        # return code. The issues REST endpoint touches no GraphQL.
+        if has:
+            q = gh(["api", "-X", "POST", f"repos/{repo}/issues/{num}/labels",
+                    "-f", "labels[]=merge-first"])
+        else:
+            q = gh(["api", "-X", "DELETE", f"repos/{repo}/issues/{num}/labels/merge-first"])
+        if q.returncode != 0 and has:
+            print(f"!! #{num}: failed to set merge-first: {q.stderr.strip()[:200]}",
+                  file=sys.stderr)
     print(f">> merge-first: #{winner} ({ranked[0][1].get('tps')} tok/s)")
     if queue_auto_merge and not dry_run:
         r = gh(["pr", "merge", str(winner), "-R", repo, "--squash", "--auto"])
@@ -348,6 +415,8 @@ def main():
             continue
         print(f"#{num}: tps={res.get('tps')} top1={res.get('top1')} kl={res.get('kl')} "
               f"ms/token={res.get('ms_per_token')} — tier is eval-label.yml's to derive")
+        if res.get("receipt_id"):
+            publish_receipt(LOG_REPO, num, res, BOX_RECEIPTS, args.dry_run)
         post(args.repo, num, res, args.dry_run)
         results.append((num, res))
         evaluated += 1
@@ -356,7 +425,21 @@ def main():
         mark_merge_first(args.repo, results, args.dry_run,
                          queue_auto_merge=args.auto_merge)
 
-    sealed = sum(1 for _, r in results if r.get("receipt_id"))
+    # A receipt id proves a receipt was minted, not that anyone can find it. The log is the
+    # only thing that makes a number checkable by someone who was not at this terminal, so
+    # ask the log rather than trusting the id.
+    sealed = 0
+    for num, r in results:
+        rid = r.get("receipt_id")
+        if not rid:
+            continue
+        q = gh(["api", f"repos/{LOG_REPO}/contents/runs/{rid}", "--silent"])
+        if q.returncode == 0:
+            sealed += 1
+        else:
+            r.pop("receipt_id", None)
+            print(f"#{num}: receipt {rid[:12]} is NOT in {LOG_REPO} — the run is unattested",
+                  file=sys.stderr)
     print(f"done — {evaluated} evaluated, {sealed} sealed to the log; "
           f"tiers are eval-label.yml's, merges wait on review")
     return 0
