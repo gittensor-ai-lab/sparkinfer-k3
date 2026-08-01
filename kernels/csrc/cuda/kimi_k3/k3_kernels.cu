@@ -2021,6 +2021,78 @@ __global__ void proj_q8_0_q8_0_kernel(float* __restrict__ y,
 
 // Plain per-block dequant of N CONTIGUOUS values (no reduction) — what a row gather
 // needs (token_embd's row for one token), as opposed to k3_proj_f32's per-ROW dot
+// Same integer dot product, ROWS output rows per block.
+//
+// WHY THE dp4a PATH NEEDED THIS AND THE f32 PATH ALREADY HAD IT. k3_proj_f32's
+// Q8_0 kernel was widened to ROWS 16/8/4; proj_q8_0_q8_0_kernel never was, and
+// still gives every output row its own block. That asymmetry is the whole reason
+// the quantised-activation path lost 22% to the f32 one on merged main
+// (134.0 vs 110.1 ms/token at ctx 131072, 8x H200) despite doing strictly less
+// work per product: 8 __dp4a instead of 32 IMAD, over a 3.76x smaller activation.
+//
+// THE TRAFFIC THIS FIXES IS NOT WHAT IT LOOKS LIKE. Quantising the activation
+// shrinks it from 28 KB to 7.6 KB, which is easy to read as "the activation is
+// now small, so amortising it buys little". That is wrong, and it is the mistake
+// that killed an earlier fused-4 attempt on this path. The activation is small
+// PER BLOCK and is re-read by EVERY block:
+//
+//     KDA projection, N=12288 rows, K=7168
+//       weights     12288 x 224 blocks x 34 B  =  93.6 MB
+//       activation  12288 blocks x 7.6 KB      =  93.0 MB   <- same order
+//
+// So the re-read is still half the traffic, and ROWS cuts it by ROWS. At ROWS 8
+// the projection goes from ~187 MB to ~105 MB, a 1.78x cut.
+//
+// ROWS accumulators plus the 8 staged activation ints is the whole register cost
+// here. The earlier attempt held acc[4][ROWS] across FOUR fused tensors on top of
+// that and spilled; one tensor at a time is what keeps this in registers.
+//
+// BIT-IDENTICAL to the single-row kernel: each row keeps the same thread-to-block
+// striding, the same i order inside the block, the same int32 accumulation, and
+// the same block_sum. Only which rows share a CUDA block changes.
+template <int BLOCK, int ROWS>
+__global__ void proj_q8_0_q8_0_multirow_kernel(float* __restrict__ y,
+                                               const BlockQ8_0* __restrict__ x,
+                                               const BlockQ8_0* __restrict__ W,
+                                               int blocks_per_row, int n_rows) {
+    const int n0 = blockIdx.x * ROWS;
+    __shared__ float shm[BLOCK / 32 + 1];
+
+    float acc[ROWS];
+#pragma unroll
+    for (int r = 0; r < ROWS; ++r) acc[r] = 0.0f;
+
+    for (int b = threadIdx.x; b < blocks_per_row; b += BLOCK) {
+        // ONE activation block, staged once and reused by every row in this block.
+        // This is the load the single-row kernel repeats in ROWS separate blocks.
+        int xq[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) xq[i] = get_int_b2(x[b].qs, i);
+        const float dx = __half2float(__ushort_as_half(x[b].d));
+
+#pragma unroll
+        for (int r = 0; r < ROWS; ++r) {
+            if (n0 + r >= n_rows) continue;
+            const BlockQ8_0* row = W + (size_t)(n0 + r) * blocks_per_row;
+            int sumi = 0;
+#pragma unroll
+            for (int i = 0; i < 8; ++i)
+                sumi = __dp4a(get_int_b2(row[b].qs, i), xq[i], sumi);
+            const float dw = __half2float(__ushort_as_half(row[b].d));
+            acc[r] += (float)sumi * (dw * dx);
+        }
+    }
+
+    // block_sum contains __syncthreads(), so every thread must call it for every
+    // row; only the store is guarded.
+#pragma unroll
+    for (int r = 0; r < ROWS; ++r) {
+        const float v = block_sum<BLOCK>(acc[r], shm);
+        if (threadIdx.x == 0 && n0 + r < n_rows) y[n0 + r] = v;
+    }
+}
+
+
 // product. Shares the same block layouts.
 __global__ void dequant_q8_0_kernel(float* __restrict__ out,
                                     const BlockQ8_0* __restrict__ blocks,
@@ -2790,20 +2862,67 @@ bool k3_proj_ggml_f32(float* y, const float* x, const void* W, int wtype,
         (BlockQ8_0*)q8_scratch, x, nb);
     // Same idle-thread sizing as the f32-activation path above.
     constexpr int BLOCK = 128;
-    switch (proj_block_for(nb)) {
-        case 32:
-            proj_q8_0_q8_0_kernel<32><<<(unsigned)N, 32, 0, stream>>>(
-                y, (const BlockQ8_0*)q8_scratch, (const BlockQ8_0*)W, nb);
-            break;
-        case 64:
-            proj_q8_0_q8_0_kernel<64><<<(unsigned)N, 64, 0, stream>>>(
-                y, (const BlockQ8_0*)q8_scratch, (const BlockQ8_0*)W, nb);
-            break;
-        default:
-            proj_q8_0_q8_0_kernel<BLOCK><<<(unsigned)N, BLOCK, 0, stream>>>(
-                y, (const BlockQ8_0*)q8_scratch, (const BlockQ8_0*)W, nb);
-            break;
+    const int TB = proj_block_for(nb);
+
+    // ROWS PER BLOCK, mirroring what the f32 path already does. The thresholds are
+    // the f32 path's, and for the same reason: multi-row divides the grid by ROWS,
+    // so it is only free while the grid still covers the device several times over.
+    // K3's big projections are N=12288 (grid 768 at ROWS 16); the small ones
+    // (n_head=96 for ssm_beta) would drop to single digits and lose more to idle SMs
+    // than the amortised activation saves.
+    //
+    // The activation being quantised does NOT remove the reason to widen. It is 7.6 KB
+    // per block instead of 28 KB, but it is still re-read by every one of the N blocks,
+    // which at N=12288, K=7168 is 93 MB against 93.6 MB of weights. Halving the total
+    // needs ROWS, not a smaller activation.
+    constexpr int ROWS_W16 = 16;
+    constexpr int ROWS_W8  = 8;
+    constexpr int ROWS_W4  = 4;
+    constexpr int MIN_N_W16 = 4096;   // grid >= 256 blocks
+    constexpr int MIN_N_W8  = 2048;
+    constexpr int MIN_N_W4  = 1024;
+
+#define K3_QQ_LAUNCH(R)                                                              \
+    do {                                                                             \
+        const unsigned grid = (unsigned)((N + (R) - 1) / (R));                        \
+        switch (TB) {                                                                \
+            case 32:                                                                 \
+                proj_q8_0_q8_0_multirow_kernel<32, R><<<grid, 32, 0, stream>>>(       \
+                    y, (const BlockQ8_0*)q8_scratch, (const BlockQ8_0*)W, nb, N);      \
+                break;                                                               \
+            case 64:                                                                 \
+                proj_q8_0_q8_0_multirow_kernel<64, R><<<grid, 64, 0, stream>>>(       \
+                    y, (const BlockQ8_0*)q8_scratch, (const BlockQ8_0*)W, nb, N);      \
+                break;                                                               \
+            default:                                                                 \
+                proj_q8_0_q8_0_multirow_kernel<BLOCK, R><<<grid, BLOCK, 0, stream>>>( \
+                    y, (const BlockQ8_0*)q8_scratch, (const BlockQ8_0*)W, nb, N);      \
+                break;                                                               \
+        }                                                                            \
+    } while (0)
+
+    if      (N >= MIN_N_W16) K3_QQ_LAUNCH(ROWS_W16);
+    else if (N >= MIN_N_W8)  K3_QQ_LAUNCH(ROWS_W8);
+    else if (N >= MIN_N_W4)  K3_QQ_LAUNCH(ROWS_W4);
+    else {
+        // Below the threshold the single-row kernel keeps the wide grid, and it is
+        // also the one the numeric test pins bit-for-bit.
+        switch (TB) {
+            case 32:
+                proj_q8_0_q8_0_kernel<32><<<(unsigned)N, 32, 0, stream>>>(
+                    y, (const BlockQ8_0*)q8_scratch, (const BlockQ8_0*)W, nb);
+                break;
+            case 64:
+                proj_q8_0_q8_0_kernel<64><<<(unsigned)N, 64, 0, stream>>>(
+                    y, (const BlockQ8_0*)q8_scratch, (const BlockQ8_0*)W, nb);
+                break;
+            default:
+                proj_q8_0_q8_0_kernel<BLOCK><<<(unsigned)N, BLOCK, 0, stream>>>(
+                    y, (const BlockQ8_0*)q8_scratch, (const BlockQ8_0*)W, nb);
+                break;
+        }
     }
+#undef K3_QQ_LAUNCH
     return true;
 }
 
