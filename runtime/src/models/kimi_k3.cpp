@@ -30,11 +30,35 @@ bool env_one(const char* name) {
     return value && value[0] == '1';
 }
 
+bool env_zero(const char* name) {
+    const char* value = std::getenv(name);
+    return value && value[0] == '0';
+}
+
 // Diagnostic compatibility controls. The original all-in-one switch remains as a
 // convenient umbrella, while the component switches let the validation harness
 // distinguish projection, expert-dispatch, and LM-head quantization drift.
 bool qact_all()    { return env_one("SPARKINFER_K3_GGML_QACT"); }
-bool qact_proj()   { return qact_all() || env_one("SPARKINFER_K3_GGML_QACT_PROJ"); }
+
+// PROJECTIONS ARE ON BY DEFAULT; the other two are not, and the asymmetry is
+// measured rather than stylistic.
+//
+// Q8 activations let the projection GEMV run llama.cpp's __dp4a integer path
+// instead of decoding weights to f32, and projections are 35.7% of decode GPU
+// time. Measured at the scored 128k context, tp=8, interleaved against its own
+// control on one binary: 109.43 -> 97.10 ms/token, -11.3%. Accuracy holds by a
+// wide margin -- top1 1.0, mean_kld 0.006433 against a 0.20 gate.
+//
+// The MoE and LM-head variants stay OFF: _MOE measured a STABLE -8.6%
+// REGRESSION (118.0/117.7/118.8/120.0 vs 109.0/108.8/108.7/109.3) and _OUTPUT
+// measured no effect at all, being one launch per token. Enabling all three
+// under one umbrella switch is what hid that for so long.
+//
+// SPARKINFER_K3_GGML_QACT_PROJ=0 restores f32 projections. It has to be an
+// explicit 0 rather than an unset: an env-gated default-off improvement is one
+// the scoring harness never runs, which is exactly the trap this comment exists
+// to stop the next person walking into.
+bool qact_proj()   { return !env_zero("SPARKINFER_K3_GGML_QACT_PROJ"); }
 bool qact_moe()    { return qact_all() || env_one("SPARKINFER_K3_GGML_QACT_MOE"); }
 bool qact_output() { return qact_all() || env_one("SPARKINFER_K3_GGML_QACT_OUTPUT"); }
 
