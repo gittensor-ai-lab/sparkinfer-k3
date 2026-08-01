@@ -597,6 +597,10 @@ struct KimiK3Forward::Scratch {
     float* moe_out = nullptr;         // [expert_latent]
     float* dense_gate = nullptr, *dense_up = nullptr, *dense_situ = nullptr; // [dense_ffn]
     float* shexp_out = nullptr;        // [H] — shared-expert output, H-wide
+    // Softmax scratch for attn_res_mix_f32, [max_ckpt + 1]. Persistent because the
+    // mix runs twice per layer: allocating it per call cost a cudaMallocAsync /
+    // cudaFreeAsync pair ~185 times per token.
+    float* res_scores = nullptr;       // [ceil(n_layers / attn_res_block_size) + 1]
     void* proj_q8 = nullptr;           // optional llama CPU-compat block_q8_0 scratch
     void* moe_q8 = nullptr;            // optional llama CPU-compat block_q8_K scratch
 
@@ -673,6 +677,15 @@ bool kimi_k3_forward_alloc_scratch(const KimiK3Config& cfg, KimiK3Forward& fwd) 
     ok &= alloc_f(s.dense_up, cfg.dense_ffn);
     ok &= alloc_f(s.dense_situ, cfg.dense_ffn);
     ok &= alloc_f(s.shexp_out, H);
+    // Same bound kimi_k3_alloc_state uses for max_ckpt, +1 for the current stream.
+    // Sized from cfg rather than from the state so the scratch stays allocatable
+    // without one; a mix that somehow saw more checkpoints than the bank can hold
+    // would already have failed the `n_ckpt >= max_ckpt` guard in the forward.
+    ok &= alloc_f(s.res_scores,
+                  cfg.attn_res_block_size > 0
+                      ? (size_t)((cfg.n_layers + cfg.attn_res_block_size - 1) /
+                                 cfg.attn_res_block_size) + 1
+                      : 1);
     ok &= alloc_bytes(s.proj_q8, k3k::k3_q8_0_bytes(cfg.dense_ffn));
     ok &= alloc_bytes(s.moe_q8,
                       k3k::k3_moe_q8_k_bytes(cfg.expert_latent, cfg.moe_ffn, cfg.top_k));
@@ -807,7 +820,7 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             if (!L.attn_res_score.ok()) return false;
             k3k::attn_res_mix_f32(s.mixed, st.res_bank, hidden_in,
                                   (const float*)L.attn_res_score.data, H, st.n_ckpt,
-                                  eps, stream);
+                                  eps, stream, s.res_scores);
             if (banked) {
                 if (st.n_ckpt >= st.max_ckpt) return false;
                 cudaMemcpyAsync(st.res_bank + (size_t)st.n_ckpt * H, hidden_in,
@@ -1001,7 +1014,7 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             if (!L.ffn_res_score.ok()) return false;
             k3k::attn_res_mix_f32(s.mixed2, st.res_bank, hidden_out,
                                   (const float*)L.ffn_res_score.data, H, st.n_ckpt, eps,
-                                  stream);
+                                  stream, s.res_scores);
         } else {
             cudaMemcpyAsync(s.mixed2, hidden_out, (size_t)H * sizeof(float),
                             cudaMemcpyDeviceToDevice, stream);

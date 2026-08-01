@@ -41,6 +41,15 @@ static void check(const char* name, double max_err, double tol) {
     if (!ok) g_fail++;
 }
 
+// The inverse assertion: a negative control has to STAY apart. A "wrong variant differs"
+// case that quietly converges is worse than no case at all, because the suite still
+// reports PASS while checking nothing.
+static void check_min(const char* name, double diff, double floor_) {
+    bool ok = diff >= floor_;
+    printf("  [%s] %-34s diff=%.3e (min=%.0e)\n", ok ? "PASS" : "FAIL", name, diff, floor_);
+    if (!ok) g_fail++;
+}
+
 static float silu(float x) { return x / (1.f + std::exp(-x)); }
 
 // ---------------------------------------------------------------------------
@@ -443,6 +452,201 @@ static double test_mla_decode_attn(int key_length, int kv_lora, int v_dim,
     return worst;
 }
 
+// ---------------------------------------------------------------------------
+// 9b. Kimi K3 MLA decode, HEAD-BATCHED AND CONTEXT-SPLIT: the schedule
+//     mla_decode_attn_hbatch_kernel + mla_decode_combine_kernel actually run.
+// ---------------------------------------------------------------------------
+// Three things differ from 9 and each can be wrong on its own, so each is modelled
+// rather than assumed:
+//
+//   - HPB heads share a block. A lane loads k_cache[t][d] once and multiplies it into
+//     HPB accumulators. Getting the s_q stride wrong here reads another head's query
+//     and still produces plausible numbers. The device kernel scores kMlaTokensPerWarp
+//     tokens per pass over the staged queries; that is a scheduling choice and not a
+//     summation-order one — a given (head, token) still accumulates d = lane, lane+32,
+//     … in that order under the same shuffle tree — so one token at a time models it.
+//   - The per-tile softmax reduces over ONE WARP (32 lanes, t += 32), not over BLOCK
+//     threads (t += 256). Different tree, different rounding — modelled exactly so the
+//     tolerance is measuring the algorithm and not this.
+//   - The slice partials are UNNORMALISED and merged by a second kernel that rescales
+//     each slice by exp(m_i - m) before dividing by the merged l. A slice boundary
+//     landing mid-tile, or an m that a later slice raises, is only exercised here.
+//
+// n_ctx values are chosen to land on and off tile and slice boundaries. Modelled on
+// the CPU because reaching this path on a device needs a context past
+// kMlaSplitMinCtx, and the whole point of a CPU reference is that CI can run it.
+static double test_mla_decode_hbatch(int key_length, int kv_lora, int v_dim,
+                                     int n_ctx, int n_head, int hpb, int splits) {
+    const float scale = 1.f / std::sqrt((float)key_length);
+
+    vector<float> q((size_t)key_length * n_head), K((size_t)key_length * n_ctx),
+                  wv((size_t)kv_lora * v_dim * n_head);
+    for (auto& x : q) x = frand();
+    for (auto& x : K) x = frand();
+    for (auto& x : wv) x = 0.2f * frand();
+
+    // --- the batched slice kernel: one entry per (head, slice) ---
+    vector<float> part_acc((size_t)n_head * splits * kv_lora, 0.f);
+    vector<float> part_m((size_t)n_head * splits, -1e30f);
+    vector<float> part_l((size_t)n_head * splits, 0.f);
+
+    const int chunk = (n_ctx + splits - 1) / splits;
+    for (int hg = 0; hg * hpb < n_head; hg++) {
+        for (int sp = 0; sp < splits; sp++) {
+            const int t_beg = sp * chunk;
+            const int t_end = std::min(n_ctx, t_beg + chunk);
+            if (t_end <= t_beg) continue;                 // empty slice contributes nothing
+
+            // s_q: hpb staged queries. acc: RSLOTS x hpb, one r per thread.
+            vector<float> s_p((size_t)hpb * MLA_TILE, 0.f);
+            vector<float> acc((size_t)hpb * kv_lora, 0.f);
+            vector<float> m(hpb, -1e30f), l(hpb, 0.f), corr(hpb, 0.f);
+
+            for (int t0 = t_beg; t0 < t_end; t0 += MLA_TILE) {
+                const int tn = std::min(MLA_TILE, t_end - t0);
+
+                // 1. score: one warp per token, lanes over d, hpb accumulators
+                for (int t = 0; t < tn; t++) {
+                    for (int hh = 0; hh < hpb; hh++) {
+                        const int h = hg * hpb + hh;
+                        vector<float> part(32, 0.f);
+                        for (int lane = 0; lane < 32; lane++)
+                            for (int d = lane; d < key_length; d += 32)
+                                part[lane] += q[(size_t)h * key_length + d] *
+                                              K[(size_t)(t0 + t) * key_length + d];
+                        s_p[(size_t)hh * MLA_TILE + t] = mla_warp_sum(part) * scale;
+                    }
+                }
+
+                // 2. online softmax, ONE WARP per head: t += 32, then the shuffle tree
+                for (int hh = 0; hh < hpb; hh++) {
+                    float* pr = &s_p[(size_t)hh * MLA_TILE];
+                    vector<float> tv(32, -1e30f);
+                    for (int lane = 0; lane < 32; lane++)
+                        for (int t = lane; t < tn; t += 32) tv[lane] = std::fmax(tv[lane], pr[t]);
+                    const float m_new = std::fmax(m[hh], mla_warp_max(tv));
+                    corr[hh] = std::exp(m[hh] - m_new);
+
+                    vector<float> lv(32, 0.f);
+                    for (int lane = 0; lane < 32; lane++)
+                        for (int t = lane; t < tn; t += 32) {
+                            const float e = std::exp(pr[t] - m_new);
+                            pr[t] = e;
+                            lv[lane] += e;
+                        }
+                    l[hh] = l[hh] * corr[hh] + mla_warp_sum(lv);
+                    m[hh] = m_new;
+                }
+
+                // 3. latent: one k_cache load per (t, r) feeding hpb accumulators
+                for (int hh = 0; hh < hpb; hh++)
+                    for (int r = 0; r < kv_lora; r++) acc[(size_t)hh * kv_lora + r] *= corr[hh];
+                for (int t = 0; t < tn; t++)
+                    for (int r = 0; r < kv_lora; r++) {
+                        const float kv = K[(size_t)(t0 + t) * key_length + r];
+                        for (int hh = 0; hh < hpb; hh++)
+                            acc[(size_t)hh * kv_lora + r] += s_p[(size_t)hh * MLA_TILE + t] * kv;
+                    }
+            }
+
+            for (int hh = 0; hh < hpb; hh++) {
+                const int h = hg * hpb + hh;
+                for (int r = 0; r < kv_lora; r++)
+                    part_acc[((size_t)h * splits + sp) * kv_lora + r] = acc[(size_t)hh * kv_lora + r];
+                part_m[(size_t)h * splits + sp] = m[hh];
+                part_l[(size_t)h * splits + sp] = l[hh];
+            }
+        }
+    }
+
+    // --- the combine kernel, then compare against a two-pass float64 reference ---
+    double worst = 0.0;
+    for (int h = 0; h < n_head; h++) {
+        vector<double> sc(n_ctx);
+        double mx = -1e300;
+        for (int t = 0; t < n_ctx; t++) {
+            double d = 0;
+            for (int i = 0; i < key_length; i++)
+                d += (double)q[(size_t)h * key_length + i] * K[(size_t)t * key_length + i];
+            sc[t] = d * scale;
+            mx = std::max(mx, sc[t]);
+        }
+        double sum = 0;
+        for (int t = 0; t < n_ctx; t++) { sc[t] = std::exp(sc[t] - mx); sum += sc[t]; }
+        vector<double> want(v_dim);
+        {
+            vector<double> latent(kv_lora, 0.0);
+            for (int r = 0; r < kv_lora; r++) {
+                double a = 0;
+                for (int t = 0; t < n_ctx; t++) a += sc[t] * K[(size_t)t * key_length + r];
+                latent[r] = a / sum;
+            }
+            for (int v = 0; v < v_dim; v++) {
+                double a = 0;
+                for (int r = 0; r < kv_lora; r++)
+                    a += (double)wv[((size_t)h * v_dim + v) * kv_lora + r] * latent[r];
+                want[v] = a;
+            }
+        }
+
+        float mm = -1e30f;
+        for (int i = 0; i < splits; i++) mm = std::fmax(mm, part_m[(size_t)h * splits + i]);
+        vector<float> w(splits);
+        float ll = 0.f;
+        for (int i = 0; i < splits; i++) {
+            w[i] = std::exp(part_m[(size_t)h * splits + i] - mm);
+            ll += part_l[(size_t)h * splits + i] * w[i];
+        }
+        const float inv = ll > 0.f ? 1.f / ll : 0.f;
+        vector<float> lat(kv_lora, 0.f);
+        for (int r = 0; r < kv_lora; r++) {
+            float a = 0.f;
+            for (int i = 0; i < splits; i++)
+                a += part_acc[((size_t)h * splits + i) * kv_lora + r] * w[i];
+            lat[r] = a * inv;
+        }
+        for (int v = 0; v < v_dim; v++) {           // one warp per output element
+            vector<float> part(32, 0.f);
+            for (int lane = 0; lane < 32; lane++)
+                for (int r = lane; r < kv_lora; r += 32)
+                    part[lane] += wv[((size_t)h * v_dim + v) * kv_lora + r] * lat[r];
+            worst = std::max(worst, std::abs((double)mla_warp_sum(part) - want[v]));
+        }
+    }
+    return worst;
+}
+
+// NEGATIVE CONTROL for the merge. Each slice returns an UNNORMALISED latent under its
+// OWN running max, so the combine has to rescale slice i by exp(m_i - max_i m_i) before
+// summing. Dropping that rescale — just adding the partials and dividing by the summed
+// l — is the natural-looking bug, and on well-conditioned inputs it produces a finite,
+// plausible vector rather than anything obviously broken.
+//
+// This runs the same two-slice split twice, once merged correctly and once without the
+// rescale, and returns how far apart they are. It must be LARGE. If it ever collapses
+// toward zero, the per-slice maxima have stopped differing and the tolerance checks
+// above are no longer exercising the merge at all.
+static double test_mla_split_merge_needs_rescale() {
+    const int n = 8;
+    // Two slices whose score ranges are far apart, which is the case the rescale is for.
+    float m0 = 12.0f, m1 = -3.0f;
+    vector<float> a0(n), a1(n);
+    for (int r = 0; r < n; r++) { a0[r] = frand(); a1[r] = frand(); }
+    const float l0 = 3.5f, l1 = 2.25f;
+
+    const float m = std::fmax(m0, m1);
+    const float w0 = std::exp(m0 - m), w1 = std::exp(m1 - m);
+    const float lr = l0 * w0 + l1 * w1;
+
+    double worst = 0.0;
+    for (int r = 0; r < n; r++) {
+        const double right = (a0[r] * w0 + a1[r] * w1) / lr;
+        const double naive = (a0[r] + a1[r]) / (l0 + l1);      // the missing-rescale bug
+        worst = std::max(worst, std::abs(right - naive));
+    }
+    return worst;
+}
+
 int main() {
     printf("sparkinfer kernel algorithm correctness (CPU reference)\n");
     check("attention hd128 kv1",   test_attention(128, 1),    1e-4);
@@ -470,6 +674,16 @@ int main() {
     check("mla decode ctx128 (exact)", test_mla_decode_attn(576, 512, 128, 128, 2),  2e-4);
     check("mla decode ctx1000",        test_mla_decode_attn(576, 512, 128, 1000, 2), 2e-4);
     check("mla decode ctx16384",       test_mla_decode_attn(576, 512, 128, 16384, 1), 2e-4);
+    // Head-batched + context-split, at K3's real MLA dims. 12 heads per block is the
+    // shipped batch; the contexts straddle tile and slice boundaries, and 5000/7 gives
+    // slices that are not a whole number of tiles. hpb 8 and 4 are the fallbacks
+    // k3_mla_heads_per_block takes for head counts 12 does not divide.
+    check("mla hbatch ctx8192 hpb12", test_mla_decode_hbatch(576, 512, 128, 8192, 12, 12, 8), 2e-4);
+    check("mla hbatch ctx5000 sp7",   test_mla_decode_hbatch(576, 512, 128, 5000, 12, 12, 7), 2e-4);
+    check("mla hbatch ctx1000 sp3",   test_mla_decode_hbatch(576, 512, 128, 1000, 12, 12, 3), 2e-4);
+    check("mla hbatch ctx8192 hpb8",  test_mla_decode_hbatch(576, 512, 128, 8192, 8,  8,  8), 2e-4);
+    check("mla hbatch ctx300 hpb4",   test_mla_decode_hbatch(576, 512, 128, 300,  4,  4,  2), 2e-4);
+    check_min("mla split merge needs rescale", test_mla_split_merge_needs_rescale(), 1e-2);
     printf("%s (%d failures)\n", g_fail ? "FAILED" : "ALL PASSED", g_fail);
     return g_fail ? 1 : 0;
 }

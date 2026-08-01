@@ -77,6 +77,115 @@ __global__ void situ_kernel(float* __restrict__ out, const float* __restrict__ g
 // walks S[i][j] with stride head_dim — coalesced across threads for fixed i, which
 // is the access pattern both reduction passes want.
 
+// STAGED VARIANT. Identical arithmetic; the state makes the trip through shared memory
+// in COLUMN CHUNKS instead of being walked in place.
+//
+// Thread j wants S[j * head_dim + i] for every i. In global that is a 512-byte stride
+// across the warp, so each load instruction touches 32 sectors to use 128 bytes — an 8x
+// read amplification over a state that is 96 heads x 128 x 128 floats = 6.3 MB per KDA
+// layer, read AND written twice per token across 69 KDA layers. Measured on 8x H200 at
+// tp=8 (nsys, main 86bb264) the kernel moved 24.6 MB per launch in 90.5 us = 271 GB/s.
+//
+// The chunk copy is linear — thread t takes (row t/IC, column i0 + t%IC), so a warp
+// covers one row's 32 consecutive floats — and the strided walk then happens in shared,
+// padded to IC + 1 so bank = (j + c) % 32 is distinct across the warp.
+//
+// IC = 32 IS THE POINT, not a tuning knob. head_dim x (IC+1) + 4*head_dim floats is
+// 18.5 KB, under the 48 KB a block gets by default. Staging the whole 128x128 tile
+// instead needs 68 KB, which requires cudaFuncSetAttribute per device and a fallback
+// when it is refused — and a run that silently took that fallback is indistinguishable
+// in the output from one that did not. Staying under the default removes the opt-in,
+// the fallback, and the question.
+//
+// THE STORED LAYOUT IS UNCHANGED, deliberately. Transposing the state to i-major would
+// coalesce the global access directly and is WRONG: kimi_k3_numeric_test seeds a random
+// non-zero state and its float64 reference documents the layout ("S[i][j] at s[j*D+i]"),
+// so j-major is a contract. It only looks private because production starts from zero.
+//
+// BIT-IDENTICAL: sk and o still accumulate i in increasing order, across chunks and
+// within them, against the same operands.
+template <int BLOCK>
+__global__ void kda_decode_step_smem_kernel(float* __restrict__ out,
+                                            float* __restrict__ state,
+                                            const float* __restrict__ q,
+                                            const float* __restrict__ k,
+                                            const float* __restrict__ v,
+                                            const float* __restrict__ g,
+                                            const float* __restrict__ beta,
+                                            int head_dim) {
+    constexpr int IC = 32;                  // state columns staged per chunk
+    const int SP = IC + 1;                  // padded row stride, kills bank conflicts
+    const int h = blockIdx.x;
+    const int j = threadIdx.x;
+
+    float* S = state + (size_t)h * head_dim * head_dim;
+    const float* qh = q + (size_t)h * head_dim;
+    const float* kh = k + (size_t)h * head_dim;
+    const float* vh = v + (size_t)h * head_dim;
+    const float* gh = g + (size_t)h * head_dim;
+    const float  b  = beta[h];
+
+    extern __shared__ float smem[];
+    float* s_k  = smem;
+    float* s_q  = s_k + head_dim;
+    float* s_sk = s_q + head_dim;
+    float* s_ge = s_sk + head_dim;
+    float* s_T  = s_ge + head_dim;          // head_dim rows of SP
+
+    if (j < head_dim) {
+        s_k[j]  = kh[j];
+        s_q[j]  = qh[j];
+        s_ge[j] = __expf(gh[j]);
+    }
+    __syncthreads();
+
+    // Step 1 + 2: decay by exp(g[i]) and sk[j] = sum_i S[i][j]*k[i].
+    float sk = 0.0f;
+    for (int i0 = 0; i0 < head_dim; i0 += IC) {
+        for (int t = j; t < head_dim * IC; t += BLOCK)
+            s_T[(t / IC) * SP + (t % IC)] = S[(size_t)(t / IC) * head_dim + i0 + (t % IC)];
+        __syncthreads();
+        if (j < head_dim) {
+            for (int c = 0; c < IC; ++c) {
+                const float sv = s_T[j * SP + c] * s_ge[i0 + c];
+                s_T[j * SP + c] = sv;
+                sk += sv * s_k[i0 + c];
+            }
+        }
+        __syncthreads();
+        for (int t = j; t < head_dim * IC; t += BLOCK)
+            S[(size_t)(t / IC) * head_dim + i0 + (t % IC)] = s_T[(t / IC) * SP + (t % IC)];
+        __syncthreads();
+    }
+    if (j < head_dim) s_sk[j] = sk;
+    __syncthreads();
+
+    // Step 3: d[j] = beta * (v[j] - sk[j]).
+    float d_j = 0.0f;
+    if (j < head_dim) d_j = b * (vh[j] - s_sk[j]);
+    __syncthreads();
+
+    // Step 4 + 5: rank-1 update, then o[j] = sum_i S[i][j]*q[i].
+    float o = 0.0f;
+    for (int i0 = 0; i0 < head_dim; i0 += IC) {
+        for (int t = j; t < head_dim * IC; t += BLOCK)
+            s_T[(t / IC) * SP + (t % IC)] = S[(size_t)(t / IC) * head_dim + i0 + (t % IC)];
+        __syncthreads();
+        if (j < head_dim) {
+            for (int c = 0; c < IC; ++c) {
+                const float sv = s_T[j * SP + c] + s_k[i0 + c] * d_j;
+                s_T[j * SP + c] = sv;
+                o += sv * s_q[i0 + c];
+            }
+        }
+        __syncthreads();
+        for (int t = j; t < head_dim * IC; t += BLOCK)
+            S[(size_t)(t / IC) * head_dim + i0 + (t % IC)] = s_T[(t / IC) * SP + (t % IC)];
+        __syncthreads();
+    }
+    if (j < head_dim) out[(size_t)h * head_dim + j] = o;
+}
+
 template <int BLOCK>
 __global__ void kda_decode_step_kernel(float* __restrict__ out, float* __restrict__ state,
                                        const float* __restrict__ q,
@@ -196,66 +305,87 @@ __global__ void kda_gate_out_kernel(float* __restrict__ out, const float* __rest
 // ---------------------------------------------------------------------------
 // 4. cross-layer attention residual mix
 // ---------------------------------------------------------------------------
-// One block. Pass 1: score every banked checkpoint plus the current stream from the
-// NORMALISED values. Pass 2: softmax. Pass 3: weighted sum over the RAW values.
-// The normalised/raw split is the reference's, not a choice — see the header.
+// Pass 1: score every banked checkpoint plus the current stream from the NORMALISED
+// values. Pass 2: softmax. Pass 3: weighted sum over the RAW values. The
+// normalised/raw split is the reference's, not a choice — see the header.
+//
+// SPLIT ACROSS THE DEVICE. All three passes used to run in a SINGLE BLOCK —
+// <<<1, 256>>>, one SM of the H200's 132 — and the mix is called twice per layer,
+// ~185 times per token. Measured on 8x H200 at tp=8 it was 5.7 ms of the 98 ms
+// token, 5.8% of decode, spent with 99.2% of the machine idle.
+//
+// The serialisation was in the shape, not the arithmetic. Pass 1 scores each
+// checkpoint INDEPENDENTLY, so the one block walked `c` in a loop for no reason
+// other than that it was one block; it becomes one block per checkpoint. Pass 3
+// writes each of the n_embd outputs independently; it becomes a normal grid.
+//
+// EVERY VALUE IS BIT-IDENTICAL, and the reasons are worth stating because "close
+// enough" would not be checkable by byte comparison:
+//   - the score kernel keeps BLOCK=256 and the same `d += BLOCK` stride, so each
+//     thread's partial sum is over the same elements in the same order, and
+//     block_sum<256> then folds them in the same tree;
+//   - the softmax is recomputed per block in pass 3 rather than passed down. It is
+//     at most n_ckpt+1 = 9 values, so a third launch would cost more than the
+//     redundancy, and thread 0 walks max/exp/normalise in the SAME order the
+//     one-block version did;
+//   - pass 3 accumulates `c` in increasing order and adds the current stream last,
+//     exactly as before. Reassociating that sum would be equivalent in real
+//     arithmetic and not in float.
+//
+// The two launches also drop a cudaMallocAsync/cudaFreeAsync PAIR per call — ~370
+// stream-ordered allocator calls per token — because the scores now live in a
+// caller-owned buffer. That is a prerequisite for ever capturing the decode step
+// into a CUDA graph, which stream-ordered allocation inside the captured region
+// complicates; it is not the reason for the change, but it is not an accident.
 
 template <int BLOCK>
-__global__ void attn_res_mix_kernel(float* __restrict__ out,
-                                    const float* __restrict__ ckpts,
-                                    const float* __restrict__ cur,
-                                    const float* __restrict__ score_w,
-                                    int n_embd, int n_ckpt, float eps,
-                                    float* __restrict__ scratch) {
+__global__ void attn_res_score_kernel(float* __restrict__ scores,
+                                      const float* __restrict__ ckpts,
+                                      const float* __restrict__ cur,
+                                      const float* __restrict__ score_w,
+                                      int n_embd, int n_ckpt, float eps) {
     __shared__ float shm[BLOCK / 32 + 1];
-    float* scores = scratch;              // n_ckpt + 1
+    // blockIdx.x in [0, n_ckpt]: the last block scores the current stream, which is
+    // the only thing that made pass 1 look sequential.
+    const int c = blockIdx.x;
+    const float* __restrict__ src = (c < n_ckpt) ? ckpts + (size_t)c * n_embd : cur;
 
-    // --- score the banked checkpoints ---
-    for (int c = 0; c < n_ckpt; ++c) {
-        const float* src = ckpts + (size_t)c * n_embd;
-        float ss = 0.0f;
-        for (int d = threadIdx.x; d < n_embd; d += BLOCK) ss += src[d] * src[d];
-        ss = block_sum<BLOCK>(ss, shm);
-        const float inv = rsqrtf(ss / (float)n_embd + eps);
-        float dot = 0.0f;
-        for (int d = threadIdx.x; d < n_embd; d += BLOCK) dot += (src[d] * inv) * score_w[d];
-        dot = block_sum<BLOCK>(dot, shm);
-        if (threadIdx.x == 0) scores[c] = dot;
-        __syncthreads();
-    }
+    float ss = 0.0f;
+    for (int d = threadIdx.x; d < n_embd; d += BLOCK) ss += src[d] * src[d];
+    ss = block_sum<BLOCK>(ss, shm);
+    const float inv = rsqrtf(ss / (float)n_embd + eps);
 
-    // --- score the current stream ---
-    {
-        float ss = 0.0f;
-        for (int d = threadIdx.x; d < n_embd; d += BLOCK) ss += cur[d] * cur[d];
-        ss = block_sum<BLOCK>(ss, shm);
-        const float inv = rsqrtf(ss / (float)n_embd + eps);
-        float dot = 0.0f;
-        for (int d = threadIdx.x; d < n_embd; d += BLOCK) dot += (cur[d] * inv) * score_w[d];
-        dot = block_sum<BLOCK>(dot, shm);
-        if (threadIdx.x == 0) scores[n_ckpt] = dot;
-        __syncthreads();
-    }
+    float dot = 0.0f;
+    for (int d = threadIdx.x; d < n_embd; d += BLOCK) dot += (src[d] * inv) * score_w[d];
+    dot = block_sum<BLOCK>(dot, shm);
+    if (threadIdx.x == 0) scores[c] = dot;
+}
 
-    // --- softmax over n_ckpt + 1, computed once by thread 0 (tiny) ---
+template <int BLOCK>
+__global__ void attn_res_apply_kernel(float* __restrict__ out,
+                                      const float* __restrict__ ckpts,
+                                      const float* __restrict__ cur,
+                                      const float* __restrict__ scores,
+                                      int n_embd, int n_ckpt) {
+    extern __shared__ float p[];              // n_ckpt + 1 softmax weights
+
     if (threadIdx.x == 0) {
         const int n = n_ckpt + 1;
         float mx = scores[0];
         for (int c = 1; c < n; ++c) mx = fmaxf(mx, scores[c]);
         float sum = 0.0f;
-        for (int c = 0; c < n; ++c) { scores[c] = __expf(scores[c] - mx); sum += scores[c]; }
+        for (int c = 0; c < n; ++c) { p[c] = __expf(scores[c] - mx); sum += p[c]; }
         const float inv = 1.0f / sum;
-        for (int c = 0; c < n; ++c) scores[c] *= inv;
+        for (int c = 0; c < n; ++c) p[c] *= inv;
     }
     __syncthreads();
 
-    // --- weighted sum over the RAW values ---
-    for (int d = threadIdx.x; d < n_embd; d += BLOCK) {
-        float acc = 0.0f;
-        for (int c = 0; c < n_ckpt; ++c) acc += scores[c] * ckpts[(size_t)c * n_embd + d];
-        acc += scores[n_ckpt] * cur[d];
-        out[d] = acc;
-    }
+    const int d = blockIdx.x * BLOCK + threadIdx.x;
+    if (d >= n_embd) return;
+    float acc = 0.0f;
+    for (int c = 0; c < n_ckpt; ++c) acc += p[c] * ckpts[(size_t)c * n_embd + d];
+    acc += p[n_ckpt] * cur[d];
+    out[d] = acc;
 }
 
 // ---------------------------------------------------------------------------
@@ -984,7 +1114,66 @@ constexpr int kMlaCtxTile = 128;
 // not worth the combine pass; kMlaMaxSplits caps the scratch and keeps the combine's
 // per-slice loop short.
 constexpr int kMlaSplitMinCtx = 4096;
-constexpr int kMlaMaxSplits   = 32;
+constexpr int kMlaMaxSplits   = 64;
+
+// ---------------------------------------------------------------------------
+// MLA IS MQA, AND ONE BLOCK PER HEAD READS THE KV CACHE n_head TIMES.
+// ---------------------------------------------------------------------------
+// k_cache is indexed [t][key_length] with NO head axis: MLA keeps one compressed
+// latent per position and all 96 query heads attend over the same rows. The kernels
+// above give each head its own block, so at the scored context every one of those
+// blocks streams the entire cache independently:
+//
+//   one MLA layer at 131,072 ctx   131072 * 576 * 4 B            =  302 MB
+//   x 96 heads (score pass reads 576/row, latent pass 512 more)  = 54.8 GB
+//   x 24 MLA layers                                              =  1.3 TB per token
+//
+// 1.3 TB per token per rank against an H200's 4.8 TB/s is ~274 ms of pure cache
+// traffic for a token that measures 220 ms, so L2 is already covering more than half
+// of it — the kernel is not slow, it is asking for the same bytes 96 times.
+//
+// kMlaHeadsPerBlock fixes the ratio rather than the bandwidth. One block takes HPB
+// heads, stages their absorbed queries in shared memory, and every k_cache element it
+// loads is consumed HPB times: once per head in the score pass, once per head in the
+// latent accumulation. Traffic falls by HPB with no change to what is computed.
+//
+// WHY 12, WHICH IS NOT THE LARGEST HPB THAT FITS. Traffic falls as 1/HPB but so does
+// concurrency: the kernel is latency-bound, not compute-bound, so what it can actually
+// pull from memory is set by how many loads are in flight, i.e. by blocks per SM. HPB
+// costs registers (RSLOTS * HPB latent accumulators live across the whole slice, plus
+// HPB * TPW score accumulators) and shared (HPB * key_length staged queries), and both
+// budgets are per SM. Measured at 131,072 ctx on 8x H200, tp=8, UD-IQ1_S, 32 tokens,
+// median ms/token, against main at 221.4:
+//
+//   HPB   regs   blocks/SM   ms/token
+//     8     96       2         141.1
+//    12    125       2         135.7
+//    16    148       1         149.9     <- 148 regs is over 65536/(256*2)
+//
+// 16 halves the traffic again and loses, because 256 * 149 registers no longer fits a
+// second block and the SM drops to 8 warps. 12 is the largest batch that still leaves
+// two blocks resident. It divides 96 exactly; k3_mla_heads_per_block falls back through
+// 8, 4 and finally 1 (the per-head kernel) for shapes where it does not.
+constexpr int kMlaHeadsPerBlock = 12;
+
+// Latent accumulator slots per thread: ceil(kv_lora / BLOCK), held in registers rather
+// than shared. r is fixed per thread for the whole slice, so the accumulator never
+// needs to be visible to another thread until the slice ends — and keeping it out of
+// shared is what leaves room for HPB staged queries.
+constexpr int kMlaMaxRSlots = 4;
+
+// Tokens a warp scores per pass over the staged queries.
+//
+// Staging the queries moves the cost rather than removing it unless each staged value
+// is used more than once. Scoring one token at a time reads HPB floats from shared per
+// 128 bytes of cache, and 32 banks x 4 B/clk caps that at ~3.7 TB/s at HPB 8 — under
+// the card's HBM rate, so the shared memory that saves the traffic becomes the thing
+// capping it. Scoring TPW tokens per pass divides that ratio by TPW.
+//
+// Measured at 131,072 ctx, HPB 12 (8x H200, tp=8, UD-IQ1_S, 32 tokens): TPW 2 gives
+// 143.2 ms/token, TPW 4 gives 135.7. The score dot product is unchanged — same lanes,
+// same d order, same shuffle tree — so this is purely a scheduling change.
+constexpr int kMlaTokensPerWarp = 4;
 
 // Scratch for the partials, grown on demand and reused. Sized n_head * splits *
 // (kv_lora + 2) floats — 6.3 MB at K3's dims with 32 splits, against ~140 GB of weights,
@@ -1021,6 +1210,51 @@ static bool k3_mla_split_scratch(int n_head, int kv_lora, int* dev_out) {
     }
     g_mla_part_cap[dev] = need;
     return true;
+}
+
+// A block's dynamic shared allocation without cudaFuncSetAttribute. Deliberately the
+// DEFAULT and not the 227 KB Hopper opt-in: an opt-in that a device refuses leaves a
+// silent fallback whose only symptom is a slower run, and the whole reason this file
+// stopped staging the score vector was a launch failure nothing polled for.
+constexpr size_t kMlaShmBudget = 48u * 1024u;
+
+// Slice-count targets for the head-batched grid. kMlaMinSliceLen keeps a slice long
+// enough that the per-slice combine work stays amortised.
+//
+// kMlaBlocksPerSm is what the batched kernel ACTUALLY achieves at kMlaHeadsPerBlock
+// (125 registers x 256 threads leaves room for two), not a wish. Asking for more
+// slices than can be resident does not add parallelism — the extra blocks queue — but
+// it does add partials for mla_decode_combine_kernel to merge and for the scratch to
+// carry, so overshooting is pure cost. At K3's dims this makes the grid
+// (96/12) * 33 = 264 blocks, exactly two per SM on a 132-SM H200, in one wave.
+constexpr int kMlaBlocksPerSm = 2;
+constexpr int kMlaMinSliceLen = 1024;
+
+// Largest head batch that divides n_head and whose staged queries fit the default
+// shared budget. 1 means "not worth it / does not fit" and selects the per-head kernel.
+// The floor is 4: below that the staging and the extra registers cost about what the
+// halved traffic saves, and every instantiation is code the launcher has to carry.
+static inline int k3_mla_heads_per_block(int n_head, int key_length) {
+    const int cand[3] = {kMlaHeadsPerBlock, 8, 4};
+    for (int ci = 0; ci < 3; ++ci) {
+        const int hpb = cand[ci];
+        if (hpb < 4 || n_head % hpb != 0) continue;
+        const size_t shm = ((size_t)hpb * (size_t)key_length +
+                            (size_t)hpb * kMlaCtxTile + 3u * (size_t)hpb) * sizeof(float);
+        if (shm <= kMlaShmBudget) return hpb;
+    }
+    return 1;
+}
+
+static inline int k3_sm_count(int dev) {
+    static int cache[kMlaMaxDevices] = {0};
+    if (dev < 0 || dev >= kMlaMaxDevices) return 0;
+    if (cache[dev] == 0) {
+        cudaDeviceProp prop{};
+        cache[dev] = (cudaGetDeviceProperties(&prop, dev) == cudaSuccess)
+                   ? prop.multiProcessorCount : -1;
+    }
+    return cache[dev] > 0 ? cache[dev] : 0;
 }
 
 template <int BLOCK>
@@ -1311,6 +1545,203 @@ __global__ void mla_decode_attn_split_kernel(float* __restrict__ part_acc,
         float* pm = part_ml + ((size_t)h * splits + sp) * 2;
         pm[0] = (t_end > t_beg) ? m : -1e30f;
         pm[1] = (t_end > t_beg) ? l : 0.0f;
+    }
+}
+
+// HEAD-BATCHED context slice. Same partial contract as mla_decode_attn_split_kernel —
+// unnormalised latent per (head, slice) plus that slice's (m, l) — so
+// mla_decode_combine_kernel merges either one without knowing which ran.
+//
+// The three phases and what each one reuses:
+//
+//   1. score    one warp per token, lanes striding d. A lane loads k_cache[t][d] ONCE
+//               and multiplies it into HPB accumulators, one per head. This is the
+//               whole point: the un-batched kernel issues the same load in HPB
+//               different blocks.
+//   2. softmax  one warp per head, over that head's kMlaCtxTile scores. The un-batched
+//               kernel used a BLOCK-wide reduction because it had one head to reduce;
+//               with HPB heads a block-wide reduction per head would serialise HPB of
+//               them, whereas warp-per-head runs all HPB at once and needs no barrier
+//               inside the phase.
+//   3. latent   thread owns r (and r + BLOCK, ...) for the whole slice. One load of
+//               k_cache[t][r] feeds HPB register accumulators.
+//
+// SUMMATION ORDER IS NOT the un-batched kernel's, and cannot be: phase 2 reduces over
+// 32 lanes where the other reduces over BLOCK threads, so the tile's max and exp-sum
+// fold in a different tree. The result is a different rounding of the same quantity,
+// not a different quantity — the score dot product, the online rescale and the latent
+// accumulation are element-for-element identical, and the latent sum over t inside a
+// tile still runs in increasing t. cpu_reference_test models THIS schedule against a
+// float64 two-pass reference; kimi_k3_numeric_test pins it on the device at a context
+// long enough to take this path.
+template <int BLOCK, int HPB, int RSLOTS, int TPW = kMlaTokensPerWarp>
+__global__ void mla_decode_attn_hbatch_kernel(float* __restrict__ part_acc,
+                                              float* __restrict__ part_ml,
+                                              const float* __restrict__ q,
+                                              const float* __restrict__ k_cache,
+                                              int key_length, int kv_lora,
+                                              int n_ctx, float scale, int splits) {
+    constexpr int NWARP = BLOCK / 32;
+    const int h0   = blockIdx.x * HPB;
+    const int sp   = blockIdx.y;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+
+    const int chunk = (n_ctx + splits - 1) / splits;
+    const int t_beg = sp * chunk;
+    const int t_end = min(n_ctx, t_beg + chunk);
+
+    extern __shared__ float smem[];
+    float* s_q = smem;                                        // HPB * key_length
+    float* s_p = s_q + (size_t)HPB * key_length;              // HPB * kMlaCtxTile
+    float* s_m = s_p + (size_t)HPB * kMlaCtxTile;             // HPB  running max
+    float* s_l = s_m + HPB;                                   // HPB  running exp-sum
+    float* s_c = s_l + HPB;                                   // HPB  this tile's rescale
+
+    for (int i = threadIdx.x; i < HPB * key_length; i += BLOCK)
+        s_q[i] = q[(size_t)(h0 + i / key_length) * key_length + (i % key_length)];
+    if (threadIdx.x < HPB) { s_m[threadIdx.x] = -1e30f; s_l[threadIdx.x] = 0.0f; }
+
+    // Latent accumulators: RSLOTS r-values x HPB heads, in registers.
+    float acc[RSLOTS][HPB];
+#pragma unroll
+    for (int u = 0; u < RSLOTS; ++u)
+#pragma unroll
+        for (int hh = 0; hh < HPB; ++hh) acc[u][hh] = 0.0f;
+    __syncthreads();
+
+    for (int t0 = t_beg; t0 < t_end; t0 += kMlaCtxTile) {
+        const int tn = min(kMlaCtxTile, t_end - t0);
+
+        // --- 1. score, kMlaTokensPerWarp tokens at a time ---
+        // The staged query is read from SHARED once per (head, d) and multiplied into
+        // TPW tokens, so a warp issues HPB shared loads per TPW*128 bytes of cache
+        // rather than per 128. See kMlaTokensPerWarp: at TPW 1 that ratio, against 32
+        // banks x 4 B/clk, caps the kernel below the card's HBM rate, and the staging
+        // that saves the traffic becomes the thing capping it.
+        for (int tb = warp * TPW; tb < tn; tb += NWARP * TPW) {
+            float s[HPB][TPW];
+#pragma unroll
+            for (int hh = 0; hh < HPB; ++hh)
+#pragma unroll
+                for (int tt = 0; tt < TPW; ++tt) s[hh][tt] = 0.0f;
+
+            // The tail duplicates the last row rather than branching: the extra lanes
+            // compute a score that is never stored, and every load stays in bounds.
+            const int tc = min(TPW, tn - tb);
+            const float* kt[TPW];
+#pragma unroll
+            for (int tt = 0; tt < TPW; ++tt)
+                kt[tt] = k_cache + (size_t)(t0 + tb + min(tt, tc - 1)) * key_length;
+
+#pragma unroll 2
+            for (int d = lane; d < key_length; d += 32) {
+                float kv[TPW];
+#pragma unroll
+                for (int tt = 0; tt < TPW; ++tt) kv[tt] = kt[tt][d];
+#pragma unroll
+                for (int hh = 0; hh < HPB; ++hh) {
+                    const float qv = s_q[hh * key_length + d];
+#pragma unroll
+                    for (int tt = 0; tt < TPW; ++tt) s[hh][tt] += qv * kv[tt];
+                }
+            }
+#pragma unroll
+            for (int hh = 0; hh < HPB; ++hh)
+#pragma unroll
+                for (int tt = 0; tt < TPW; ++tt) {
+                    float v = s[hh][tt];
+#pragma unroll
+                    for (int off = 16; off > 0; off >>= 1)
+                        v += __shfl_down_sync(0xffffffff, v, off);
+                    if (lane == 0 && tt < tc) s_p[hh * kMlaCtxTile + tb + tt] = v * scale;
+                }
+        }
+        __syncthreads();
+
+        // --- 2. online softmax, one warp per head ---
+        // (m, l) for head hh live in shared so they survive the tile loop, but the warp
+        // that owns hh is the only thing that touches them. Read both before the
+        // __syncwarp so no lane can observe this tile's write in place of the running
+        // value it is supposed to fold into.
+        for (int hh = warp; hh < HPB; hh += NWARP) {
+            float* pr = s_p + hh * kMlaCtxTile;
+            const float m_prev = s_m[hh];
+            const float l_prev = s_l[hh];
+            __syncwarp();
+
+            float tm = -1e30f;
+            for (int t = lane; t < tn; t += 32) tm = fmaxf(tm, pr[t]);
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                tm = fmaxf(tm, __shfl_down_sync(0xffffffff, tm, off));
+            tm = __shfl_sync(0xffffffff, tm, 0);   // every lane rescales with the same m
+
+            const float m_new = fmaxf(m_prev, tm);
+            // First tile: m_prev is -1e30 and corr underflows to 0, the right multiplier
+            // for an accumulator that is still zero.
+            const float corr = __expf(m_prev - m_new);
+
+            float ls = 0.0f;
+            for (int t = lane; t < tn; t += 32) {
+                const float e = __expf(pr[t] - m_new);
+                pr[t] = e;
+                ls += e;
+            }
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                ls += __shfl_down_sync(0xffffffff, ls, off);
+            if (lane == 0) {
+                s_l[hh] = l_prev * corr + ls;
+                s_m[hh] = m_new;
+                s_c[hh] = corr;
+            }
+        }
+        __syncthreads();
+
+        // --- 3. latent accumulation ---
+        // One k_cache[t][r] load feeds HPB fused multiply-adds. RSLOTS is small and
+        // both inner loops are fully unrolled, so acc stays in registers: a runtime
+        // index here would spill the whole array to local memory and undo the point.
+#pragma unroll
+        for (int u = 0; u < RSLOTS; ++u)
+#pragma unroll
+            for (int hh = 0; hh < HPB; ++hh) acc[u][hh] *= s_c[hh];
+
+#pragma unroll 4
+        for (int t = 0; t < tn; ++t) {
+            const float* kt = k_cache + (size_t)(t0 + t) * key_length;
+            float p[HPB];
+#pragma unroll
+            for (int hh = 0; hh < HPB; ++hh) p[hh] = s_p[hh * kMlaCtxTile + t];
+#pragma unroll
+            for (int u = 0; u < RSLOTS; ++u) {
+                const int r = threadIdx.x + u * BLOCK;
+                if (r < kv_lora) {
+                    const float kv = kt[r];
+#pragma unroll
+                    for (int hh = 0; hh < HPB; ++hh) acc[u][hh] += p[hh] * kv;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // UNNORMALISED partials, one (head, slice) row each — the combine applies 1/l.
+#pragma unroll
+    for (int u = 0; u < RSLOTS; ++u) {
+        const int r = threadIdx.x + u * BLOCK;
+        if (r < kv_lora)
+#pragma unroll
+            for (int hh = 0; hh < HPB; ++hh)
+                part_acc[((size_t)(h0 + hh) * splits + sp) * kv_lora + r] = acc[u][hh];
+    }
+    if (threadIdx.x < HPB) {
+        // An empty slice (n_ctx < splits) must contribute nothing: l = 0 and a very
+        // negative m make its weight exactly zero in the merge.
+        float* pm = part_ml + ((size_t)(h0 + threadIdx.x) * splits + sp) * 2;
+        pm[0] = (t_end > t_beg) ? s_m[threadIdx.x] : -1e30f;
+        pm[1] = (t_end > t_beg) ? s_l[threadIdx.x] : 0.0f;
     }
 }
 
@@ -1669,6 +2100,24 @@ void kda_decode_step_f32(float* out, float* state,
     const int T = head_dim;
     // s_k, s_q, s_sk, s_ge
     const size_t shm = (size_t)4 * head_dim * sizeof(float);
+
+    // s_k, s_q, s_sk, s_ge, plus head_dim rows of (IC + 1) for the staged chunk.
+    // 18.5 KB at K3's dims — under the 48 KB default, so there is no opt-in to fail and
+    // no fallback path whose use would be invisible in the output.
+    //
+    // head_dim == BLOCK is a REQUIREMENT, not a convenience. The launch uses head_dim
+    // threads, and the staged kernel's copy loops stride by BLOCK; at head_dim < BLOCK
+    // the columns between head_dim and BLOCK would never be written and the block would
+    // reduce over stale shared memory. The unstaged kernel below indexes by threadIdx.x
+    // alone and is correct at any width, so it stays the fallback.
+    constexpr int IC = 32, SMEM_BLOCK = 128;
+    const size_t shm_staged =
+        ((size_t)4 * head_dim + (size_t)head_dim * (IC + 1)) * sizeof(float);
+    if (head_dim == SMEM_BLOCK && head_dim % IC == 0) {
+        kda_decode_step_smem_kernel<SMEM_BLOCK><<<(unsigned)n_head, T, shm_staged, stream>>>(
+            out, state, q, k, v, g, beta, head_dim);
+        return;
+    }
     kda_decode_step_kernel<128><<<(unsigned)n_head, T, shm, stream>>>(
         out, state, q, k, v, g, beta, head_dim);
 }
@@ -1683,7 +2132,7 @@ void kda_gate_out_f32(float* out, const float* o, const float* norm_w,
 
 void attn_res_mix_f32(float* out, const float* ckpts, const float* cur,
                       const float* score_w, int n_embd, int n_ckpt,
-                      float eps, cudaStream_t stream) {
+                      float eps, cudaStream_t stream, float* scores) {
     if (n_embd <= 0) return;
     if (n_ckpt <= 0) {
         // Layer 0 / nothing banked: the reference returns cur unchanged.
@@ -1691,11 +2140,23 @@ void attn_res_mix_f32(float* out, const float* ckpts, const float* cur,
                         cudaMemcpyDeviceToDevice, stream);
         return;
     }
-    float* scratch = nullptr;
-    cudaMallocAsync(&scratch, (size_t)(n_ckpt + 1) * sizeof(float), stream);
-    attn_res_mix_kernel<256><<<1, 256, 0, stream>>>(
-        out, ckpts, cur, score_w, n_embd, n_ckpt, eps, scratch);
-    cudaFreeAsync(scratch, stream);
+    constexpr int B = 256;
+    // `scores` is caller-owned when the caller has a per-forward scratch to lend
+    // (the decode path does, and passes it on every call). The fallback keeps the
+    // old stream-ordered allocation so callers without scratch — the numeric test,
+    // and the pipeline/TP entry points that mix once per token rather than 185
+    // times — need no change.
+    float* sc = scores;
+    const bool owned = (sc == nullptr);
+    if (owned) cudaMallocAsync(&sc, (size_t)(n_ckpt + 1) * sizeof(float), stream);
+
+    attn_res_score_kernel<B><<<(unsigned)(n_ckpt + 1), B, 0, stream>>>(
+        sc, ckpts, cur, score_w, n_embd, n_ckpt, eps);
+    attn_res_apply_kernel<B><<<(unsigned)((n_embd + B - 1) / B), B,
+                              (size_t)(n_ckpt + 1) * sizeof(float), stream>>>(
+        out, ckpts, cur, sc, n_embd, n_ckpt);
+
+    if (owned) cudaFreeAsync(sc, stream);
 }
 
 void kda_conv_step_f32(float* out, float* state, const float* x, const float* w,
@@ -2047,13 +2508,71 @@ void mla_decode_attn_f32(float* out, const float* q, const float* k_cache,
     // pass and the extra global round trip cost more than the parallelism buys, and the
     // un-split kernel is also the one the numeric test pins bit-for-bit.
     int dev = 0;
-    const int splits = (n_ctx >= kMlaSplitMinCtx && k3_mla_split_scratch(n_head, kv_lora, &dev))
-                     ? std::min(kMlaMaxSplits, (n_ctx + kMlaSplitMinCtx - 1) / kMlaSplitMinCtx)
-                     : 1;
+    int splits = (n_ctx >= kMlaSplitMinCtx && k3_mla_split_scratch(n_head, kv_lora, &dev))
+               ? std::min(kMlaMaxSplits, (n_ctx + kMlaSplitMinCtx - 1) / kMlaSplitMinCtx)
+               : 1;
     if (splits <= 1) {
         mla_decode_attn_kernel<BLOCK><<<(unsigned)n_head, BLOCK, shm, stream>>>(
             out, q, k_cache, wv_b, key_length, kv_lora, v_dim, n_ctx, scale);
         return;
+    }
+
+    // Batch heads per block where the shape allows it, so each cached row is loaded
+    // once for HPB heads instead of once per head. RSLOTS must cover kv_lora from a
+    // single BLOCK-strided pass, and both it and HPB are template parameters because
+    // the accumulators only stay in registers when every index is a compile-time one.
+    const int rslots  = (kv_lora + BLOCK - 1) / BLOCK;
+    const int hpb     = k3_mla_heads_per_block(n_head, key_length);
+    const size_t hshm = ((size_t)hpb * key_length + (size_t)hpb * kMlaCtxTile +
+                         3 * (size_t)hpb) * sizeof(float);
+    if (hpb > 1 && rslots <= kMlaMaxRSlots) {
+        // Dividing the grid by HPB also divides the block count, so give the slice
+        // count back what the head axis lost: ~4 blocks per SM, never slicing below
+        // kMlaMinSliceLen tokens (below that the combine's per-slice loop and the
+        // extra partials outweigh the parallelism).
+        const int groups = n_head / hpb;
+        const int sm     = k3_sm_count(dev);
+        if (sm > 0) {
+            const int want = (kMlaBlocksPerSm * sm + groups - 1) / groups;
+            splits = std::max(splits, std::min(want, n_ctx / kMlaMinSliceLen));
+            splits = std::min(std::max(splits, 1), kMlaMaxSplits);
+        }
+        dim3 hgrid((unsigned)groups, (unsigned)splits);
+        bool launched = true;
+        switch (hpb * 8 + rslots) {
+            case 12 * 8 + 1: mla_decode_attn_hbatch_kernel<BLOCK, 12, 1><<<hgrid, BLOCK, hshm, stream>>>(
+                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits); break;
+            case 12 * 8 + 2: mla_decode_attn_hbatch_kernel<BLOCK, 12, 2><<<hgrid, BLOCK, hshm, stream>>>(
+                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits); break;
+            case 12 * 8 + 3: mla_decode_attn_hbatch_kernel<BLOCK, 12, 3><<<hgrid, BLOCK, hshm, stream>>>(
+                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits); break;
+            case 12 * 8 + 4: mla_decode_attn_hbatch_kernel<BLOCK, 12, 4><<<hgrid, BLOCK, hshm, stream>>>(
+                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits); break;
+            case 8 * 8 + 1: mla_decode_attn_hbatch_kernel<BLOCK, 8, 1><<<hgrid, BLOCK, hshm, stream>>>(
+                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits); break;
+            case 8 * 8 + 2: mla_decode_attn_hbatch_kernel<BLOCK, 8, 2><<<hgrid, BLOCK, hshm, stream>>>(
+                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits); break;
+            case 8 * 8 + 3: mla_decode_attn_hbatch_kernel<BLOCK, 8, 3><<<hgrid, BLOCK, hshm, stream>>>(
+                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits); break;
+            case 8 * 8 + 4: mla_decode_attn_hbatch_kernel<BLOCK, 8, 4><<<hgrid, BLOCK, hshm, stream>>>(
+                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits); break;
+            case 4 * 8 + 1: mla_decode_attn_hbatch_kernel<BLOCK, 4, 1><<<hgrid, BLOCK, hshm, stream>>>(
+                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits); break;
+            case 4 * 8 + 2: mla_decode_attn_hbatch_kernel<BLOCK, 4, 2><<<hgrid, BLOCK, hshm, stream>>>(
+                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits); break;
+            case 4 * 8 + 3: mla_decode_attn_hbatch_kernel<BLOCK, 4, 3><<<hgrid, BLOCK, hshm, stream>>>(
+                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits); break;
+            case 4 * 8 + 4: mla_decode_attn_hbatch_kernel<BLOCK, 4, 4><<<hgrid, BLOCK, hshm, stream>>>(
+                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits); break;
+            default: launched = false; break;
+        }
+        if (launched) {
+            const size_t cshm = ((size_t)kv_lora + (size_t)splits + 1) * sizeof(float);
+            mla_decode_combine_kernel<BLOCK><<<(unsigned)n_head, BLOCK, cshm, stream>>>(
+                out, g_mla_part_acc[dev], g_mla_part_ml[dev], wv_b, kv_lora, v_dim, splits);
+            return;
+        }
+        splits = std::min(splits, kMlaMaxSplits);
     }
 
     dim3 grid((unsigned)n_head, (unsigned)splits);
@@ -2117,11 +2636,73 @@ bool k3_proj_f32(float* y, const float* x, const void* W, int wtype,
             // small ones (n_head=96 for ssm_beta) would drop to 24 blocks and lose more
             // to idle SMs than the activation traffic was costing. Single-row below the
             // threshold keeps those on the wide grid.
+            // ROWS is how much work a block has to hide memory latency behind, and
+            // K3's shapes left it far too low.
+            //
+            // At the MoE-adjacent widths — routed_down/routed_up and the three shared
+            // expert projections — K is 3584 or 7168, so blocks_per_row is 112 or 224
+            // and the `b += BLOCK` loop runs ONCE or TWICE. A block therefore issues
+            // one or two rounds of loads, then stops to reduce. There is nothing left
+            // in flight to cover the next miss.
+            //
+            // Measured on 8x H200 at tp=8 (nsys, main 86bb264, per token per rank):
+            // this kernel moves ~19 GB in 37.1 ms = ~512 GB/s of the card's 4.8 TB/s,
+            // while proj_q8_0_fused4 — the SAME access pattern over the same 34-byte
+            // BlockQ8_0 — reaches 1.33 TB/s. The difference is not the pattern, it is
+            // that fused4 reads 8 blocks per iteration (4 tensors x ROWS=2) where this
+            // read 4, so it has 8 independent accumulator chains in flight instead of 4.
+            // Widening ROWS buys the same thing here.
+            //
+            // BIT-IDENTICAL: row r's accumulator still sums blocks b = threadIdx.x,
+            // +BLOCK, ... in that order, and still folds over the same BLOCK threads.
+            // ROWS only changes how many rows a block happens to carry, which no
+            // accumulation order depends on.
+            //
+            // THREE tiers, because widening also divides the grid, and each tier is
+            // taken only while the grid still covers the device several times over.
+            // Two tiers is not enough at K3's shapes: a single 16-row tier gated at
+            // N >= 4096 would push routed_down (N = 3584) and the shared-expert
+            // projections (N = 3072) all the way back down to 4 rows, which is a
+            // regression on 276 of the ~600 calls a token.
+            constexpr int ROWS_W16 = 16;
+            constexpr int ROWS_W8 = 8;
             constexpr int ROWS = 4;
-            constexpr int MULTIROW_MIN_N = 1024;   // grid >= 256 blocks
+            constexpr int MIN_BLOCKS = 256;
             const int nb = K / 32;
             const int TB = proj_block_for(nb);
-            if (N >= MULTIROW_MIN_N) {
+            if (N >= ROWS_W16 * MIN_BLOCKS) {
+                const unsigned grid = (unsigned)((N + ROWS_W16 - 1) / ROWS_W16);
+                switch (TB) {
+                    case 32:
+                        proj_q8_0_multirow_kernel<32, ROWS_W16><<<grid, 32, 0, stream>>>(
+                            y, x, (const BlockQ8_0*)W, nb, N);
+                        break;
+                    case 64:
+                        proj_q8_0_multirow_kernel<64, ROWS_W16><<<grid, 64, 0, stream>>>(
+                            y, x, (const BlockQ8_0*)W, nb, N);
+                        break;
+                    default:
+                        proj_q8_0_multirow_kernel<BLOCK, ROWS_W16>
+                            <<<grid, BLOCK, 0, stream>>>(y, x, (const BlockQ8_0*)W, nb, N);
+                        break;
+                }
+            } else if (N >= ROWS_W8 * MIN_BLOCKS) {
+                const unsigned grid = (unsigned)((N + ROWS_W8 - 1) / ROWS_W8);
+                switch (TB) {
+                    case 32:
+                        proj_q8_0_multirow_kernel<32, ROWS_W8><<<grid, 32, 0, stream>>>(
+                            y, x, (const BlockQ8_0*)W, nb, N);
+                        break;
+                    case 64:
+                        proj_q8_0_multirow_kernel<64, ROWS_W8><<<grid, 64, 0, stream>>>(
+                            y, x, (const BlockQ8_0*)W, nb, N);
+                        break;
+                    default:
+                        proj_q8_0_multirow_kernel<BLOCK, ROWS_W8>
+                            <<<grid, BLOCK, 0, stream>>>(y, x, (const BlockQ8_0*)W, nb, N);
+                        break;
+                }
+            } else if (N >= ROWS * MIN_BLOCKS) {
                 const unsigned grid = (unsigned)((N + ROWS - 1) / ROWS);
                 switch (TB) {
                     case 32:
@@ -2168,7 +2749,12 @@ bool k3_proj_f32_x4(float* y0, float* y1, float* y2, float* y3, const float* x,
     // path silently handling a case it was not written for.
     if (N <= 0 || K <= 0 || wtype != 8 || K % 32 != 0) return false;
     if (!y0 || !y1 || !y2 || !y3 || !W0 || !W1 || !W2 || !W3) return false;
-    constexpr int ROWS = 2;
+    // Four rows per block rather than two, for the same reason multirow widened: the
+    // block gets 4 tensors x 4 rows = 16 independent accumulator chains to keep in
+    // flight instead of 8, and the grid (12288/4 = 3072 blocks) still covers the
+    // device many times over. Bit-identical — a row's accumulation order over b and
+    // over i is untouched, only how many rows share a block changes.
+    constexpr int ROWS = 4;
     if (N < ROWS) return false;
     const int nb = K / 32;
     const unsigned grid = (unsigned)((N + ROWS - 1) / ROWS);
