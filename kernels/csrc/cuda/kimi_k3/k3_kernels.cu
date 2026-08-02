@@ -855,14 +855,24 @@ __device__ __forceinline__ float block_dot_q8k(const BlockIQ1S& b,
     const int delta = (h & 0x8000) ? -1 : 1;
     const uint32_t idx =
         (uint32_t)b.qs[4 * ib32 + l] | (((uint32_t)(h >> (3 * l)) & 7u) << 8);
-    const int8_t* grid = (const int8_t*)&iq1s_grid_c[idx];
-    int sumi = 0, sumq = 0;
-#pragma unroll
-    for (int j = 0; j < 8; ++j) {
-        const int q8 = (int)x.qs[8 * lane + j];
-        sumi += (int)grid[j] * q8;
-        sumq += q8;
-    }
+    // Both sums below are INTEGER, so reassociating them is exact — the returned
+    // float is bit-identical to the scalar loop, not merely close.
+    //
+    // sumi: iq1s_grid_c is uint64_t[], i.e. the eight int8 weights are already one
+    // aligned 64-bit word, and x.qs starts at offset 4 with 8*lane a multiple of 8,
+    // so both sides are 4-byte aligned. Two __dp4a replace eight scalar IMADs.
+    const uint64_t gw = iq1s_grid_c[idx];
+    const int2 g = make_int2((int)(uint32_t)gw, (int)(uint32_t)(gw >> 32));
+    const int* xq = (const int*)(x.qs + 8 * lane);
+    int sumi = __dp4a(g.x, xq[0], 0);
+    sumi = __dp4a(g.y, xq[1], sumi);
+    // sumq is the plain sum of this lane's eight activation bytes — which is exactly
+    // what quantize_q8_k_kernel already computed into bsums and nothing ever read.
+    // ls and delta are constant per ib32 (= lane>>2), so the four lanes of an ib32
+    // span x.qs[32*ib32 .. +31] = bsums[2*ib32] + bsums[2*ib32+1]. Letting lane l==0
+    // carry the whole group and the others contribute 0 leaves the warp reduction
+    // below summing each ib32 exactly once, and drops 8 adds from every lane.
+    int sumq = (l == 0) ? ((int)x.bsums[2 * ib32] + (int)x.bsums[2 * ib32 + 1]) : 0;
     sumi *= ls;
     sumq *= ls * delta;
     for (int off = 16; off > 0; off >>= 1) {
