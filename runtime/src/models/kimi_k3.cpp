@@ -1129,12 +1129,21 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
                 L.attn_q.ok() && L.attn_k.ok() && L.attn_v.ok() && L.ssm_g.ok() &&
                 L.attn_q.type == 8 && L.attn_k.type == 8 &&
                 L.attn_v.type == 8 && L.ssm_g.type == 8;
+            // The hoist above already quantised `normed` into act_q8; hand the fused
+            // group that buffer instead of letting it quantise the same bytes again.
+            // Without this the hoist was a net LOSS on all 69 KDA layers -- it added a
+            // launch that nothing consumed, because ssm_f_a and ssm_beta are f32-weighted
+            // and never quantised in the first place. Measured -233 launches/token/rank
+            // against the -462 the arithmetic predicted; this is the missing 69.
+            const bool qkvg_pre = (hoisted_src == s.normed);
             const bool fused_qkvg = fusable &&
                 (ggml_qact_proj
                      ? k3k::k3_proj_ggml_f32_x4(s.qkv_q, s.qkv_k, s.qkv_v, s.g_proj_out,
                                                 s.normed, L.attn_q.data, L.attn_k.data,
                                                 L.attn_v.data, L.ssm_g.data,
-                                                L.attn_q.type, qkv, H, s.proj_q8, stream)
+                                                L.attn_q.type, qkv, H,
+                                                qkvg_pre ? s.act_q8 : s.proj_q8,
+                                                stream, qkvg_pre)
                      : k3k::k3_proj_f32_x4(s.qkv_q, s.qkv_k, s.qkv_v, s.g_proj_out,
                                            s.normed, L.attn_q.data, L.attn_k.data,
                                            L.attn_v.data, L.ssm_g.data,
