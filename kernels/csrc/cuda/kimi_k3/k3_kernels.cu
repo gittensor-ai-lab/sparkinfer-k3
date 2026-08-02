@@ -3192,7 +3192,7 @@ bool k3_proj_f32(float* y, const float* x, const void* W, int wtype,
 bool k3_proj_ggml_f32_x4(float* y0, float* y1, float* y2, float* y3, const float* x,
                          const void* W0, const void* W1, const void* W2, const void* W3,
                          int wtype, int N, int K, void* q8_scratch,
-                         cudaStream_t stream, bool x_pre_q8) {
+                         cudaStream_t stream) {
     // Same narrow contract as the f32-activation x4 below: Q8_0 weights, four
     // identical shapes, false means "use the slow path" rather than an error.
     if (N <= 0 || K <= 0 || wtype != 8 || K % 32 != 0) return false;
@@ -3208,16 +3208,9 @@ bool k3_proj_ggml_f32_x4(float* y0, float* y1, float* y2, float* y3, const float
     // consumer go out back-to-back on one stream, so no caller has to promise
     // anything about the activation's lifetime -- the reuse cannot outlive the
     // launch that produced it.
-    //
-    // ...unless the CALLER already quantised this exact activation, which it does on
-    // every KDA layer: `normed` is hoisted for ssm_f_a and ssm_beta before this runs.
-    // Quantising again here made the hoist a net LOSS on those 69 layers -- it added a
-    // launch and removed none, because the other two consumers turned out to be
-    // f32-weighted and never quantised at all. x is passed only so this can tell.
     constexpr int QT = 128;
-    if (!x_pre_q8)
-        quantize_q8_0_kernel<<<(nb + QT - 1) / QT, QT, 0, stream>>>(
-            (BlockQ8_0*)q8_scratch, x, nb);
+    quantize_q8_0_kernel<<<(nb + QT - 1) / QT, QT, 0, stream>>>(
+        (BlockQ8_0*)q8_scratch, x, nb);
 
     const unsigned grid = (unsigned)((N + ROWS - 1) / ROWS);
     const BlockQ8_0* xq = (const BlockQ8_0*)q8_scratch;
@@ -3271,40 +3264,16 @@ bool k3_proj_f32_x4(float* y0, float* y1, float* y2, float* y3, const float* x,
     return true;
 }
 
-// Quantise one activation to Q8_0, on its own, so a caller with several projections
-// over the SAME activation can pay for it once.
-//
-// K3 re-quantises the identical vector three or four times per layer: `normed` feeds the
-// fused qkvg group plus ssm_f_a and ssm_beta on every KDA layer, and `normed2` feeds the
-// router, routed_down and both shared-expert projections on every MoE layer. Profiled at
-// ctx 131072 that is 61,848 launches of quantize_q8_0 -- 7.9% of GPU kernel time at
-// 4.19 us each to move ~28 KB, i.e. ~6.7 GB/s on a 4.8 TB/s part. It is not work, it is
-// launch overhead, and 462 of those launches per token per rank are recomputing bytes
-// that are already sitting in the scratch.
-bool k3_quantize_act_f32(void* q8_out, const float* x, int K, cudaStream_t stream) {
-    if (!q8_out || !x || K <= 0 || K % 32 != 0) return false;
+bool k3_proj_ggml_f32(float* y, const float* x, const void* W, int wtype,
+                      int N, int K, void* q8_scratch, cudaStream_t stream) {
+    if (N <= 0 || K <= 0) return false;
+    if (wtype == 0)
+        return k3_proj_f32(y, x, W, wtype, N, K, stream);
+    if (wtype != 8 || !q8_scratch || K % 32 != 0) return false;
     const int nb = K / 32;
     constexpr int QT = 128;
     quantize_q8_0_kernel<<<(nb + QT - 1) / QT, QT, 0, stream>>>(
-        (BlockQ8_0*)q8_out, x, nb);
-    return true;
-}
-
-// Projection from an ALREADY-quantised activation. This is k3_proj_ggml_f32's body with
-// the quantise lifted out; that function now calls it, so there is one implementation and
-// the hoisted and non-hoisted paths cannot drift apart.
-//
-// Deliberately takes the quantised buffer rather than caching one keyed on `x`. An
-// earlier attempt at this optimisation DID cache, guarded by "was the scratch last
-// written from this pointer?", and shipped top1 0.0 / mean_kld 0.937 -- fluent, wrong,
-// and faster. That guard tracked which pointer the scratch came from, never whether the
-// bytes behind it still matched. Passing the buffer makes the reuse window explicit in
-// the caller's straight-line code instead of an invariant someone has to maintain.
-bool k3_proj_q8act_f32(float* y, const void* q8_scratch, const void* W, int wtype,
-                       int N, int K, cudaStream_t stream) {
-    if (N <= 0 || K <= 0) return false;
-    if (wtype != 8 || !q8_scratch || K % 32 != 0) return false;
-    const int nb = K / 32;
+        (BlockQ8_0*)q8_scratch, x, nb);
     // Same idle-thread sizing as the f32-activation path above.
     constexpr int BLOCK = 128;
     const int TB = proj_block_for(nb);
@@ -3369,16 +3338,6 @@ bool k3_proj_q8act_f32(float* y, const void* q8_scratch, const void* W, int wtyp
     }
 #undef K3_QQ_LAUNCH
     return true;
-}
-
-bool k3_proj_ggml_f32(float* y, const float* x, const void* W, int wtype,
-                      int N, int K, void* q8_scratch, cudaStream_t stream) {
-    if (N <= 0 || K <= 0) return false;
-    if (wtype == 0)
-        return k3_proj_f32(y, x, W, wtype, N, K, stream);
-    if (wtype != 8 || !q8_scratch || K % 32 != 0) return false;
-    if (!k3_quantize_act_f32(q8_scratch, x, K, stream)) return false;
-    return k3_proj_q8act_f32(y, q8_scratch, W, wtype, N, K, stream);
 }
 
 size_t k3_q8_0_bytes(int K) {
