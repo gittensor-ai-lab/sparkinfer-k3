@@ -1557,6 +1557,57 @@ class CiWorkflowTest(unittest.TestCase):
         self.assertEqual(rc.returncode, 1, "a 4x-over-wall-clock claim was scored")
         self.assertIn("wall clock allows at most", rc.stderr)
 
+    def test_a_guard_refusal_actually_aborts_the_script(self):
+        """THE GUARD'S EXIT CODE HAS TO SURVIVE THE SHELL AROUND IT.
+
+        The wiring used to be `read -r TPS MSTOK <<<"$(python3 ...)" || exit 1`. The
+        `|| exit 1` binds to `read`, bash discards the substitution's exit status, and read
+        returns 0 on the empty string a refusing guard leaves behind -- so the refusal
+        printed its message and the script walked on with TPS="" into label.py, which died
+        on float('') with a traceback that buried the reason. #64 hit exactly this on the
+        guard's first live firing.
+
+        Tested against the REAL fragment cut from the script, not a paraphrase: refusal
+        inputs must exit 1, must not print the empty ">> sparkinfer:" line, and honest
+        inputs must still score."""
+        import tempfile
+        ev = (ROOT / "bench/scripts/kimi_k3_eval.sh").read_text()
+        live = [l for l in ev.split("\n") if not l.lstrip().startswith("#")]
+        self.assertFalse([l for l in live if 'read -r TPS MSTOK <<<"$(' in l],
+                         "the swallowed-exit wiring is back")
+        start = ev.index('SPEED_VERDICT="$(python3 -')
+        end = ev.index('[self-timed, within the wall-clock bound]"', start)
+        end = ev.index("\n", end) + 1
+        fragment = ev[start:end]
+
+        def run(ns_lo, ns_hi, self_tps, self_ms):
+            script = (
+                "set -euo pipefail\n"
+                f"NS_LO={int(ns_lo)}\nNS_HI={int(ns_hi)}\n"
+                "TOKENS_LO=8\nTOKENS_HI=136\n"
+                f"SELF_TPS={self_tps}\nSELF_MS={self_ms}\nLLAMA_REF=16.70\n"
+                + fragment
+                + "\necho SCORED_TPS=$TPS\n")
+            f = tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False)
+            f.write(script); f.close()
+            return subprocess.run(["bash", f.name], capture_output=True, text=True)
+
+        LOAD = 150e9
+        # honest: guard passes, verdict parsed, scored
+        r = run(LOAD + 8e9, LOAD + 8e9 + 128e9, 1.0, 1000.0)
+        self.assertEqual(r.returncode, 0, f"honest run failed:\n{r.stderr}")
+        self.assertIn("SCORED_TPS=1.00", r.stdout)
+
+        # refusal: #64's live numbers — collapsed differential, modest claim
+        r = run(LOAD + 8e9, LOAD + 8e9 + 5.2e9, 10.53, 94.98)
+        self.assertEqual(r.returncode, 1,
+                         "the guard refused but the SCRIPT did not abort:\n"
+                         f"stdout={r.stdout!r}")
+        self.assertIn("did not do the extra work", r.stderr)
+        self.assertNotIn(">> sparkinfer:  tok/s", r.stdout,
+                         "the empty echo means the script walked past the refusal")
+        self.assertNotIn("SCORED_TPS", r.stdout)
+
     def test_a_missing_reference_says_so_out_loud(self):
         """LLAMA_REF is 0 on a node/quant/context that has not been referenced yet. The
         ceiling cannot be computed, so the residual is open -- and a guard that quietly
@@ -1975,6 +2026,178 @@ class CiWorkflowTest(unittest.TestCase):
         self.assertIn("for num, r in results:", src,
                       "excluding from the merge must not exclude from the receipt check")
 
+    def test_a_fresh_eval_clears_a_moot_needs_rebase(self):
+        """needs-rebase demands a re-measurement; a fresh eval at the CURRENT head IS that
+        re-measurement, so the label must come off — and only then. #59 carried a label
+        left over from #63's merge, was re-evaluated at the same head against the ratcheted
+        frontier, won the round — and needs-rebase ∈ NEVER_MERGE_LABELS would have made
+        merge_blockers refuse the bot's own winner. A human checked and removed it by hand;
+        clear_moot_rebase_label is that check, and this test is the hand-check's spec:
+
+          moot    = same head as evaluated, no conflicts     -> removed
+          not moot = head moved since the eval, or DIRTY     -> kept
+        """
+        bot = self._bot()
+        HEAD = "99e4bad5aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+        def with_state(labels, head=HEAD, state="BEHIND", after_labels=("perf",)):
+            calls, seen = [], {"n": 0}
+            def fake_gh(args, timeout=120):
+                calls.append(args)
+                return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+            def fake_state(repo, num):
+                seen["n"] += 1
+                use = labels if seen["n"] == 1 else after_labels
+                return {"labels": [{"name": n} for n in use],
+                        "headRefOid": head, "mergeStateStatus": state}
+            old = (bot.gh, bot._pr_state)
+            bot.gh, bot._pr_state = fake_gh, fake_state
+            return calls, lambda: (setattr(bot, "gh", old[0]),
+                                   setattr(bot, "_pr_state", old[1]))
+
+        # 1. moot: label present, head == evaluated, BEHIND (by e.g. the ratchet) -> removed
+        calls, restore = with_state(["needs-rebase", "eval:m"])
+        try:
+            self.assertIs(bot.clear_moot_rebase_label("o/r", 59, HEAD, False), True)
+            self.assertTrue(any("needs-rebase" in a[-1] for a in calls if "DELETE" in a),
+                            "moot label was not deleted")
+        finally:
+            restore()
+
+        # 2. head moved since the eval: the tier belongs to an older commit — label stands
+        calls, restore = with_state(["needs-rebase", "eval:m"], head="f" * 40)
+        try:
+            self.assertIs(bot.clear_moot_rebase_label("o/r", 59, HEAD, False), False)
+            self.assertEqual([a for a in calls if "DELETE" in a], [],
+                             "a genuinely stale label was deleted")
+        finally:
+            restore()
+
+        # 3. conflicts are real staleness no re-measurement cures
+        calls, restore = with_state(["needs-rebase", "eval:m"], state="DIRTY")
+        try:
+            self.assertIs(bot.clear_moot_rebase_label("o/r", 59, HEAD, False), False)
+            self.assertEqual([a for a in calls if "DELETE" in a], [])
+        finally:
+            restore()
+
+        # 4. the delete must be VERIFIED, same discipline as clear_stale_tier
+        calls, restore = with_state(["needs-rebase", "eval:m"],
+                                    after_labels=("needs-rebase",))
+        try:
+            self.assertIs(bot.clear_moot_rebase_label("o/r", 59, HEAD, False), False,
+                          "a DELETE that did not take effect was reported as cleared")
+        finally:
+            restore()
+
+        # 5. wiring: every eval clears it (all modes), and both merge paths re-check
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        self.assertIn('clear_moot_rebase_label(args.repo, num, pr.get("headRefOid"', src,
+                      "a plain round leaves the moot label for the next merge to trip on")
+        mw = src[src.index("def merge_winner("):src.index("def sync_rebase_labels(")]
+        self.assertIn("clear_moot_rebase_label(", mw,
+                      "merge_winner trusts that nothing re-labelled the winner since eval")
+        mf = src[src.index("def mark_merge_first("):src.index("def main(")]
+        self.assertIn("clear_moot_rebase_label(", mf,
+                      "the auto-merge queue trusts that nothing re-labelled the winner")
+
+    def test_the_post_merge_sweep_does_not_wait_for_github_to_notice(self):
+        """The sweep at the tail of a merge runs SECONDS after main moved, while GitHub
+        still reports every other PR as UNKNOWN — and the BEHIND/DIRTY test, right for a
+        standalone sweep, labels nothing at the one moment staleness is a certainty. The
+        merge is the evidence; force_stale makes the sweep act on it. The no-tier noise
+        rule and the merged-PR skip must survive, and 'current again' must not fire off a
+        stale UNKNOWN."""
+        bot = self._bot()
+        posted, deleted = [], []
+
+        def fake_gh(args, timeout=120):
+            if args[:2] == ["pr", "view"]:
+                num = args[2]
+                labels = {"5": [], "7": ["eval:xs"], "8": [],
+                          "9": ["needs-rebase", "eval:none"]}[num]
+                return subprocess.CompletedProcess(args, 0, stdout=json.dumps(
+                    {"state": "OPEN", "mergeStateStatus": "UNKNOWN",
+                     "labels": [{"name": n} for n in labels]}), stderr="")
+            if "-X" in args and "POST" in args:
+                posted.append(args[args.index("-X") - 1] if False else args[3])
+            if "-X" in args and "DELETE" in args:
+                deleted.append(args[3])
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+        old = bot.gh
+        bot.gh = fake_gh
+        try:
+            prs = [{"number": 5}, {"number": 7}, {"number": 8}, {"number": 9}]
+            # tail-of-merge sweep: #5 merged; #7 (tier, UNKNOWN) must be labelled anyway
+            bot.sync_rebase_labels("o/r", prs, merged_num=5, dry_run=False, force_stale=True)
+            self.assertTrue(any("/issues/7/labels" in p for p in posted),
+                            "an UNKNOWN tier-carrying PR was not labelled after the merge")
+            self.assertFalse(any("/issues/5/" in p for p in posted),
+                             "the merged PR itself was labelled")
+            self.assertFalse(any("/issues/8/labels" in p for p in posted),
+                             "a no-tier PR was labelled — the noise rule regressed")
+            self.assertFalse(any("/issues/9/" in d for d in deleted),
+                             "force_stale cleared a label off a stale UNKNOWN state")
+            # standalone sweep unchanged: UNKNOWN neither sets nor clears
+            posted.clear(); deleted.clear()
+            bot.sync_rebase_labels("o/r", prs, merged_num=-1, dry_run=False)
+            self.assertEqual(posted, [], "a standalone sweep labelled on UNKNOWN")
+            self.assertEqual(deleted, [], "a standalone sweep cleared on UNKNOWN")
+            # and the merge path passes force_stale
+            src = (ROOT / "eval/k3_eval_bot.py").read_text()
+            self.assertIn("sync_rebase_labels(args.repo, prs, winner, args.dry_run, "
+                          "force_stale=True)", src,
+                          "the tail-of-merge sweep still waits for BEHIND")
+        finally:
+            bot.gh = old
+
+    def test_push_triggered_label_clear_is_safe_and_narrow(self):
+        """rebase-label-sync.yml clears needs-rebase the moment a push answers it, so the
+        'clears by itself' sentence in the bot's comment is true between sweeps.
+
+        Its safety rests on ONE invariant: pull_request_target runs with base-repo WRITE
+        access, which is only acceptable because the workflow never checks out or executes
+        PR code — event payload and API calls, nothing else. A checkout of the head in this
+        file hands a hostile fork write access to the repo, so that is the first thing this
+        test refuses.
+
+        Narrowness is the other half: it only REMOVES the label (adding is the sweep's job,
+        tied to tier presence and frontier movement a push knows nothing about), decides
+        from compare/behind_by (immediate and exact) rather than the UNKNOWN-settling
+        mergeStateStatus, and verifies the delete rather than trusting the call."""
+        import yaml as _y
+        p = ROOT / ".github/workflows/rebase-label-sync.yml"
+        self.assertTrue(p.exists(), "the push-triggered clear does not exist")
+        txt = p.read_text()
+        wf = _y.safe_load(txt)
+        # THE invariant: write-context workflow, zero PR code. Asserted on the parsed
+        # steps, not the text — the file's own warning comment names the footgun.
+        steps = [s for job in wf["jobs"].values() for s in job.get("steps", [])]
+        self.assertFalse([s for s in steps if "checkout" in str(s.get("uses", ""))],
+                         "pull_request_target + checkout of PR code = write access for a "
+                         "hostile fork; this workflow must stay API-only")
+        self.assertFalse([s for s in steps if "github.event.pull_request.head.sha" in
+                          str(s.get("run", "")) and "fetch" in str(s.get("run", ""))],
+                         "fetching the head by sha is checkout by another name")
+        trig = wf.get(True) or wf.get("on")
+        self.assertIn("pull_request_target", trig,
+                      "fork PRs get a read-only token under plain pull_request — the "
+                      "decision would be right and the delete would fail")
+        self.assertEqual(trig["pull_request_target"]["types"], ["synchronize"],
+                         "only a push answers the label; other events are the sweep's job")
+        # Narrow: removes only, decides by behind_by, fork-safe compare form, verified delete.
+        self.assertIn("behind_by", txt, "mergeStateStatus reads UNKNOWN right after a push")
+        self.assertIn("head.label", txt, "owner:branch is the fork-safe compare form")
+        self.assertNotIn("labels[]=needs-rebase", txt, "this workflow must never ADD the label")
+        self.assertIn('-X DELETE', txt)
+        self.assertIn('index("needs-rebase")', txt, "an issued DELETE is not a removed label")
+        # Rapid force-pushes race; only the newest head may decide.
+        self.assertEqual(wf["concurrency"]["cancel-in-progress"], True)
+        # No label, no work — and if the gate is dropped, every push on every PR runs this.
+        self.assertIn("contains(github.event.pull_request.labels.*.name, 'needs-rebase')",
+                      wf["jobs"]["sync"]["if"])
+
     def test_a_failed_round_still_has_a_log_path(self):
         """rounds/<main_sha>/ exists for the round that seals nothing -- and the first one
         that needed it published nothing anyway.
@@ -2055,10 +2278,14 @@ class CiWorkflowTest(unittest.TestCase):
                       src, "needs-rebase is never removed once the branch is current")
         self.assertIn("elif has and current:", src)
         sync = src[src.index("def sync_rebase_labels("):src.index("def mark_merge_first(")]
-        self.assertIn('stale = state in ("BEHIND", "DIRTY")', sync,
-                      "only a branch that trails main has a stale tier")
-        self.assertIn('current = state in ("CLEAN", "UNSTABLE", "BLOCKED")', sync,
-                      "BLOCKED means waiting on review, not behind — the label must clear")
+        self.assertIn('stale = state in ("BEHIND", "DIRTY") or force_stale', sync,
+                      "only a branch that trails main has a stale tier — except at the tail "
+                      "of a merge, where the merge itself is the evidence")
+        # BLOCKED means waiting on review, not behind — the label must clear. The
+        # force_stale guard only suppresses clearing on the tail-of-merge sweep, where the
+        # not-yet-recomputed state cannot say "current again" about anything.
+        self.assertIn('current = (not force_stale) and state in ("CLEAN", "UNSTABLE", "BLOCKED")',
+                      sync, "BLOCKED must clear the label in a standalone sweep")
         # UNKNOWN is 'GitHub has not finished computing mergeability': not evidence either
         # way, so it must neither set nor clear the label.
         self.assertNotIn('"UNKNOWN"', sync,

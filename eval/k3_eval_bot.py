@@ -896,6 +896,62 @@ def clear_stale_tier(repo, num, dry_run):
     return True
 
 
+def clear_moot_rebase_label(repo, num, evaluated_sha, dry_run):
+    """Remove needs-rebase when the re-measurement it demanded has just happened.
+
+    The label means ONE thing: "the tier on this PR was measured against a frontier that
+    has moved". A fresh evaluation at the CURRENT head against the CURRENT frontier is
+    precisely the re-measurement it asks for, so a label that survives it is no longer
+    information — and because needs-rebase is in NEVER_MERGE_LABELS, it is an active
+    hazard: #59 carried one left over from #63's merge, was re-evaluated at the same head
+    against the ratcheted frontier and won the round, and the stale label alone would have
+    made merge_blockers refuse the bot's own winner. A human checked and removed it by
+    hand; this is that check, encoded.
+
+    Moot requires BOTH:
+      - the live head equals the sha this round evaluated — a push since the eval means
+        the tier belongs to a commit that is no longer what would merge, and the label
+        (whatever set it) is doing its job;
+      - the branch is not DIRTY — conflicts are real staleness no re-measurement cures.
+
+    Returns True when the PR is verified to carry no needs-rebase afterwards. Same
+    discipline as clear_stale_tier: an unreadable state is not "no label", and an issued
+    DELETE is not a removed label — re-read and believe only the PR.
+    """
+    live = _pr_state(repo, num)
+    if not live:
+        print(f"!! #{num}: cannot read PR state — leaving any {REBASE_LABEL} in place",
+              file=sys.stderr)
+        return False
+    labels = {l.get("name", "") for l in (live.get("labels") or [])}
+    if REBASE_LABEL not in labels:
+        return True
+    head = (live.get("headRefOid") or "").lower()
+    want = (evaluated_sha or "").lower()
+    if not want or not head or not (head.startswith(want) or want.startswith(head)):
+        print(f"!! #{num}: {REBASE_LABEL} stands — head {head[:8]} is not the evaluated "
+              f"{want[:8] or '?'}, so the fresh tier does not belong to this head",
+              file=sys.stderr)
+        return False
+    if live.get("mergeStateStatus") == "DIRTY":
+        print(f"!! #{num}: {REBASE_LABEL} stands — merge conflicts are real staleness",
+              file=sys.stderr)
+        return False
+    if dry_run:
+        print(f"--- dry-run: would clear {REBASE_LABEL} from #{num} (re-measured at {head[:8]})")
+        return True
+    gh(["api", "-X", "DELETE", f"repos/{repo}/issues/{num}/labels/{REBASE_LABEL}"])
+    after = _pr_state(repo, num)
+    left = {l.get("name", "") for l in ((after or {}).get("labels") or [])}
+    if not after or REBASE_LABEL in left:
+        print(f"!! #{num}: could not clear {REBASE_LABEL} — it is still on the PR",
+              file=sys.stderr)
+        return False
+    print(f">> #{num}: {REBASE_LABEL} cleared — this round re-measured it at {head[:8]} "
+          f"against the current frontier")
+    return True
+
+
 def wait_for_tier(repo, num, tries=30, delay=10):
     """Poll until eval-label.yml has applied the eval:* label for the comment just posted.
 
@@ -997,6 +1053,12 @@ def merge_winner(repo, num, pr, dry_run):
     quietly. A silent no-op here would be indistinguishable from a successful merge in the
     run log, and that is exactly how an unreviewed merge goes unnoticed.
     """
+    # A needs-rebase this round already answered (fresh tier at this exact head) must not
+    # refuse the round's own winner. The eval loop clears it once; this covers a label that
+    # arrived between the eval and the merge — including from this round's own standalone
+    # sweep. Genuinely stale labels (head moved, conflicts) survive the check and block
+    # below, which is what they are for.
+    clear_moot_rebase_label(repo, num, pr.get("headRefOid", ""), dry_run)
     blockers = merge_blockers(repo, num, pr, mode="admin")
     if blockers:
         print(f"!! #{num}: NOT merged — {'; '.join(blockers)}", file=sys.stderr)
@@ -1012,13 +1074,21 @@ def merge_winner(repo, num, pr, dry_run):
     return True
 
 
-def sync_rebase_labels(repo, prs, merged_num, dry_run):
+def sync_rebase_labels(repo, prs, merged_num, dry_run, force_stale=False):
     """After a merge, every other open PR is scored against a frontier that just moved.
 
     Their tier is stale by definition rather than by suspicion: the denominator changed.
     So they get the label and an explanation. It clears automatically once the branch is no
     longer behind -- a label only a maintainer can remove turns a mechanical state into a
     queue somebody has to babysit, and the miner has already done the work by rebasing.
+
+    force_stale: pass True on the sweep that runs AS THE TAIL OF A MERGE. GitHub recomputes
+    mergeability asynchronously, so seconds after main moves every other PR still reads
+    UNKNOWN -- and the BEHIND/DIRTY test below, which is right for a standalone sweep,
+    silently labels nothing at the one moment staleness is a certainty rather than a state
+    to be queried. The merge IS the evidence: every other tier-carrying open PR trails main
+    by at least that commit, whether or not GitHub has noticed yet. The no-tier rule still
+    applies, and the merged PR itself is still skipped.
     """
     for pr in prs:
         num = pr["number"]
@@ -1045,8 +1115,10 @@ def sync_rebase_labels(repo, prs, merged_num, dry_run):
         # either way, so it neither sets nor clears: acting on it would label people over an
         # API race.
         state = info.get("mergeStateStatus")
-        stale = state in ("BEHIND", "DIRTY")
-        current = state in ("CLEAN", "UNSTABLE", "BLOCKED")
+        stale = state in ("BEHIND", "DIRTY") or force_stale
+        # force_stale also suppresses the clear branch: nothing is "current again" seconds
+        # after main moved, whatever the not-yet-recomputed state claims.
+        current = (not force_stale) and state in ("CLEAN", "UNSTABLE", "BLOCKED")
         behind = stale
         has = REBASE_LABEL in labels
         # The label means "your measured tier is stale because the frontier moved". A PR
@@ -1139,8 +1211,11 @@ def mark_merge_first(repo, results, dry_run, queue_auto_merge=False, prs=()):
     # Queueing is not merging, but it is arming: once the required review lands, GitHub
     # merges with nobody looking again. So the substantive guards apply here too -- the
     # merge-state ones do not, because waiting for them IS the feature.
-    blockers = merge_blockers(repo, winner, {p["number"]: p for p in prs}.get(winner, {}),
-                              waiting_is_blocking=False)
+    winner_pr = {p["number"]: p for p in prs}.get(winner, {})
+    # Same moot-check as merge_winner: a needs-rebase this round already answered must not
+    # keep the winner out of the auto-merge queue.
+    clear_moot_rebase_label(repo, winner, winner_pr.get("headRefOid", ""), dry_run)
+    blockers = merge_blockers(repo, winner, winner_pr, waiting_is_blocking=False)
     if blockers:
         print(f"!! #{winner}: NOT queued for auto-merge — {'; '.join(blockers)}",
               file=sys.stderr)
@@ -1359,6 +1434,11 @@ def main():
               f"ms/token={res.get('ms_per_token')} — tier is eval-label.yml's to derive")
         if res.get("receipt_id"):
             publish_receipt(LOG_REPO, num, res, BOX_RECEIPTS, args.dry_run)
+        # This evaluation IS the re-measurement a leftover needs-rebase demanded, so clear
+        # it now — in EVERY mode, not just merge modes. A plain round that leaves the moot
+        # label standing hands the next merge-mode round (or a human) a winner that
+        # merge_blockers refuses on a label whose complaint was already answered: #59.
+        clear_moot_rebase_label(args.repo, num, pr.get("headRefOid", ""), args.dry_run)
         # Clear the previous round's tier BEFORE posting, so the label that appears after
         # can only be this round's. Otherwise wait_for_tier returns instantly on a stale one.
         tier_cleared = True
@@ -1403,7 +1483,11 @@ def main():
             # Only after something actually merged does the frontier move, so the rebase
             # sweep is conditional on the merge -- labelling everything needs-rebase after a
             # merge that was blocked would tell every contributor to redo work for nothing.
-            sync_rebase_labels(args.repo, prs, winner, args.dry_run)
+            #
+            # force_stale: this sweep runs SECONDS after main moved, while GitHub still
+            # reports every other PR as UNKNOWN. Waiting for BEHIND here labels nothing at
+            # the one moment staleness is a certainty — the merge itself is the evidence.
+            sync_rebase_labels(args.repo, prs, winner, args.dry_run, force_stale=True)
     elif args.merge_admin:
         # "no results" and "results, none of them safe to merge on" are different rounds and
         # the operator reading this needs to know which one happened.
