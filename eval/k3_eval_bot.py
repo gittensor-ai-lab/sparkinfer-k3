@@ -49,6 +49,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 
 REPO_DEFAULT = "gittensor-ai-lab/sparkinfer-k3"
 BOX_REPO_DIR = os.environ.get("K3_BOX_REPO_DIR", "/workspace/k3-botrun")
@@ -834,7 +835,8 @@ def wait_mergeable_state(repo, num, tries=20, delay=6):
 
 
 def clear_stale_tier(repo, num, dry_run):
-    """Remove any eval:* label BEFORE posting this round's result.
+    """Remove any eval:* label BEFORE posting this round's result. Returns True only when
+    the PR is VERIFIED to carry no eval:* label afterwards.
 
     Without this, wait_for_tier is satisfied by the PREVIOUS round's tier. #59 carried
     eval:none from a round scored against a 4.53 frontier; the wait found an eval:* label
@@ -846,19 +848,52 @@ def clear_stale_tier(repo, num, dry_run):
     Clearing first makes it unambiguous: any eval:* present afterwards belongs to this
     round. It also fails in the safe direction -- if eval-label.yml never runs, the PR ends
     with NO tier and merge_blockers refuses, rather than merging on a stale one.
+
+    THE RETURN VALUE IS THE WHOLE GUARANTEE, AND IT HAS TO BE EARNED. gh() does not raise:
+    it hands back a CompletedProcess and an unchecked DELETE loop treats a 403 exactly like
+    a success. That printed "cleared stale tier" over a label that was still there, and
+    wait_for_tier then returned it instantly -- #59 again, this time with a log line
+    asserting it had been prevented. Two silent-failure paths, both closed here: an
+    unreadable state is not "no labels", and an issued DELETE is not a removed label.
+
+    Re-read rather than trust the exit codes. A 404 means someone else removed it, which is
+    a fine outcome and a failed call; only what is on the PR afterwards decides anything.
     """
-    labels = {l.get("name", "") for l in (_pr_state(repo, num).get("labels") or [])}
-    stale = sorted(l for l in labels if l.startswith("eval:"))
+    info = _pr_state(repo, num)
+    if not info:
+        print(f"!! #{num}: cannot read labels from {repo} — refusing to assume any tier "
+              f"found later belongs to this round", file=sys.stderr)
+        return False
+    stale = sorted(l for l in {l.get("name", "") for l in (info.get("labels") or [])}
+                   if l.startswith("eval:"))
     if not stale:
-        return
+        return True
     if dry_run:
         print(f"--- dry-run: would clear stale {', '.join(stale)} from #{num}")
-        return
+        return True
+
+    errs = []
     for l in stale:
-        gh(["api", "-X", "DELETE",
-            f"repos/{repo}/issues/{num}/labels/{l.replace(':', '%3A')}"])
+        r = gh(["api", "-X", "DELETE",
+                f"repos/{repo}/issues/{num}/labels/{urllib.parse.quote(l, safe='')}"])
+        if r.returncode != 0:
+            tail = (r.stderr or "").strip().splitlines()
+            errs.append(f"{l}: {tail[-1] if tail else 'no stderr'}")
+
+    after = _pr_state(repo, num)
+    if not after:
+        print(f"!! #{num}: cannot confirm the stale tier was cleared — treating it as not "
+              f"cleared", file=sys.stderr)
+        return False
+    left = sorted(l for l in {l.get("name", "") for l in (after.get("labels") or [])}
+                  if l.startswith("eval:"))
+    if left:
+        print(f"!! #{num}: could not clear stale tier ({', '.join(left)}) — "
+              f"{'; '.join(errs) if errs else 'the label is still on the PR'}", file=sys.stderr)
+        return False
     print(f">> #{num}: cleared stale tier ({', '.join(stale)}) — it was measured against a "
           f"frontier that has since moved")
+    return True
 
 
 def wait_for_tier(repo, num, tries=30, delay=10):
@@ -1306,6 +1341,11 @@ def main():
 
     evaluated = 0
     results = []
+    # PRs whose previous tier could not be cleared. They are still evaluated, posted and
+    # sealed -- the measurement is good -- but merge_blockers only checks that SOME eval:*
+    # label is present, so on those PRs a stale tier would satisfy it. Excluded from the
+    # merge decision rather than merged on a number measured against an older frontier.
+    unsafe_tier = set()
     for pr in eligible:
         num = pr["number"]
         print(f"#{num}: evaluating {pr['headRefOid'][:8]} on {NODE} "
@@ -1321,13 +1361,23 @@ def main():
             publish_receipt(LOG_REPO, num, res, BOX_RECEIPTS, args.dry_run)
         # Clear the previous round's tier BEFORE posting, so the label that appears after
         # can only be this round's. Otherwise wait_for_tier returns instantly on a stale one.
+        tier_cleared = True
         if args.merge_admin or args.auto_merge:
-            clear_stale_tier(args.repo, num, args.dry_run)
+            tier_cleared = clear_stale_tier(args.repo, num, args.dry_run)
         post(args.repo, num, res, args.dry_run)
         # eval-label.yml applies the tier asynchronously. Wait for it here, once, rather
         # than letting the merge decision below read a label that has not landed yet.
         if not args.dry_run and (args.merge_admin or args.auto_merge):
-            wait_for_tier(args.repo, num)
+            if tier_cleared:
+                wait_for_tier(args.repo, num)
+            else:
+                # Waiting is pointless when a stale label is still there -- it would return
+                # on the first poll, on the old tier. Say so and take this PR out of the
+                # merge decision instead of pretending the wait meant something.
+                unsafe_tier.add(num)
+                print(f"!! #{num}: evaluated and posted, but excluded from this round's merge "
+                      f"decision — a tier from an earlier round is still on it",
+                      file=sys.stderr)
         results.append((num, res))
         evaluated += 1
 
@@ -1338,12 +1388,16 @@ def main():
     if args.merge_first or args.auto_merge or args.merge_admin:
         sync_rebase_labels(args.repo, prs, merged_num=-1, dry_run=args.dry_run)
 
+    # The merge decision runs on the PRs whose tier is known to be this round's. Everything
+    # else -- posting, sealing, the round log -- still sees every result.
+    mergeable = [r for r in results if r[0] not in unsafe_tier]
+
     if args.merge_first or args.auto_merge or args.merge_admin:
-        mark_merge_first(args.repo, results, args.dry_run,
+        mark_merge_first(args.repo, mergeable, args.dry_run,
                          queue_auto_merge=args.auto_merge, prs=prs)
 
-    if args.merge_admin and results:
-        winner = max(results, key=lambda r: r[1].get("tps") or 0)[0]
+    if args.merge_admin and mergeable:
+        winner = max(mergeable, key=lambda r: r[1].get("tps") or 0)[0]
         by_num = {p["number"]: p for p in prs}
         if merge_winner(args.repo, winner, by_num.get(winner, {}), args.dry_run):
             # Only after something actually merged does the frontier move, so the rebase
@@ -1351,7 +1405,14 @@ def main():
             # merge that was blocked would tell every contributor to redo work for nothing.
             sync_rebase_labels(args.repo, prs, winner, args.dry_run)
     elif args.merge_admin:
-        print("no results to merge", file=sys.stderr)
+        # "no results" and "results, none of them safe to merge on" are different rounds and
+        # the operator reading this needs to know which one happened.
+        if unsafe_tier:
+            print(f"no results safe to merge — {len(unsafe_tier)} PR(s) still carry a tier "
+                  f"from an earlier round: {', '.join(f'#{n}' for n in sorted(unsafe_tier))}",
+                  file=sys.stderr)
+        else:
+            print("no results to merge", file=sys.stderr)
 
     # A receipt id proves a receipt was minted, not that anyone can find it. The log is the
     # only thing that makes a number checkable by someone who was not at this terminal, so

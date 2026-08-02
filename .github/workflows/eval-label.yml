@@ -229,8 +229,25 @@ jobs:
           # Same bars the harness used. label.py's defaults are the Qwen track's (0.20)
           # and must stay loose for it; K3 pins 0.05. If these two ever disagree the
           # workflow re-derives a different verdict from the same numbers.
-          env["SPARKINFER_KL_BAR"] = "0.05"
-          env["SPARKINFER_KL_PREFER"] = "0.02"
+          #
+          # THESE ARE THE TRUSTED VALUES. The harness's are env-overridable (KIMI_K3_KL_BAR),
+          # so a box can run with a looser bar and produce a verdict this job cannot
+          # reproduce. It records what it used, so check that FIRST -- otherwise the only
+          # symptom is a label mismatch blamed on an edited payload.
+          KL_BAR, KL_PREFER = "0.05", "0.02"
+          for key, pinned in (("kl_bar", KL_BAR), ("kl_prefer", KL_PREFER)):
+              used = d.get(key)
+              if used is None:
+                  print(f"::warning::payload does not record {key}; it predates the pin or "
+                        f"was produced by a different harness", file=sys.stderr)
+              elif abs(float(used) - float(pinned)) > 1e-9:
+                  print(f"::error::the node scored with {key}={used} but this repo pins "
+                        f"{pinned}. The verdict was computed under a different accuracy "
+                        f"policy — re-run the eval without KIMI_K3_{key.upper()} set.",
+                        file=sys.stderr)
+                  sys.exit(1)
+          env["SPARKINFER_KL_BAR"] = KL_BAR
+          env["SPARKINFER_KL_PREFER"] = KL_PREFER
           out = subprocess.run(
               [sys.executable, "bench/scripts/label.py", str(d["tps"]), str(frontier),
                "0", str(d["top1"]), str(d["kl"]), str(d["commit"])],

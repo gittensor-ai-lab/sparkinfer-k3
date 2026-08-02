@@ -57,15 +57,21 @@ prov     = json.loads(sys.argv[7]) if len(sys.argv) > 7 and sys.argv[7] else {}
 # when it re-derives, because a bot and a workflow disagreeing about REJECT is the same
 # class of bug as disagreeing about the frontier.
 #
-# K3 pins 0.05 (operator policy). It matters that this is much tighter than the default:
-# K3's main measures 0.004046, so under 0.20 a PR could degrade parity FORTY-FOLD and still
-# pass clean -- and with KL_PREFER 0.15 it would not even be annotated. That gap surfaced on
-# #63, which doubled the KLD to 0.008075, passed every automated check silently, and was
-# caught only because a human read the number.
+# K3 pins 0.05 (operator policy), which is much tighter than the default: K3's main measures
+# 0.004046, so under 0.20 a PR could degrade parity FORTY-FOLD and still pass clean. 0.05
+# bounds that at about twelve-fold, with the soft flag at 0.02 (about five-fold).
 #
-# Either way the gate is a FLOOR, not a ratchet: it asks "under the bar?", never "worse than
-# main?". A ratchet against current measured parity would be the stronger rule and is a
-# governance decision rather than a constant.
+# WHAT THIS BAR DOES NOT DO, STATED PLAINLY SO NOBODY RE-DERIVES IT FROM THE INCIDENT. #63
+# doubled the KLD to 0.008075 and no automated check said a word; it was caught because a
+# human read the number. 0.008075 is under 0.05 and under 0.02, so the SAME PR would pass
+# clean and unflagged today. The bar bounds the worst case; it does not detect a regression.
+#
+# That is inherent to the shape of the rule: the gate is a FLOOR, and it asks "under the
+# bar?", never "worse than main?". Catching a #63 needs a RATCHET against current measured
+# parity -- a pinned KL beside the frontier slot in reference.lock, moved on merge the same
+# way the frontier is. That is a governance decision rather than a constant, and it has not
+# been taken. Do not tighten the floor toward main's number instead: at 2x measured parity
+# it would REJECT on ordinary run-to-run variation, which is how a gate stops being read.
 TOP1_BAR  = float(os.environ.get("SPARKINFER_TOP1_BAR",  "0.90"))
 KL_BAR    = float(os.environ.get("SPARKINFER_KL_BAR",    "0.20"))
 KL_PREFER = float(os.environ.get("SPARKINFER_KL_PREFER", "0.15"))

@@ -26,8 +26,9 @@
 #
 # plus the correctness gate: top-1 agreement and mean KLD against llama.cpp on the
 # SAME weights and the SAME ids, from bench/refdata/. label.py REJECTs below
-# top1 0.90 / KLD 0.20 no matter how fast the run was — a speedup that erodes parity
-# with the reference is not a speedup worth having.
+# top1 0.90 / KLD 0.05 (K3's pinned bar — label.py's shared default is the Qwen track's
+# 0.20) no matter how fast the run was — a speedup that erodes parity with the reference
+# is not a speedup worth having.
 #
 # WHY THE REFERENCE IS A CAPTURE AND NOT A LIVE llama.cpp RUN. Re-running llama.cpp
 # for every eval would mean loading 553 GiB twice per PR. bench/refdata/*.spkl is the
@@ -35,6 +36,18 @@
 # identical and costs one sparkinfer forward.
 #
 # Env: KIMI_K3_MODEL (or KIMI_K3_MODELS_DIR) · SPARKINFER_BUILD · KIMI_K3_NODE
+#
+# Speed-guard knobs (step 1). The two guards have to overlap — see the comment there:
+#   KIMI_K3_MARGIN_TOKENS  128    tokens of difference between the two timed runs
+#   KIMI_K3_SPEED_TOL      1.5    max claim / wall-clock differential
+#   KIMI_K3_WORK_TOL       2.0    max wall-clock differential / claim (proves the work ran)
+#   KIMI_K3_MAX_OVER_LLAMA 3.0    max claim as a multiple of the llama.cpp reference
+#   KIMI_K3_JITTER_S       2.0    assumed load jitter; only used to check the guards overlap
+#
+# Accuracy bars (step 3). Both are RECORDED into the payload and checked by eval-label.yml,
+# so a run scored under a moved bar is refused rather than silently re-derived:
+#   KIMI_K3_KL_BAR         0.05   hard REJECT ceiling for mean KLD
+#   KIMI_K3_KL_PREFER      0.02   soft flag (accuracy_warn) above this
 
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -176,10 +189,24 @@ echo ">> sparkinfer frontier             : $FRONTIER tok/s$([[ "$FRONTIER" == "0
 # the run refused itself. The signal has to dominate the jitter, hence a fixed and much
 # larger token margin rather than a multiple of TOKENS.
 #
-# What this still cannot prove is that the work was real: a bench that returns immediately is
-# indistinguishable from an infinitely fast one. That residual is bounded by the accuracy
-# gate, which now runs off-box (step 2) -- but only at short context, because no 128k
-# reference exists to check the seeked run against.
+# THE DIFFERENTIAL BOUNDS NOTHING UNLESS THE SECOND RUN ACTUALLY DID THE EXTRA TOKENS.
+#
+# n_tokens is argv[4] of a binary the PR wrote. Nothing here compels it to be honoured, and
+# a bench that ignores it does the SAME work in both runs: the difference collapses to load
+# jitter, ext_tps goes to (nearly) infinity, and every claim clears the bound. The upper
+# bound alone is therefore self-neutering -- the cheapest attack on it is to do less work,
+# not more.
+#
+# So the marginal time must ALSO be at least as long as the claim itself implies. That side
+# is safe in the way the upper bound is not: load jitter INFLATES d_ns (the differential
+# reads slower than truth), so it can only ever make this check pass more easily, never fail
+# spuriously. Together the two sides pin d_ns into a window, and a fabricated claim of X
+# tok/s now has to burn MARGIN_TOKENS/X seconds of real wall clock to be believed.
+#
+# What this still cannot prove is that the elapsed time was spent DECODING -- sleep() buys
+# the same seconds. That residual is bounded by the accuracy gate, which now runs off-box
+# (step 2) -- but only at short context, because no 128k reference exists to check the
+# seeked run against.
 NDEV="$(printf '%s' "$DEVICES" | tr ',' '\n' | grep -c .)"
 TOKENS_LO="$TOKENS"
 # ~128 marginal tokens is ~28 s at main's current 128k speed, against 1-2 s of load jitter:
@@ -219,10 +246,14 @@ if [[ -z "$SELF_TPS" ]]; then
 fi
 
 read -r TPS MSTOK <<<"$(python3 - "$NS_LO" "$NS_HI" "$TOKENS_LO" "$TOKENS_HI" \
-                                 "$SELF_TPS" "$SELF_MS" "${KIMI_K3_SPEED_TOL:-1.5}" <<'PY'
+                                 "$SELF_TPS" "$SELF_MS" "${KIMI_K3_SPEED_TOL:-1.5}" \
+                                 "${KIMI_K3_WORK_TOL:-2.0}" "$LLAMA_REF" \
+                                 "${KIMI_K3_MAX_OVER_LLAMA:-3.0}" "${KIMI_K3_JITTER_S:-2.0}" <<'PY'
 import sys
 ns_lo, ns_hi, n_lo, n_hi = (int(x) for x in sys.argv[1:5])
 self_tps, self_ms, tol = float(sys.argv[5]), float(sys.argv[6] or 0), float(sys.argv[7])
+work_tol = float(sys.argv[8])
+llama_ref, max_over_llama, jitter_s = (float(x or 0) for x in sys.argv[9:12])
 d_ns, d_n = ns_hi - ns_lo, n_hi - n_lo
 if d_n <= 0 or d_ns <= 0:
     sys.stderr.write(f"kimi_k3_eval: non-positive time delta ({d_ns} ns over {d_n} tokens) — "
@@ -243,6 +274,56 @@ if self_tps > ext_tps * tol:
         "  refusing to score: the binary is built from the PR's runtime/, and a self-report\n"
         "  faster than elapsed time is the signature of a fabricated number.\n")
     raise SystemExit(1)
+# THE OTHER SIDE: the marginal tokens have to have COST something. A bench that ignores its
+# n_tokens argument does identical work in both runs, d_ns is then load jitter alone, and the
+# check above passes for any claim at all. Jitter can only inflate d_ns, so this side has
+# nothing to absorb but the same slack -- work_tol is generous because it does not need to be
+# tight, it needs to separate "128 tokens of decode" from "no tokens of decode".
+if self_ms > 0 and ext_tps > self_tps * work_tol:
+    implied_s = d_n * self_ms / 1000.0
+    sys.stderr.write(
+        f"kimi_k3_eval: {d_n} extra tokens took {d_ns / 1e9:.2f} s of wall clock, but at the "
+        f"claimed {self_ms:.2f} ms/token they must take about {implied_s:.2f} s "
+        f"({implied_s / work_tol:.2f} s at the {work_tol}x floor).\n"
+        "  refusing to score: the longer run did not do the extra work, so the differential\n"
+        "  bounds nothing and the self-report is unchecked.\n")
+    raise SystemExit(1)
+
+# A TIMING GUARD CAN ONLY BOUND A CLAIM IN PROPORTION TO THE TIME THAT CLAIM IMPLIES.
+#
+# The check above costs an attacker MARGIN_TOKENS/claim seconds of real wall clock. That is
+# ruinous for a claim near the truth (128 tokens at main's ~1 tok/s is ~128 s) and free for
+# an absurd one: at 500 tok/s the 128 marginal tokens "should" take 0.26 s, which the load
+# jitter supplies for nothing. The crossover is MARGIN_TOKENS / (jitter * work_tol) -- above
+# it, elapsed time stops being evidence, and no amount of tuning the tolerance changes that.
+#
+# So the band above the crossover has to be closed by PLAUSIBILITY instead of by timing.
+# llama.cpp on the same weights, box and context is the anchor already pinned in
+# reference.lock, and label.py saturates at XL well before a few multiples of it -- a claim
+# far past the reference earns nothing extra and is not a number this harness should be
+# auto-scoring. A real breakthrough gets re-measured by hand and the knob raised on purpose.
+crossover = d_n / (jitter_s * work_tol) if jitter_s > 0 and work_tol > 0 else float("inf")
+if llama_ref > 0:
+    ceiling = llama_ref * max_over_llama
+    if self_tps > ceiling:
+        sys.stderr.write(
+            f"kimi_k3_eval: the bench claims {self_tps} tok/s, over {max_over_llama}x the "
+            f"llama.cpp reference ({llama_ref}) at this context — ceiling {ceiling:.2f}.\n"
+            "  refusing to score: past this point the wall-clock differential is smaller than\n"
+            "  load jitter, so nothing here can tell a breakthrough from a fabrication.\n"
+            "  Re-measure by hand and raise KIMI_K3_MAX_OVER_LLAMA deliberately if it is real.\n")
+        raise SystemExit(1)
+    if ceiling > crossover:
+        sys.stderr.write(
+            f">> WARN: guard coverage gap — claims between {crossover:.1f} and {ceiling:.1f} "
+            f"tok/s can ride {jitter_s} s of load jitter.\n"
+            f">>       Raise KIMI_K3_MARGIN_TOKENS (now {d_n}) or lower "
+            "KIMI_K3_MAX_OVER_LLAMA to close it.\n")
+else:
+    sys.stderr.write(
+        f">> WARN: no llama.cpp reference for this node/quant/context, so the plausibility\n"
+        f">>       ceiling is off and any claim above ~{crossover:.1f} tok/s is unguarded.\n")
+
 # Scored on the self-report: precise, and the tier must not wobble with load jitter.
 print(f"{self_tps:.2f} {self_ms:.2f}")
 PY
@@ -257,7 +338,7 @@ echo ">> sparkinfer: $TPS tok/s ($MSTOK ms/token)  [self-timed, within the wall-
 # repo root -- so a bench could open bench/refdata/hello.spkl and write it back out as its
 # own --logits dump. That is top1 1.0 and KL 0.0 for a binary that computed nothing, and no
 # rule rejected a suspiciously perfect result: label.py only bounds top1 >= 0.90 and
-# KL <= 0.20 (honest main measures 0.004, so an exact 0.0 was a tell nothing looked for).
+# KL <= 0.05 (honest main measures 0.004, so an exact 0.0 was a tell nothing looked for).
 #
 # So the controller now measures accuracy: it feeds the ids, copies the logits dump back,
 # and compares against a reference the box never sees, then passes the result in as
@@ -299,10 +380,25 @@ fi
 
 # ---- 3. label -------------------------------------------------------------
 COMMIT="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+
+# K3 PINS ITS OWN ACCURACY BARS. label.py is shared with the inherited Qwen track, whose
+# honest runs measure KL 0.0175-0.03, so its DEFAULT must stay loose (0.20) or every Qwen
+# run would be REJECTed. K3 measures 0.004046 on main, so 0.20 would let a PR degrade
+# parity forty-fold and pass clean.
+#
+# The knob exists for local experiments, and that is exactly why the values are RECORDED
+# into provenance below. eval-label.yml re-derives the verdict with its own pinned 0.05,
+# so a box that ran with a different bar produces a label the workflow cannot reproduce --
+# which used to surface as "reported label != re-derived: payload edited or harness version
+# mismatch", naming the two things that were not wrong. Publishing the bars lets the
+# workflow say which knob was moved instead of guessing.
+KL_BAR="${KIMI_K3_KL_BAR:-0.05}"
+KL_PREFER="${KIMI_K3_KL_PREFER:-0.02}"
+
 PROV="$(python3 - "$NODE" "$DEVICES" "$LAYERS" "$MODEL" "$MSTOK" "$FINGERPRINT" \
-        "${EXT_TOP1:+controller}" "$SCORED_CTX" <<'PY'
+        "${EXT_TOP1:+controller}" "$SCORED_CTX" "$KL_BAR" "$KL_PREFER" <<'PY'
 import json, sys, os
-node, devs, layers, model, mstok, fp, acc_src, ctx = sys.argv[1:9]
+node, devs, layers, model, mstok, fp, acc_src, ctx, kl_bar, kl_prefer = sys.argv[1:11]
 print(json.dumps({
     "node": node, "devices": devs, "layers": int(layers),
     "quant": os.path.basename(os.path.dirname(model)),
@@ -317,6 +413,11 @@ print(json.dumps({
     "accuracy_source": acc_src or "on_box",
     "model_fingerprint": fp,
     "scored_ctx": int(ctx),
+    # The accuracy policy this verdict was computed under. Not a scoring key -- label.py's
+    # allowlist would reject it if it were -- but the trusted re-derivation compares it to
+    # its own pin, so a moved knob is named rather than inferred.
+    "kl_bar": float(kl_bar),
+    "kl_prefer": float(kl_prefer),
 }, separators=(",", ":")))
 PY
 )"
@@ -330,15 +431,12 @@ if [[ "${LLAMA_REF%%.*}" == "0" ]]; then
     echo ">>       Run: bench/scripts/kimi_k3_baseline.sh --node $NODE --decode-only" >&2
 fi
 
-# K3 PINS ITS OWN ACCURACY BARS. label.py is shared with the inherited Qwen track, whose
-# honest runs measure KL 0.0175-0.03, so its DEFAULT must stay loose (0.20) or every Qwen
-# run would be REJECTed. K3 measures 0.004046 on main, so 0.20 would let a PR degrade
-# parity forty-fold and pass clean -- which is how #63 doubled the KLD silently.
-# eval-label.yml pins the SAME pair when it re-derives; a bot and a workflow disagreeing
-# about REJECT is the same class of bug as disagreeing about the frontier.
+# The bars pinned above. eval-label.yml pins the SAME pair when it re-derives; a bot and a
+# workflow disagreeing about REJECT is the same class of bug as disagreeing about the
+# frontier.
 RESULT="$(SPARKINFER_DIFFICULTY_REF="$LLAMA_REF" SPARKINFER_SCORED_CONTEXT="$SCORED_CTX" \
-    SPARKINFER_KL_BAR="${KIMI_K3_KL_BAR:-0.05}" \
-    SPARKINFER_KL_PREFER="${KIMI_K3_KL_PREFER:-0.02}" \
+    SPARKINFER_KL_BAR="$KL_BAR" \
+    SPARKINFER_KL_PREFER="$KL_PREFER" \
     python3 "$HERE/label.py" "$TPS" "$FRONTIER" 0 "$TOP1" "$KL" "$COMMIT" "$PROV")"
 echo
 echo "$RESULT"
