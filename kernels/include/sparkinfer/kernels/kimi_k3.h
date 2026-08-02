@@ -461,6 +461,19 @@ bool k3_proj_f32(float* y, const float* x, const void* W, int wtype,
 // must treat false as "use the slow path", not as an error.
 //
 // Bit-identical to four separate k3_proj_f32 calls.
+// Q8-activation variant of k3_proj_f32_x4: quantises x ONCE and feeds all four
+// projections from that one staged activation, in a single launch.
+//
+// Exists because enabling quantised activations disabled the f32 x4 path and
+// dropped the 69 KDA layers to four separate projections, each re-quantising
+// the same vector -- 59,696 quantize launches, 8.7% of GPU time, at ~7 GB/s.
+// Returns false for anything outside its contract (non-Q8_0, mismatched shape,
+// N < 4), which means "use the slow path", not an error.
+bool k3_proj_ggml_f32_x4(float* y0, float* y1, float* y2, float* y3, const float* x,
+                         const void* W0, const void* W1, const void* W2, const void* W3,
+                         int wtype, int N, int K, void* q8_scratch,
+                         cudaStream_t stream);
+
 bool k3_proj_f32_x4(float* y0, float* y1, float* y2, float* y3, const float* x,
                     const void* W0, const void* W1, const void* W2, const void* W3,
                     int wtype, int N, int K, cudaStream_t stream);
