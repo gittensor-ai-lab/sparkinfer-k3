@@ -250,21 +250,27 @@ __global__ void kda_decode_step_vt_kernel(float* __restrict__ out,
     __syncthreads();
 
     // Step 1 + 2: decay by exp(g[i]) and sk = sum_i S[i][j]*k[i].
+    //
+    // THE DECAYED STATE IS NOT WRITTEN BACK HERE. The staged kernel stored S*exp(g) to
+    // global at the end of this pass and re-read it in the next one; pass 2 below simply
+    // recomputes the product from the untouched S. That drops a full write of the state
+    // per launch — a quarter of this kernel's global traffic — plus one staging loop and
+    // one barrier per chunk, and the recomputed multiply is free next to the load it
+    // replaces.
+    //
+    // __fmul_rn, not `*`, and that is load-bearing. The old pass 1 stored the product to
+    // shared, which forced it to be materialised as a rounded f32. Here it feeds an add
+    // directly, so nvcc (--fmad=true by default) would happily contract it into an fma
+    // and skip the intermediate rounding — giving a different result in the last bits and
+    // silently costing the bit-identity this whole change is claiming.
     float sk = 0.0f;
     for (int i0 = 0; i0 < head_dim; i0 += IC) {
         for (int t = jl; t < BV * IC; t += BV)
             s_T[(t / IC) * SP + (t % IC)] =
                 S[(size_t)(j0 + t / IC) * head_dim + i0 + (t % IC)];
         __syncthreads();
-        for (int c = 0; c < IC; ++c) {
-            const float sv = s_T[jl * SP + c] * s_ge[i0 + c];
-            s_T[jl * SP + c] = sv;
-            sk += sv * s_k[i0 + c];
-        }
-        __syncthreads();
-        for (int t = jl; t < BV * IC; t += BV)
-            S[(size_t)(j0 + t / IC) * head_dim + i0 + (t % IC)] =
-                s_T[(t / IC) * SP + (t % IC)];
+        for (int c = 0; c < IC; ++c)
+            sk += __fmul_rn(s_T[jl * SP + c], s_ge[i0 + c]) * s_k[i0 + c];
         __syncthreads();
     }
 
@@ -280,7 +286,11 @@ __global__ void kda_decode_step_vt_kernel(float* __restrict__ out,
                 S[(size_t)(j0 + t / IC) * head_dim + i0 + (t % IC)];
         __syncthreads();
         for (int c = 0; c < IC; ++c) {
-            const float sv = s_T[jl * SP + c] + s_k[i0 + c] * d_j;
+            // S here is the ORIGINAL state, because pass 1 no longer wrote its decayed
+            // copy — so the decay is reapplied, to exactly the same operands with exactly
+            // the same rounding, and the sum below sees the identical f32 the staged
+            // kernel read back from global.
+            const float sv = __fmul_rn(s_T[jl * SP + c], s_ge[i0 + c]) + s_k[i0 + c] * d_j;
             s_T[jl * SP + c] = sv;
             o += sv * s_q[i0 + c];
         }
