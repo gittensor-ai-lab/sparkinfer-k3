@@ -177,6 +177,75 @@ def eligibility(pr):
     return True, "eligible"
 
 
+# A GUARD THAT CAN BE RETRIED IS NOT A GUARD.
+#
+# These are the harness saying "I will not score this", which is an ANSWER, not a glitch.
+# Running the same measurement again until it passes is not a retry, it is sampling until the
+# result is convenient -- and every one of these guards exists because a number could
+# otherwise be fabricated. If one of them fires, the round takes the refusal.
+VERDICT_MARKERS = (
+    "refusing to score",
+    "wall clock allows",
+    "did not do the extra work",
+    "harness measured commit",
+    "non-positive time delta",
+    "reported no ms/token line",
+)
+# These are the BOX misbehaving: the model never loaded, the collective never initialised, the
+# connection died. They say nothing about the code under test, so the round should try again
+# rather than throw away every PR in it.
+TRANSIENT_RE = re.compile(
+    r"ncclCommInitAll|unhandled cuda error|\bNCCL\b|cudaMalloc failed|init failed at tp=|"
+    r"weight load failed|out of memory|\bCUDA error\b|bench failed|"
+    r"ssh timeout|Connection (?:timed out|closed|refused|reset)|Broken pipe|"
+    r"kex_exchange_identification|banner exchange",
+    re.I)
+
+
+def is_transient(exc):
+    """True if `exc` is the box failing, not the harness reaching a verdict.
+
+    Order matters: a verdict marker anywhere in the message wins, even if a transient-looking
+    word also appears in the 1200-char tail the error carries. Refusing to retry is the safe
+    direction -- it costs a round, where retrying a verdict costs the guard.
+    """
+    msg = str(exc)
+    if any(m in msg for m in VERDICT_MARKERS):
+        return False
+    return bool(TRANSIENT_RE.search(msg))
+
+
+def with_box_retry(what, fn, tries=3, delay=20):
+    """Run fn(), retrying only when the BOX failed rather than the code under test.
+
+    A frontier failure used to discard the entire round: measure_frontier raises, main() bails,
+    and not one PR is evaluated however healthy it was. Two rounds in the ledger died exactly
+    there -- rounds/66955446f62f and rounds/11eb5e4d02b7, the latter on
+
+        [tp] FATAL: ncclCommInitAll(n=8): unhandled cuda error
+        init failed at tp=8, 93 layers
+
+    -- and every eligible PR in both got nothing. A transient collective-init error is not a
+    statement about anyone's code, and it should cost a couple of minutes, not a round.
+
+    Each attempt re-enters _box_build, which kills orphaned compute processes before it builds,
+    so a retry is a genuinely clean attempt rather than the same poisoned box twice.
+
+    Verdicts are never retried -- see is_transient.
+    """
+    for i in range(1, tries + 1):
+        try:
+            return fn()
+        except RuntimeError as exc:
+            if i >= tries or not is_transient(exc):
+                raise
+            print(f"!! {what}: attempt {i}/{tries} failed on the box — {str(exc).splitlines()[0][:160]}",
+                  file=sys.stderr)
+            print(f"   retrying in {delay}s; the next attempt rebuilds and clears stray "
+                  "compute processes first", file=sys.stderr)
+            time.sleep(delay)
+
+
 def resolve_mergeability(repo, prs, tries=8, delay=5):
     """Settle pr['mergeable'] for the PRs where it decides whether to book the node.
 
@@ -1498,9 +1567,13 @@ def main():
             r = gh(["api", f"repos/{args.repo}/commits/main", "--jq", ".sha"])
             main_sha = (r.stdout or "").strip()
         else:
-            main_sha, main_tps, quant = measure_frontier(args.repo)
+            # Retried, because this one failure discards every PR in the round. A persistent
+            # failure still stops it -- falling back to the pinned lock value would score the
+            # round against a number main has already beaten, which is the #20 mispricing.
+            main_sha, main_tps, quant = with_box_retry(
+                "frontier", lambda: measure_frontier(args.repo))
     except RuntimeError as exc:
-        print(f"frontier measurement failed — {exc}", file=sys.stderr)
+        print(f"frontier measurement failed after retries — {exc}", file=sys.stderr)
         # _bail falls back to the main_sha resolved before the try block, so this round is
         # published under rounds/<sha>/ even though it sealed nothing.
         return _bail(1)
@@ -1550,7 +1623,12 @@ def main():
         print(f"#{num}: evaluating {pr['headRefOid'][:8]} on {NODE} "
               f"against frontier {frontier} …")
         try:
-            res = evaluate(pr, args.repo, frontier, seal=not args.no_seal)
+            # Same reasoning as the frontier, one PR down: a collective that failed to
+            # initialise is not a verdict on this PR's kernels, and losing its round over one
+            # is the same unfairness in miniature. A refusal from the harness is NOT retried.
+            res = with_box_retry(
+                f"#{num}",
+                lambda: evaluate(pr, args.repo, frontier, seal=not args.no_seal))
         except RuntimeError as exc:
             print(f"#{num}: eval failed — {exc}", file=sys.stderr)
             continue
