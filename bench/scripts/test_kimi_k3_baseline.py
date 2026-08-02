@@ -2069,6 +2069,64 @@ class CiWorkflowTest(unittest.TestCase):
         ok, _ = bot.eligibility(pr(crlf))
         self.assertTrue(ok, "CRLF line endings broke the section scan")
 
+    # ---- #81: a regression was merged as "the round's largest verified gain" -------------
+    def test_eval_none_is_not_a_passing_tier(self):
+        """merge_blockers accepted any label starting with 'eval:' as proof of passing.
+
+        `eval:none` starts with 'eval:'. So the one label whose whole meaning is "no
+        significant gain" satisfied the check that exists to require a gain. #81 merged
+        through that hole at 14.54 tok/s against a 21.24 frontier and cost main 31.5%."""
+        bot = self._bot()
+        self.assertNotIn(bot.NO_GAIN_TIER, bot.SCORING_TIERS)
+        self.assertTrue(bot.NO_GAIN_TIER.startswith("eval:"),
+                        "the whole bug was that this prefix matched — keep the test honest")
+        for t in ("eval:xs", "eval:s", "eval:m", "eval:l", "eval:xl"):
+            self.assertIn(t, bot.SCORING_TIERS)
+
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        start = src.index("def merge_blockers")
+        mb = src[start:start + src[start:].index("\ndef ", 1)]     # this function only
+        self.assertIn("bad = []", mb, "sliced the wrong function")
+        # sync_rebase_labels uses the same prefix test legitimately -- ANY tier, including
+        # eval:none, goes stale when the frontier moves -- so this must be scoped, not global.
+        self.assertNotIn('any(l.startswith("eval:") for l in labels)', mb,
+                         "the prefix check is back — eval:none passes the gate again")
+        self.assertIn("NO_GAIN_TIER in labels", mb,
+                      "eval:none is not explicitly refused")
+        self.assertIn("SCORING_TIERS", mb)
+
+    def test_the_merge_winner_must_actually_beat_the_frontier(self):
+        """Ranking by absolute tok/s makes the least-bad result of a bad round the winner.
+
+        With a single result a REGRESSION is trivially the maximum, which is exactly what
+        happened: one PR in the round, 14.54 tok/s, frontier 21.24, and the bot reported it
+        as 'the round's largest verified gain' and admin-merged it.
+
+        Replays that round and the mixed case."""
+        FRONTIER = 21.24
+        pick = lambda results: [(n, r) for n, r in results
+                                if float(r.get("tps") or 0) > FRONTIER]
+
+        # The actual #81 round: one result, and it is a regression.
+        self.assertEqual(pick([(81, {"tps": 14.54})]), [],
+                         "a regression is still a merge candidate — #81 all over again")
+
+        # Mixed round: only the genuine win survives, and it is the winner.
+        cands = pick([(81, {"tps": 14.54}), (74, {"tps": 21.26}), (99, {"tps": FRONTIER})])
+        self.assertEqual([n for n, _ in cands], [74])
+        self.assertEqual(max(cands, key=lambda r: r[1]["tps"])[0], 74)
+
+        # Exactly equal to the frontier is not a gain.
+        self.assertEqual(pick([(99, {"tps": FRONTIER})]), [],
+                         "matching the frontier was treated as beating it")
+
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        decision = src[src.index("mergeable = [r for r in results"):]
+        self.assertIn("> frontier", decision,
+                      "the winner is still chosen without comparing against the frontier")
+        self.assertLess(decision.index("> frontier"), decision.index("mark_merge_first("),
+                        "merge-first is labelled before the losers are filtered out")
+
     # ---- the accuracy gate was a floor, not a ratchet -----------------------------------
     MAIN_KL = 0.0038673887147093475      # main measured this, three rounds running
     PR74_KL = 0.0059102102093803194      # what #74 measured and merged on
