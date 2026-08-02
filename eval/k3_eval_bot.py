@@ -45,6 +45,7 @@ import io
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -80,6 +81,28 @@ REBASE_LABEL = "needs-rebase"
 # the ticked box, because that is the author's attestation that they ran it.
 TICKED = re.compile(r"-\s*\[\s*[xX]\s*\]")
 H200 = re.compile(r"h200", re.I)
+NODE_RUN_HEADING = re.compile(r"^##\s+node run\s*$", re.I)
+ANY_HEADING = re.compile(r"^##\s+")
+
+
+def node_run_section(body):
+    """Only the text between '## Node run' and the next '##' heading.
+
+    Same bug, same fix as node-attestation.yml (#78): a body-wide TICKED+H200 scan matched
+    the PR-template Checklist boilerplate '- [x] `...--node h200x8 --dry-run` resolves' --
+    ticked on nearly every PR and containing 'h200' -- so a PR read as attested while the
+    real Node run box sat unticked. Here the consequence was bounded (the bot still
+    measures for real) but live: #71 was evaluated in two rounds and #74 queued, neither
+    ever having attested a node run. The attestation is a claim made in ONE place; read
+    only that place. No section => not attested, which fails closed.
+    """
+    lines = (body or "").split("\n")
+    start = next((i for i, ln in enumerate(lines) if NODE_RUN_HEADING.match(ln)), -1)
+    if start == -1:
+        return ""
+    end = next((i for i in range(start + 1, len(lines)) if ANY_HEADING.match(lines[i])),
+               len(lines))
+    return "\n".join(lines[start + 1:end])
 
 
 def gh(args, timeout=120):
@@ -104,7 +127,7 @@ def sh(cmd, timeout=7200):
 
 def list_prs(repo):
     r = gh(["pr", "list", "-R", repo, "--state", "open", "--limit", "50", "--json",
-            "number,title,isDraft,headRefOid,body,author,labels,isCrossRepository"])
+            "number,title,isDraft,headRefOid,body,author,labels,isCrossRepository,mergeable"])
     if r.returncode != 0:
         raise SystemExit(f"k3_eval_bot: gh pr list failed: {r.stderr.strip()}")
     return json.loads(r.stdout or "[]")
@@ -117,11 +140,160 @@ def eligibility(pr):
     labels = {l.get("name", "") for l in pr.get("labels") or []}
     if "hold" in labels:
         return False, "hold label set"
-    body = pr.get("body") or ""
-    ticked = any(TICKED.search(ln) and H200.search(ln) for ln in body.splitlines())
+
+    # A conflicted branch cannot be brought current, so it cannot be measured against a
+    # frontier that is about to move under it, and it cannot be merged at the end. #64 sat in
+    # a round as CONFLICTING: update_pr_branch could not advance it -- the round log shows
+    # #77, #74 and #71 updated and #64 simply absent -- so anything it measured would have
+    # described a tree that does not exist on main. That is ~40 GPU-minutes spent on a result
+    # nobody can act on.
+    #
+    # Only an explicit CONFLICTING skips. GitHub computes mergeability lazily and answers
+    # UNKNOWN while recomputing, which is the normal state for every open PR in the seconds
+    # after main moves -- treating that as a conflict would skip the entire field. UNKNOWN
+    # falls through to the merge path, where wait_mergeable_state() already blocks for a real
+    # answer.
+    if pr.get("mergeable") == "CONFLICTING":
+        return False, "conflicts with main — rebase before it can be evaluated or merged"
+
+    # CI's own verdict on the attestation, re-derived by node-attestation.yml on every edit
+    # and synchronize, so it does not go stale. It is already in NEVER_MERGE_LABELS: a PR
+    # carrying it cannot merge at the end of the round however fast it measures, so booking
+    # the node for it is spending GPU on a foregone conclusion.
+    #
+    # It is also a cross-check on the scan below. Both read the same checkbox out of the same
+    # body, so a disagreement means one of them is broken -- which is exactly the state this
+    # file was in before the fix below: the label said #74 and #71 had no node run, the bot
+    # said they did, and the bot was wrong. Two independent readings that must agree beat one
+    # reading trusted absolutely.
+    if "needs-node-run" in labels:
+        return False, ("needs-node-run — node-attestation.yml found no ticked node box "
+                       "in '## Node run'")
+
+    section = node_run_section(pr.get("body") or "")
+    ticked = any(TICKED.search(ln) and H200.search(ln) for ln in section.splitlines())
     if not ticked:
         return False, "the 8x H200 box is not ticked — the author has not attested a node run"
     return True, "eligible"
+
+
+# A GUARD THAT CAN BE RETRIED IS NOT A GUARD.
+#
+# These are the harness saying "I will not score this", which is an ANSWER, not a glitch.
+# Running the same measurement again until it passes is not a retry, it is sampling until the
+# result is convenient -- and every one of these guards exists because a number could
+# otherwise be fabricated. If one of them fires, the round takes the refusal.
+VERDICT_MARKERS = (
+    "refusing to score",
+    "wall clock allows",
+    "did not do the extra work",
+    "harness measured commit",
+    "non-positive time delta",
+    "reported no ms/token line",
+)
+# These are the BOX misbehaving: the model never loaded, the collective never initialised, the
+# connection died. They say nothing about the code under test, so the round should try again
+# rather than throw away every PR in it.
+TRANSIENT_RE = re.compile(
+    r"ncclCommInitAll|unhandled cuda error|\bNCCL\b|cudaMalloc failed|init failed at tp=|"
+    r"weight load failed|out of memory|\bCUDA error\b|bench failed|"
+    r"ssh timeout|Connection (?:timed out|closed|refused|reset)|Broken pipe|"
+    r"kex_exchange_identification|banner exchange",
+    re.I)
+
+
+def is_transient(exc):
+    """True if `exc` is the box failing, not the harness reaching a verdict.
+
+    Order matters: a verdict marker anywhere in the message wins, even if a transient-looking
+    word also appears in the 1200-char tail the error carries. Refusing to retry is the safe
+    direction -- it costs a round, where retrying a verdict costs the guard.
+    """
+    msg = str(exc)
+    if any(m in msg for m in VERDICT_MARKERS):
+        return False
+    return bool(TRANSIENT_RE.search(msg))
+
+
+def with_box_retry(what, fn, tries=3, delay=20):
+    """Run fn(), retrying only when the BOX failed rather than the code under test.
+
+    A frontier failure used to discard the entire round: measure_frontier raises, main() bails,
+    and not one PR is evaluated however healthy it was. Two rounds in the ledger died exactly
+    there -- rounds/66955446f62f and rounds/11eb5e4d02b7, the latter on
+
+        [tp] FATAL: ncclCommInitAll(n=8): unhandled cuda error
+        init failed at tp=8, 93 layers
+
+    -- and every eligible PR in both got nothing. A transient collective-init error is not a
+    statement about anyone's code, and it should cost a couple of minutes, not a round.
+
+    Each attempt re-enters _box_build, which kills orphaned compute processes before it builds,
+    so a retry is a genuinely clean attempt rather than the same poisoned box twice.
+
+    Verdicts are never retried -- see is_transient.
+    """
+    for i in range(1, tries + 1):
+        try:
+            return fn()
+        except RuntimeError as exc:
+            if i >= tries or not is_transient(exc):
+                raise
+            print(f"!! {what}: attempt {i}/{tries} failed on the box — {str(exc).splitlines()[0][:160]}",
+                  file=sys.stderr)
+            print(f"   retrying in {delay}s; the next attempt rebuilds and clears stray "
+                  "compute processes first", file=sys.stderr)
+            time.sleep(delay)
+
+
+def resolve_mergeability(repo, prs, tries=8, delay=5):
+    """Settle pr['mergeable'] for the PRs where it decides whether to book the node.
+
+    THE BOT ASKS THIS QUESTION AT THE ONE MOMENT THE ANSWER IS GUARANTEED TO BE MISSING.
+
+    GitHub computes mergeability lazily and answers UNKNOWN while recomputing, which is the
+    normal state for every open PR in the seconds after the base branch moves -- and this bot
+    moves the base branch itself, committing the frontier to reference.lock at the start of
+    every round. So the CONFLICTING skip was least reliable exactly when it was needed.
+    Verified live: seconds after a merge, #64 read ELIGIBLE while being CONFLICTING; a minute
+    later the same call read CONFLICTING and skipped it correctly.
+
+    Polled only for PRs that are otherwise eligible, so it costs a handful of API calls rather
+    than the ~40 GPU-minutes the answer is protecting. A PR already skipped for an unticked
+    box or a needs-node-run label is not asked about -- mergeability cannot change that.
+
+    FAILS OPEN on timeout, loudly. A wrong skip during a wide UNKNOWN (a GitHub incident)
+    would stop every round and the payouts with it; a wrong include costs one wasted eval that
+    merge_blockers and wait_mergeable_state still refuse at the end. The asymmetry decides it.
+    """
+    for pr in prs:
+        if pr.get("mergeable") in ("MERGEABLE", "CONFLICTING"):
+            continue
+        if not eligibility(pr)[0]:
+            continue
+        num = pr["number"]
+        for i in range(tries):
+            info = _pr_state(repo, num)
+            # No data at all is "cannot read this PR", not "still recomputing" -- polling it
+            # for a minute helps nobody. One retry covers a transient blip, as in
+            # wait_mergeable_state.
+            if not info:
+                if i >= 1:
+                    print(f"!! #{num}: cannot read merge state from {repo}", file=sys.stderr)
+                    break
+                time.sleep(min(delay, 2))
+                continue
+            state = info.get("mergeable") or "UNKNOWN"
+            if state != "UNKNOWN":
+                pr["mergeable"] = state
+                if i:
+                    print(f"   #{num}: mergeability settled to {state} after ~{i * delay}s")
+                break
+            time.sleep(delay)
+        else:
+            print(f"!! #{num}: mergeability still UNKNOWN after {tries * delay}s — evaluating "
+                  "it anyway; a conflicted branch is still refused at the merge",
+                  file=sys.stderr)
 
 
 def _box_build(sha, what):
@@ -300,6 +472,21 @@ def _box_eval(what, frontier=None, seal=False, top1=None, kl=None):
     """
     seal_flag = " --seal" if seal else ""
     front_flag = "" if frontier is None else f" --frontier {frontier}"
+    # Harness knobs set on the CONTROLLER, forwarded to the box. bench/scripts is restored
+    # from origin/main before every build, so the harness the box runs is whatever is on the
+    # protected branch -- there is otherwise no way to run a round against a tuned constant
+    # without merging it first. That is the right default for anything a PR could influence,
+    # and the wrong one for an operator fixing a harness bug the round is currently hitting.
+    #
+    # PRINTED, not silent. These change how a number was produced, so a round log that does
+    # not name them describes a measurement nobody can reproduce. The value goes in the log
+    # that ships to sparkinfer-k3-log, next to the result it produced.
+    passthru = {k: v for k, v in sorted(os.environ.items())
+                if k.startswith("KIMI_K3_") and k not in ("KIMI_K3_MODELS_DIR",)}
+    if passthru:
+        print("   harness overrides from the controller: "
+              + " ".join(f"{k}={v}" for k, v in passthru.items()))
+    env_prefix = "".join(f"{k}={shlex.quote(v)} " for k, v in passthru.items())
     # Accuracy graded on THIS machine, handed to the harness. Without these the harness
     # falls back to comparing on the box against a reference the binary can read.
     acc_flag = "" if top1 is None or kl is None else f" --top1 {top1} --kl {kl}"
@@ -312,6 +499,7 @@ def _box_eval(what, frontier=None, seal=False, top1=None, kl=None):
         # $SPARKINFER_BUILD/kimi_k3_tp_bench, so pointing this at build/ makes it exit 2 with
         # "not built" immediately after a build that in fact succeeded.
         f"KIMI_K3_MODELS_DIR={BOX_MODELS_DIR} SPARKINFER_BUILD={BOX_REPO_DIR}/build/runtime "
+        f"{env_prefix}"
         f"bash bench/scripts/kimi_k3_eval.sh --node {NODE} --devices {DEVICES}"
         f"{front_flag}{acc_flag}{seal_flag}"
     )
@@ -795,7 +983,7 @@ def publish_round_log(repo_log, main_sha, results, text, dry_run):
 
 def _pr_state(repo, num):
     r = gh(["pr", "view", str(num), "-R", repo, "--json",
-            "mergeStateStatus,labels,headRefOid,state"])
+            "mergeStateStatus,mergeable,labels,headRefOid,state"])
     try:
         return json.loads(r.stdout or "{}")
     except json.JSONDecodeError:
@@ -1316,6 +1504,11 @@ def main():
             sys.stderr.write(f"k3_eval_bot: #{args.only_pr} is not an open PR on {args.repo}\n")
             return 1
 
+    # Settle mergeability BEFORE anything reads it. gh pr list answers UNKNOWN while GitHub
+    # recomputes, and the previous round's own frontier commit is what set it recomputing --
+    # so the conflict skip has to wait for a real answer or it is decorative.
+    resolve_mergeability(args.repo, prs)
+
     if args.list:
         for pr in prs:
             ok, why = eligibility(pr)
@@ -1374,9 +1567,13 @@ def main():
             r = gh(["api", f"repos/{args.repo}/commits/main", "--jq", ".sha"])
             main_sha = (r.stdout or "").strip()
         else:
-            main_sha, main_tps, quant = measure_frontier(args.repo)
+            # Retried, because this one failure discards every PR in the round. A persistent
+            # failure still stops it -- falling back to the pinned lock value would score the
+            # round against a number main has already beaten, which is the #20 mispricing.
+            main_sha, main_tps, quant = with_box_retry(
+                "frontier", lambda: measure_frontier(args.repo))
     except RuntimeError as exc:
-        print(f"frontier measurement failed — {exc}", file=sys.stderr)
+        print(f"frontier measurement failed after retries — {exc}", file=sys.stderr)
         # _bail falls back to the main_sha resolved before the try block, so this round is
         # published under rounds/<sha>/ even though it sealed nothing.
         return _bail(1)
@@ -1426,7 +1623,12 @@ def main():
         print(f"#{num}: evaluating {pr['headRefOid'][:8]} on {NODE} "
               f"against frontier {frontier} …")
         try:
-            res = evaluate(pr, args.repo, frontier, seal=not args.no_seal)
+            # Same reasoning as the frontier, one PR down: a collective that failed to
+            # initialise is not a verdict on this PR's kernels, and losing its round over one
+            # is the same unfairness in miniature. A refusal from the harness is NOT retried.
+            res = with_box_retry(
+                f"#{num}",
+                lambda: evaluate(pr, args.repo, frontier, seal=not args.no_seal))
         except RuntimeError as exc:
             print(f"#{num}: eval failed — {exc}", file=sys.stderr)
             continue

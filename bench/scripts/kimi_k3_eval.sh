@@ -184,10 +184,12 @@ echo ">> sparkinfer frontier             : $FRONTIER tok/s$([[ "$FRONTIER" == "0
 #   the run-to-run variance of the model load, so it is a BOUND, not a reading.
 #
 # Using the differential as the authoritative number failed on trusted main: at 8 and 24
-# tokens the marginal signal was ~3.5 s while the ~29 s load varies by 1-2 s, so 1.1 s of
-# jitter landed in it -- 4.55 tok/s self-reported against 3.45 measured, a 32% error, and
-# the run refused itself. The signal has to dominate the jitter, hence a fixed and much
-# larger token margin rather than a multiple of TOKENS.
+# tokens the marginal signal was ~3.5 s against a ~29 s load, so jitter landed in it -- 4.55
+# tok/s self-reported against 3.45 measured, a 32% error, and the run refused itself. The
+# signal has to dominate the jitter, hence a fixed and much larger token margin rather than a
+# multiple of TOKENS. (That jitter was estimated at 1-2 s here. Measured later on the h200x8
+# box it is 7.0 s peak-to-peak -- see MARGIN_TOKENS below, which is sized off the measurement
+# rather than the estimate.)
 #
 # THE DIFFERENTIAL BOUNDS NOTHING UNLESS THE SECOND RUN ACTUALLY DID THE EXTRA TOKENS.
 #
@@ -209,9 +211,30 @@ echo ">> sparkinfer frontier             : $FRONTIER tok/s$([[ "$FRONTIER" == "0
 # seeked run against.
 NDEV="$(printf '%s' "$DEVICES" | tr ',' '\n' | grep -c .)"
 TOKENS_LO="$TOKENS"
-# ~128 marginal tokens is ~28 s at main's current 128k speed, against 1-2 s of load jitter:
-# a 5% bound rather than a 32% one. Env-tunable because the right value tracks ms/token.
-MARGIN_TOKENS="${KIMI_K3_MARGIN_TOKENS:-128}"
+# THE MARGIN HAS TO TRACK THE ENGINE, OR THE GUARD EATS ITS OWN WORK.
+#
+# 128 was chosen when main ran at 4.53 tok/s, where 128 marginal tokens is ~28 s of decode
+# against 1-2 s of load jitter -- a 5% bound. That ratio is not a constant: the decode signal
+# is MARGIN_TOKENS x ms/token, so every speedup this loop pays for SHRINKS it, while the load
+# jitter it has to clear does not move. Four rounds of merged wins later:
+#
+#     main  4.53 tok/s -> 128 marginal tokens = 28.3 s
+#     main  9.04 tok/s ->                       14.2 s
+#     main 14.95 tok/s ->                        8.6 s
+#     main 18.88 tok/s ->                        6.8 s     <- signal
+#
+# and measured on the h200x8 box at 131072 ctx, the 554 GiB load takes 33.25-40.27 s across
+# five back-to-back runs: 7.0 s of spread. The noise had overtaken the signal. #77 was refused
+# by the work_tol side for exactly this -- 128 tokens that should cost 6.36 s were measured at
+# 2.96 s, a 3.4 s shortfall that fits inside the load spread -- with a self-report of 49.70
+# ms/token that the other four sweep points corroborate to within 0.2%. A guard that refuses
+# an honest PR because the thing it guards got faster is a countdown, not a check.
+#
+# 512 restores the margin: 27.1 s of decode, and work_tol=2.0 tolerates a 13.6 s shortfall
+# against 7.0 s of observed jitter. It costs ~20 s more wall clock per bench pair, which is
+# nothing against a ~40 minute round, and it re-widens as ms/token falls -- so this number
+# owes a review the next time the frontier doubles. Env-tunable for that reason.
+MARGIN_TOKENS="${KIMI_K3_MARGIN_TOKENS:-512}"
 TOKENS_HI="$(( TOKENS_LO + MARGIN_TOKENS ))"
 
 # POLARIS_API_KEY signs the attestation ledger, and `. .polaris_env` put it in the
@@ -228,10 +251,39 @@ run_bench() {  # $1 = n_tokens ; echoes elapsed ns on stdout, bench output on fd
     printf '%s' "$(( t1 - t0 ))"
 }
 
+# The two runs are back to back, and the first one is holding ~1.1 TiB across 8 devices when
+# it exits. Freeing that is not instant: two consecutive 136-token runs on an OTHERWISE IDLE
+# box (nvidia-smi: 0 MiB used on all 8) died in cudaMalloc partway through layer 92 -- the
+# last layer, so it very nearly fit -- while the same command run a minute later succeeded
+# twice. The driver had not finished reclaiming the previous process's memory.
+#
+# That is survivable but wasteful: the bench returns 1 on init failure (kimi_k3_tp_bench.cpp
+# returns 1 at "init failed"), so run_bench aborts the whole eval and the PR gets no number
+# at all through no fault of its own. Wait for the devices to actually come back instead.
+settle_gpus() {  # wait until every device is ~free, or give up and let the run try anyway
+    command -v nvidia-smi >/dev/null 2>&1 || { sleep 5; return 0; }
+    local i busy
+    for i in $(seq 1 "${KIMI_K3_SETTLE_TRIES:-30}"); do
+        # `|| true` is load-bearing: this script runs under `set -euo pipefail`, so without
+        # it a single non-zero nvidia-smi -- a driver hiccup, an ECC scrub, a transient --
+        # fails the pipeline, fails the assignment, and kills the whole eval. A wait added to
+        # stop a PR losing its eval would then be a new way for a PR to lose its eval.
+        # Failing here degrades to "assume free" (wc -l prints 0 on empty input), which is
+        # exactly what the no-nvidia-smi path above does.
+        busy="$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null \
+                | awk -v lim="${KIMI_K3_SETTLE_MIB:-2048}" '$1 > lim' | wc -l || true)"
+        [[ "$busy" == "0" ]] && { [[ "$i" == "1" ]] || echo ">> GPUs settled after ${i}s" >&2; return 0; }
+        sleep 1
+    done
+    echo ">> warning: GPUs still busy after ${KIMI_K3_SETTLE_TRIES:-30}s — running anyway" >&2
+}
+
 echo ">> timing sparkinfer decode at ctx $SCORED_CTX (2 runs, ${TOKENS_LO} and ${TOKENS_HI} tokens) ..."
 SPEED_OUT="$(mktemp -t k3speed_XXXXXX)"
 trap 'rm -f "$SPEED_OUT"' EXIT
+settle_gpus
 NS_LO="$(run_bench "$TOKENS_LO" 3>"$SPEED_OUT")" || { echo "kimi_k3_eval: bench failed" >&2; exit 1; }
+settle_gpus
 NS_HI="$(run_bench "$TOKENS_HI" 3>>"$SPEED_OUT")" || { echo "kimi_k3_eval: bench failed" >&2; exit 1; }
 
 # The self-report is the reading; the differential is the bound it has to survive. A missing
