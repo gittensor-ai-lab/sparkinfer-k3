@@ -30,11 +30,35 @@ bool env_one(const char* name) {
     return value && value[0] == '1';
 }
 
+bool env_zero(const char* name) {
+    const char* value = std::getenv(name);
+    return value && value[0] == '0';
+}
+
 // Diagnostic compatibility controls. The original all-in-one switch remains as a
 // convenient umbrella, while the component switches let the validation harness
 // distinguish projection, expert-dispatch, and LM-head quantization drift.
 bool qact_all()    { return env_one("SPARKINFER_K3_GGML_QACT"); }
-bool qact_proj()   { return qact_all() || env_one("SPARKINFER_K3_GGML_QACT_PROJ"); }
+
+// PROJECTIONS ARE ON BY DEFAULT; the other two are not, and the asymmetry is
+// measured rather than stylistic.
+//
+// Q8 activations let the projection GEMV run llama.cpp's __dp4a integer path
+// instead of decoding weights to f32, and projections are 35.7% of decode GPU
+// time. Measured at the scored 128k context, tp=8, interleaved against its own
+// control on one binary: 109.43 -> 97.10 ms/token, -11.3%. Accuracy holds by a
+// wide margin -- top1 1.0, mean_kld 0.006433 against a 0.20 gate.
+//
+// The MoE and LM-head variants stay OFF: _MOE measured a STABLE -8.6%
+// REGRESSION (118.0/117.7/118.8/120.0 vs 109.0/108.8/108.7/109.3) and _OUTPUT
+// measured no effect at all, being one launch per token. Enabling all three
+// under one umbrella switch is what hid that for so long.
+//
+// SPARKINFER_K3_GGML_QACT_PROJ=0 restores f32 projections. It has to be an
+// explicit 0 rather than an unset: an env-gated default-off improvement is one
+// the scoring harness never runs, which is exactly the trap this comment exists
+// to stop the next person walking into.
+bool qact_proj()   { return !env_zero("SPARKINFER_K3_GGML_QACT_PROJ"); }
 bool qact_moe()    { return qact_all() || env_one("SPARKINFER_K3_GGML_QACT_MOE"); }
 bool qact_output() { return qact_all() || env_one("SPARKINFER_K3_GGML_QACT_OUTPUT"); }
 
@@ -53,7 +77,7 @@ bool qact_output() { return qact_all() || env_one("SPARKINFER_K3_GGML_QACT_OUTPU
 // count, noise for values. The planner bands over BLOCKS so every cut is legal by
 // construction; re-deriving offsets here would put that guarantee back at risk.
 bool upload_sliced(const GGUF& g, const std::string& name, KimiK3Weights& w,
-                   KimiK3Tensor& out, bool required) {
+                   KimiK3Tensor& out, bool required, bool kda_layer) {
     const GGUFTensor* t = g.tensor(name);
     if (!t) {
         if (required)
@@ -89,7 +113,7 @@ bool upload_sliced(const GGUF& g, const std::string& name, KimiK3Weights& w,
     // the rule is deliberate: attn_k_b/attn_v_b also carry Rule::ExpertShard (they
     // band the head axis), and banding those without teaching the MLA kernels their
     // per-rank head count would silently drop 7/8 of the attention heads.
-    if (w.policy == KimiK3Weights::ShardPolicy::ExpertsOnly) {
+    if (w.policy != KimiK3Weights::ShardPolicy::Full) {
         auto ends_with = [&](const char* suf) {
             const std::size_t n = std::strlen(suf);
             return name.size() >= n && name.compare(name.size() - n, n, suf) == 0;
@@ -97,7 +121,43 @@ bool upload_sliced(const GGUF& g, const std::string& name, KimiK3Weights& w,
         const bool routed_expert_stack = ends_with("ffn_gate_exps.weight") ||
                                          ends_with("ffn_up_exps.weight")   ||
                                          ends_with("ffn_down_exps.weight");
-        if (!routed_expert_stack) {
+
+        // ExpertsAndMla bands the 24 MLA layers' PER-HEAD tensors and col-shards
+        // their output. `!kda_layer` carries exactly the same weight here that
+        // `kda_layer` does below, and for the same reason: attn_output.weight and
+        // attn_q.weight are written by BOTH branches. Banding either by name alone
+        // would shard the wrong two-thirds of the model and leave every KDA layer
+        // contracting over an eighth of its input, which stays fluent and is wrong.
+        //
+        // attn_kv_a_mqa / attn_kv_a_norm are NOT here: MQA means one latent KV
+        // shared by all 96 heads, so every rank needs that projection — and the
+        // cache it fills — whole. Banding it is the one mistake that would make
+        // this look like it works while each rank attended to an eighth of the
+        // context.
+        const bool mla_sharded =
+            KimiK3Weights::shards_mla(w.policy) && !kda_layer &&
+            (ends_with("attn_q_b.weight")  || ends_with("attn_k_b.weight") ||
+             ends_with("attn_v_b.weight")  || ends_with("attn_gate.weight") ||
+             ends_with("attn_q.weight")    || ends_with("attn_output.weight"));
+
+        // ExpertsAndKda additionally bands the KDA attention projections.
+        //
+        // `kda_layer` IS NOT REDUNDANT WITH THE SUFFIX, and leaving it out is the
+        // bug this whole branch exists to avoid. attn_output.weight is written by
+        // BOTH branches — it is KDA's wo on 69 layers and MLA's wo on the other 24
+        // — and MLA is deliberately not sharded. Banding it by name alone would
+        // col-shard MLA's wo while the MLA kernels still hand it the full
+        // qh*value_length_mla activation, so every MLA layer would contract over an
+        // eighth of its input and the all-reduce would sum eight of those into a
+        // fluent wrong answer. Same trap for attn_q.weight, which MLA reuses as its
+        // dense-q fallback.
+        const bool kda_sharded =
+            KimiK3Weights::shards_kda(w.policy) && kda_layer &&
+            (ends_with("attn_q.weight")  || ends_with("attn_k.weight") ||
+             ends_with("attn_v.weight")  || ends_with("ssm_g.weight")  ||
+             ends_with("ssm_f_b.weight") || ends_with("attn_output.weight"));
+
+        if (!routed_expert_stack && !kda_sharded && !mla_sharded) {
             void* d = nullptr;
             if (cudaMalloc(&d, (size_t)t->n_bytes) != cudaSuccess) {
                 std::fprintf(stderr, "[k3] cudaMalloc failed for %s (%ld bytes)\n",
@@ -119,8 +179,25 @@ bool upload_sliced(const GGUF& g, const std::string& name, KimiK3Weights& w,
         }
     }
 
+    // A KDA LAYER'S attn_k/attn_v ARE NOT A GQA KV GROUP.
+    //
+    // weight_plan downgrades attn_k.weight / attn_v.weight to Replicate whenever
+    // ShardDims::kv_replicated is set, because a kv group must be visible whole to
+    // every query head attending through it. That rule is right for MLA — K3's GGUF
+    // stores it as MQA with ONE kv head, so at tp=8 it must replicate — and wrong
+    // for KDA, where the same two tensor NAMES are per-head input projections at
+    // [hidden, qkv] with no kv group anywhere near them.
+    //
+    // The downgrade does not fire today only because the K3 TP driver never sets
+    // kv_replicated, so it defaults to false. That is luck, not design: the moment
+    // anyone populates `shard` through tp::shard_dims() — which DOES set it for K3 —
+    // every rank would silently hold a full-width attn_k while its attn_q was banded,
+    // and the layer would run at full speed over mismatched slices. So the KDA path
+    // states the exemption rather than depending on a field being unset.
+    tp::ShardDims sd = w.shard;
+    if (kda_layer) sd.kv_replicated = false;
     const tp::TensorResidency r =
-        tp::plan_tensor_residency(name, t->dims, t->n_dims, t->ggml_type, w.shard);
+        tp::plan_tensor_residency(name, t->dims, t->n_dims, t->ggml_type, sd);
 
     // A tensor with no rule, an unknown quant type, or a mid-block cut STOPS THE
     // LOAD. The alternative — fall back to replicating it — silently changes the
@@ -175,8 +252,8 @@ bool upload_sliced(const GGUF& g, const std::string& name, KimiK3Weights& w,
 
 // Kept as the name the 49 load sites use.
 bool upload_raw(const GGUF& g, const std::string& name, KimiK3Weights& w,
-                KimiK3Tensor& out, bool required) {
-    return upload_sliced(g, name, w, out, required);
+                KimiK3Tensor& out, bool required, bool kda_layer = false) {
+    return upload_sliced(g, name, w, out, required, kda_layer);
 }
 
 // wk_b / wv_b feed mla_absorb_q_f32 / mla_decode_attn_f32, which take them as plain
@@ -196,7 +273,7 @@ bool upload_force_f32(const GGUF& g, const std::string& name, KimiK3Weights& w,
         return !required;
     }
     if (t->ggml_type == 0) {
-        return upload_raw(g, name, w, out, required);
+        return upload_raw(g, name, w, out, required, /*kda_layer=*/false);
     }
 
     // Stage the rank's QUANTISED slice through upload_sliced (so the ColShard /
@@ -207,7 +284,7 @@ bool upload_force_f32(const GGUF& g, const std::string& name, KimiK3Weights& w,
     // holding an eighth of them reads past the end.
     KimiK3Tensor staged;
     const std::size_t owned_before = w.owned.size();
-    if (!upload_sliced(g, name, w, staged, required)) return false;
+    if (!upload_sliced(g, name, w, staged, required, /*kda_layer=*/false)) return false;
     if (!staged.ok()) return !required;
 
     long rank_values = 1;
@@ -338,6 +415,49 @@ bool kimi_k3_load_weights_scoped(const GGUF& g, const KimiK3Config& cfg,
                                 const K3PlanOptions& opt, KimiK3Weights& out,
                                 int first_layer, int last_layer,
                                 bool load_embed, bool load_head) {
+    // THIS RANK's KDA slice, derived once and carried on the weights so the loader
+    // and the forward cannot disagree about it. Under any policy but ExpertsAndKda
+    // it stays the tp=1 identity: full width, zero offsets.
+    {
+        tp::Config tcfg;
+        tcfg.tp_size = KimiK3Weights::shards_kda(out.policy)
+                     ? (out.shard.tp_size > 0 ? out.shard.tp_size : 1) : 1;
+        tp::KdaShape ks;
+        ks.hidden = cfg.hidden;
+        ks.n_heads = cfg.n_q_heads;
+        ks.head_dim = cfg.kda_head_dim;
+        ks.conv_kernel = cfg.kda_conv_kernel;
+        const int r = tcfg.tp_size > 1 ? out.shard.rank : 0;
+        tp::ShardError e = tp::kda_shard_dims(ks, tcfg, r, &out.kda);
+        if (!e.ok()) {
+            std::fprintf(stderr, "[k3] KDA shard: %s\n", e.message.c_str());
+            return false;
+        }
+    }
+
+    // THIS RANK's MLA head slice, on the same discipline: derived once, carried on
+    // the weights, tp=1 identity under any policy but ExpertsAndMla. The forward
+    // reads md.n_heads unconditionally, so a policy that does not shard MLA gets
+    // the full 96 from the same field rather than from a different code path.
+    {
+        tp::Config tcfg;
+        tcfg.tp_size = KimiK3Weights::shards_mla(out.policy)
+                     ? (out.shard.tp_size > 0 ? out.shard.tp_size : 1) : 1;
+        tp::MlaShape ms;
+        ms.hidden = cfg.hidden;
+        ms.n_q_heads = cfg.n_q_heads;
+        ms.key_length_mla = cfg.key_length_mla;
+        ms.value_length_mla = cfg.value_length_mla;
+        ms.qk_nope = cfg.key_length_mla - cfg.rope_dim;
+        ms.kv_lora_rank = cfg.kv_lora_rank;
+        const int r = tcfg.tp_size > 1 ? out.shard.rank : 0;
+        tp::ShardError e = tp::mla_shard_dims(ms, tcfg, r, &out.mla);
+        if (!e.ok()) {
+            std::fprintf(stderr, "[k3] MLA shard: %s\n", e.message.c_str());
+            return false;
+        }
+    }
+
     out.layers.assign(cfg.n_layers, KimiK3LayerWeights{});
 
     bool ok = true;
@@ -369,9 +489,9 @@ bool kimi_k3_load_weights_scoped(const GGUF& g, const KimiK3Config& cfg,
         }
 
         if (L.is_kda) {
-            ok &= upload_raw(g, blk(i, "attn_q.weight"), out, L.attn_q, true);
-            ok &= upload_raw(g, blk(i, "attn_k.weight"), out, L.attn_k, true);
-            ok &= upload_raw(g, blk(i, "attn_v.weight"), out, L.attn_v, true);
+            ok &= upload_raw(g, blk(i, "attn_q.weight"), out, L.attn_q, true, /*kda_layer=*/true);
+            ok &= upload_raw(g, blk(i, "attn_k.weight"), out, L.attn_k, true, /*kda_layer=*/true);
+            ok &= upload_raw(g, blk(i, "attn_v.weight"), out, L.attn_v, true, /*kda_layer=*/true);
             ok &= upload_raw(g, blk(i, "ssm_conv1d_q.weight"), out, L.ssm_conv1d_q, true);
             ok &= upload_raw(g, blk(i, "ssm_conv1d_k.weight"), out, L.ssm_conv1d_k, true);
             ok &= upload_raw(g, blk(i, "ssm_conv1d_v.weight"), out, L.ssm_conv1d_v, true);
@@ -382,13 +502,13 @@ bool kimi_k3_load_weights_scoped(const GGUF& g, const KimiK3Config& cfg,
                 ok = false;
             }
             ok &= upload_raw(g, blk(i, "ssm_f_a.weight"), out, L.ssm_f_a, true);
-            ok &= upload_raw(g, blk(i, "ssm_f_b.weight"), out, L.ssm_f_b, true);
+            ok &= upload_raw(g, blk(i, "ssm_f_b.weight"), out, L.ssm_f_b, true, /*kda_layer=*/true);
             ok &= upload_raw(g, blk(i, "ssm_beta.weight"), out, L.ssm_beta, true);
             ok &= upload_raw(g, blk(i, "ssm_dt.bias"), out, L.ssm_dt_bias, true);
             ok &= upload_raw(g, blk(i, "ssm_a"), out, L.ssm_a, true);
-            ok &= upload_raw(g, blk(i, "ssm_g.weight"), out, L.ssm_g, true);
+            ok &= upload_raw(g, blk(i, "ssm_g.weight"), out, L.ssm_g, true, /*kda_layer=*/true);
             ok &= upload_raw(g, blk(i, "ssm_norm.weight"), out, L.ssm_norm, true);
-            ok &= upload_raw(g, blk(i, "attn_output.weight"), out, L.attn_output, true);
+            ok &= upload_raw(g, blk(i, "attn_output.weight"), out, L.attn_output, true, /*kda_layer=*/true);
         } else {
             L.has_q_lora = opt.has_q_lora;
             if (L.has_q_lora) {
@@ -468,8 +588,11 @@ int kimi_k3_mla_ordinal(const KimiK3Config& cfg, int layer) {
 }
 
 bool kimi_k3_alloc_state(const KimiK3Config& cfg, int max_ctx, KimiK3RuntimeState& out,
-                        int first_layer, int last_layer) {
-    const int qkv = cfg.n_q_heads * cfg.kda_head_dim;
+                        int first_layer, int last_layer, const tp::KdaShardDims* kda) {
+    // THIS RANK's KDA width. Null kda == full width, which is what tp=1 and every
+    // unsharded policy must keep getting, byte for byte.
+    const int qkv    = kda ? kda->qkv     : cfg.n_q_heads * cfg.kda_head_dim;
+    const int n_head = kda ? kda->n_heads : cfg.n_q_heads;
     const int n_kda = cfg.n_kda_layers();
     const int n_mla = cfg.n_mla_layers();
     const int lo = first_layer < 0 ? 0 : first_layer;
@@ -505,7 +628,7 @@ bool kimi_k3_alloc_state(const KimiK3Config& cfg, int max_ctx, KimiK3RuntimeStat
             out.conv_state_q[k] = alloc((size_t)(cfg.kda_conv_kernel - 1) * qkv);
             out.conv_state_k[k] = alloc((size_t)(cfg.kda_conv_kernel - 1) * qkv);
             out.conv_state_v[k] = alloc((size_t)(cfg.kda_conv_kernel - 1) * qkv);
-            out.delta_state[k]  = alloc((size_t)cfg.kda_head_dim * cfg.kda_head_dim * cfg.n_q_heads);
+            out.delta_state[k]  = alloc((size_t)cfg.kda_head_dim * cfg.kda_head_dim * n_head);
             if (!out.conv_state_q[k] || !out.conv_state_k[k] || !out.conv_state_v[k] ||
                 !out.delta_state[k])
                 return false;
@@ -522,7 +645,7 @@ bool kimi_k3_alloc_state(const KimiK3Config& cfg, int max_ctx, KimiK3RuntimeStat
     }
 
     out.conv_state_elems = (cfg.kda_conv_kernel - 1) * qkv;
-    out.delta_state_elems = cfg.kda_head_dim * cfg.kda_head_dim * cfg.n_q_heads;
+    out.delta_state_elems = cfg.kda_head_dim * cfg.kda_head_dim * n_head;
     out.kv_cache_elems = cfg.key_length * max_ctx;
     out.res_bank_row_elems = cfg.hidden;
 
@@ -796,8 +919,24 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
     const bool do_ffn_f  = (phase == K3LayerPhase::All || phase == K3LayerPhase::FfnFinish);
 
     const int H = cfg.hidden;
-    const int qkv = cfg.n_q_heads * cfg.kda_head_dim;
-    const int qh = cfg.n_q_heads;
+    // THIS RANK's KDA widths. Under every policy but ExpertsAndKda these are the
+    // full dimensions, because KimiK3Weights::kda is left at the tp=1 identity --
+    // so the unsharded path is the same code with the same values, not a branch.
+    //
+    // qh IS this rank's MLA head count, and the note that used to sit here said
+    // the opposite: that head-sharding MLA "divides the FLOPs but not the bytes",
+    // because MQA means every rank walks the whole latent cache. That is wrong for
+    // this kernel and the profile is what corrected it. mla_decode_attn_hbatch
+    // stages 12 heads per block, so 96 heads is EIGHT passes over the 302 MB
+    // latent cache per layer; a 12-head band is ONE pass. The bytes divide by 8
+    // because the unsharded kernel was already reading the cache eight times.
+    //
+    // Under every other policy `mla` holds the tp=1 identity, so this is the same
+    // value the replicated path always had rather than a branch that can drift.
+    const tp::KdaShardDims& kd = fwd.w->kda;
+    const tp::MlaShardDims& md = fwd.w->mla;
+    const int qkv = kd.qkv;
+    const int qh = md.n_heads;
     const int qk_nope = cfg.key_length_mla - cfg.rope_dim;
     const int res_bs = cfg.attn_res_block_size;
     const bool banked = res_bs > 0 && (layer % res_bs == 0);
@@ -841,7 +980,21 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
         if (L.is_kda) {
             const int kda_ord = kimi_k3_kda_ordinal(cfg, layer);
             if (kda_ord < 0) return false;
-            const int head_dim = cfg.kda_head_dim, n_head = cfg.n_q_heads;
+            const int head_dim = cfg.kda_head_dim;
+            const int n_head = kd.n_heads;              // heads THIS rank owns
+
+            // The replicated per-channel vectors, read at this rank's band.
+            // ssm_conv1d_* is [conv_kernel, 1, qkv] and CHANNEL-MAJOR -- the kernel
+            // reads w + c*d_conv -- so the band is a pointer offset, not a copy.
+            // At tp=1 and under ExpertsOnly every offset here is 0, so these are the
+            // same pointers the unsharded path always used.
+            const int    ch_off = kd.qkv_band.offset;
+            const int    hd_off = kd.head_band.offset;
+            const float* w_cq = (const float*)L.ssm_conv1d_q.data + (size_t)ch_off * cfg.kda_conv_kernel;
+            const float* w_ck = (const float*)L.ssm_conv1d_k.data + (size_t)ch_off * cfg.kda_conv_kernel;
+            const float* w_cv = (const float*)L.ssm_conv1d_v.data + (size_t)ch_off * cfg.kda_conv_kernel;
+            const float* w_dt = (const float*)L.ssm_dt_bias.data + ch_off;
+            const float* w_a  = (const float*)L.ssm_a.data + hd_off;
 
             // attn_q / attn_k / attn_v / ssm_g all read the SAME s.normed at the same
             // [qkv, H] shape, so they go out as one launch instead of four, and one
@@ -871,13 +1024,13 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             if (!L.ssm_conv1d_q.ok() || !L.ssm_conv1d_k.ok() || !L.ssm_conv1d_v.ok())
                 return false;
             k3k::kda_conv_step_f32(s.conv_q, st.conv_state_q[kda_ord], s.qkv_q,
-                                   (const float*)L.ssm_conv1d_q.data, cfg.kda_conv_kernel,
+                                   w_cq, cfg.kda_conv_kernel,
                                    qkv, stream);
             k3k::kda_conv_step_f32(s.conv_k, st.conv_state_k[kda_ord], s.qkv_k,
-                                   (const float*)L.ssm_conv1d_k.data, cfg.kda_conv_kernel,
+                                   w_ck, cfg.kda_conv_kernel,
                                    qkv, stream);
             k3k::kda_conv_step_f32(s.conv_v, st.conv_state_v[kda_ord], s.qkv_v,
-                                   (const float*)L.ssm_conv1d_v.data, cfg.kda_conv_kernel,
+                                   w_cv, cfg.kda_conv_kernel,
                                    qkv, stream);
             if (fwd.debug) fwd.debug("dbg_conv_q", layer, s.conv_q, qkv);
             if (fwd.debug) fwd.debug("dbg_conv_v", layer, s.conv_v, qkv);
@@ -892,23 +1045,29 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             if (!proj(s.f_a_out, s.normed, L.ssm_f_a, head_dim, H)) return false;
             if (!proj(s.g_raw, s.f_a_out, L.ssm_f_b, qkv, head_dim)) return false;
             if (!L.ssm_dt_bias.ok()) return false;
-            k3k::k3_add_f32(s.g_raw, s.g_raw, (const float*)L.ssm_dt_bias.data, qkv, stream);
+            k3k::k3_add_f32(s.g_raw, s.g_raw, w_dt, qkv, stream);
 
             if (!L.ssm_a.ok()) return false;
-            k3k::kda_decay_gate_f32(s.decay_g, s.g_raw, (const float*)L.ssm_a.data,
+            k3k::kda_decay_gate_f32(s.decay_g, s.g_raw, w_a,
                                     head_dim, n_head, cfg.kda_gate_lower_bound, stream);
 
-            if (!proj(s.beta_out, s.normed, L.ssm_beta, n_head, H)) return false;
+            // ssm_beta is [n_heads, hidden] and stays REPLICATED: its suffix is shared
+            // with Qwen's GDN, so one weight_plan entry governs both models. Project
+            // all cfg.n_q_heads rows and read this rank's band -- 96 rows of a
+            // 7168-wide Q8_0 matrix is 0.7 MB against 468 MB of projections, so the
+            // duplicated work is not worth a rule that would change another model.
+            if (!proj(s.beta_out, s.normed, L.ssm_beta, cfg.n_q_heads, H)) return false;
             // beta is the delta-rule update rate: llama.cpp's build_kda_layer applies
             // a sigmoid to the projection before the scan consumes it. Omitting this
             // left beta unbounded (rms ~1.7 vs the correct ~0.75) and scaled the whole
             // KDA output — the layer-0 divergence vs llama that this restores.
-            k3k::sigmoid_inplace_f32(s.beta_out, n_head, stream);
+            k3k::sigmoid_inplace_f32(s.beta_out, cfg.n_q_heads, stream);
 
             if (fwd.debug) fwd.debug("dbg_decay_g", layer, s.decay_g, qkv);
-            if (fwd.debug) fwd.debug("dbg_beta", layer, s.beta_out, n_head);
+            if (fwd.debug) fwd.debug("dbg_beta", layer, s.beta_out, cfg.n_q_heads);
             k3k::kda_decode_step_f32(s.delta_out, st.delta_state[kda_ord],
-                                     s.conv_q, s.conv_k, s.conv_v, s.decay_g, s.beta_out,
+                                     s.conv_q, s.conv_k, s.conv_v, s.decay_g,
+                                     s.beta_out + hd_off,
                                      head_dim, n_head, stream);
             if (fwd.debug) fwd.debug("dbg_delta_out", layer, s.delta_out, qkv);
 

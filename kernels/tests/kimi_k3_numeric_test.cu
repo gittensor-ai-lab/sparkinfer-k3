@@ -796,6 +796,20 @@ int main() {
     // 8 does not divide 12, so k3_mla_heads_per_block falls back to the 8-head
     // instantiation — the branch a non-K3 head count would take.
     test_mla_decode_attn(20000, 8);    std::printf("\n");
+    // A WIDE COMBINE, which nothing above reaches.
+    //
+    // The split count is min(want, n_ctx / kMlaMinSliceLen) capped by the budget,
+    // so at n_ctx 20,000 it lands around 39 whatever the cap is — every case above
+    // therefore merges a few dozen slices and would pass identically with the cap
+    // at 64 or at 512. Head-sharding MLA to 12 heads raises the budget to 512
+    // slices, and 128k of context is what actually asks for them: ~256 partials
+    // folded by one combine, each carrying its own max and sum-of-exp.
+    //
+    // This is the case that fails if the online-softmax rescale does not hold at
+    // that width, and it exists because the end-to-end accuracy gate CANNOT see
+    // it: the eval scores on a short reference prompt while timing at 128k, so it
+    // runs splits=1 and reports a byte-identical KLD however wrong this path is.
+    test_mla_decode_attn(131072, 12);  std::printf("\n");
     test_moe_router_noaux_tc(); std::printf("\n");
 
     std::printf("%d cases, %d failure(s)\n", g_case, g_fail);

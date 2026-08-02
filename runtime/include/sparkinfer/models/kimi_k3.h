@@ -132,17 +132,72 @@ struct KimiK3Weights {
     //                width, so the forward runs at full cfg dims on every rank and
     //                needs no per-rank shape threading.
     //
-    //   Full         Also row/col-shard the attention and dense-FFN projections, per
-    //                weight_plan. Saves the remaining ~22 GiB and splits the attention
-    //                FLOPs, but every kernel then has to be handed per-rank widths and
-    //                the KDA/MLA state has to be sized per rank. NOT YET SUPPORTED by
-    //                the forward — the loader would shard weights the executor still
-    //                indexes at full width, which reads past the end of the slice.
+    //   ExpertsAndKda  ExpertsOnly, plus a head-parallel shard of the 69 KDA
+    //                attention layers: attn_q/k/v/ssm_g/ssm_f_b row-shard by qkv,
+    //                attn_output col-shards, and the recurrent state divides with
+    //                them. Costs ONE extra all-reduce per KDA layer, at hidden,
+    //                after attn_output.
     //
-    // Kept explicit rather than inferred from tp_size so that turning on Full is a
+    //                MEASURED, nsys at ctx 131072 on main + #57: the two Q8_0
+    //                projection kernels are 35.7% of GPU kernel time and the KDA
+    //                share of them is head-parallel, so ExpertsOnly has all eight
+    //                ranks streaming the same ~468 MB of KDA weights per layer
+    //                every token — 32.3 GB per rank per token, 8x redundant.
+    //
+    //                MLA IS DELIBERATELY LEFT REPLICATED. It is MQA: all 96 query
+    //                heads attend over ONE latent cache, so sharding query heads
+    //                divides the FLOPs but not the cache read. It buys a fraction
+    //                and pays a full collective.
+    //
+    //   Full         Also row/col-shard the MLA and dense-FFN projections, per
+    //                weight_plan. NOT YET SUPPORTED by the forward — the loader
+    //                would shard weights the executor still indexes at full width,
+    //                which reads past the end of the slice.
+    //
+    // Kept explicit rather than inferred from tp_size so that turning one on is a
     // deliberate act with a matching forward, not a silent consequence of tp>1.
-    enum class ShardPolicy { ExpertsOnly, Full };
+    //   ExpertsAndMla  Also head-band the 24 MLA layers' per-head projections
+    //                (q_b, k_b, v_b, gate) and col-shard their output. The latent
+    //                KV projection and the KV cache stay REPLICATED — that is what
+    //                MQA means. Costs one all-reduce per MLA layer.
+    //
+    // MLA IS SHARDED AND KDA IS NOT, WHICH LOOKS BACKWARDS UNTIL IT IS PRICED.
+    // KDA is 69 of the 93 layers and MLA only 24, but measured on the shipped
+    // build MLA attention is 36.9% of GPU kernel time against KDA's 6.6% — 16x
+    // more per layer. Both cost one collective per layer, and collectives are
+    // ~0.088% of GPU time each, so:
+    //
+    //     shard KDA:  +5.8% compute, -6.1% collectives  =  -0.3%, a REGRESSION
+    //     shard MLA: +32.3% compute, -2.1% collectives  = +30.2%
+    //
+    // ExpertsAndKda therefore stays available and stays OFF; it is kept because
+    // the arithmetic above is only obvious once both branches exist to compare.
+    //   ExpertsAndAttn Both attention bands. One all-reduce per layer, 93 of them
+    //                on top of the 92 MoE ones.
+    //
+    // WHY BOTH, AFTER THE ARITHMETIC SAID KDA ALONE LOSES MONEY. That estimate
+    // priced a collective at ~0.088% of GPU time, taken from a profile whose
+    // NCCL time was inflated by rank-arrival skew (35 ms max against a 71 us
+    // mean). With submission parallelised that skew is gone and a reduce is far
+    // cheaper than the estimate, so the 5.8% of KDA compute is worth its 69
+    // extra reduces after all. Measured head-to-head on this box: an all-93
+    // shard (PR #64) runs 63.6 ms against this tree's MLA-only 70.3.
+    //
+    // The narrower policies stay because they are the evidence: ExpertsAndMla is
+    // what isolates the MLA band's contribution, and ExpertsAndKda the KDA one.
+    enum class ShardPolicy { ExpertsOnly, ExpertsAndKda, ExpertsAndMla, ExpertsAndAttn, Full };
     ShardPolicy policy = ShardPolicy::ExpertsOnly;
+
+    // Which bands a policy shards. Every site that used to compare the enum
+    // directly asks through these instead — adding ExpertsAndAttn by hand at
+    // each `== ExpertsAndKda` would have been six chances to miss one, and a
+    // missed site shards weights the forward still indexes at full width.
+    static bool shards_kda(ShardPolicy p) {
+        return p == ShardPolicy::ExpertsAndKda || p == ShardPolicy::ExpertsAndAttn;
+    }
+    static bool shards_mla(ShardPolicy p) {
+        return p == ShardPolicy::ExpertsAndMla || p == ShardPolicy::ExpertsAndAttn;
+    }
 
     // WHICH SLICE OF EACH TENSOR THIS RANK HOLDS. Set BEFORE calling the loader;
     // the default (tp_size 1) makes every rule degenerate to Replicate, so the
@@ -154,6 +209,18 @@ struct KimiK3Weights {
     // forward needs it too: an all-reduce whose tp_size disagrees with the tp_size
     // the weights were sharded under is a partial sum presented as an answer.
     tp::ShardDims shard;
+
+    // This rank's KDA slice, under ShardPolicy::ExpertsAndKda. Left at the tp=1
+    // identity (full width, zero offsets) under every other policy, so the forward
+    // reads it unconditionally and the unsharded path is the same code with the
+    // same values it always had — not a branch that can drift.
+    tp::KdaShardDims kda;
+
+    // This rank's MLA head slice, under ShardPolicy::ExpertsAndMla. Same
+    // discipline as `kda`: left at the tp=1 identity under every other policy so
+    // the forward reads it unconditionally and the replicated path is the same
+    // code with the same values, not a branch that can drift out of step.
+    tp::MlaShardDims mla;
 
     // Every device buffer this struct owns, for bulk free in the destructor.
     std::vector<void*> owned;
@@ -232,8 +299,14 @@ struct KimiK3RuntimeState {
 // and are never touched. This is what lets the layer-split pipeline fit: the MLA KV
 // cache is per-MLA-layer and grows with context (~58 GB total at 1M), so an
 // every-stage-allocates-everything sizing would need that PER STAGE.
+// `kda` sizes the KDA recurrent state to THIS RANK's heads under
+// ShardPolicy::ExpertsAndKda. Null (the default) means full width, which is what
+// every unsharded caller wants and what tp=1 must keep getting. Passing a sharded
+// KdaShardDims while the forward still indexes at full width would read past the
+// end of the allocation, so the two are changed together or not at all.
 bool kimi_k3_alloc_state(const KimiK3Config& cfg, int max_ctx, KimiK3RuntimeState& out,
-                        int first_layer = -1, int last_layer = -1);
+                        int first_layer = -1, int last_layer = -1,
+                        const tp::KdaShardDims* kda = nullptr);
 void kimi_k3_reset_state(KimiK3RuntimeState& s);   // zero everything, position=0, n_ckpt=0
 void kimi_k3_free_state(KimiK3RuntimeState& s);
 

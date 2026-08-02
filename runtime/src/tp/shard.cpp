@@ -225,5 +225,172 @@ int reduce_count_per_token(int n_layers) {
     return n_layers > 0 ? n_layers * 2 : 0;   // one after attn out, one after ffn down
 }
 
+// ---------------------------------------------------------------------------
+// Kimi K3 KDA — head-parallel shard math. See the header for why MLA is excluded.
+// ---------------------------------------------------------------------------
+
+ShardError kda_shard_dims(const KdaShape& shape, const Config& cfg, int rank,
+                          KdaShardDims* out) {
+    std::ostringstream os;
+    bool any = false;
+
+    if (!out) return ShardError{"kda_shard_dims: null out"};
+    if (cfg.tp_size <= 0) return ShardError{"tp_size must be >= 1"};
+    if (rank < 0 || rank >= cfg.tp_size) {
+        os << "rank " << rank << " outside [0," << cfg.tp_size << ")";
+        return ShardError{os.str()};
+    }
+    if (!cfg.devices.empty() && static_cast<int>(cfg.devices.size()) != cfg.tp_size) {
+        os << "devices.size()=" << cfg.devices.size() << " != tp_size=" << cfg.tp_size;
+        return ShardError{os.str()};
+    }
+
+    // Shape sanity BEFORE divisibility, so a zeroed/default KdaShape reports
+    // "n_heads must be > 0" rather than "0 not divisible by 8", which reads like
+    // a config problem when it is a plumbing one.
+    if (shape.hidden <= 0)      add_err(os, any, "hidden must be > 0");
+    if (shape.n_heads <= 0)     add_err(os, any, "n_heads must be > 0");
+    if (shape.head_dim <= 0)    add_err(os, any, "head_dim must be > 0");
+    if (shape.conv_kernel <= 0) add_err(os, any, "conv_kernel must be > 0");
+    if (any) return ShardError{os.str()};
+
+    KdaShardDims d;
+    d.tp_size = cfg.tp_size;
+    d.rank = rank;
+    d.hidden = shape.hidden;
+    d.head_dim = shape.head_dim;
+    d.conv_kernel = shape.conv_kernel;
+    d.n_heads_total = shape.n_heads;
+    d.qkv_total = shape.n_heads * shape.head_dim;
+
+    if (cfg.tp_size == 1) {
+        // The identity shard, in the same code path as the sharded one for the
+        // same reason ShardDims keeps it here: it is what guarantees the tp=1
+        // build cannot diverge from the tp>1 one.
+        d.n_heads = shape.n_heads;
+        d.head_band = Band{0, shape.n_heads};
+        d.qkv = d.qkv_total;
+        d.qkv_band = Band{0, d.qkv_total};
+    } else {
+        if (!divisible(shape.n_heads, cfg.tp_size)) {
+            std::ostringstream m;
+            m << "n_heads=" << shape.n_heads << " not divisible by tp_size=" << cfg.tp_size
+              << " (a KDA head owns a private recurrent state and cannot be split)";
+            return ShardError{m.str()};
+        }
+        d.head_band = even_band(shape.n_heads, cfg.tp_size, rank);
+        d.n_heads = d.head_band.extent;
+        d.qkv_band = Band{d.head_band.offset * shape.head_dim,
+                          d.head_band.extent * shape.head_dim};
+        d.qkv = d.qkv_band.extent;
+    }
+
+    // THE INVARIANT, checked rather than assumed. The KDA branch addresses this
+    // same slice both by head and by qkv row; a disagreement between the two is
+    // the failure mode that runs at full speed and emits wrong tokens.
+    if (d.qkv_band.offset != d.head_band.offset * d.head_dim ||
+        d.qkv_band.extent != d.head_band.extent * d.head_dim) {
+        std::ostringstream m;
+        m << "qkv_band [" << d.qkv_band.offset << "," << d.qkv_band.end()
+          << ") does not match head_band [" << d.head_band.offset << ","
+          << d.head_band.end() << ") scaled by head_dim=" << d.head_dim;
+        return ShardError{m.str()};
+    }
+
+    d.conv_state_elems  = static_cast<long>(d.conv_kernel - 1) * d.qkv;
+    d.delta_state_elems = static_cast<long>(d.head_dim) * d.head_dim * d.n_heads;
+
+    *out = d;
+    return {};
+}
+
+ShardError mla_shard_dims(const MlaShape& shape, const Config& cfg, int rank,
+                          MlaShardDims* out) {
+    std::ostringstream os;
+    bool any = false;
+
+    if (!out) return ShardError{"mla_shard_dims: null out"};
+    if (cfg.tp_size <= 0) return ShardError{"tp_size must be >= 1"};
+    if (rank < 0 || rank >= cfg.tp_size) {
+        os << "rank " << rank << " outside [0," << cfg.tp_size << ")";
+        return ShardError{os.str()};
+    }
+    if (!cfg.devices.empty() && static_cast<int>(cfg.devices.size()) != cfg.tp_size) {
+        os << "devices.size()=" << cfg.devices.size() << " != tp_size=" << cfg.tp_size;
+        return ShardError{os.str()};
+    }
+
+    // Shape sanity before divisibility, same reason as the KDA path: a zeroed
+    // MlaShape should say "n_q_heads must be > 0", not "0 not divisible by 8".
+    if (shape.hidden <= 0)           add_err(os, any, "hidden must be > 0");
+    if (shape.n_q_heads <= 0)        add_err(os, any, "n_q_heads must be > 0");
+    if (shape.key_length_mla <= 0)   add_err(os, any, "key_length_mla must be > 0");
+    if (shape.value_length_mla <= 0) add_err(os, any, "value_length_mla must be > 0");
+    if (shape.qk_nope <= 0)          add_err(os, any, "qk_nope must be > 0");
+    if (shape.kv_lora_rank <= 0)     add_err(os, any, "kv_lora_rank must be > 0");
+    if (any) return ShardError{os.str()};
+
+    MlaShardDims d;
+    d.tp_size = cfg.tp_size;
+    d.rank = rank;
+    d.hidden = shape.hidden;
+    d.n_heads_total = shape.n_q_heads;
+
+    if (cfg.tp_size == 1) {
+        d.n_heads = shape.n_q_heads;
+        d.head_band = Band{0, shape.n_q_heads};
+    } else {
+        if (!divisible(shape.n_q_heads, cfg.tp_size)) {
+            std::ostringstream m;
+            m << "n_q_heads=" << shape.n_q_heads << " not divisible by tp_size="
+              << cfg.tp_size << " (softmax is over a whole head; a head cannot split)";
+            return ShardError{m.str()};
+        }
+        d.head_band = even_band(shape.n_q_heads, cfg.tp_size, rank);
+        d.n_heads = d.head_band.extent;
+    }
+
+    // Every derived band is the head band scaled by that tensor's per-head
+    // stride. Deriving them all from one band is what makes it impossible for
+    // q_b, k_b, v_b, the gate and the output projection to disagree about which
+    // heads this rank owns — the failure that runs at full speed and emits
+    // fluent, wrong tokens because nothing bounds-checks a head id.
+    auto scaled = [&](int stride) {
+        return Band{d.head_band.offset * stride, d.head_band.extent * stride};
+    };
+    d.q_rows_band = scaled(shape.key_length_mla);
+    d.v_rows_band = scaled(shape.value_length_mla);
+    d.wk_b_band   = scaled(shape.qk_nope * shape.kv_lora_rank);
+    d.wv_b_band   = scaled(shape.kv_lora_rank * shape.value_length_mla);
+
+    // Checked, not assumed — same reason the KDA path checks its invariant.
+    const bool consistent =
+        d.q_rows_band.extent == d.n_heads * shape.key_length_mla &&
+        d.v_rows_band.extent == d.n_heads * shape.value_length_mla &&
+        d.wk_b_band.extent   == d.n_heads * shape.qk_nope * shape.kv_lora_rank &&
+        d.wv_b_band.extent   == d.n_heads * shape.kv_lora_rank * shape.value_length_mla;
+    if (!consistent) {
+        std::ostringstream m;
+        m << "derived MLA bands disagree with head_band [" << d.head_band.offset
+          << "," << d.head_band.end() << ") x n_heads=" << d.n_heads;
+        return ShardError{m.str()};
+    }
+
+    *out = d;
+    return {};
+}
+
+int k3_reduce_count_per_token(int n_kda_layers, int n_moe_layers, bool kda_sharded) {
+    return k3_reduce_count_per_token(n_kda_layers, 0, n_moe_layers, kda_sharded, false);
+}
+
+int k3_reduce_count_per_token(int n_kda_layers, int n_mla_layers, int n_moe_layers,
+                              bool kda_sharded, bool mla_sharded) {
+    const int kda = (kda_sharded && n_kda_layers > 0) ? n_kda_layers : 0;
+    const int mla = (mla_sharded && n_mla_layers > 0) ? n_mla_layers : 0;
+    const int moe = n_moe_layers > 0 ? n_moe_layers : 0;
+    return kda + mla + moe;
+}
+
 }  // namespace tp
 }  // namespace sparkinfer

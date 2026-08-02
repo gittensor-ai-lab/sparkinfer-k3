@@ -5,6 +5,7 @@
 #include "sparkinfer/kernels/kimi_k3.h"
 #include "sparkinfer/tp/shard.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
@@ -17,6 +18,67 @@ namespace k3k = sparkinfer::kernels::k3;
 namespace sparkinfer {
 
 namespace {
+
+// ---------------------------------------------------------------------------
+// Host-issue accounting (SPARKINFER_K3_ISSUE_PROFILE=1)
+// ---------------------------------------------------------------------------
+// Why this exists, and why it is shaped this way:
+//
+// A single host thread issues every rank's kernels, rank 0 first and rank 7
+// last, and 92 all-reduces per token act as hard barriers. If issuing a layer
+// costs the host a meaningful fraction of what the layer costs the GPU, then
+// rank 7 arrives at every barrier structurally late and the collective's cost
+// is not the transfer at all — it is the host that has not finished asking yet.
+//
+// Everything measured below is ASYNCHRONOUS work-submission. That is the whole
+// point: no cudaEventRecord, no cudaEventSynchronize, no extra stream sync.
+// Instrumenting this path with CUDA events would sync the very thing being
+// measured (SPARKINFER_K3_PROFILE=1 does exactly that and eliminates the fast
+// mode on this box), so this uses steady_clock only — ~20 ns per sample against
+// microsecond-scale intervals, and it cannot change the GPU's schedule.
+//
+// t_issue  host time submitting the per-rank layer phases (async enqueue)
+// t_coll   host time inside the group all-reduce call (async enqueue)
+// t_sync   host time blocked in the ONE end-of-token sync -> GPU catch-up
+// t_total  wall time of the whole forward_token
+//
+// t_issue >> 0 and t_sync ~ 0 means the GPU is starved and the host is the
+// bottleneck. The reverse means the host stays ahead and the GPU is the wall.
+struct IssueProfile {
+    bool on = false;
+    long long n_tokens = 0;
+    double t_issue = 0, t_coll = 0, t_sync = 0, t_total = 0;
+    long long n_phase_calls = 0, n_setdev = 0;
+};
+
+IssueProfile& issue_profile() {
+    static IssueProfile p = [] {
+        IssueProfile q;
+        const char* e = std::getenv("SPARKINFER_K3_ISSUE_PROFILE");
+        q.on = e && e[0] == '1';
+        return q;
+    }();
+    return p;
+}
+
+using IClock = std::chrono::steady_clock;
+inline double secs_since(IClock::time_point t0) {
+    return std::chrono::duration<double>(IClock::now() - t0).count();
+}
+
+// Bounded spin. Pause for cache-friendly waiting, then yield so a box that is
+// oversubscribed (or a rank that died) degrades to scheduling instead of
+// burning a core forever.
+inline void spin_step(int& n) {
+    if (++n < 4096) {
+#if defined(__x86_64__) || defined(__i386__)
+        __builtin_ia32_pause();
+#endif
+    } else {
+        std::this_thread::yield();
+        n = 4096;
+    }
+}
 
 // Token row gather. Same contract as the single-GPU path: token_embd is replicated,
 // so every rank does this identically and no broadcast is needed.
@@ -32,6 +94,73 @@ bool embed_token(const KimiK3Weights& w, const KimiK3Config& cfg, int token_id,
 }
 
 }  // namespace
+
+// ---------------------------------------------------------------------------
+// K3IssuePool
+// ---------------------------------------------------------------------------
+
+void K3IssuePool::start(const std::vector<int>& devices) {
+    if (!workers_.empty()) return;
+    devices_ = devices;
+    stop_.store(false, std::memory_order_relaxed);
+    epoch_.store(0, std::memory_order_relaxed);
+    done_.store(0, std::memory_order_relaxed);
+
+    const int n = (int)devices_.size();
+    workers_.reserve((size_t)n);
+    for (int r = 0; r < n; ++r) {
+        workers_.emplace_back([this, r] {
+            // ONCE per thread, not once per launch. The current device is
+            // thread-local, so this is the whole reason the 1496 per-token
+            // cudaSetDevice calls disappear rather than merely moving.
+            cudaSetDevice(devices_[(size_t)r]);
+            unsigned seen = 0;
+            for (;;) {
+                int spins = 0;
+                while (epoch_.load(std::memory_order_acquire) == seen) {
+                    if (stop_.load(std::memory_order_acquire)) return;
+                    spin_step(spins);
+                }
+                seen = epoch_.load(std::memory_order_acquire);
+                if (stop_.load(std::memory_order_acquire)) return;
+
+                // A throwing job must not strand the barrier: the done_ count
+                // is what the submitter waits on, so it is incremented on every
+                // path out of the call.
+                bool ok = false;
+                try {
+                    ok = (*job_)(r);
+                } catch (...) {
+                    ok = false;
+                }
+                if (!ok) failed_.store(true, std::memory_order_relaxed);
+                done_.fetch_add(1, std::memory_order_release);
+            }
+        });
+    }
+}
+
+bool K3IssuePool::run(const std::function<bool(int)>& job) {
+    const int n = (int)workers_.size();
+    if (n == 0) return false;
+    job_ = &job;
+    failed_.store(false, std::memory_order_relaxed);
+    done_.store(0, std::memory_order_relaxed);
+    epoch_.fetch_add(1, std::memory_order_release);
+
+    int spins = 0;
+    while (done_.load(std::memory_order_acquire) < n) spin_step(spins);
+    job_ = nullptr;
+    return !failed_.load(std::memory_order_relaxed);
+}
+
+void K3IssuePool::shutdown() {
+    if (workers_.empty()) return;
+    stop_.store(true, std::memory_order_release);
+    epoch_.fetch_add(1, std::memory_order_release);   // wake the parked spinners
+    for (auto& t : workers_) if (t.joinable()) t.join();
+    workers_.clear();
+}
 
 bool kimi_k3_tp_init(const GGUF& g, const KimiK3Config& cfg, const K3PlanOptions& opt,
                     const std::vector<int>& devices, int max_ctx, KimiK3TP& out) {
@@ -86,7 +215,43 @@ bool kimi_k3_tp_init(const GGUF& g, const KimiK3Config& cfg, const K3PlanOptions
         }
         out.streams[(size_t)r] = R.stream;
 
-        R.weights.policy = KimiK3Weights::ShardPolicy::ExpertsOnly;
+        // Which attention bands to shard.
+        //
+        // MLA first, because it is where the time is: profiled at ctx 131072,
+        // MLA attention is 36.9% of GPU kernel time over 24 layers against KDA's
+        // 6.6% over 69 — 16x more per layer.
+        //
+        // KDA WAS OFF HERE, ON AN ARITHMETIC THAT WAS WRONG. The estimate priced
+        // a collective at ~0.088% of GPU time and concluded:
+        //
+        //     shard KDA: +5.8% compute, -6.1% collectives = -0.3%, a regression
+        //
+        // That per-collective figure came from a profile whose NCCL time was
+        // inflated by rank-arrival skew — 35 ms max against a 71 us mean — i.e.
+        // it priced the stall, not the reduce. With submission parallelised the
+        // stall is gone and a reduce costs a fraction of that, so the 5.8% is
+        // worth its 69 extra collectives.
+        //
+        // What settled it was measuring the competitor rather than arguing with
+        // them: PR #64 shards all 93 layers and runs 63.6 ms/token on this box,
+        // against 70.3 for the MLA-only build here. Sharding both bands is the
+        // better trade once the skew that made collectives look expensive is
+        // fixed — and this tree is the one that fixed it.
+        static const bool shard_kda = [] {
+            const char* e = std::getenv("SPARKINFER_K3_SHARD_KDA");
+            return !(e && e[0] == '0');          // ON unless explicitly disabled
+        }();
+        static const bool shard_mla = [] {
+            const char* e = std::getenv("SPARKINFER_K3_SHARD_MLA");
+            return !(e && e[0] == '0');          // ON unless explicitly disabled
+        }();
+        const bool k = shard_kda && tp_size > 1;
+        const bool m = shard_mla && tp_size > 1;
+        R.weights.policy =
+            (k && m) ? KimiK3Weights::ShardPolicy::ExpertsAndAttn :
+            k        ? KimiK3Weights::ShardPolicy::ExpertsAndKda  :
+            m        ? KimiK3Weights::ShardPolicy::ExpertsAndMla  :
+                       KimiK3Weights::ShardPolicy::ExpertsOnly;
         R.weights.shard.tp_size = tp_size;
         R.weights.shard.rank = r;
         R.weights.shard.hidden = cfg.hidden;
@@ -101,7 +266,11 @@ bool kimi_k3_tp_init(const GGUF& g, const KimiK3Config& cfg, const K3PlanOptions
             rank_err[(size_t)r] = "weight load failed";
             return false;
         }
-        if (!kimi_k3_alloc_state(cfg, max_ctx, R.state)) {
+        // Sized to the slice the weights were just cut with. Passing the weights'
+        // own KdaShardDims rather than re-deriving it is what makes it impossible
+        // for the state and the projections to disagree about which heads this rank
+        // owns -- the failure that runs at full speed and emits wrong tokens.
+        if (!kimi_k3_alloc_state(cfg, max_ctx, R.state, -1, -1, &R.weights.kda)) {
             rank_err[(size_t)r] = "alloc_state failed";
             return false;
         }
@@ -183,7 +352,11 @@ bool kimi_k3_tp_init(const GGUF& g, const KimiK3Config& cfg, const K3PlanOptions
 
     std::string err;
     out.coll = tp::make_collective(devices, requested, &err,
-                                   /*max_count=*/(size_t)cfg.expert_latent,
+                                   // hidden (7168) > expert_latent (3584): the KDA
+                                   // reduce is the wider payload, and a collective
+                                   // sized to the narrower one would truncate it.
+                                   /*max_count=*/(size_t)(cfg.hidden > cfg.expert_latent
+                                                          ? cfg.hidden : cfg.expert_latent),
                                    /*need_f32=*/true);
     if (!out.coll) {
         std::fprintf(stderr, "[k3-tp] no collective: %s\n", err.c_str());
@@ -220,14 +393,53 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
     const int H = cfg.hidden;
     const int tp_size = (int)p.ranks.size();
 
+    IssueProfile& ip = issue_profile();
+    const IClock::time_point t_tok0 = ip.on ? IClock::now() : IClock::time_point{};
+
+    // Parallel submission. Off at tp_size 1 (nothing to parallelise, and the
+    // single-rank path must stay identical) and off under SPARKINFER_K3_SERIAL_ISSUE=1,
+    // which is the A/B control: same binary, same kernels, only the submission
+    // order changes. Any measured delta is therefore the submission, not a rebuild.
+    static const bool serial_issue = [] {
+        const char* e = std::getenv("SPARKINFER_K3_SERIAL_ISSUE");
+        return e && e[0] == '1';
+    }();
+    const bool parallel_issue = (tp_size > 1) && !serial_issue;
+    if (parallel_issue && !p.issue.started()) {
+        std::vector<int> devs;
+        devs.reserve(p.ranks.size());
+        for (auto& R : p.ranks) devs.push_back(R.device);
+        p.issue.start(devs);
+    }
+
+    // Submit `job` on every rank — concurrently when the pool is up, otherwise
+    // in rank order exactly as before. The serial arm keeps its per-call
+    // cudaSetDevice; the parallel arm does not need one, because each worker
+    // pinned its device once at thread start.
+    auto issue_all = [&](const std::function<bool(int)>& job) -> bool {
+        if (parallel_issue) return p.issue.run(job);
+        for (int r = 0; r < tp_size; ++r) {
+            if (cudaSetDevice(p.ranks[(size_t)r].device) != cudaSuccess) return false;
+            if (!job(r)) return false;
+        }
+        return true;
+    };
+
     // The cross-layer residual bank is PER TOKEN on every rank — same lifetime rule
     // as the single-GPU path, and forgetting it here fails on token 2 rather than
     // token 1, because max_ckpt is exactly one token's worth of checkpoints.
     for (auto& R : p.ranks) R.state.n_ckpt = 0;
 
-    for (auto& R : p.ranks) {
-        if (cudaSetDevice(R.device) != cudaSuccess) return false;
-        if (!embed_token(R.weights, cfg, token_id, R.x, R.stream)) return false;
+    {
+        const IClock::time_point t0 = ip.on ? IClock::now() : IClock::time_point{};
+        if (!issue_all([&](int r) {
+                KimiK3TPRank& R = p.ranks[(size_t)r];
+                return embed_token(R.weights, cfg, token_id, R.x, R.stream);
+            })) return false;
+        if (ip.on) {
+            ip.t_issue += secs_since(t0);
+            if (!parallel_issue) ip.n_setdev += tp_size;
+        }
     }
 
     for (int layer = 0; layer < cfg.n_layers; ++layer) {
@@ -239,12 +451,78 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
         // phase boundary is where a fully-sharded build WOULD reduce, and keeping
         // the call sites is what makes that a one-line change rather than a
         // re-split of the forward.
-        for (auto& R : p.ranks) {
-            if (cudaSetDevice(R.device) != cudaSuccess) return false;
-            if (!kimi_k3_forward_layer_phase(R.fwd, layer, K3LayerPhase::Attn,
-                                             R.x, R.x_next)) return false;
-            if (!kimi_k3_forward_layer_phase(R.fwd, layer, K3LayerPhase::FfnPartial,
-                                             R.x, R.x_next)) return false;
+        // Under ExpertsAndKda a KDA layer's attn_output is COL-sharded, so every rank
+        // holds a full-width partial sum of the attention output and the two phases
+        // are no longer separable -- the reduce has to land between them. This is the
+        // boundary the forward already exposes; kimi_k3_partial_buffer(Attn) returns
+        // s.attn_out at cfg.hidden, which is exactly the partial.
+        //
+        // When the KDA attention is NOT sharded the two phases are still issued as
+        // one job, so the replicated path keeps its single barrier per layer and
+        // pays nothing for a split it does not need.
+        // Same seam, the other band: under ExpertsAndMla an MLA layer's
+        // attn_output is COL-sharded, so its partial is full-width at hidden and
+        // has to be summed before ffn_norm — rms_norm is not linear and cannot be
+        // applied to a partial sum. Exactly one of these can be true, because the
+        // two policies are mutually exclusive and a layer is either KDA or MLA.
+        const bool kda_reduce = tp_size > 1 && cfg.is_kda_layer(layer) &&
+            KimiK3Weights::shards_kda(p.ranks[0].weights.policy);
+        const bool mla_reduce = tp_size > 1 && !cfg.is_kda_layer(layer) &&
+            KimiK3Weights::shards_mla(p.ranks[0].weights.policy);
+        const bool attn_reduce = kda_reduce || mla_reduce;
+
+        const IClock::time_point t_p12 = ip.on ? IClock::now() : IClock::time_point{};
+        if (!issue_all([&](int r) {
+                KimiK3TPRank& R = p.ranks[(size_t)r];
+                if (!kimi_k3_forward_layer_phase(R.fwd, layer, K3LayerPhase::Attn,
+                                                 R.x, R.x_next)) return false;
+                if (attn_reduce) return true;  // FfnPartial waits for the reduce
+                return kimi_k3_forward_layer_phase(R.fwd, layer, K3LayerPhase::FfnPartial,
+                                                   R.x, R.x_next);
+            })) return false;
+        // Closed HERE so t_issue never spans the reduce below; the second issue
+        // adds its own span. Letting one bracket cover both would book collective
+        // time as submission time and quietly inflate exactly the number this
+        // instrumentation exists to keep honest.
+        if (ip.on) {
+            ip.t_issue += secs_since(t_p12);
+            ip.n_phase_calls += (attn_reduce ? 1 : 2) * tp_size;
+            if (!parallel_issue) ip.n_setdev += tp_size;
+        }
+
+        if (attn_reduce) {
+            int count = 0;
+            for (int r = 0; r < tp_size; ++r) {
+                int n = 0;
+                float* buf = kimi_k3_partial_buffer(p.ranks[(size_t)r].fwd, layer,
+                                                    K3LayerPhase::Attn, &n);
+                if (!buf || n <= 0) return false;
+                if (r == 0) count = n;
+                else if (n != count) return false;
+                p.reduce_bufs[(size_t)r] = buf;
+            }
+            const IClock::time_point tk = ip.on ? IClock::now() : IClock::time_point{};
+            const bool okk = p.coll->allreduce_f32_group(p.reduce_bufs, (size_t)count,
+                                                         p.streams);
+            if (ip.on) ip.t_coll += secs_since(tk);
+            if (!okk) {
+                std::fprintf(stderr, "[k3-tp] attention all-reduce failed at layer %d\n", layer);
+                return false;
+            }
+            ++p.n_collectives;
+
+            const IClock::time_point t_fp = ip.on ? IClock::now() : IClock::time_point{};
+            if (!issue_all([&](int r) {
+                    KimiK3TPRank& R = p.ranks[(size_t)r];
+                    return kimi_k3_forward_layer_phase(R.fwd, layer,
+                                                       K3LayerPhase::FfnPartial,
+                                                       R.x, R.x_next);
+                })) return false;
+            if (ip.on) {
+                ip.t_issue += secs_since(t_fp);
+                ip.n_phase_calls += tp_size;
+                if (!parallel_issue) ip.n_setdev += tp_size;
+            }
         }
 
         // --- the collective -------------------------------------------------
@@ -288,19 +566,35 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
                     cudaMemcpy(p.reduce_bufs[(size_t)r], sum.data(),
                                (size_t)count * sizeof(float), cudaMemcpyHostToDevice);
                 }
-            } else if (!p.coll->allreduce_f32_group(p.reduce_bufs, (size_t)count, p.streams)) {
-                std::fprintf(stderr, "[k3-tp] all-reduce failed at layer %d\n", layer);
-                return false;
+            } else {
+                const IClock::time_point tc = ip.on ? IClock::now() : IClock::time_point{};
+                const bool okc = p.coll->allreduce_f32_group(p.reduce_bufs, (size_t)count,
+                                                             p.streams);
+                if (ip.on) ip.t_coll += secs_since(tc);
+                if (!okc) {
+                    std::fprintf(stderr, "[k3-tp] all-reduce failed at layer %d\n", layer);
+                    return false;
+                }
             }
             ++p.n_collectives;
         }
 
         // --- phase 3 on every rank ------------------------------------------
-        for (auto& R : p.ranks) {
-            if (cudaSetDevice(R.device) != cudaSuccess) return false;
-            if (!kimi_k3_forward_layer_phase(R.fwd, layer, K3LayerPhase::FfnFinish,
-                                             R.x, R.x_next)) return false;
-            std::swap(R.x, R.x_next);
+        const IClock::time_point t_p3 = ip.on ? IClock::now() : IClock::time_point{};
+        if (!issue_all([&](int r) {
+                KimiK3TPRank& R = p.ranks[(size_t)r];
+                if (!kimi_k3_forward_layer_phase(R.fwd, layer, K3LayerPhase::FfnFinish,
+                                                 R.x, R.x_next)) return false;
+                // Each worker swaps only its OWN rank's pair; no rank reads
+                // another's x, so this needs no synchronisation beyond the
+                // barrier that ends the phase.
+                std::swap(R.x, R.x_next);
+                return true;
+            })) return false;
+        if (ip.on) {
+            ip.t_issue += secs_since(t_p3);
+            ip.n_phase_calls += tp_size;
+            if (!parallel_issue) ip.n_setdev += tp_size;
         }
     }
 
@@ -324,9 +618,29 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
                           cfg.vocab, H, R0.stream))
         return false;
 
+    const IClock::time_point t_s0 = ip.on ? IClock::now() : IClock::time_point{};
     if (cudaStreamSynchronize(R0.stream) != cudaSuccess) return false;
+    if (ip.on) ip.t_sync += secs_since(t_s0);
     if (cudaMemcpy(out_logits, R0.logits, (size_t)cfg.vocab * sizeof(float),
                    cudaMemcpyDeviceToHost) != cudaSuccess) return false;
+
+    if (ip.on) {
+        ip.t_total += secs_since(t_tok0);
+        ++ip.n_tokens;
+        // Report every token: the run is 32 tokens and the per-token variation is
+        // itself the signal (a host-bound loop is steady, a GPU-bound one is not).
+        const double n = (double)ip.n_tokens;
+        std::fprintf(stderr,
+            "[k3-issue] tok=%lld  total=%.2f ms  issue=%.2f ms (%.1f%%)  "
+            "coll=%.2f ms (%.1f%%)  sync=%.2f ms (%.1f%%)  "
+            "| phase_calls/tok=%.0f setdev/tok=%.0f\n",
+            ip.n_tokens,
+            1e3 * ip.t_total / n,
+            1e3 * ip.t_issue / n, 100.0 * ip.t_issue / ip.t_total,
+            1e3 * ip.t_coll  / n, 100.0 * ip.t_coll  / ip.t_total,
+            1e3 * ip.t_sync  / n, 100.0 * ip.t_sync  / ip.t_total,
+            (double)ip.n_phase_calls / n, (double)ip.n_setdev / n);
+    }
 
     // Advance every rank's position together. They run the same attention, so a rank
     // whose position drifted would index a different KV row for the same token.
@@ -335,6 +649,10 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
 }
 
 void kimi_k3_tp_free(KimiK3TP& p) {
+    // Join the submission threads BEFORE any rank buffer is freed. They only
+    // spin while parked, but a worker that is still inside a phase call would
+    // be launching against memory this loop is about to release.
+    p.issue.shutdown();
     for (auto& R : p.ranks) {
         cudaSetDevice(R.device);
         if (R.x) cudaFree(R.x);

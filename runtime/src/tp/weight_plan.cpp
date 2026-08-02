@@ -100,9 +100,14 @@ const std::unordered_map<std::string, Rule>& table() {
         // partitioned too. Correct-but-unsharded until that is designed; flagged in
         // docs/tensor-parallel.md as outstanding rather than silently row-sharded.
         {"ssm_conv1d.weight",       Rule::Replicate},
-        {"ssm_beta.weight",         Rule::Replicate},
         {"ssm_alpha.weight",        Rule::Replicate},
         {"ssm_out.weight",          Rule::Replicate},
+        // SHARED SUFFIX: Qwen's GDN and K3's KDA both ship ssm_beta.weight. The
+        // table is keyed by suffix alone, so this one entry governs both models —
+        // which is why it stays Replicate even though K3's KDA plan could shard it
+        // (see the K3 block below). Changing it here would silently change Qwen3.6
+        // too. It is small enough that replicate-and-offset costs nothing.
+        {"ssm_beta.weight",         Rule::Replicate},
 
         // --- Kimi K3 additions -------------------------------------------------
         // Enumerated from the REAL UD-Q2_K_XL tensor table (2573 tensors), not from
@@ -123,8 +128,9 @@ const std::unordered_map<std::string, Rule>& table() {
         // axis LAST, so they shard on the head axis, not on a matrix dim.
         {"attn_k_b.weight",         Rule::ExpertShard},   // head-axis band
         {"attn_v_b.weight",         Rule::ExpertShard},   // head-axis band
-        // K3's sigmoid output gate: same shape as the attn output, so same rule.
-        {"attn_gate.weight",        Rule::RowShard},
+        // (K3's sigmoid output gate, attn_gate.weight, is declared once in the
+        // attention block above — same shape, same rule, and a second entry here
+        // would be silently dropped. See the duplicate-key guard in the test.)
 
         // Cross-layer residual scoring vectors: [hidden], elementwise against the
         // residual stream, and every rank scores the same stream. Replicated.
@@ -142,14 +148,38 @@ const std::unordered_map<std::string, Rule>& table() {
         // noaux_tc router bias, one scalar per expert.
         {"exp_probs_b.bias",        Rule::Replicate},
 
-        // KDA (69 layers). q/k/v projections produce head-major activations and
-        // row-shard; the recurrent-state machinery is per-head and small, and the
-        // conv/state partitioning is not designed yet, so it replicates.
+        // KDA (69 layers). A KDA head owns a PRIVATE recurrent state (conv window
+        // + delta matrix) and never reads another head's, so the whole branch is
+        // head-parallel: q/k/v/g row-shard by qkv, attn_output col-shards, and the
+        // state divides with them. tp::kda_shard_dims() is the partitioning that
+        // comment used to say was "not designed yet" — it now is, and is pinned in
+        // tp_shard_cpu_test.
+        //
+        // WHAT SHARDS HERE vs WHAT IS REPLICATE-AND-OFFSET.
+        //
+        // Only the tensors big enough to matter get a rule; the small per-channel
+        // vectors stay replicated at full width and the forward indexes them at
+        // this rank's band (kda_shard_dims' qkv_band / head_band). Per KDA layer
+        // the projections are ~468 MB and these vectors are ~250 KB, so a rule for
+        // them would buy nothing and cost an axis the residency planner does not
+        // have — ssm_conv1d_* is [conv_kernel, 1, qkv], channel-major, so its band
+        // is a pointer offset rather than a copy plan.
+        //
+        //   ssm_dt.bias   [qkv]                 offset by qkv_band.offset
+        //   ssm_a         [n_heads]             offset by head_band.offset
+        //   ssm_conv1d_*  [conv_kernel, 1, qkv] offset by qkv_band.offset*conv_kernel
+        //   ssm_beta      [n_heads, hidden]     offset by head_band.offset (and see
+        //                                       the shared-suffix note above)
+        //
+        // ssm_f_a is replicated for a DIFFERENT reason, and it is the one entry
+        // here that must never be promoted: it is [head_dim, hidden], so its OUTPUT
+        // is the shared head_dim-wide vector that every rank's ssm_f_b shard then
+        // consumes WHOLE. Sharding it leaves each rank a fraction of a vector every
+        // rank needs entire — a wrong answer, not a slower one.
         {"ssm_a",                   Rule::Replicate},
         {"ssm_dt.bias",             Rule::Replicate},
-        {"ssm_beta.weight",         Rule::Replicate},
-        {"ssm_f_a.weight",          Rule::Replicate},
-        {"ssm_f_b.weight",          Rule::Replicate},
+        {"ssm_f_a.weight",          Rule::Replicate},   // output is SHARED — never shard
+        {"ssm_f_b.weight",          Rule::RowShard},    // [qkv, head_dim]: qkv is the output
         {"ssm_g.weight",            Rule::RowShard},
         {"ssm_conv1d_q.weight",     Rule::Replicate},
         {"ssm_conv1d_k.weight",     Rule::Replicate},

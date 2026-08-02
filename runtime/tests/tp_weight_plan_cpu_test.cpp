@@ -341,6 +341,160 @@ static void test_rule_names_are_stable() {
     CHECK(std::string(rule_name(Rule::Unknown)) == "unknown", "unknown");
 }
 
+// ---------------------------------------------------------------------------
+// Kimi K3 KDA — the head-parallel plan, cross-checked against tp::kda_shard_dims
+// ---------------------------------------------------------------------------
+
+static KdaShape k3_kda_shape() {
+    KdaShape sh;
+    sh.hidden = 7168; sh.n_heads = 96; sh.head_dim = 128; sh.conv_kernel = 4;
+    return sh;
+}
+
+static void test_kda_every_loader_tensor_has_a_rule() {
+    std::printf("kda_every_loader_tensor_has_a_rule\n");
+    // Exactly the names runtime/src/models/kimi_k3.cpp uploads for a KDA layer.
+    // Rule::Unknown here is a hard load failure, so a missing entry must be caught
+    // in CI and not on a rented node three hours into a run.
+    const char* kda_tensors[] = {
+        "blk.0.attn_norm.weight",     "blk.0.attn_res_score.weight",
+        "blk.0.attn_q.weight",        "blk.0.attn_k.weight",
+        "blk.0.attn_v.weight",        "blk.0.ssm_g.weight",
+        "blk.0.ssm_conv1d_q.weight",  "blk.0.ssm_conv1d_k.weight",
+        "blk.0.ssm_conv1d_v.weight",  "blk.0.ssm_f_a.weight",
+        "blk.0.ssm_f_b.weight",       "blk.0.ssm_beta.weight",
+        "blk.0.ssm_dt.bias",          "blk.0.ssm_a",
+        "blk.0.ssm_norm.weight",      "blk.0.attn_output.weight",
+    };
+    for (const char* t : kda_tensors)
+        CHECK(rule_for(t) != Rule::Unknown, "%s has no rule", t);
+}
+
+static void test_kda_plan_is_internally_consistent() {
+    std::printf("kda_plan_is_internally_consistent\n");
+    // The four projections that consume the full hidden state and produce the
+    // qkv-wide activation must all take the SAME rule. One of them replicated
+    // while the others shard gives that rank a full-width tensor indexed at
+    // rank-local offsets — fluent output over the wrong slice.
+    CHECK_RULE("blk.3.attn_q.weight", Rule::RowShard);
+    CHECK_RULE("blk.3.attn_k.weight", Rule::RowShard);
+    CHECK_RULE("blk.3.attn_v.weight", Rule::RowShard);
+    CHECK_RULE("blk.3.ssm_g.weight",  Rule::RowShard);
+    // ssm_f_b also lands on the qkv axis (its output is qkv wide), so it shards
+    // with them. This is the row the plan was missing.
+    CHECK_RULE("blk.3.ssm_f_b.weight", Rule::RowShard);
+    // The one collective point in a KDA layer.
+    CHECK_RULE("blk.3.attn_output.weight", Rule::ColShard);
+    CHECK(rule_needs_reduce(Rule::ColShard), "attn_output must force a reduce");
+    CHECK(!rule_needs_reduce(Rule::RowShard), "a row shard needs no collective");
+
+    // MUST NOT be promoted: ssm_f_a's OUTPUT is the shared head_dim-wide vector
+    // every rank's ssm_f_b shard consumes whole.
+    CHECK_RULE("blk.3.ssm_f_a.weight", Rule::Replicate);
+    // 1-D over head_dim, not over qkv. head_dim never shards.
+    CHECK_RULE("blk.3.ssm_norm.weight", Rule::Replicate);
+    // Replicate-and-offset: small, and indexed at the rank's band by the forward.
+    CHECK_RULE("blk.3.ssm_dt.bias", Rule::Replicate);
+    CHECK_RULE("blk.3.ssm_a", Rule::Replicate);
+    CHECK_RULE("blk.3.ssm_conv1d_q.weight", Rule::Replicate);
+    CHECK_RULE("blk.3.ssm_beta.weight", Rule::Replicate);
+}
+
+static void test_kda_plan_extents_match_kda_shard_dims() {
+    std::printf("kda_plan_extents_match_kda_shard_dims\n");
+    // THE CROSS-CHECK. weight_plan slices the weights; kda_shard_dims sizes the
+    // activations and the recurrent state. They are computed independently, and a
+    // disagreement between them is invisible at runtime — the shapes are each
+    // self-consistent, the model loads, and every rank contracts over a slice that
+    // does not match its own state.
+    const int tp = 8;
+    for (int r = 0; r < tp; ++r) {
+        ShardDims d;
+        CHECK(shard_dims(kimi_k3(), cfg_of(tp), r, &d).ok(), "shard_dims rank %d", r);
+        KdaShardDims k;
+        CHECK(kda_shard_dims(k3_kda_shape(), cfg_of(tp), r, &k).ok(), "kda rank %d", r);
+
+        // GGUF stores [in, out]; plan_for takes (rows=out, cols=in).
+        TensorPlan q = plan_for("blk.0.attn_q.weight", 12288, 7168, d);
+        CHECK(q.rule == Rule::RowShard, "attn_q rule");
+        CHECK(q.rows == k.qkv, "attn_q rows %d vs kda qkv %d", q.rows, k.qkv);
+        CHECK(q.band.offset == k.qkv_band.offset,
+              "attn_q band %d vs kda qkv_band %d", q.band.offset, k.qkv_band.offset);
+
+        TensorPlan fb = plan_for("blk.0.ssm_f_b.weight", 12288, 128, d);
+        CHECK(fb.rows == k.qkv, "ssm_f_b rows");
+        CHECK(fb.band.offset == k.qkv_band.offset, "ssm_f_b band");
+
+        // attn_output consumes the SAME band it produced: the col shard of Wo has
+        // to line up with the row shard of q/k/v/g or the contraction is over a
+        // different slice than the one this rank computed.
+        TensorPlan o = plan_for("blk.0.attn_output.weight", 7168, 12288, d);
+        CHECK(o.rule == Rule::ColShard, "attn_output rule");
+        CHECK(o.cols == k.qkv, "attn_output cols %d vs kda qkv %d", o.cols, k.qkv);
+        CHECK(o.band.offset == k.qkv_band.offset,
+              "THE SEAM: attn_output col band %d must equal attn_q row band %d",
+              o.band.offset, k.qkv_band.offset);
+
+        // ssm_f_a stays whole on every rank, at every rank.
+        TensorPlan fa = plan_for("blk.0.ssm_f_a.weight", 128, 7168, d);
+        CHECK(fa.rule == Rule::Replicate, "ssm_f_a must stay whole");
+        CHECK(fa.rows == 128, "ssm_f_a rows must be full head_dim, got %d", fa.rows);
+    }
+}
+
+static void test_kda_attn_k_v_are_not_a_kv_group() {
+    std::printf("kda_attn_k_v_are_not_a_kv_group\n");
+    // THE TRAP. attn_k.weight / attn_v.weight are written by BOTH branches: on an
+    // MLA layer they are absent (MLA uses attn_k_b/attn_v_b), on a KDA layer they
+    // are per-head input projections at [hidden, qkv] with no kv group involved.
+    //
+    // weight_plan downgrades them to Replicate whenever kv_replicated is set, and
+    // shard_dims() DOES set it for K3 (MLA stored as MQA, 1 kv head < 8 ranks). If
+    // the KDA loader ever inherits that flag, every rank holds a full-width attn_k
+    // beside a banded attn_q and the layer runs at full speed over mismatched
+    // slices. The loader states the exemption explicitly; this pins both halves.
+    ShardDims d;
+    CHECK(shard_dims(kimi_k3(), cfg_of(8), 0, &d).ok(), "shard");
+    CHECK(d.kv_replicated, "K3 at tp=8 must report kv_replicated — 1 kv head < 8 ranks");
+
+    TensorPlan mla = plan_for("blk.3.attn_k.weight", 12288, 7168, d);
+    CHECK(mla.rule == Rule::Replicate, "with kv_replicated set, the table downgrades");
+    CHECK(mla.replicated_fallback, "and says so");
+
+    // The exemption the KDA loader applies: same tensor, kv_replicated cleared.
+    ShardDims kda = d;
+    kda.kv_replicated = false;
+    for (const char* t : {"blk.3.attn_k.weight", "blk.3.attn_v.weight",
+                          "blk.3.attn_q.weight"}) {
+        TensorPlan p = plan_for(t, 12288, 7168, kda);
+        CHECK(p.rule == Rule::RowShard, "%s must row-shard on a KDA layer", t);
+        CHECK(p.rows == 1536, "%s rows %d, want 1536", t, p.rows);
+        CHECK(!p.replicated_fallback, "%s must not report a fallback", t);
+    }
+    // And all three must land on the SAME band, or q/k/v cover different heads.
+    CHECK(plan_for("blk.3.attn_q.weight", 12288, 7168, kda).band.offset ==
+          plan_for("blk.3.attn_k.weight", 12288, 7168, kda).band.offset,
+          "attn_q and attn_k must band identically");
+}
+
+static void test_kda_table_has_no_shadowed_duplicates() {
+    std::printf("kda_table_has_no_shadowed_duplicates\n");
+    // The table is one std::unordered_map built from an initializer list, so a
+    // repeated key is NOT an error: the first insertion wins and the second is
+    // silently dropped. An author editing the second copy then sees no effect.
+    // Both known collisions (attn_gate.weight, ssm_beta.weight) have been folded
+    // into a single entry each; this pins the key count so a new one shows up as
+    // a mismatch here rather than as an edit that quietly does nothing.
+    std::vector<std::string> sfx = known_tensor_suffixes();
+    CHECK(sfx.size() == 52, "table has %zu suffixes, expected 52 — if you added or "
+          "removed a rule, update this count; if it did NOT change when you added "
+          "one, you have shadowed an existing key", sfx.size());
+    // And no key appears twice in what the table hands back.
+    for (std::size_t i = 0; i < sfx.size(); ++i)
+        for (std::size_t j = i + 1; j < sfx.size(); ++j)
+            CHECK(sfx[i] != sfx[j], "duplicate suffix %s", sfx[i].c_str());
+}
+
 int main() {
     test_the_two_collective_tensors();
     test_attention_rules();
@@ -359,6 +513,12 @@ int main() {
     test_indivisible_shapes_are_refused_at_plan_time();
     test_every_known_suffix_has_a_real_rule();
     test_rule_names_are_stable();
+
+    test_kda_every_loader_tensor_has_a_rule();
+    test_kda_plan_is_internally_consistent();
+    test_kda_plan_extents_match_kda_shard_dims();
+    test_kda_attn_k_v_are_not_a_kv_group();
+    test_kda_table_has_no_shadowed_duplicates();
 
     std::printf("\n%d checks, %d failure(s)\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
