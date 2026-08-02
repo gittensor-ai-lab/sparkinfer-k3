@@ -1069,7 +1069,15 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             // layers — four launches instead of one, and four quantisations of the
             // identical s.normed, because k3_proj_ggml_f32 quantises per call.
             // That was 8.7% of GPU time in 59,696 quantize launches.
-            const bool fusable =
+            // SPARKINFER_K3_FUSE_QKVG=0 forces the four separate projections, so
+            // the fusion can be A/B'd on ONE binary. Every reliable measurement on
+            // this branch has come from a same-binary control; the ones that were
+            // not (rebuild vs rebuild) are the ones that had to be retracted.
+            static const bool want_fuse = [] {
+                const char* e = std::getenv("SPARKINFER_K3_FUSE_QKVG");
+                return !(e && e[0] == '0');
+            }();
+            const bool fusable = want_fuse &&
                 L.attn_q.ok() && L.attn_k.ok() && L.attn_v.ok() && L.ssm_g.ok() &&
                 L.attn_q.type == 8 && L.attn_k.type == 8 &&
                 L.attn_v.type == 8 && L.ssm_g.type == 8;
