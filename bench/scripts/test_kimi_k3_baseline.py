@@ -1557,6 +1557,57 @@ class CiWorkflowTest(unittest.TestCase):
         self.assertEqual(rc.returncode, 1, "a 4x-over-wall-clock claim was scored")
         self.assertIn("wall clock allows at most", rc.stderr)
 
+    def test_a_guard_refusal_actually_aborts_the_script(self):
+        """THE GUARD'S EXIT CODE HAS TO SURVIVE THE SHELL AROUND IT.
+
+        The wiring used to be `read -r TPS MSTOK <<<"$(python3 ...)" || exit 1`. The
+        `|| exit 1` binds to `read`, bash discards the substitution's exit status, and read
+        returns 0 on the empty string a refusing guard leaves behind -- so the refusal
+        printed its message and the script walked on with TPS="" into label.py, which died
+        on float('') with a traceback that buried the reason. #64 hit exactly this on the
+        guard's first live firing.
+
+        Tested against the REAL fragment cut from the script, not a paraphrase: refusal
+        inputs must exit 1, must not print the empty ">> sparkinfer:" line, and honest
+        inputs must still score."""
+        import tempfile
+        ev = (ROOT / "bench/scripts/kimi_k3_eval.sh").read_text()
+        live = [l for l in ev.split("\n") if not l.lstrip().startswith("#")]
+        self.assertFalse([l for l in live if 'read -r TPS MSTOK <<<"$(' in l],
+                         "the swallowed-exit wiring is back")
+        start = ev.index('SPEED_VERDICT="$(python3 -')
+        end = ev.index('[self-timed, within the wall-clock bound]"', start)
+        end = ev.index("\n", end) + 1
+        fragment = ev[start:end]
+
+        def run(ns_lo, ns_hi, self_tps, self_ms):
+            script = (
+                "set -euo pipefail\n"
+                f"NS_LO={int(ns_lo)}\nNS_HI={int(ns_hi)}\n"
+                "TOKENS_LO=8\nTOKENS_HI=136\n"
+                f"SELF_TPS={self_tps}\nSELF_MS={self_ms}\nLLAMA_REF=16.70\n"
+                + fragment
+                + "\necho SCORED_TPS=$TPS\n")
+            f = tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False)
+            f.write(script); f.close()
+            return subprocess.run(["bash", f.name], capture_output=True, text=True)
+
+        LOAD = 150e9
+        # honest: guard passes, verdict parsed, scored
+        r = run(LOAD + 8e9, LOAD + 8e9 + 128e9, 1.0, 1000.0)
+        self.assertEqual(r.returncode, 0, f"honest run failed:\n{r.stderr}")
+        self.assertIn("SCORED_TPS=1.00", r.stdout)
+
+        # refusal: #64's live numbers — collapsed differential, modest claim
+        r = run(LOAD + 8e9, LOAD + 8e9 + 5.2e9, 10.53, 94.98)
+        self.assertEqual(r.returncode, 1,
+                         "the guard refused but the SCRIPT did not abort:\n"
+                         f"stdout={r.stdout!r}")
+        self.assertIn("did not do the extra work", r.stderr)
+        self.assertNotIn(">> sparkinfer:  tok/s", r.stdout,
+                         "the empty echo means the script walked past the refusal")
+        self.assertNotIn("SCORED_TPS", r.stdout)
+
     def test_a_missing_reference_says_so_out_loud(self):
         """LLAMA_REF is 0 on a node/quant/context that has not been referenced yet. The
         ceiling cannot be computed, so the residual is open -- and a guard that quietly

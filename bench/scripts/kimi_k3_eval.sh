@@ -245,7 +245,17 @@ if [[ -z "$SELF_TPS" ]]; then
     exit 1
 fi
 
-read -r TPS MSTOK <<<"$(python3 - "$NS_LO" "$NS_HI" "$TOKENS_LO" "$TOKENS_HI" \
+# A GUARD THAT CANNOT ABORT IS COMMENTARY. This used to be
+#   read -r TPS MSTOK <<<"$(python3 ...)" || exit 1
+# and the `|| exit 1` binds to `read`, not to the substitution — bash discards the
+# substitution's exit status, and read returns 0 on the empty string a refusing guard
+# leaves behind. So the refusal printed its message and the script walked on with TPS=""
+# through the empty ">> sparkinfer:  tok/s" echo into label.py, which died on float('')
+# with a traceback that buried the actual reason. #64 hit exactly this on the guard's
+# first live firing: refused for a collapsed differential, then "eval failed —
+# ValueError" instead of the refusal being the last word. Capture first, so the exit
+# status is REAL; then parse.
+SPEED_VERDICT="$(python3 - "$NS_LO" "$NS_HI" "$TOKENS_LO" "$TOKENS_HI" \
                                  "$SELF_TPS" "$SELF_MS" "${KIMI_K3_SPEED_TOL:-1.5}" \
                                  "${KIMI_K3_WORK_TOL:-2.0}" "$LLAMA_REF" \
                                  "${KIMI_K3_MAX_OVER_LLAMA:-3.0}" "${KIMI_K3_JITTER_S:-2.0}" <<'PY'
@@ -328,6 +338,13 @@ else:
 print(f"{self_tps:.2f} {self_ms:.2f}")
 PY
 )" || exit 1
+read -r TPS MSTOK <<<"$SPEED_VERDICT"
+# Belt and braces: the guard prints exactly "TPS MSTOK" on success, so an empty parse here
+# means the wiring above regressed, not that the run was slow. Refuse rather than limp on.
+if [[ -z "$TPS" || -z "$MSTOK" ]]; then
+    echo "kimi_k3_eval: speed guard exited 0 but produced no verdict — wiring bug, not a measurement" >&2
+    exit 1
+fi
 echo ">> sparkinfer: $TPS tok/s ($MSTOK ms/token)  [self-timed, within the wall-clock bound]"
 
 # ---- 2. correctness -------------------------------------------------------
