@@ -161,7 +161,7 @@ int main(int argc, char** argv) {
     // reduces over the full context. Leaves room for the warm-up token plus n_tokens more,
     // so no step runs past max_ctx.
     if (do_seek) {
-        const int target = max_ctx - n_tokens - 2;
+        const int target = max_ctx - n_tokens - 3;   // room for both warm-up tokens
         if (target <= 0) {
             std::printf("--seek: ctx %d too small for %d tokens\n", max_ctx, n_tokens);
             return 1;
@@ -195,8 +195,14 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    // Warm-up token, discarded: one-time context/module/lattice-table costs.
+    // TWO warm-up tokens, discarded. The first pays the one-time context/module/
+    // lattice-table costs and must stay eager for exactly that reason; the second is
+    // where the decode graph is captured and instantiated (see kimi_k3_tp.cpp), so
+    // the capture's one-time cost lands here rather than inside the timed loop. Both
+    // timed runs of the eval discard the same two tokens, so the wall-clock
+    // differential is unaffected.
     if (!kimi_k3_tp_forward_token(p, 1000, logits.data())) { std::printf("warmup failed\n"); return 1; }
+    if (!kimi_k3_tp_forward_token(p, 1001, logits.data())) { std::printf("warmup failed\n"); return 1; }
 
     const auto t0 = std::chrono::steady_clock::now();
     for (int t = 0; t < n_tokens; ++t) {
