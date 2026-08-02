@@ -2069,6 +2069,80 @@ class CiWorkflowTest(unittest.TestCase):
         ok, _ = bot.eligibility(pr(crlf))
         self.assertTrue(ok, "CRLF line endings broke the section scan")
 
+    # ---- the accuracy gate was a floor, not a ratchet -----------------------------------
+    MAIN_KL = 0.0038673887147093475      # main measured this, three rounds running
+    PR74_KL = 0.0059102102093803194      # what #74 measured and merged on
+
+    def test_the_ratchet_sees_drift_the_absolute_bar_cannot(self):
+        """label.py asks "is KL under the bar?", never "is it worse than main?".
+
+        At K3's bars that is a lot of room: main measures 0.0038674 against KL_PREFER 0.02 and
+        KL_BAR 0.05, so a PR can degrade parity ~5x and pass CLEAN -- not even annotated. #74
+        did exactly that at 1.53x and merged with nothing said, moving main's baseline
+        permanently; the next 1.53x then lands at 0.0089 and also passes clean. About five
+        such merges fit under the warn line, each individually 'fine'.
+
+        The ratchet compares against what main measured THIS ROUND on THIS BOX."""
+        bot = self._bot()
+        m = self.MAIN_KL
+
+        self.assertEqual(bot.kl_ratchet(m, m)[0], "ok",
+                         "a bit-identical PR (#77, #81) must be silent")
+        verdict, ratio, note = bot.kl_ratchet(self.PR74_KL, m)
+        self.assertEqual(verdict, "warn", "#74's 1.53x regression was reported as clean again")
+        self.assertAlmostEqual(ratio, 1.528, places=2)
+        self.assertIn("1.53x", note)
+        self.assertIn("main", note)
+
+        # The bars themselves would have said nothing about any of these.
+        for mult, want in ((1.2499, "ok"), (1.25, "warn"), (1.9999, "warn"),
+                           (2.0, "reject"), (5.0, "reject")):
+            self.assertEqual(bot.kl_ratchet(m * mult, m)[0], want,
+                             f"{mult}x main classified wrong")
+            self.assertLess(m * mult, 0.05 if mult < 12 else 1e9,
+                            "test case is above the absolute bar, so it proves nothing new")
+
+    def test_the_ratchet_only_ever_adds_a_constraint(self):
+        """A missing baseline must not become a silent reject -- that would halt the loop on
+        the --frontier path, which deliberately skips measuring main. It degrades to "ok" with
+        an explicit note, and the absolute bars still apply underneath, unchanged."""
+        bot = self._bot()
+        for pr_kl, base, label in ((0.005, 0, "--frontier: no baseline"),
+                                   (0.005, None, "baseline missing"),
+                                   (None, self.MAIN_KL, "PR KL missing"),
+                                   ("abc", self.MAIN_KL, "unparseable"),
+                                   (0.005, -1, "nonsense baseline")):
+            verdict, _, note = bot.kl_ratchet(pr_kl, base)
+            self.assertEqual(verdict, "ok", f"{label} became a blocking verdict")
+            self.assertIn("unavailable", note, f"{label} did not say why")
+
+    def test_a_rejected_pr_cannot_be_merged_by_the_round(self):
+        """The label is the enforcement, so it has to be one the merge path already refuses."""
+        bot = self._bot()
+        self.assertIn(bot.KL_REGRESSION_LABEL, bot.NEVER_MERGE_LABELS)
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        loop = src[src.index("for pr in eligible:"):]
+        self.assertIn("kl_ratchet(", loop, "the ratchet is never evaluated in the round")
+        self.assertIn("--add-label", loop, "a rejected PR is never actually labelled")
+        # If the label cannot be applied, the PR must not merge anyway.
+        self.assertIn("unsafe_tier.add(num)",
+                      loop[loop.index("could not apply"):loop.index("could not apply") + 400],
+                      "a failed label left the PR mergeable — the guard would be advisory")
+
+    def test_parity_is_reported_even_when_it_passes(self):
+        """#74 passed every automated check silently. A number a human can see beats a
+        threshold nobody is told about, so the comment carries parity whatever the verdict."""
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        post = src[src.index("def post("):src.index("def publish_receipt")]
+        self.assertIn("parity", post)
+        self.assertIn("parity vs main", post, "the comment never shows the comparison")
+        loop = src[src.index("for pr in eligible:"):]
+        self.assertIn("parity=parity", loop, "post() is called without the parity it needs")
+        # --frontier must still define the baseline or the round dies on NameError.
+        head = src[src.index("if args.frontier is not None:"):src.index("for pr in eligible:")]
+        self.assertIn("main_kl = 0.0", head,
+                      "main_kl is unbound on the --frontier path — NameError mid-round")
+
     def test_a_transient_box_failure_does_not_discard_the_whole_round(self):
         """One frontier failure used to throw away every PR in the round.
 
