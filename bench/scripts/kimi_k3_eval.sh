@@ -407,9 +407,15 @@ print(json.dumps({
     "llama_commit": os.environ.get("KIMI_K3_LLAMACPP_COMMIT", ""),
     # How the two numbers that decide the tier were obtained. Both used to come from the
     # binary under test; a verifier reading the log could not tell, because nothing recorded
-    # it. "wall_clock" and "controller" are the trustworthy values -- anything else means
-    # the run was graded by the thing it was grading.
-    "speed_source": "wall_clock_differential",
+    # it.
+    #
+    # SAY WHAT ACTUALLY HAPPENED. This used to claim "wall_clock_differential" while the
+    # scored value is the binary's SELF-REPORT (admitted only inside the wall-clock window
+    # -- see step 1). A provenance field that asserts the trustworthy path regardless of
+    # which path ran is worse than no field: it teaches a log reader to stop checking.
+    # eval-label.yml now refuses any value it does not recognise, which is what makes this
+    # a record instead of a caption.
+    "speed_source": "self_report_wall_clock_bounded",
     "accuracy_source": acc_src or "on_box",
     "model_fingerprint": fp,
     "scored_ctx": int(ctx),

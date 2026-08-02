@@ -68,25 +68,46 @@ def load_trusted_keys(filepath: str) -> list:
         sys.exit(2)
 
 
-def verify_strict(receipt: dict, validator: ReceiptValidator) -> list:
-    """Additional strict-mode checks beyond the basic verification."""
+def verify_strict(receipt: dict, validator: ReceiptValidator,
+                  trusted_key_b64: str = "",
+                  require_pinned_clocks: bool = True) -> list:
+    """Additional strict-mode checks beyond the basic verification.
+
+    trusted_key_b64: when set, the receipt must verify against THIS key, not merely its own
+    embedded one. Without it a self-signed receipt is internally consistent and passes —
+    the signature proves integrity, not origin. eval-label.yml passes the repo's pinned
+    eval/polaris/sparkinfer_eval.pub.
+
+    require_pinned_clocks: the K3 eval box cannot lock GPU clocks in-container, so its
+    sealer records clocks_pinned=False honestly (kimi_k3_attest.py). Requiring the pin
+    there would reject every receipt the repo's own sealer produces; the caller that knows
+    the box relaxes it, and the measured clock stays recorded in the receipt either way.
+    """
     # The validator parameter was accepted and never used, so every caller passing
     # ReceiptValidator(r) was buying nothing: "verifies" meant five fields were non-empty.
     # Run it first and treat a signature failure as fatal.
+    #
+    # verify() returns (passed, results) -- a 2-tuple, which is ALWAYS truthy. Binding it to
+    # a single name restored exactly the hole this function was written to close: `if not
+    # ok` could never fire, so a receipt with a forged or absent signature passed strict
+    # verification on the strength of five non-empty fields. Unpack it, and carry the
+    # validator's own failing lines out so the reason is visible rather than summarised.
     problems = []
     try:
-        ok = validator.verify()
+        ok, checks = validator.verify(public_key_b64=trusted_key_b64 or None)
     except Exception as exc:                       # noqa: BLE001 - any failure is a failure
-        return ["signature check raised %s: %s" % (type(exc).__name__, exc)]
+        return ["✗ strict: signature check raised %s: %s" % (type(exc).__name__, exc)]
     if not ok:
-        problems.append("✗ strict: signature does not verify against the receipt public key")
+        problems.append("✗ strict: receipt does not verify against "
+                        + ("the trusted key" if trusted_key_b64 else "its own signature/hash"))
+        problems.extend(c for c in checks if c.startswith("✗"))
     issues = problems        # carry the signature verdict into the returned list
     a = receipt.get("attestation", {})
     e = a.get("environment", {})
     r = a.get("references", {})
 
-    # Clock must be pinned
-    if not e.get("clocks_pinned"):
+    # Clock must be pinned (unless the caller vouches for a box that cannot pin — see above)
+    if require_pinned_clocks and not e.get("clocks_pinned"):
         issues.append("✗ strict: clock was NOT pinned (clocks_pinned=false)")
 
     # Model SHA256 must be present

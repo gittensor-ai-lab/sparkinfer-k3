@@ -1812,6 +1812,59 @@ class CiWorkflowTest(unittest.TestCase):
         self.assertEqual(rc, 0, "an older payload without the bars was refused")
         self.assertIn("does not record kl_bar", err)
 
+    def test_speed_source_is_a_record_not_a_caption(self):
+        """The provenance used to hardcode speed_source="wall_clock_differential" while the
+        scored value is the binary's SELF-REPORT (bounded by the differential), and nothing
+        read the field -- so every payload asserted the trustworthy path, including any that
+        did not take it, and a log reader could not tell them apart.
+
+        Two halves make it a record: the harness writes what actually happened, and the
+        workflow refuses a value its guarded path does not produce. The legacy name stays
+        accepted -- it labels the same bounded path, misnamed -- so pre-rename payloads in
+        the log remain scorable."""
+        ev = (ROOT / "bench/scripts/kimi_k3_eval.sh").read_text()
+        self.assertIn('"speed_source": "self_report_wall_clock_bounded"', ev,
+                      "the harness must record the path that actually ran")
+        self.assertNotIn('"speed_source": "wall_clock_differential"', ev,
+                         "the misleading caption is back")
+        head = "8757caf10683484582b346663ee8944ac66e2e06"
+        base = {"tps": 4.2, "top1": 1.0, "kl": 0.001, "commit": head[:7]}
+        for src in ("self_report_wall_clock_bounded", "wall_clock_differential"):
+            rc, _, err = self._run_verdict({**base, "speed_source": src}, head)
+            self.assertEqual(rc, 0, f"speed_source={src} was refused:\n{err}")
+        rc, _, err = self._run_verdict({**base, "speed_source": "binary_self_report"}, head)
+        self.assertEqual(rc, 1, "an unrecognised speed_source was labelled anyway")
+        self.assertIn("speed_source", err)
+        rc, _, err = self._run_verdict(base, head)   # pre-recording payloads: warn only
+        self.assertEqual(rc, 0, "a payload without speed_source was refused")
+
+    def test_receipt_verification_enforces_the_repo_key_and_the_clock_policy(self):
+        """Three facts about the strict path, asserted where CI actually runs it:
+
+        1. verify_strict unpacks (passed, results) -- `ok = validator.verify()` bound the
+           whole 2-tuple, always truthy, so `if not ok` was dead and a forged signature
+           passed strict verification (behavioural proof lives in eval/polaris/
+           test_receipt.py::TestStrictVerification).
+        2. The workflow passes the repo's pinned key. Without it the signature is checked
+           against the receipt's own embedded key -- integrity, not origin -- and
+           eval/polaris/sparkinfer_eval.pub was committed but never loaded.
+        3. It relaxes exactly the clock check, because kimi_k3_attest.py honestly records
+           clocks_pinned=False (the box cannot lock clocks in-container). Default-strict
+           plus that sealer means REQUIRE_EVAL_RECEIPT=1 rejects every receipt the repo's
+           own sealer produces -- the flag would ship dead."""
+        src = (ROOT / "eval/polaris/verify.py").read_text()
+        self.assertIn("ok, checks = validator.verify(", src,
+                      "the (passed, results) tuple is bound to one name again")
+        wf = (ROOT / ".github/workflows/eval-label.yml").read_text()
+        self.assertIn('load_trusted_key("eval/polaris/sparkinfer_eval.pub")', wf,
+                      "the pinned key exists but the workflow never loads it")
+        self.assertIn("trusted_key_b64=key", wf)
+        self.assertIn("require_pinned_clocks=False", wf,
+                      "strict clock check + honest sealer = every K3 receipt rejected")
+        at = (ROOT / "bench/scripts/kimi_k3_attest.py").read_text()
+        self.assertIn("clocks_pinned=False", at,
+                      "the sealer must keep recording the truth, not start pinning on paper")
+
     # ---- clearing the previous round's tier -------------------------------------------
     def _bot(self):
         """Import the bot module itself. The structural tests read its source; this one has
