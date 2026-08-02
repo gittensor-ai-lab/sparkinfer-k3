@@ -798,12 +798,18 @@ int main() {
     test_mla_decode_attn(20000, 8);    std::printf("\n");
     // A WIDE COMBINE, which nothing above reaches.
     //
-    // The split count is min(want, n_ctx / kMlaMinSliceLen) capped by the budget,
-    // so at n_ctx 20,000 it lands around 39 whatever the cap is — every case above
-    // therefore merges a few dozen slices and would pass identically with the cap
-    // at 64 or at 512. Head-sharding MLA to 12 heads raises the budget to 512
-    // slices, and 128k of context is what actually asks for them: ~256 partials
+    // The split count is min(fill target, n_ctx / k3_mla_min_slice_len) capped by
+    // the budget, so at n_ctx 20,000 it lands on 39 whatever the cap is — every case
+    // above therefore merges a few dozen slices and would pass identically with the
+    // cap at 64 or at 512. Head-sharding MLA to 12 heads raises the budget to 512
+    // slices, and 128k of context is what actually asks for them: 256 partials
     // folded by one combine, each carrying its own max and sum-of-exp.
+    //
+    // Both of those counts were WRONG from the day they were written until the slice
+    // floor was derived: the flat kMlaMinSliceLen = 1024 halved them to 19 and 128.
+    // The comment described the coverage that was intended; the constant silently
+    // delivered half of it. They agree now, and k3_mla_min_slice_len's static_assert
+    // is what keeps them agreeing.
     //
     // This is the case that fails if the online-softmax rescale does not hold at
     // that width, and it exists because the end-to-end accuracy gate CANNOT see
