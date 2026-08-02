@@ -487,6 +487,20 @@ bool k3_proj_f32_x4(float* y0, float* y1, float* y2, float* y3, const float* x,
 //
 // This entry point preserves F32 weights exactly and applies llama's Q8_0 activation
 // conversion only for Q8_0 weights. q8_scratch must hold (K/32)*34 bytes.
+//
+// The two calls below are the same thing with the quantisation lifted out, for callers
+// that project the SAME activation several times: quantise once, then hand the buffer to
+// each consumer. K3 does exactly that 3-4 times per layer, and quantize_q8_0 is 7.9% of
+// GPU kernel time in 61,848 launches that mostly re-encode bytes already in the scratch.
+//
+// The buffer is a PARAMETER, not a cache keyed on `x`. The cached version of this
+// optimisation was tried, guarded on "was the scratch last written from this pointer?",
+// and produced top1 0.0 at a faster ms/token: the guard tracked the pointer the scratch
+// came from, never whether the bytes behind it still matched.
+bool k3_quantize_act_f32(void* q8_out, const float* x, int K, cudaStream_t stream);
+bool k3_proj_q8act_f32(float* y, const void* q8_act, const void* W, int wtype,
+                       int N, int K, cudaStream_t stream);
+
 bool k3_proj_ggml_f32(float* y, const float* x, const void* W, int wtype,
                       int N, int K, void* q8_scratch, cudaStream_t stream);
 
