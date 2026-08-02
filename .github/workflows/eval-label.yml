@@ -125,14 +125,26 @@ jobs:
           python3 - <<'PY'
           import json, sys
           sys.path.insert(0, "eval")
-          from polaris.verify import verify_strict
+          from polaris.verify import verify_strict, load_trusted_key
           from polaris.receipt import ReceiptValidator
           r = json.load(open("/tmp/receipt.json"))
-          problems = verify_strict(r, ReceiptValidator(r))
+          # THE TRUST ANCHOR IS THE REPO'S PINNED KEY, NOT THE RECEIPT'S OWN. A receipt
+          # carries its public_key so it stays verifiable after rotation, but checking a
+          # signature only against the embedded key proves integrity, not origin — anyone
+          # can mint a self-consistent receipt with a key they generated. The signer that
+          # counts is the eval bot, and its public key is committed here.
+          key = load_trusted_key("eval/polaris/sparkinfer_eval.pub")
+          # require_pinned_clocks=False: the K3 box cannot lock GPU clocks in-container,
+          # and its sealer says so honestly (kimi_k3_attest.py records clocks_pinned=False
+          # plus the measured MHz). Requiring the pin would reject every receipt the
+          # repo's own sealer produces; the tier basis is same-box llama.cpp, so the
+          # comparison survives an unpinned clock in a way a cross-box one would not.
+          problems = verify_strict(r, ReceiptValidator(r), trusted_key_b64=key,
+                                   require_pinned_clocks=False)
           if problems:
               # Under-provenanced is not the same as fraudulent, but it is not scorable
-              # either — an unpinned clock means the tok/s is not comparable to the
-              # frontier it is being scored against.
+              # either — a wrong signer or a missing model sha means nothing binds these
+              # numbers to a real run on the pinned weights.
               print("::error::receipt failed strict verification:")
               for p in problems:
                   print(f"  {p}")
@@ -229,8 +241,40 @@ jobs:
           # Same bars the harness used. label.py's defaults are the Qwen track's (0.20)
           # and must stay loose for it; K3 pins 0.05. If these two ever disagree the
           # workflow re-derives a different verdict from the same numbers.
-          env["SPARKINFER_KL_BAR"] = "0.05"
-          env["SPARKINFER_KL_PREFER"] = "0.02"
+          #
+          # THESE ARE THE TRUSTED VALUES. The harness's are env-overridable (KIMI_K3_KL_BAR),
+          # so a box can run with a looser bar and produce a verdict this job cannot
+          # reproduce. It records what it used, so check that FIRST -- otherwise the only
+          # symptom is a label mismatch blamed on an edited payload.
+          KL_BAR, KL_PREFER = "0.05", "0.02"
+          for key, pinned in (("kl_bar", KL_BAR), ("kl_prefer", KL_PREFER)):
+              used = d.get(key)
+              if used is None:
+                  print(f"::warning::payload does not record {key}; it predates the pin or "
+                        f"was produced by a different harness", file=sys.stderr)
+              elif abs(float(used) - float(pinned)) > 1e-9:
+                  print(f"::error::the node scored with {key}={used} but this repo pins "
+                        f"{pinned}. The verdict was computed under a different accuracy "
+                        f"policy — re-run the eval without KIMI_K3_{key.upper()} set.",
+                        file=sys.stderr)
+                  sys.exit(1)
+          env["SPARKINFER_KL_BAR"] = KL_BAR
+          env["SPARKINFER_KL_PREFER"] = KL_PREFER
+          # speed_source is only a record if a wrong value is refused. The harness writes
+          # the truthful name for its one measured path; "wall_clock_differential" is the
+          # same bounded path under its old (misleading) name, kept so pre-rename payloads
+          # in the log stay scorable. Anything else means the number was not produced by
+          # the harness's guarded path and must not be labelled.
+          SPEED_SOURCES_OK = {"self_report_wall_clock_bounded", "wall_clock_differential"}
+          src = d.get("speed_source")
+          if src is None:
+              print("::warning::payload does not record speed_source; it predates the "
+                    "recording or was produced by a different harness", file=sys.stderr)
+          elif src not in SPEED_SOURCES_OK:
+              print(f"::error::speed_source={src!r} is not a value the harness's guarded "
+                    f"path produces ({sorted(SPEED_SOURCES_OK)}). The speed was measured "
+                    f"some other way — refusing to label it.", file=sys.stderr)
+              sys.exit(1)
           out = subprocess.run(
               [sys.executable, "bench/scripts/label.py", str(d["tps"]), str(frontier),
                "0", str(d["top1"]), str(d["kl"]), str(d["commit"])],

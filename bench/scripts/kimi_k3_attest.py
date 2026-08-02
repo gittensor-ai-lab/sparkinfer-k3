@@ -168,7 +168,11 @@ def main():
     b.set_environment(eval_mode=f"kimi_k3/{args.node}",
                       decode_tokens=int(prov.get("layers") or 0),
                       gpu_name=name, gpu_arch=arch,
-                      clocks_pinned=False,          # measured: could not lock in-container
+                      # Honest: the box cannot lock clocks in-container, and lying here
+                      # would defeat the receipt. Verifiers that know this box relax the
+                      # strict clock check instead (verify_strict(require_pinned_clocks=
+                      # False) in eval-label.yml); the measured MHz stays recorded.
+                      clocks_pinned=False,
                       clock_mhz=clk, clock_spread_mhz=0, pin_target_mhz=0,
                       cuda_version=os.environ.get("CUDA_VERSION", ""),
                       driver_version=drv)

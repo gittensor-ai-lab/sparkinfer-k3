@@ -444,5 +444,95 @@ class TestCanonicalizationEdgeCases(unittest.TestCase):
         self.assertIsInstance(c, bytes)
 
 
+class TestStrictVerification(unittest.TestCase):
+    """verify_strict is the ONLY verification eval-label.yml runs once
+    REQUIRE_EVAL_RECEIPT=1: it calls verify_strict(r, ReceiptValidator(r), ...) and labels
+    the PR if the returned list is empty. Nothing else in that job checks a signature."""
+
+    def setUp(self):
+        from eval.polaris.verify import verify_strict
+        self.verify_strict = verify_strict
+        self.priv, self.pub = generate_keypair()
+        self.pub_b64 = base64.b64encode(self.pub).decode("ascii")
+
+    def _receipt(self):
+        return build_receipt(build_sample_attestation(), self.priv)
+
+    def test_intact_receipt_passes_strict(self):
+        r = self._receipt()
+        self.assertEqual(self.verify_strict(r, ReceiptValidator(r)), [])
+
+    def test_forged_signature_is_rejected(self):
+        """`ok = validator.verify()` bound the whole (passed, results) 2-tuple to one name.
+        A non-empty tuple is always truthy, so `if not ok` was unreachable and a receipt
+        with a garbage signature verified on the strength of five non-empty fields."""
+        r = self._receipt()
+        r["signature"] = base64.b64encode(b"\x00" * 64).decode("ascii")
+        problems = self.verify_strict(r, ReceiptValidator(r))
+        self.assertTrue(problems, "a forged signature passed strict verification")
+        self.assertTrue(any("signature" in p.lower() for p in problems), problems)
+
+    def test_tampered_measurement_is_rejected(self):
+        """The tier is the thing worth forging: sign an honest run, then edit the tok/s."""
+        r = self._receipt()
+        r["attestation"]["verdict"]["tps"] = 9999.0
+        self.assertTrue(self.verify_strict(r, ReceiptValidator(r)),
+                        "an edited tok/s passed strict verification")
+
+    def test_unsigned_receipt_is_rejected(self):
+        r = self._receipt()
+        del r["signature"]
+        self.assertTrue(self.verify_strict(r, ReceiptValidator(r)),
+                        "an unsigned receipt passed strict verification")
+
+    def test_every_problem_is_marked_failing(self):
+        """verify.py's main() only flips `passed` for lines starting with ✗, so a problem
+        reported without the marker is printed and then ignored."""
+        r = self._receipt()
+        r["signature"] = "not base64 @@@"
+        for p in self.verify_strict(r, ReceiptValidator(r)):
+            self.assertTrue(p.startswith("✗"), f"problem not marked as a failure: {p}")
+
+    def test_self_signed_receipt_fails_against_the_trusted_key(self):
+        """A signature checked only against the receipt's own embedded key proves integrity,
+        not origin: anyone can mint a self-consistent receipt with a key they generated.
+        With trusted_key_b64 set, the signer has to be the pinned eval bot."""
+        other_priv, _ = generate_keypair()
+        r = build_receipt(build_sample_attestation(), other_priv)   # valid, wrong signer
+        self.assertEqual(self.verify_strict(r, ReceiptValidator(r)), [],
+                         "premise: a self-signed receipt is internally consistent")
+        problems = self.verify_strict(r, ReceiptValidator(r), trusted_key_b64=self.pub_b64)
+        self.assertTrue(problems, "a receipt from an untrusted signer passed strict")
+        # ... and the RIGHT signer still passes with the key enforced
+        r = self._receipt()
+        self.assertEqual(
+            self.verify_strict(r, ReceiptValidator(r), trusted_key_b64=self.pub_b64), [])
+
+    def test_repo_pinned_key_is_loadable(self):
+        """eval-label.yml trusts eval/polaris/sparkinfer_eval.pub. The file has comment
+        lines; load_trusted_key must skip them and return valid base64 of 32 bytes."""
+        from eval.polaris.verify import load_trusted_key
+        key = load_trusted_key(os.path.join(os.path.dirname(__file__), "sparkinfer_eval.pub"))
+        self.assertEqual(len(base64.b64decode(key)), 32)
+
+    def test_unpinned_clock_policy_is_explicit(self):
+        """kimi_k3_attest.py records clocks_pinned=False because the K3 box cannot lock
+        clocks in-container -- honestly. Default strict rejects that (right for boxes that
+        CAN pin); the caller that knows the box relaxes exactly this one check and nothing
+        else."""
+        att = build_sample_attestation()
+        att["environment"]["clocks_pinned"] = False
+        r = build_receipt(att, self.priv)
+        strict = self.verify_strict(r, ReceiptValidator(r))
+        self.assertTrue(any("NOT pinned" in p for p in strict))
+        relaxed = self.verify_strict(r, ReceiptValidator(r), require_pinned_clocks=False)
+        self.assertEqual(relaxed, [], relaxed)
+        # the relaxation must not swallow a real failure
+        r["signature"] = base64.b64encode(b"\x00" * 64).decode("ascii")
+        self.assertTrue(self.verify_strict(r, ReceiptValidator(r),
+                                           require_pinned_clocks=False),
+                        "require_pinned_clocks=False also relaxed the signature check")
+
+
 if __name__ == "__main__":
     unittest.main()

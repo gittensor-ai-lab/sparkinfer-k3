@@ -1208,7 +1208,7 @@ class CiWorkflowTest(unittest.TestCase):
         the repo root -- meant a bench could open bench/refdata/hello.spkl and write it back
         out as its own --logits dump: top1 1.0, KL 0.0, no work done. Nothing rejected a
         suspiciously exact result either, since label.py only bounds top1 >= 0.90 and
-        KL <= 0.01 while honest main measures 0.004."""
+        KL <= 0.05 while honest main measures 0.004."""
         src = (ROOT / "eval/k3_eval_bot.py").read_text()
         self.assertIn("git checkout -q origin/main -- bench/scripts", src,
                       "the bot grades with the PR's own harness")
@@ -1431,19 +1431,142 @@ class CiWorkflowTest(unittest.TestCase):
         tok/s self-reported against 3.45 measured, and the harness refused itself. The
         margin is a fixed, much larger token count now so the signal dominates the jitter.
 
-        The bound is ONE-SIDED on purpose: jitter only ever makes the differential read
-        slower than truth, so a self-report below it is never suspicious. Only a claim
-        FASTER than elapsed time allows is evidence."""
+        Jitter is one-directional -- it only ever makes the differential read SLOWER than
+        truth -- so the two sides of the bound are not symmetric. `self_tps > ext_tps * tol`
+        catches a claim faster than elapsed time; `ext_tps > self_tps * work_tol` catches a
+        differential too CHEAP to be 128 tokens of decode. See
+        test_the_longer_run_must_do_the_extra_work for why the second one is not optional."""
         ev = (ROOT / "bench/scripts/kimi_k3_eval.sh").read_text()
         speed = ev[ev.index("# ---- 1. speed"):ev.index("# ---- 2. correctness")]
         self.assertIn("MARGIN_TOKENS=", speed,
                       "a multiple of TOKENS gives a signal smaller than the load jitter")
         self.assertNotIn("TOKENS * 3", speed)
-        self.assertIn("self_tps > ext_tps * tol", speed, "the bound must be one-sided")
+        self.assertIn("self_tps > ext_tps * tol", speed,
+                      "a claim faster than elapsed time must be rejected")
         self.assertIn('print(f"{self_tps:.2f} {self_ms:.2f}")', speed,
                       "the SELF-REPORT is what gets scored; the differential only bounds it")
         # a missing self-report is fatal -- there is nothing to score
         self.assertIn("reported no ms/token line", speed)
+
+    # ---- the speed guard, exercised rather than read -----------------------------------
+    def _speed_guard(self):
+        """Extract the speed heredoc out of kimi_k3_eval.sh so the test runs the code that
+        actually gates a PR, not a paraphrase of it that can drift."""
+        import tempfile
+        ev = (ROOT / "bench/scripts/kimi_k3_eval.sh").read_text()
+        body = ev[ev.index("<<'PY'\nimport sys"):]
+        body = body[body.index("\n") + 1:body.index("\nPY\n")]
+        f = tempfile.NamedTemporaryFile("w", suffix=".py", delete=False)
+        f.write(body); f.close()
+        return f.name
+
+    def _run_guard(self, ns_lo, ns_hi, n_lo, n_hi, self_tps, self_ms,
+                   tol="1.5", work_tol="2.0", llama_ref="16.70",
+                   max_over_llama="3.0", jitter_s="2.0"):
+        return subprocess.run(
+            [sys.executable, self._speed_guard(), str(int(ns_lo)), str(int(ns_hi)),
+             str(n_lo), str(n_hi), str(self_tps), str(self_ms), tol, work_tol,
+             llama_ref, max_over_llama, jitter_s], capture_output=True, text=True)
+
+    def test_the_longer_run_must_do_the_extra_work(self):
+        """THE DIFFERENTIAL ONLY BOUNDS A CLAIM IF THE SECOND RUN DECODED THE EXTRA TOKENS.
+
+        n_tokens is argv[4] of a binary built from the PR's own runtime/. Nothing compels it
+        to be honoured, and a bench that ignores it does identical work in both runs: d_ns
+        collapses to load jitter, ext_tps goes to (nearly) infinity, and `self_tps > ext_tps
+        * tol` passes for ANY claim. The upper bound alone is neutered by doing LESS work,
+        which is the one thing it cannot notice.
+
+        Honest numbers below are main's 128k reality: ~1 tok/s, so 128 marginal tokens is
+        ~128 s of wall clock on top of a ~150 s load."""
+        LOAD, HONEST_MS = 150e9, 1000.0          # 150 s load, 1.00 s/token
+        honest_hi = LOAD + 8e9 + 128e9           # the 128 marginal tokens actually happen
+
+        rc = self._run_guard(LOAD + 8e9, honest_hi, 8, 136, 1.0, HONEST_MS)
+        self.assertEqual(rc.returncode, 0, f"an honest run was refused:\n{rc.stderr}")
+        self.assertEqual(rc.stdout.split()[0], "1.00", "the self-report must be what is scored")
+
+        # THE ATTACK: both runs decode 8 tokens, so the difference is load jitter alone
+        # (1.2 s). 128 "marginal" tokens over 1.2 s reads as 106 tok/s, so the ceiling the
+        # one-sided bound computes is ~160 -- and the claim below is 40 tok/s, forty times
+        # the truth and comfortably underneath it.
+        attack = dict(ns_lo=LOAD + 8e9, ns_hi=LOAD + 8e9 + 1.2e9, n_lo=8, n_hi=136,
+                      self_tps=40.0, self_ms=25.0)
+
+        # First: show the one-sided bound really does wave it through (work_tol off).
+        rc = self._run_guard(**attack, work_tol="1e9", max_over_llama="1e9")
+        self.assertEqual(rc.returncode, 0, "the premise of this test no longer holds")
+        self.assertEqual(rc.stdout.split()[0], "40.00", "the fabricated claim was scored")
+
+        rc = self._run_guard(**attack)
+        self.assertEqual(rc.returncode, 1,
+                         "a run where the longer pass did no extra work was scored:\n"
+                         f"stdout={rc.stdout!r}")
+        self.assertIn("did not do the extra work", rc.stderr)
+
+        # ... and the same collapse cannot be laundered by claiming a modest number either:
+        # the floor scales with the claim, so 5 tok/s still needs ~12.8 s of marginal time.
+        rc = self._run_guard(LOAD + 8e9, LOAD + 8e9 + 1.2e9, 8, 136, 5.0, 200.0)
+        self.assertEqual(rc.returncode, 1, "a collapsed differential passed with a small claim")
+
+    def test_the_two_guards_leave_no_band_uncovered(self):
+        """A timing guard can only bound a claim in proportion to the time that claim
+        implies: 128 tokens at 1 tok/s is 128 s of evidence, at 500 tok/s it is 0.26 s, which
+        load jitter supplies for free. The work check therefore stops biting above
+        MARGIN_TOKENS/(jitter*work_tol), and the band above THAT is closed by plausibility --
+        a claim past a few multiples of llama.cpp is refused outright, because label.py
+        saturates at XL long before it and nothing here can tell 50x from a printf.
+
+        The defaults must overlap. If the ceiling sat above the crossover there would be a
+        band where a fabricated claim is both timing-free and scorable, which is the original
+        hole in a narrower window."""
+        MARGIN, JITTER, WORK_TOL, LLAMA, MULT = 128, 2.0, 2.0, 16.70, 3.0
+        crossover = MARGIN / (JITTER * WORK_TOL)      # 32 tok/s: timing stops being evidence
+        ceiling = LLAMA * MULT                        # 50.1 tok/s: plausibility takes over
+        self.assertLessEqual(
+            ceiling, crossover * 2,
+            f"defaults leave a {crossover:.0f}-{ceiling:.0f} tok/s band that is neither "
+            "timed nor bounded by the reference")
+
+        LOAD = 150e9
+        # A claim inside the free-timing band is still refused, by the ceiling.
+        rc = self._run_guard(LOAD + 8e9, LOAD + 8e9 + 1.2e9, 8, 136, 120.0, 8.33)
+        self.assertEqual(rc.returncode, 1, "a 7x-llama claim rode the jitter into a tier")
+        self.assertIn("llama.cpp reference", rc.stderr)
+
+        # And an honest run that genuinely beats llama.cpp by a normal margin is untouched.
+        rc = self._run_guard(LOAD + 8e9, LOAD + 8e9 + 6.4e9, 8, 136, 20.0, 50.0)
+        self.assertEqual(rc.returncode, 0, f"a real 20 tok/s run was refused:\n{rc.stderr}")
+
+    def test_jitter_never_trips_the_work_check(self):
+        """Load jitter INFLATES d_ns (the differential reads slower than truth), so it can
+        only make the work check pass more easily. The check must therefore never fire on an
+        honest run, however unlucky the load -- a false refusal here costs a real PR its
+        tier, which is exactly how the 8-and-24-token version broke on trusted main."""
+        LOAD, MS = 150e9, 1000.0
+        for jitter_s in (-2, -1, 0, 1, 2, 5):
+            rc = self._run_guard(LOAD + 8e9, LOAD + 8e9 + 128e9 + jitter_s * 1e9,
+                                 8, 136, 1.0, MS)
+            self.assertEqual(rc.returncode, 0,
+                             f"{jitter_s:+} s of load jitter refused an honest run:\n{rc.stderr}")
+
+    def test_a_faster_claim_than_elapsed_time_is_still_refused(self):
+        """The original one-sided check must survive the second side being added."""
+        LOAD = 150e9
+        rc = self._run_guard(LOAD + 8e9, LOAD + 8e9 + 128e9, 8, 136, 4.0, 250.0)
+        self.assertEqual(rc.returncode, 1, "a 4x-over-wall-clock claim was scored")
+        self.assertIn("wall clock allows at most", rc.stderr)
+
+    def test_a_missing_reference_says_so_out_loud(self):
+        """LLAMA_REF is 0 on a node/quant/context that has not been referenced yet. The
+        ceiling cannot be computed, so the residual is open -- and a guard that quietly
+        degrades to nothing is worse than one that says it did."""
+        LOAD = 150e9
+        rc = self._run_guard(LOAD + 8e9, LOAD + 8e9 + 128e9, 8, 136, 1.0, 1000.0,
+                             llama_ref="0")
+        self.assertEqual(rc.returncode, 0)
+        self.assertIn("no llama.cpp reference", rc.stderr)
+        self.assertIn("unguarded", rc.stderr)
 
     def test_polaris_key_is_kept_out_of_the_benchs_environment(self):
         """`. /root/.polaris_env` exports POLARIS_API_KEY, and every child inherits it --
@@ -1623,7 +1746,7 @@ class CiWorkflowTest(unittest.TestCase):
         The shell this replaced ran it with `|| true` and read the JSON. Porting it to
         Python without that turned every round into "compare_logits failed" with an empty
         stderr -- which is exactly how the first hardened round died. The gate that decides
-        anything is label.py's (top1 >= 0.90, kl <= 0.01), applied downstream."""
+        anything is label.py's (top1 >= 0.90, kl <= 0.05), applied downstream."""
         src = (ROOT / "eval/k3_eval_bot.py").read_text()
         acc = src[src.index("def measure_accuracy("):src.index("def _box_eval(")]
         self.assertNotIn("if p.returncode != 0 or not", acc,
@@ -1648,15 +1771,209 @@ class CiWorkflowTest(unittest.TestCase):
         about the frontier -- and it would surface as 'reported label != re-derived'.
 
         Why tighter than the default matters: K3's main measures 0.004046, so under 0.20 a PR
-        could degrade parity forty-fold and still pass clean. #63 doubled the KLD to 0.008075
-        and no automated check said a word."""
+        could degrade parity forty-fold and still pass clean; 0.05 bounds that at ~12x.
+
+        It does NOT catch #63 and this test does not claim it does -- 0.008075 is under both
+        0.05 and the 0.02 soft flag, so that PR would pass clean and unflagged today. A floor
+        bounds the worst case; only a ratchet against measured parity detects a regression.
+        See the KL_BAR comment in label.py."""
         ev = (ROOT / "bench/scripts/kimi_k3_eval.sh").read_text()
-        self.assertIn('SPARKINFER_KL_BAR="${KIMI_K3_KL_BAR:-0.05}"', ev)
-        self.assertIn('SPARKINFER_KL_PREFER="${KIMI_K3_KL_PREFER:-0.02}"', ev)
+        self.assertIn('KL_BAR="${KIMI_K3_KL_BAR:-0.05}"', ev)
+        self.assertIn('KL_PREFER="${KIMI_K3_KL_PREFER:-0.02}"', ev)
+        self.assertIn('SPARKINFER_KL_BAR="$KL_BAR"', ev,
+                      "the bar label.py is given must be the one recorded in provenance")
+        self.assertIn('SPARKINFER_KL_PREFER="$KL_PREFER"', ev)
         wf = (ROOT / ".github/workflows/eval-label.yml").read_text()
-        self.assertIn('env["SPARKINFER_KL_BAR"] = "0.05"', wf,
+        self.assertIn('KL_BAR, KL_PREFER = "0.05", "0.02"', wf,
                       "the trusted re-derivation would use the Qwen default and disagree")
-        self.assertIn('env["SPARKINFER_KL_PREFER"] = "0.02"', wf)
+
+    def test_a_moved_kl_knob_names_itself(self):
+        """The harness bar is env-overridable and the workflow's is pinned, so a box running
+        with KIMI_K3_KL_BAR set produces a verdict the trusted side cannot reproduce. Left to
+        the label comparison it surfaces as 'payload edited or harness version mismatch' --
+        naming the two things that are not wrong. The harness records the bars it used and
+        the workflow checks them first, so the message names the knob."""
+        ev = (ROOT / "bench/scripts/kimi_k3_eval.sh").read_text()
+        self.assertIn('"kl_bar": float(kl_bar)', ev, "the bars are not recorded in provenance")
+        lbl = (ROOT / "bench/scripts/label.py").read_text()
+        self.assertNotIn('"kl_bar"', lbl.split("_VERDICT_KEYS = ")[1].split("}")[0],
+                         "kl_bar in the allowlist would let a payload set its own bar")
+        head = "8757caf10683484582b346663ee8944ac66e2e06"
+        base = {"tps": 4.2, "top1": 1.0, "kl": 0.001, "commit": head[:7]}
+        rc, _, err = self._run_verdict({**base, "kl_bar": 0.05, "kl_prefer": 0.02}, head)
+        self.assertEqual(rc, 0, f"a run on the pinned bars was refused:\n{err}")
+        rc, _, err = self._run_verdict({**base, "kl_bar": 0.20, "kl_prefer": 0.15}, head)
+        self.assertEqual(rc, 1, "a run scored under a looser bar was labelled anyway")
+        self.assertIn("kl_bar=0.2", err)
+        self.assertIn("KIMI_K3_KL_BAR", err, "the error must name the knob to unset")
+        # A payload from before the pin is warned about, not refused -- it would block every
+        # in-flight PR the moment this lands.
+        rc, _, err = self._run_verdict(base, head)
+        self.assertEqual(rc, 0, "an older payload without the bars was refused")
+        self.assertIn("does not record kl_bar", err)
+
+    def test_speed_source_is_a_record_not_a_caption(self):
+        """The provenance used to hardcode speed_source="wall_clock_differential" while the
+        scored value is the binary's SELF-REPORT (bounded by the differential), and nothing
+        read the field -- so every payload asserted the trustworthy path, including any that
+        did not take it, and a log reader could not tell them apart.
+
+        Two halves make it a record: the harness writes what actually happened, and the
+        workflow refuses a value its guarded path does not produce. The legacy name stays
+        accepted -- it labels the same bounded path, misnamed -- so pre-rename payloads in
+        the log remain scorable."""
+        ev = (ROOT / "bench/scripts/kimi_k3_eval.sh").read_text()
+        self.assertIn('"speed_source": "self_report_wall_clock_bounded"', ev,
+                      "the harness must record the path that actually ran")
+        self.assertNotIn('"speed_source": "wall_clock_differential"', ev,
+                         "the misleading caption is back")
+        head = "8757caf10683484582b346663ee8944ac66e2e06"
+        base = {"tps": 4.2, "top1": 1.0, "kl": 0.001, "commit": head[:7]}
+        for src in ("self_report_wall_clock_bounded", "wall_clock_differential"):
+            rc, _, err = self._run_verdict({**base, "speed_source": src}, head)
+            self.assertEqual(rc, 0, f"speed_source={src} was refused:\n{err}")
+        rc, _, err = self._run_verdict({**base, "speed_source": "binary_self_report"}, head)
+        self.assertEqual(rc, 1, "an unrecognised speed_source was labelled anyway")
+        self.assertIn("speed_source", err)
+        rc, _, err = self._run_verdict(base, head)   # pre-recording payloads: warn only
+        self.assertEqual(rc, 0, "a payload without speed_source was refused")
+
+    def test_receipt_verification_enforces_the_repo_key_and_the_clock_policy(self):
+        """Three facts about the strict path, asserted where CI actually runs it:
+
+        1. verify_strict unpacks (passed, results) -- `ok = validator.verify()` bound the
+           whole 2-tuple, always truthy, so `if not ok` was dead and a forged signature
+           passed strict verification (behavioural proof lives in eval/polaris/
+           test_receipt.py::TestStrictVerification).
+        2. The workflow passes the repo's pinned key. Without it the signature is checked
+           against the receipt's own embedded key -- integrity, not origin -- and
+           eval/polaris/sparkinfer_eval.pub was committed but never loaded.
+        3. It relaxes exactly the clock check, because kimi_k3_attest.py honestly records
+           clocks_pinned=False (the box cannot lock clocks in-container). Default-strict
+           plus that sealer means REQUIRE_EVAL_RECEIPT=1 rejects every receipt the repo's
+           own sealer produces -- the flag would ship dead."""
+        src = (ROOT / "eval/polaris/verify.py").read_text()
+        self.assertIn("ok, checks = validator.verify(", src,
+                      "the (passed, results) tuple is bound to one name again")
+        wf = (ROOT / ".github/workflows/eval-label.yml").read_text()
+        self.assertIn('load_trusted_key("eval/polaris/sparkinfer_eval.pub")', wf,
+                      "the pinned key exists but the workflow never loads it")
+        self.assertIn("trusted_key_b64=key", wf)
+        self.assertIn("require_pinned_clocks=False", wf,
+                      "strict clock check + honest sealer = every K3 receipt rejected")
+        at = (ROOT / "bench/scripts/kimi_k3_attest.py").read_text()
+        self.assertIn("clocks_pinned=False", at,
+                      "the sealer must keep recording the truth, not start pinning on paper")
+
+    # ---- clearing the previous round's tier -------------------------------------------
+    def _bot(self):
+        """Import the bot module itself. The structural tests read its source; this one has
+        to run the function, because the bug it guards is that a call SUCCEEDS on paper."""
+        import importlib
+        sys.path.insert(0, str(ROOT / "eval"))
+        try:
+            return importlib.import_module("k3_eval_bot")
+        finally:
+            sys.path.pop(0)
+
+    def _with_fake_gh(self, bot, labels, delete_rc, after=None):
+        """Patch gh/_pr_state; returns (calls, restore). `after` is the label list the second
+        _pr_state read sees — i.e. whether the DELETE actually took effect."""
+        calls, state = [], {"n": 0}
+        seen = [labels] if after is None else [labels, after]
+
+        def fake_gh(args, timeout=120):
+            calls.append(args)
+            return subprocess.CompletedProcess(
+                args, delete_rc, stdout="",
+                stderr="" if delete_rc == 0 else "gh: Resource not accessible (HTTP 403)")
+
+        def fake_state(repo, num):
+            i = min(state["n"], len(seen) - 1)
+            state["n"] += 1
+            return {} if seen[i] is None else {"labels": [{"name": n} for n in seen[i]]}
+
+        old = (bot.gh, bot._pr_state)
+        bot.gh, bot._pr_state = fake_gh, fake_state
+        return calls, lambda: (setattr(bot, "gh", old[0]), setattr(bot, "_pr_state", old[1]))
+
+    def test_clearing_a_stale_tier_is_verified_not_assumed(self):
+        """THE RETURN VALUE IS THE WHOLE GUARANTEE. gh() hands back a CompletedProcess and
+        does not raise, so an unchecked DELETE loop treats a 403 exactly like a success: it
+        printed 'cleared stale tier' over a label that was still on the PR, wait_for_tier
+        returned it on the first poll, and the merge decision was taken on the previous
+        round's number -- #59, with a log line asserting it had been prevented.
+
+        Three states, three answers: cleared (True), still there (False), unreadable
+        (False). Only the first may let a PR into the merge decision."""
+        bot = self._bot()
+
+        # 1. the DELETE works and the re-read confirms it
+        calls, restore = self._with_fake_gh(bot, ["eval:none", "perf"], 0, after=["perf"])
+        try:
+            self.assertIs(bot.clear_stale_tier("o/r", 59, dry_run=False), True)
+            self.assertEqual(len(calls), 1, "one DELETE for one eval:* label")
+            self.assertIn("eval%3Anone", calls[0][-1], "the colon must be percent-encoded")
+        finally:
+            restore()
+
+        # 2. the DELETE is refused and the label survives -- the case that used to print
+        #    success. Nothing about the exit code is trusted here: the re-read decides.
+        calls, restore = self._with_fake_gh(bot, ["eval:xl"], 1, after=["eval:xl"])
+        try:
+            self.assertIs(bot.clear_stale_tier("o/r", 59, dry_run=False), False,
+                          "a stale tier that survived the DELETE was reported as cleared")
+        finally:
+            restore()
+
+        # 3. someone else removed it first: the DELETE 404s but the PR is clean, which is
+        #    the outcome we wanted. Exit codes would call this a failure.
+        calls, restore = self._with_fake_gh(bot, ["eval:xs"], 1, after=[])
+        try:
+            self.assertIs(bot.clear_stale_tier("o/r", 59, dry_run=False), True)
+        finally:
+            restore()
+
+        # 4. the state cannot be read at all. "No labels" is not the same as "cannot tell".
+        calls, restore = self._with_fake_gh(bot, None, 0)
+        try:
+            self.assertIs(bot.clear_stale_tier("o/r", 59, dry_run=False), False,
+                          "an unreadable PR state was treated as having no stale tier")
+            self.assertEqual(calls, [], "nothing should be deleted on an unreadable state")
+        finally:
+            restore()
+
+        # 5. no stale tier, and a dry run: both clean, neither writes.
+        calls, restore = self._with_fake_gh(bot, ["perf"], 0)
+        try:
+            self.assertIs(bot.clear_stale_tier("o/r", 59, dry_run=False), True)
+            self.assertEqual(calls, [])
+        finally:
+            restore()
+        calls, restore = self._with_fake_gh(bot, ["eval:l"], 0)
+        try:
+            self.assertIs(bot.clear_stale_tier("o/r", 59, dry_run=True), True)
+            self.assertEqual(calls, [], "dry-run deleted a label")
+        finally:
+            restore()
+
+    def test_an_uncleared_tier_keeps_the_pr_out_of_the_merge_decision(self):
+        """merge_blockers only asks whether SOME eval:* label is present, so on a PR whose
+        previous tier could not be cleared a stale one satisfies it. The round still
+        evaluates, posts and seals that PR -- the measurement is fine -- but it must not be
+        the winner. Asserted structurally: the merge path reads a filtered list."""
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        self.assertIn("tier_cleared = clear_stale_tier(", src,
+                      "the return value is discarded, which is the bug it exists to report")
+        self.assertIn("unsafe_tier.add(num)", src)
+        self.assertIn("mergeable = [r for r in results if r[0] not in unsafe_tier]", src)
+        self.assertIn("mark_merge_first(args.repo, mergeable", src,
+                      "merge-first still ranks a PR carrying a stale tier")
+        self.assertIn("max(mergeable, key=", src,
+                      "the winner is still picked from unfiltered results")
+        # and the round log / sealing still see everything
+        self.assertIn("for num, r in results:", src,
+                      "excluding from the merge must not exclude from the receipt check")
 
     def test_a_failed_round_still_has_a_log_path(self):
         """rounds/<main_sha>/ exists for the round that seals nothing -- and the first one
