@@ -5,8 +5,8 @@
 
 Emits one line:  RESULT_JSON {...}
 
-- Correctness gate first: top-1 token agreement >= 0.90 and KL <= 0.20 (preferred <= 0.15), else
-  REJECT (score 0). A pass with KL above the preferred 0.15 is flagged `accuracy_warn` — accuracy is
+- Correctness gate first: top-1 token agreement >= 0.90 and KL <= KL_BAR (default 0.20, K3 pins
+  0.05), else REJECT (score 0). A pass above KL_PREFER is flagged `accuracy_warn` — accuracy is
   first; a speed gain that erodes parity with llama.cpp is not worth taking.
 - Significance gate: the gain must exceed SIG (2% of the frontier, a CI/noise proxy), else "none".
   A gain that clears it floors at XS (verified but small); "none" always means "not verified".
@@ -46,11 +46,26 @@ prov     = json.loads(sys.argv[7]) if len(sys.argv) > 7 and sys.argv[7] else {}
 # erodes it is REJECTed regardless of speed. KL_BAR is the HARD reject ceiling; KL_PREFER the soft
 # target — a pass above it is flagged.
 #
-# These STRICT bars hold on the held-out prompts (H1) because the KL metric was fixed: it now dumps a
-# deep sparkinfer top-k so llama's tail isn't floored (see accuracy.sh / accuracy_compare.py). Before
-# the fix the gate read KL 0.14–0.33 on diverse prompts (a truncation artifact) and seemed to need
-# loosening; with matched-depth measurement the TRUE divergence is ~0.01–0.03 (top-1 0.96–0.98), so
-# the original 0.20 ceiling holds with large margin. Don't loosen these to paper over a metric bug.
+# The bars are only meaningful if the METRIC is right. An earlier gate read KL 0.14-0.33 on diverse
+# prompts and looked like it needed loosening; that was a truncation artifact, fixed by dumping a deep
+# sparkinfer top-k so llama's tail is not floored (see accuracy.sh / accuracy_compare.py). Do not
+# loosen these to paper over a metric bug -- if the number looks wrong, suspect the measurement first.
+# THESE DEFAULTS ARE THE QWEN TRACK'S, AND MUST STAY LOOSE. label.py is shared: honest Qwen
+# runs measure KL 0.0175-0.03, so tightening the DEFAULT to K3's policy would REJECT every
+# one of them. Per-model policy belongs where that model is scored, which is what the env
+# overrides are for -- kimi_k3_eval.sh pins K3's bar, and eval-label.yml pins the same one
+# when it re-derives, because a bot and a workflow disagreeing about REJECT is the same
+# class of bug as disagreeing about the frontier.
+#
+# K3 pins 0.05 (operator policy). It matters that this is much tighter than the default:
+# K3's main measures 0.004046, so under 0.20 a PR could degrade parity FORTY-FOLD and still
+# pass clean -- and with KL_PREFER 0.15 it would not even be annotated. That gap surfaced on
+# #63, which doubled the KLD to 0.008075, passed every automated check silently, and was
+# caught only because a human read the number.
+#
+# Either way the gate is a FLOOR, not a ratchet: it asks "under the bar?", never "worse than
+# main?". A ratchet against current measured parity would be the stronger rule and is a
+# governance decision rather than a constant.
 TOP1_BAR  = float(os.environ.get("SPARKINFER_TOP1_BAR",  "0.90"))
 KL_BAR    = float(os.environ.get("SPARKINFER_KL_BAR",    "0.20"))
 KL_PREFER = float(os.environ.get("SPARKINFER_KL_PREFER", "0.15"))

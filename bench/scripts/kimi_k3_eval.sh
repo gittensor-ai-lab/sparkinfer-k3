@@ -330,7 +330,15 @@ if [[ "${LLAMA_REF%%.*}" == "0" ]]; then
     echo ">>       Run: bench/scripts/kimi_k3_baseline.sh --node $NODE --decode-only" >&2
 fi
 
+# K3 PINS ITS OWN ACCURACY BARS. label.py is shared with the inherited Qwen track, whose
+# honest runs measure KL 0.0175-0.03, so its DEFAULT must stay loose (0.20) or every Qwen
+# run would be REJECTed. K3 measures 0.004046 on main, so 0.20 would let a PR degrade
+# parity forty-fold and pass clean -- which is how #63 doubled the KLD silently.
+# eval-label.yml pins the SAME pair when it re-derives; a bot and a workflow disagreeing
+# about REJECT is the same class of bug as disagreeing about the frontier.
 RESULT="$(SPARKINFER_DIFFICULTY_REF="$LLAMA_REF" SPARKINFER_SCORED_CONTEXT="$SCORED_CTX" \
+    SPARKINFER_KL_BAR="${KIMI_K3_KL_BAR:-0.05}" \
+    SPARKINFER_KL_PREFER="${KIMI_K3_KL_PREFER:-0.02}" \
     python3 "$HERE/label.py" "$TPS" "$FRONTIER" 0 "$TOP1" "$KL" "$COMMIT" "$PROV")"
 echo
 echo "$RESULT"

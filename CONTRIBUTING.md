@@ -46,7 +46,7 @@ K3's harness is `kimi_k3_*`.
 
 **Accuracy gate, and it runs FIRST.** `kimi_k3_eval.sh` compares your build's logits
 against the captured llama.cpp reference (`bench/refdata/`) on identical weights and
-identical token ids. `label.py` REJECTs below **top-1 0.90** or **mean KL 0.20** no matter
+identical token ids. `label.py` REJECTs below **top-1 0.90** or **mean KL 0.05** no matter
 how fast the run was — a speedup that erodes parity is not a speedup worth taking.
 
 Current measured parity on `main`: **top-1 100%, mean KLD 4.05e-03**. Note that KLD is

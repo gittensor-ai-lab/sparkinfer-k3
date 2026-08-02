@@ -833,6 +833,34 @@ def wait_mergeable_state(repo, num, tries=20, delay=6):
     return _pr_state(repo, num)
 
 
+def clear_stale_tier(repo, num, dry_run):
+    """Remove any eval:* label BEFORE posting this round's result.
+
+    Without this, wait_for_tier is satisfied by the PREVIOUS round's tier. #59 carried
+    eval:none from a round scored against a 4.53 frontier; the wait found an eval:* label
+    instantly and returned, and eval-label.yml only later replaced it with eval:xs. Nothing
+    broke because #59 was not the winner -- but a merge decision made on a tier measured
+    against a frontier that has since moved is precisely the mispricing this whole loop
+    exists to prevent.
+
+    Clearing first makes it unambiguous: any eval:* present afterwards belongs to this
+    round. It also fails in the safe direction -- if eval-label.yml never runs, the PR ends
+    with NO tier and merge_blockers refuses, rather than merging on a stale one.
+    """
+    labels = {l.get("name", "") for l in (_pr_state(repo, num).get("labels") or [])}
+    stale = sorted(l for l in labels if l.startswith("eval:"))
+    if not stale:
+        return
+    if dry_run:
+        print(f"--- dry-run: would clear stale {', '.join(stale)} from #{num}")
+        return
+    for l in stale:
+        gh(["api", "-X", "DELETE",
+            f"repos/{repo}/issues/{num}/labels/{l.replace(':', '%3A')}"])
+    print(f">> #{num}: cleared stale tier ({', '.join(stale)}) — it was measured against a "
+          f"frontier that has since moved")
+
+
 def wait_for_tier(repo, num, tries=30, delay=10):
     """Poll until eval-label.yml has applied the eval:* label for the comment just posted.
 
@@ -1291,6 +1319,10 @@ def main():
               f"ms/token={res.get('ms_per_token')} — tier is eval-label.yml's to derive")
         if res.get("receipt_id"):
             publish_receipt(LOG_REPO, num, res, BOX_RECEIPTS, args.dry_run)
+        # Clear the previous round's tier BEFORE posting, so the label that appears after
+        # can only be this round's. Otherwise wait_for_tier returns instantly on a stale one.
+        if args.merge_admin or args.auto_merge:
+            clear_stale_tier(args.repo, num, args.dry_run)
         post(args.repo, num, res, args.dry_run)
         # eval-label.yml applies the tier asynchronously. Wait for it here, once, rather
         # than letting the merge decision below read a label that has not landed yet.
