@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from pathlib import Path
 
@@ -2067,6 +2068,85 @@ class CiWorkflowTest(unittest.TestCase):
         crlf = base.replace("- [ ] Tested", "- [x] Tested").replace("\n", "\r\n")
         ok, _ = bot.eligibility(pr(crlf))
         self.assertTrue(ok, "CRLF line endings broke the section scan")
+
+    def test_unknown_mergeability_is_settled_before_the_node_is_booked(self):
+        """The CONFLICTING skip was decorative in the one case it had to work.
+
+        GitHub answers UNKNOWN while recomputing mergeability, and the base branch moving is
+        what sets it recomputing -- which this bot does to ITSELF, committing the frontier to
+        reference.lock at the start of every round. Observed live: seconds after a merge, #64
+        read ELIGIBLE while being CONFLICTING; a minute later the same call read CONFLICTING.
+
+        So the round must wait for a real answer. Asked only about PRs that are otherwise
+        eligible -- mergeability cannot rescue an unticked box -- and fails OPEN on timeout,
+        because a wrong skip during a GitHub incident stops every round while a wrong include
+        costs one eval the merge guards still refuse."""
+        bot = self._bot()
+        body = "## Node run\n- [x] Tested on **8× H200** (`sm_90`)\n"
+        calls = []
+
+        def fake_state(seq):
+            it = iter(seq)
+            def _state(repo, num):
+                v = next(it, seq[-1])
+                calls.append((num, v))
+                return {"mergeable": v} if v else {}
+            return _state
+
+        orig_state, orig_sleep = bot._pr_state, time.sleep
+        try:
+            bot.time.sleep = lambda s: None       # do not actually wait in a unit test
+
+            # The live race: UNKNOWN, UNKNOWN, then the truth. Must end CONFLICTING.
+            bot._pr_state = fake_state(["UNKNOWN", "UNKNOWN", "CONFLICTING"])
+            prs = [{"number": 64, "isDraft": False, "labels": [], "body": body}]
+            bot.resolve_mergeability("r", prs, tries=5, delay=0)
+            self.assertEqual(prs[0]["mergeable"], "CONFLICTING")
+            self.assertFalse(bot.eligibility(prs[0])[0],
+                             "a conflicted PR still reached the node after settling")
+
+            # Never settles -> fail OPEN, so a GitHub incident cannot halt the loop.
+            calls.clear()
+            bot._pr_state = fake_state(["UNKNOWN"])
+            prs = [{"number": 64, "isDraft": False, "labels": [], "body": body}]
+            bot.resolve_mergeability("r", prs, tries=3, delay=0)
+            self.assertTrue(bot.eligibility(prs[0])[0],
+                            "a stuck UNKNOWN skipped the PR — that halts the loop")
+            self.assertEqual(len(calls), 3, "the poll did not use its full budget")
+
+            # An unreadable PR gives up after one retry rather than polling for a minute.
+            calls.clear()
+            bot._pr_state = fake_state([None])
+            prs = [{"number": 64, "isDraft": False, "labels": [], "body": body}]
+            bot.resolve_mergeability("r", prs, tries=20, delay=0)
+            self.assertLessEqual(len(calls), 2, "an unreadable PR was polled 20 times")
+
+            # PRs skipped for a NON-mergeability reason are never asked about.
+            calls.clear()
+            bot._pr_state = fake_state(["CONFLICTING"])
+            prs = [{"number": 55, "isDraft": False, "body": body,
+                    "labels": [{"name": "needs-node-run"}]},
+                   {"number": 9, "isDraft": True, "labels": [], "body": body}]
+            bot.resolve_mergeability("r", prs, tries=3, delay=0)
+            self.assertEqual(calls, [], "spent API calls on PRs that were already skipped")
+
+            # An already-definite answer is not re-queried.
+            calls.clear()
+            prs = [{"number": 77, "isDraft": False, "labels": [], "body": body,
+                    "mergeable": "MERGEABLE"}]
+            bot.resolve_mergeability("r", prs, tries=3, delay=0)
+            self.assertEqual(calls, [], "re-queried a mergeability GitHub had already given")
+        finally:
+            bot._pr_state, bot.time.sleep = orig_state, orig_sleep
+
+    def test_pr_state_actually_asks_for_mergeable(self):
+        """resolve_mergeability reads info['mergeable'] — dead code if _pr_state never asks."""
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        fn = src[src.index("def _pr_state"):src.index("def wait_mergeable_state")]
+        self.assertIn("mergeable", fn)
+        main = src[src.index("prs = list_prs("):]
+        self.assertLess(main.index("resolve_mergeability("), main.index("if args.list:"),
+                        "mergeability must be settled before anything reads it")
 
     def test_settle_gpus_cannot_kill_the_eval_it_exists_to_protect(self):
         """settle_gpus waits for the driver to reclaim ~1.1 TiB between the two timed runs,

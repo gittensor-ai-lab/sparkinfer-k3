@@ -177,6 +177,56 @@ def eligibility(pr):
     return True, "eligible"
 
 
+def resolve_mergeability(repo, prs, tries=8, delay=5):
+    """Settle pr['mergeable'] for the PRs where it decides whether to book the node.
+
+    THE BOT ASKS THIS QUESTION AT THE ONE MOMENT THE ANSWER IS GUARANTEED TO BE MISSING.
+
+    GitHub computes mergeability lazily and answers UNKNOWN while recomputing, which is the
+    normal state for every open PR in the seconds after the base branch moves -- and this bot
+    moves the base branch itself, committing the frontier to reference.lock at the start of
+    every round. So the CONFLICTING skip was least reliable exactly when it was needed.
+    Verified live: seconds after a merge, #64 read ELIGIBLE while being CONFLICTING; a minute
+    later the same call read CONFLICTING and skipped it correctly.
+
+    Polled only for PRs that are otherwise eligible, so it costs a handful of API calls rather
+    than the ~40 GPU-minutes the answer is protecting. A PR already skipped for an unticked
+    box or a needs-node-run label is not asked about -- mergeability cannot change that.
+
+    FAILS OPEN on timeout, loudly. A wrong skip during a wide UNKNOWN (a GitHub incident)
+    would stop every round and the payouts with it; a wrong include costs one wasted eval that
+    merge_blockers and wait_mergeable_state still refuse at the end. The asymmetry decides it.
+    """
+    for pr in prs:
+        if pr.get("mergeable") in ("MERGEABLE", "CONFLICTING"):
+            continue
+        if not eligibility(pr)[0]:
+            continue
+        num = pr["number"]
+        for i in range(tries):
+            info = _pr_state(repo, num)
+            # No data at all is "cannot read this PR", not "still recomputing" -- polling it
+            # for a minute helps nobody. One retry covers a transient blip, as in
+            # wait_mergeable_state.
+            if not info:
+                if i >= 1:
+                    print(f"!! #{num}: cannot read merge state from {repo}", file=sys.stderr)
+                    break
+                time.sleep(min(delay, 2))
+                continue
+            state = info.get("mergeable") or "UNKNOWN"
+            if state != "UNKNOWN":
+                pr["mergeable"] = state
+                if i:
+                    print(f"   #{num}: mergeability settled to {state} after ~{i * delay}s")
+                break
+            time.sleep(delay)
+        else:
+            print(f"!! #{num}: mergeability still UNKNOWN after {tries * delay}s — evaluating "
+                  "it anyway; a conflicted branch is still refused at the merge",
+                  file=sys.stderr)
+
+
 def _box_build(sha, what):
     """Check `sha` out on the box and build the K3 bench there.
 
@@ -864,7 +914,7 @@ def publish_round_log(repo_log, main_sha, results, text, dry_run):
 
 def _pr_state(repo, num):
     r = gh(["pr", "view", str(num), "-R", repo, "--json",
-            "mergeStateStatus,labels,headRefOid,state"])
+            "mergeStateStatus,mergeable,labels,headRefOid,state"])
     try:
         return json.loads(r.stdout or "{}")
     except json.JSONDecodeError:
@@ -1384,6 +1434,11 @@ def main():
         if not prs:
             sys.stderr.write(f"k3_eval_bot: #{args.only_pr} is not an open PR on {args.repo}\n")
             return 1
+
+    # Settle mergeability BEFORE anything reads it. gh pr list answers UNKNOWN while GitHub
+    # recomputes, and the previous round's own frontier commit is what set it recomputing --
+    # so the conflict skip has to wait for a real answer or it is decorative.
+    resolve_mergeability(args.repo, prs)
 
     if args.list:
         for pr in prs:
