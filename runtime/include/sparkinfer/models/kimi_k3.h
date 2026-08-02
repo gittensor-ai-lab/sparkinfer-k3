@@ -293,7 +293,15 @@ struct KimiK3RuntimeState {
     std::vector<float*> delta_state;                               // [head_dim, head_dim, n_head]
 
     // Indexed by MLA-layer ordinal (0..n_mla_layers-1).
+    //
+    // Element type is f16 when kv_f16 is set (the default — llama.cpp's own
+    // type_k, and the largest byte item a decode token moves), f32 when
+    // SPARKINFER_K3_KV_F16=0 restores the historical layout. The pointers stay
+    // float* so every existing null-check and container stays as-is; the three
+    // touch points (alloc size, reset memset, store/attend in the forward) all
+    // consult kv_f16, and nothing else dereferences these buffers.
     std::vector<float*> mla_kv_cache;   // [key_length, max_ctx]
+    bool kv_f16 = false;                // set by kimi_k3_alloc_state, fixed for life
 
     // Shared across the whole model — one bank, not one per layer.
     float* res_bank = nullptr;   // [hidden, max_ckpt]
