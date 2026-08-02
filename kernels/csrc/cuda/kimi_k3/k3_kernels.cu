@@ -3192,7 +3192,7 @@ bool k3_proj_f32(float* y, const float* x, const void* W, int wtype,
 bool k3_proj_ggml_f32_x4(float* y0, float* y1, float* y2, float* y3, const float* x,
                          const void* W0, const void* W1, const void* W2, const void* W3,
                          int wtype, int N, int K, void* q8_scratch,
-                         cudaStream_t stream) {
+                         cudaStream_t stream, bool x_pre_q8) {
     // Same narrow contract as the f32-activation x4 below: Q8_0 weights, four
     // identical shapes, false means "use the slow path" rather than an error.
     if (N <= 0 || K <= 0 || wtype != 8 || K % 32 != 0) return false;
@@ -3208,9 +3208,16 @@ bool k3_proj_ggml_f32_x4(float* y0, float* y1, float* y2, float* y3, const float
     // consumer go out back-to-back on one stream, so no caller has to promise
     // anything about the activation's lifetime -- the reuse cannot outlive the
     // launch that produced it.
+    //
+    // ...unless the CALLER already quantised this exact activation, which it does on
+    // every KDA layer: `normed` is hoisted for ssm_f_a and ssm_beta before this runs.
+    // Quantising again here made the hoist a net LOSS on those 69 layers -- it added a
+    // launch and removed none, because the other two consumers turned out to be
+    // f32-weighted and never quantised at all. x is passed only so this can tell.
     constexpr int QT = 128;
-    quantize_q8_0_kernel<<<(nb + QT - 1) / QT, QT, 0, stream>>>(
-        (BlockQ8_0*)q8_scratch, x, nb);
+    if (!x_pre_q8)
+        quantize_q8_0_kernel<<<(nb + QT - 1) / QT, QT, 0, stream>>>(
+            (BlockQ8_0*)q8_scratch, x, nb);
 
     const unsigned grid = (unsigned)((N + ROWS - 1) / ROWS);
     const BlockQ8_0* xq = (const BlockQ8_0*)q8_scratch;

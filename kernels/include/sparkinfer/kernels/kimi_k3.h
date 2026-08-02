@@ -469,10 +469,13 @@ bool k3_proj_f32(float* y, const float* x, const void* W, int wtype,
 // the same vector -- 59,696 quantize launches, 8.7% of GPU time, at ~7 GB/s.
 // Returns false for anything outside its contract (non-Q8_0, mismatched shape,
 // N < 4), which means "use the slow path", not an error.
+// x_pre_q8: q8_scratch ALREADY holds this activation, so skip the quantise. Set it only
+// when the caller quantised THIS x into THAT buffer immediately above -- it is a statement
+// about the two lines around the call, not a cache lookup.
 bool k3_proj_ggml_f32_x4(float* y0, float* y1, float* y2, float* y3, const float* x,
                          const void* W0, const void* W1, const void* W2, const void* W3,
                          int wtype, int N, int K, void* q8_scratch,
-                         cudaStream_t stream);
+                         cudaStream_t stream, bool x_pre_q8 = false);
 
 bool k3_proj_f32_x4(float* y0, float* y1, float* y2, float* y3, const float* x,
                     const void* W0, const void* W1, const void* W2, const void* W3,
