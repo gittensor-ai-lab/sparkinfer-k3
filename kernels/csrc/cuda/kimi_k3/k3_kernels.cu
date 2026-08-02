@@ -1514,7 +1514,15 @@ __global__ void mla_decode_attn_kernel(float* __restrict__ out,
                                        const float* __restrict__ k_cache,
                                        const float* __restrict__ wv_b,
                                        int key_length, int kv_lora, int v_dim,
-                                       int n_ctx, float scale) {
+                                       const int* __restrict__ d_pos, float scale) {
+    // LENGTH COMES FROM DEVICE MEMORY, NOT FROM A KERNEL ARGUMENT.
+    //
+    // A captured graph freezes its arguments. Passing position+1 by value meant every
+    // replay attended over the context length that happened to be live at CAPTURE time —
+    // right on the first replay and wrong on every one after it, which is the failure
+    // mode that looks like a correct model slowly going insane. n_ctx is only ever a loop
+    // bound here, so reading it from memory costs one load and changes no arithmetic.
+    const int n_ctx = *d_pos + 1;   // d_pos is the ROW INDEX; the length is one more
     constexpr int NWARP = BLOCK / 32;
     const int h    = blockIdx.x;
     const int lane = threadIdx.x & 31;
@@ -1721,7 +1729,12 @@ __global__ void mla_decode_attn_split_kernel(float* __restrict__ part_acc,
                                              const float* __restrict__ q,
                                              const float* __restrict__ k_cache,
                                              int key_length, int kv_lora,
-                                             int n_ctx, float scale, int splits) {
+                                             const int* __restrict__ d_pos,
+                                             float scale, int splits) {
+    // Device-read length; see mla_decode_attn_kernel. `splits` stays a launch-time
+    // constant because it sizes the GRID, which a captured graph cannot change — the
+    // driver re-captures instead when the plan moves (k3_mla_decode_plan).
+    const int n_ctx = *d_pos + 1;   // d_pos is the ROW INDEX; the length is one more
     constexpr int NWARP = BLOCK / 32;
     const int h    = blockIdx.x;
     const int sp   = blockIdx.y;
@@ -1831,7 +1844,10 @@ __global__ void mla_decode_attn_hbatch_kernel(float* __restrict__ part_acc,
                                               const float* __restrict__ q,
                                               const float* __restrict__ k_cache,
                                               int key_length, int kv_lora,
-                                              int n_ctx, float scale, int splits) {
+                                              const int* __restrict__ d_pos,
+                                              float scale, int splits) {
+    // Device-read length; see mla_decode_attn_kernel.
+    const int n_ctx = *d_pos + 1;   // d_pos is the ROW INDEX; the length is one more
     constexpr int NWARP = BLOCK / 32;
     const int h0   = blockIdx.x * HPB;
     const int sp   = blockIdx.y;
@@ -2477,6 +2493,30 @@ __global__ void sigmoid_inplace_f32_kernel(float* __restrict__ x, int64_t n) {
     if (i < n) x[i] = 1.0f / (1.0f + __expf(-x[i]));
 }
 
+// Writes this token's MLA K-cache row at a position only the DEVICE knows.
+//
+// Replaces a host-computed `mla_kv_cache + position * key_length` fed to two
+// cudaMemcpyAsync. Those bake the destination ADDRESS into a captured graph, so replay
+// would rewrite one row forever while the model read stale keys for every later token —
+// correct on replay 1, wrong from replay 2. Concatenation order (normed kv_cmpr, then RAW
+// k_pe) is exactly the two memcpys it replaces; this moves bytes and does no arithmetic,
+// so it is bit-identical by construction.
+__global__ void mla_kv_store_kernel(float* __restrict__ cache,
+                                    const float* __restrict__ kv_cmpr_normed,
+                                    const float* __restrict__ kv_a_out,
+                                    const int* __restrict__ d_pos,
+                                    int kv_lora, int rope_dim, int key_length) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= kv_lora + rope_dim) return;
+    float* row = cache + (size_t)(*d_pos) * (size_t)key_length;
+    row[i] = (i < kv_lora) ? kv_cmpr_normed[i] : kv_a_out[i];
+}
+
+// Advance the device's view of the position, inside the captured region.
+// The host mirror still advances too — it is what picks the launch plan, which a graph
+// cannot change. k3_read_pos_f32 exists so a test can prove the two never drift.
+__global__ void bump_pos_kernel(int* __restrict__ p) { *p += 1; }
+
 template <int BLOCK>
 __global__ void rms_norm_kernel(float* __restrict__ out, const float* __restrict__ x,
                                 const float* __restrict__ w, int n, float eps) {
@@ -2646,6 +2686,24 @@ static void ensure_iq1s_tables() {
     if (dev >= 0 && ready[dev]) return;
     cudaMemcpyToSymbol(iq1s_grid_c, iq1s_grid_host, sizeof(iq1s_grid_host));
     if (dev >= 0) ready[dev] = true;
+}
+
+// UPLOAD THE LATTICE TABLES BEFORE ANY CAPTURE BEGINS.
+//
+// ensure_iq2xs_tables()/ensure_iq1s_tables() are lazy and per-device, and they upload with
+// cudaMemcpyToSymbol — the SYNCHRONOUS form, which is illegal inside a stream capture.
+// Under UD-IQ1_S that first upload lands on the first MoE layer (layer 0 is leading_dense
+// and has no IQ1_S expert weights), so a capture that recorded layer 0 cleanly was being
+// invalidated at layer 1 by a one-time initialisation that has nothing to do with the layer.
+//
+// The failure is also maximally misleading: cudaGetLastError reports "operation failed due
+// to a previous error during capture" from the NEXT launch, so it accuses the MoE dispatch.
+//
+// Same hazard class as k3_mla_prewarm_split_scratch, same answer: do it eagerly at init,
+// with each device current, so the in-capture call hits its `ready[dev]` early return.
+void k3_prewarm_quant_tables() {
+    ensure_iq2xs_tables();
+    ensure_iq1s_tables();
 }
 
 void dequant_iq2_xs_f32(float* out, const void* src, int64_t n, cudaStream_t stream) {
@@ -2918,11 +2976,68 @@ void mla_absorb_q_f32(float* out, const float* q_nope, const float* q_pe,
         out, q_nope, q_pe, wk_b, qk_nope, kv_lora, rope_dim);
 }
 
+// THE ONE DERIVATION OF `splits`. The launcher below calls this, and so does the driver's
+// graph-invalidation check — deliberately the same function, not the same formula written
+// twice. A capture that believes the plan is unchanged while the launcher picks a different
+// grid does not fail loudly; it launches the wrong shape.
+int k3_mla_decode_plan(int n_head, int kv_lora, int n_ctx) {
+    if (n_head <= 0 || kv_lora <= 0 || n_ctx <= 0) return 1;
+    int dev = 0;
+    if (n_ctx < kMlaSplitMinCtx) return 1;
+    if (!k3_mla_split_scratch(n_head, kv_lora, &dev)) return 1;
+    return std::min(k3_mla_max_splits(n_head),
+                    (n_ctx + kMlaSplitMinCtx - 1) / kMlaSplitMinCtx);
+}
+
+// Allocate the split scratch BEFORE any capture begins.
+//
+// k3_mla_split_scratch() cudaMallocs when capacity is short, and an allocation inside a
+// stream capture does not fail the allocation — it fails the CAPTURE, from a call site
+// nowhere near the graph code. Pre-warming at the largest shape the model will use means
+// the in-capture call hits its `need <= cap` early return and allocates nothing.
+bool k3_mla_prewarm_split_scratch(int n_head, int kv_lora) {
+    int dev = 0;
+    return k3_mla_split_scratch(n_head, kv_lora, &dev);
+}
+
+void k3_mla_kv_store_f32(float* cache, const float* kv_cmpr_normed,
+                         const float* kv_a_out, const int* d_pos,
+                         int kv_lora, int rope_dim, int key_length,
+                         cudaStream_t stream) {
+    if (!cache || !d_pos || kv_lora <= 0 || rope_dim <= 0 || key_length <= 0) return;
+    const int n = kv_lora + rope_dim;
+    const int T = 256;
+    mla_kv_store_kernel<<<(unsigned)((n + T - 1) / T), T, 0, stream>>>(
+        cache, kv_cmpr_normed, kv_a_out, d_pos, kv_lora, rope_dim, key_length);
+}
+
+void k3_bump_pos(int* d_pos, cudaStream_t stream) {
+    if (!d_pos) return;
+    bump_pos_kernel<<<1, 1, 0, stream>>>(d_pos);
+}
+
+// TWO LENGTHS, AND THE SPLIT BETWEEN THEM IS THE WHOLE POINT.
+//
+//   n_ctx    — the HOST's view. Used only to derive `splits`, which sizes the grid and
+//              picks which kernel runs. A captured graph cannot change either, so this
+//              one is allowed to be a plain int: when it moves the plan, the driver
+//              re-captures (see k3_mla_decode_plan).
+//   d_pos    — the DEVICE's view, holding the ROW INDEX. The kernels derive the length
+//              from it as *d_pos + 1, the same +1 the host applies. One device value
+//              with one meaning: the KV store indexes a row with it, the attention
+//              lengths a loop with it. Read from
+//              memory on every launch, so a replayed graph attends over the live
+//              position instead of the one frozen at capture time.
+//
+// They must agree. k3_mla_decode_plan() is the single derivation both the driver's
+// invalidation check and this launcher call — a probe that can drift from what actually
+// launches fails by launching the wrong grid, which is worse than not having one.
 void mla_decode_attn_f32(float* out, const float* q, const float* k_cache,
                          const float* wv_b, int key_length, int kv_lora,
-                         int v_dim, int n_head, int n_ctx, float scale,
-                         cudaStream_t stream) {
+                         int v_dim, int n_head, int n_ctx, const int* d_pos,
+                         float scale, cudaStream_t stream) {
     if (n_head <= 0 || n_ctx <= 0 || key_length <= 0 || kv_lora <= 0 || v_dim <= 0) return;
+    if (!d_pos) return;
     constexpr int BLOCK = 256;
     // O(key_length + kv_lora + tile) and NOT O(n_ctx) — 4.8 KB at K3's real dims,
     // the same at 128 tokens of context and at 1M. See the kernel's header note on
@@ -2946,7 +3061,7 @@ void mla_decode_attn_f32(float* out, const float* q, const float* k_cache,
                : 1;
     if (splits <= 1) {
         mla_decode_attn_kernel<BLOCK><<<(unsigned)n_head, BLOCK, shm, stream>>>(
-            out, q, k_cache, wv_b, key_length, kv_lora, v_dim, n_ctx, scale);
+            out, q, k_cache, wv_b, key_length, kv_lora, v_dim, d_pos, scale);
         return;
     }
 
@@ -2989,29 +3104,29 @@ void mla_decode_attn_f32(float* out, const float* q, const float* k_cache,
         bool launched = true;
         switch (hpb * 8 + rslots) {
             case 12 * 8 + 1: mla_decode_attn_hbatch_kernel<BLOCK, 12, 1><<<hgrid, BLOCK, hshm, stream>>>(
-                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits); break;
+                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, d_pos, scale, splits); break;
             case 12 * 8 + 2: mla_decode_attn_hbatch_kernel<BLOCK, 12, 2><<<hgrid, BLOCK, hshm, stream>>>(
-                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits); break;
+                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, d_pos, scale, splits); break;
             case 12 * 8 + 3: mla_decode_attn_hbatch_kernel<BLOCK, 12, 3><<<hgrid, BLOCK, hshm, stream>>>(
-                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits); break;
+                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, d_pos, scale, splits); break;
             case 12 * 8 + 4: mla_decode_attn_hbatch_kernel<BLOCK, 12, 4><<<hgrid, BLOCK, hshm, stream>>>(
-                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits); break;
+                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, d_pos, scale, splits); break;
             case 8 * 8 + 1: mla_decode_attn_hbatch_kernel<BLOCK, 8, 1><<<hgrid, BLOCK, hshm, stream>>>(
-                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits); break;
+                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, d_pos, scale, splits); break;
             case 8 * 8 + 2: mla_decode_attn_hbatch_kernel<BLOCK, 8, 2><<<hgrid, BLOCK, hshm, stream>>>(
-                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits); break;
+                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, d_pos, scale, splits); break;
             case 8 * 8 + 3: mla_decode_attn_hbatch_kernel<BLOCK, 8, 3><<<hgrid, BLOCK, hshm, stream>>>(
-                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits); break;
+                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, d_pos, scale, splits); break;
             case 8 * 8 + 4: mla_decode_attn_hbatch_kernel<BLOCK, 8, 4><<<hgrid, BLOCK, hshm, stream>>>(
-                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits); break;
+                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, d_pos, scale, splits); break;
             case 4 * 8 + 1: mla_decode_attn_hbatch_kernel<BLOCK, 4, 1><<<hgrid, BLOCK, hshm, stream>>>(
-                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits); break;
+                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, d_pos, scale, splits); break;
             case 4 * 8 + 2: mla_decode_attn_hbatch_kernel<BLOCK, 4, 2><<<hgrid, BLOCK, hshm, stream>>>(
-                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits); break;
+                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, d_pos, scale, splits); break;
             case 4 * 8 + 3: mla_decode_attn_hbatch_kernel<BLOCK, 4, 3><<<hgrid, BLOCK, hshm, stream>>>(
-                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits); break;
+                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, d_pos, scale, splits); break;
             case 4 * 8 + 4: mla_decode_attn_hbatch_kernel<BLOCK, 4, 4><<<hgrid, BLOCK, hshm, stream>>>(
-                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits); break;
+                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, d_pos, scale, splits); break;
             default: launched = false; break;
         }
         if (launched) {
@@ -3026,7 +3141,7 @@ void mla_decode_attn_f32(float* out, const float* q, const float* k_cache,
     dim3 grid((unsigned)n_head, (unsigned)splits);
     mla_decode_attn_split_kernel<BLOCK><<<grid, BLOCK, shm, stream>>>(
         g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora,
-        n_ctx, scale, splits);
+        d_pos, scale, splits);
     // s_acc + s_w, where s_w needs splits + 1 slots (the last holds 1/l).
     const size_t cshm = ((size_t)kv_lora + (size_t)splits + 1) * sizeof(float);
     mla_decode_combine_kernel<BLOCK><<<(unsigned)n_head, BLOCK, cshm, stream>>>(

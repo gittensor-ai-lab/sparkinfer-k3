@@ -649,12 +649,46 @@ static void test_mla_decode_attn(int n_ctx, int H) {
 
     float *dq = to_dev(q), *dk = to_dev(k_cache), *dw = to_dev(wv_b), *dout = nullptr;
     CU(cudaMalloc(&dout, (size_t)v_dim * H * sizeof(float)));
-    mla_decode_attn_f32(dout, dq, dk, dw, key_length, kv_lora, v_dim, H, n_ctx, scale, 0);
+
+    // The kernel now reads the ROW INDEX from device memory and lengths its loop as
+    // *d_pos + 1, so the test has to supply n_ctx the same way the runtime does. Passing
+    // the length where the index belongs is exactly the off-by-one this test should catch,
+    // so it is spelled out rather than folded into the call.
+    const int pos_host = n_ctx - 1;
+    int* d_pos = nullptr;
+    CU(cudaMalloc(&d_pos, sizeof(int)));
+    CU(cudaMemcpy(d_pos, &pos_host, sizeof(int), cudaMemcpyHostToDevice));
+
+    mla_decode_attn_f32(dout, dq, dk, dw, key_length, kv_lora, v_dim, H,
+                        n_ctx, d_pos, scale, 0);
     CU(cudaDeviceSynchronize());
     CU(cudaGetLastError());
     close_enough(from_dev(dout, (size_t)v_dim * H), ref, "mla decode attn vs float64 ref");
 
+    // The device length must be what the kernel actually obeys, not decoration. Re-run
+    // with d_pos one SHORT and require the result to change: if the kernel were still
+    // using the host n_ctx, this would silently pass and the whole device-position
+    // change would be unverified.
+    // Collapse to a SINGLE position rather than shortening by one. One token out of a
+    // long context can move the output by less than the tolerance — measured 6.5e-04 at
+    // one of these shapes — so "shorter by one" is not a reliable discriminator and a
+    // kernel that ignored d_pos entirely could pass it. Attending over position 0 alone
+    // cannot coincide with attending over all of them.
+    if (n_ctx >= 2) {
+        const int pos_short = 0;
+        CU(cudaMemcpy(d_pos, &pos_short, sizeof(int), cudaMemcpyHostToDevice));
+        mla_decode_attn_f32(dout, dq, dk, dw, key_length, kv_lora, v_dim, H,
+                            n_ctx, d_pos, scale, 0);
+        CU(cudaDeviceSynchronize());
+        CU(cudaGetLastError());
+        const std::vector<float> got_f = from_dev(dout, (size_t)v_dim * H);
+        const std::vector<double> got(got_f.begin(), got_f.end());
+        assert_variant_differs(got, ref,
+                               "mla decode attn ignores d_pos (device length not obeyed)");
+    }
+
     CU(cudaFree(dq)); CU(cudaFree(dk)); CU(cudaFree(dw)); CU(cudaFree(dout));
+    CU(cudaFree(d_pos));
 }
 
 // ---------------------------------------------------------------------------

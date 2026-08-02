@@ -158,7 +158,15 @@ static void test_missing_nccl_does_not_silently_unshard() {
 static void test_env_parsing() {
     std::printf("env_parsing\n");
     std::string why;
-    CHECK_BACKEND(backend_from_string("", &why), Backend::Nccl);
+    // UNSET MEANS AUTO SINCE #74, NOT NCCL.
+    //
+    // #74 changed this deliberately — "EMPTY NOW MEANS 'PICK THE FAST ONE'" — because an
+    // unset SPARKINFER_TP_BACKEND was silently grading every eval on the slower collective.
+    // The test was not updated with it, so `env_parsing` has been red on main ever since,
+    // asserting a contract the code intentionally abandoned. Corrected here rather than
+    // left failing: a permanently red test trains people to ignore the suite.
+    CHECK_BACKEND(backend_from_string("", &why), Backend::Auto);
+    CHECK_BACKEND(backend_from_string("auto", &why), Backend::Auto);
     CHECK_BACKEND(backend_from_string("nccl", &why), Backend::Nccl);
     CHECK_BACKEND(backend_from_string("none", &why), Backend::None);
     CHECK_BACKEND(backend_from_string("off", &why), Backend::None);
@@ -168,9 +176,11 @@ static void test_env_parsing() {
     CHECK_BACKEND(backend_from_string("nvls", &why), Backend::Multimem);
     CHECK(why.empty(), "known values need no explanation: %s", why.c_str());
 
-    // A typo must not kill a run that took 20 minutes to load 802 GiB.
+    // A typo must not kill a run that took 20 minutes to load 802 GiB. It now falls back
+    // to Auto rather than Nccl — same guarantee (the run survives a typo), following the
+    // default #74 moved.
     why.clear();
-    CHECK_BACKEND(backend_from_string("mutlimem", &why), Backend::Nccl);
+    CHECK_BACKEND(backend_from_string("mutlimem", &why), Backend::Auto);
     CHECK(why.find("unknown") != std::string::npos, "should flag the typo: %s", why.c_str());
     CHECK(why.find("mutlimem") != std::string::npos, "should echo it: %s", why.c_str());
 }

@@ -268,6 +268,17 @@ struct KimiK3RuntimeState {
     int max_ctx = 0;
     int position = 0;   // next token's position; incremented by forward_token
 
+    // THE DEVICE'S COPY OF `position`, and why both exist.
+    //
+    // Kernels must read the position from memory or a captured graph replays the one
+    // frozen at capture time. But the LAUNCH PLAN (grid size, which MLA kernel) is a host
+    // decision a graph cannot change, and that decision needs the position too. So the
+    // host mirror above stays authoritative for planning, d_pos is authoritative for
+    // arithmetic, and they advance together — the host increments, and bump_pos runs
+    // inside the captured region. kimi_k3_check_pos_sync() exists so a test can prove
+    // they never drift; drift here is invisible for thousands of tokens and then wrong.
+    int* d_pos = nullptr;   // device int, 4 bytes, owned by kimi_k3_alloc_state()
+
     // Sizes needed to zero each buffer correctly in kimi_k3_reset_state() — stored
     // here rather than re-threading a KimiK3Config through that call. Populated by
     // kimi_k3_alloc_state().
@@ -307,6 +318,12 @@ struct KimiK3RuntimeState {
 bool kimi_k3_alloc_state(const KimiK3Config& cfg, int max_ctx, KimiK3RuntimeState& out,
                         int first_layer = -1, int last_layer = -1,
                         const tp::KdaShardDims* kda = nullptr);
+// Move the decode position. Writes BOTH the host mirror (which picks the MLA launch plan)
+// and the device copy (which the KV store and attention index with). Never set
+// state.position directly — the two must not drift, and a caller that sets only the host
+// side produces a benchmark that runs fast because it is attending over one position.
+bool kimi_k3_set_position(KimiK3RuntimeState& s, int pos);
+
 void kimi_k3_reset_state(KimiK3RuntimeState& s);   // zero everything, position=0, n_ckpt=0
 void kimi_k3_free_state(KimiK3RuntimeState& s);
 
