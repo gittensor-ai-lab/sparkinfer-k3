@@ -1063,14 +1063,34 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             // k3_proj_f32_x4 returns false for anything outside its narrow contract
             // (non-Q8_0, mismatched shape, missing tensor) — that is "use the slow path",
             // not an error, so the fallback below is the general case, not dead code.
-            const bool fused_qkvg =
-                !ggml_qact_proj &&
+            // The shape check is shared; only the activation format differs. Under
+            // qact this used to be `!ggml_qact_proj && ...`, which meant enabling
+            // quantised activations silently DISABLED the fusion on all 69 KDA
+            // layers — four launches instead of one, and four quantisations of the
+            // identical s.normed, because k3_proj_ggml_f32 quantises per call.
+            // That was 8.7% of GPU time in 59,696 quantize launches.
+            // SPARKINFER_K3_FUSE_QKVG=0 forces the four separate projections, so
+            // the fusion can be A/B'd on ONE binary. Every reliable measurement on
+            // this branch has come from a same-binary control; the ones that were
+            // not (rebuild vs rebuild) are the ones that had to be retracted.
+            static const bool want_fuse = [] {
+                const char* e = std::getenv("SPARKINFER_K3_FUSE_QKVG");
+                return !(e && e[0] == '0');
+            }();
+            const bool fusable = want_fuse &&
                 L.attn_q.ok() && L.attn_k.ok() && L.attn_v.ok() && L.ssm_g.ok() &&
                 L.attn_q.type == 8 && L.attn_k.type == 8 &&
-                L.attn_v.type == 8 && L.ssm_g.type == 8 &&
-                k3k::k3_proj_f32_x4(s.qkv_q, s.qkv_k, s.qkv_v, s.g_proj_out, s.normed,
-                                    L.attn_q.data, L.attn_k.data, L.attn_v.data,
-                                    L.ssm_g.data, L.attn_q.type, qkv, H, stream);
+                L.attn_v.type == 8 && L.ssm_g.type == 8;
+            const bool fused_qkvg = fusable &&
+                (ggml_qact_proj
+                     ? k3k::k3_proj_ggml_f32_x4(s.qkv_q, s.qkv_k, s.qkv_v, s.g_proj_out,
+                                                s.normed, L.attn_q.data, L.attn_k.data,
+                                                L.attn_v.data, L.ssm_g.data,
+                                                L.attn_q.type, qkv, H, s.proj_q8, stream)
+                     : k3k::k3_proj_f32_x4(s.qkv_q, s.qkv_k, s.qkv_v, s.g_proj_out,
+                                           s.normed, L.attn_q.data, L.attn_k.data,
+                                           L.attn_v.data, L.ssm_g.data,
+                                           L.attn_q.type, qkv, H, stream));
             if (!fused_qkvg) {
                 if (!proj(s.qkv_q, s.normed, L.attn_q, qkv, H)) return false;
                 if (!proj(s.qkv_k, s.normed, L.attn_k, qkv, H)) return false;

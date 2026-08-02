@@ -1,0 +1,79 @@
+# Clear needs-rebase THE MOMENT a push answers it, not at the next bot sweep.
+#
+# The label's one meaning: "your branch trails main, so the tier on it was measured against
+# a frontier that has moved". The bot's sweep clears it, but the sweep only runs when a
+# round runs — so a contributor who rebased promptly sat labelled (and NEVER_MERGE-blocked)
+# until someone next ran the bot, while our comment told them it "clears by itself".
+# This workflow makes that sentence true.
+#
+# WHY pull_request_target AND NOT pull_request: contributor PRs come from forks, and the
+# fork-scoped GITHUB_TOKEN is read-only — a pull_request run could decide correctly and
+# then fail to remove the label. pull_request_target runs with base-repo write access,
+# which is safe here for exactly one reason: THIS WORKFLOW NEVER CHECKS OUT OR EXECUTES
+# PR CODE. It reads the event payload and calls the API, nothing else. Do not add an
+# actions/checkout of the head to this file, ever — that is the pull_request_target
+# footgun, and with it a hostile PR runs with write access to the repo.
+#
+# WHY compare/behind_by AND NOT mergeStateStatus: the push just happened, so GitHub reports
+# UNKNOWN for a while and settling it needs the same polling dance as the bot's
+# wait_mergeable_state (#57). The compare API answers immediately and answers the actual
+# question — behind_by == 0 means the branch contains main's tip, which is the one thing
+# the label is about. It also cannot conflict with main from that position, so the DIRTY
+# case needs no separate check. Adding the label stays the sweep's job: it is tied to tier
+# presence and frontier movement, which a push event knows nothing about.
+name: rebase-label-sync
+
+on:
+  pull_request_target:
+    types: [synchronize]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+# Rapid force-pushes race each other; only the run for the newest head may decide.
+concurrency:
+  group: rebase-label-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    # Cheap gate off the event payload: no label, no work. The payload is a snapshot, but a
+    # label added between push and run only means we do nothing this push — the next push
+    # or sweep gets it. Wrong-direction staleness (label removed meanwhile) makes the
+    # DELETE below a no-op.
+    if: contains(github.event.pull_request.labels.*.name, 'needs-rebase')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clear needs-rebase if this push brought the branch current
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          BASE: ${{ github.event.pull_request.base.ref }}
+          HEAD_LABEL: ${{ github.event.pull_request.head.label }}
+        run: |
+          set -euo pipefail
+          # head.label is "owner:branch" — the fork-safe form the compare API documents.
+          behind="$(gh api "repos/$REPO/compare/$BASE...$HEAD_LABEL" --jq '.behind_by')"
+          if [ -z "$behind" ]; then
+            echo "::warning::could not compute behind_by for $HEAD_LABEL — leaving the label"
+            exit 0
+          fi
+          if [ "$behind" -gt 0 ]; then
+            echo "::notice::#$PR is still $behind commit(s) behind $BASE — the push did not"
+            echo "::notice::rebase onto current main, so needs-rebase stands."
+            exit 0
+          fi
+          # SAME DISCIPLINE AS THE BOT: an issued DELETE is not a removed label. Re-read
+          # and fail loudly if it survived — a red run on the PR beats a silent no-op that
+          # leaves the contributor blocked with no signal.
+          gh api -X DELETE "repos/$REPO/issues/$PR/labels/needs-rebase" >/dev/null || true
+          left="$(gh api "repos/$REPO/issues/$PR/labels" --jq '[.[].name] | index("needs-rebase")')"
+          if [ "$left" != "null" ]; then
+            echo "::error::needs-rebase is still on #$PR after the delete"
+            exit 1
+          fi
+          echo "::notice::#$PR is current with $BASE — needs-rebase cleared. The next round"
+          echo "::notice::re-measures against the new frontier."

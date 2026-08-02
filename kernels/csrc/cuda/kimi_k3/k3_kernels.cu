@@ -1270,17 +1270,100 @@ static bool k3_mla_split_scratch(int n_head, int kv_lora, int* dev_out) {
 // stopped staging the score vector was a launch failure nothing polled for.
 constexpr size_t kMlaShmBudget = 48u * 1024u;
 
-// Slice-count targets for the head-batched grid. kMlaMinSliceLen keeps a slice long
-// enough that the per-slice combine work stays amortised.
+// Slice-count targets for the head-batched grid.
 //
 // kMlaBlocksPerSm is what the batched kernel ACTUALLY achieves at kMlaHeadsPerBlock
 // (125 registers x 256 threads leaves room for two), not a wish. Asking for more
 // slices than can be resident does not add parallelism — the extra blocks queue — but
 // it does add partials for mla_decode_combine_kernel to merge and for the scratch to
-// carry, so overshooting is pure cost. At K3's dims this makes the grid
-// (96/12) * 33 = 264 blocks, exactly two per SM on a 132-SM H200, in one wave.
+// carry, so overshooting is pure cost. This one is a REGISTER fact and it is
+// independent of n_head, so head-sharding does not touch it: see the HPB table above,
+// where 16 heads at 148 regs drops to one block per SM and loses 10%.
 constexpr int kMlaBlocksPerSm = 2;
-constexpr int kMlaMinSliceLen = 1024;
+
+// THE SLICE FLOOR IS DERIVED FROM hpb AND THE DIMS, NOT PICKED.
+//
+// This used to be `kMlaMinSliceLen = 1024`, a flat token count, and it silently
+// became the binding term the moment the shard policy moved. The arithmetic:
+// `splits` is min(fill target, n_ctx / floor), so the floor sets the CONTEXT AT
+// WHICH THE FILL TARGET BECOMES REACHABLE AT ALL —
+//
+//     n_ctx_to_fill = ceil(kMlaBlocksPerSm * sm / groups) * floor,  groups = n_head/hpb
+//
+// At n_head 96 that is 33 * 1024 = 33,792 tokens, comfortably under the scored
+// context, so `fill` won and the floor was never exercised. Head-sharding took
+// groups 8 -> 1 (PR #63, which changed neither this constant nor the target
+// beside it), which multiplied the threshold by exactly 8 to 270,336 — and
+// stranded the scored 131,072 inside the new gap at 128 blocks, 0.97 per SM,
+// against the 2 per SM the line above declares. A flat token count cannot track
+// hpb, so it re-breaks on every shard-policy change. Derive it instead.
+//
+// WHAT A SLICE ACTUALLY COSTS FOR EXISTING, in DRAM, per block:
+//
+//   partials out   HPB * (kv_lora + 2) floats   one row per head, at the end of
+//                                                mla_decode_attn_hbatch_kernel
+//   combine reads  HPB *  kv_lora      floats   mla_decode_combine_kernel reads them
+//                                                straight back
+//   staged q       HPB *  key_length   floats   the s_q stage, but all of q is 27 KB
+//                                                and every block reads it — L2, not
+//                                                DRAM; it is startup latency, and it
+//                                                amortises at chunk >= HPB tokens
+//
+// and what it does with it: key_length floats of k_cache per token, in the score
+// phase. The latent pass re-reads the first kv_lora floats of the SAME row, inside
+// the same tile, so that one is L2 too. Hence the tax a slice pays is
+//
+//   tax(slice) = 2 * hpb * kv_lora / (key_length * slice)
+//
+// — note that n_head, n_ctx and splits ALL cancel. The tax is a function of the
+// SLICE LENGTH alone, which is why a slice-length floor is the right shape of rule
+// and why its value must come from hpb and the dims.
+//
+// WHAT THE TAX BUDGET IS SET FROM. Measured at 131,072 ctx, n_head 12 (8x H200,
+// tp=8, one binary per point, 32 tokens), against 54.53 ms/token at the 1024 floor:
+//
+//   floor  slice  grid   blk/SM   tax     ms/token
+//   1024   1024    128     0.97   2.08%     54.53
+//    512    512    256     1.94   4.17%     52.44   <- +3.98%
+//    256    497    264     2.00   4.29%     52.23   <- +4.42%, and 0.40% over the row
+//                                                      above is under the 2% bar
+//
+// So 4.17% of tax bought a 2.06x fill and won. That is the largest tax on this
+// curve the measurement actually validates — the 256 row differs by 0.40%, which is
+// noise, and it buys the last 8 blocks by cutting six OTHER cells of the shard/
+// context space to 2-tile slices at an 8.3% tax nothing has measured. Budget the
+// tax at the point that was measured and let the dims place the floor.
+constexpr int kMlaMaxSliceTaxPct = 5;
+
+// Rounded UP to whole kMlaCtxTile, because the tile is the work quantum: the slice
+// loop runs ceil(chunk / kMlaCtxTile) times and each iteration pays three
+// __syncthreads, two rounds of HPB-heads-over-NWARP-warps softmax and RSLOTS*HPB
+// rescales whatever tn is, so a slice that is not a whole number of tiles pays a full
+// tile for a partial one. Below NWARP * kMlaTokensPerWarp = 32 tokens the score phase
+// leaves whole warps with no work at all. One tile is the hard floor; the tax budget
+// decides how many.
+//
+//   hpb 12 -> 427 -> 512 tokens (4 tiles, 4.17%)   <- K3 sharded and replicated
+//   hpb  8 -> 285 -> 384 tokens (3 tiles, 3.70%)
+//   hpb  4 -> 143 -> 256 tokens (2 tiles, 2.78%)
+//
+// Fewer heads per block stage less q and write fewer partials, so they genuinely
+// amortise sooner — the flat 1024 was 2x conservative at hpb 12 and 4x at hpb 4.
+static constexpr int k3_mla_min_slice_len(int hpb, int key_length, int kv_lora) {
+    if (hpb <= 0 || key_length <= 0 || kv_lora <= 0) return kMlaCtxTile;
+    const long long den = (long long)key_length * kMlaMaxSliceTaxPct;
+    const long long raw = (2ll * hpb * kv_lora * 100 + den - 1) / den;
+    const long long tiles = (raw + kMlaCtxTile - 1) / kMlaCtxTile;
+    return (int)((tiles < 1 ? 1 : tiles) * kMlaCtxTile);
+}
+
+// Pin the derivation to the shape it was measured at. If kMlaCtxTile, the tax budget
+// or K3's MLA dims move, this fails the build rather than silently re-tuning the
+// scored config the way the flat constant did.
+static_assert(k3_mla_min_slice_len(12, 576, 512) == 4 * kMlaCtxTile,
+              "hpb 12 at K3's 576/512 must floor at 512 tokens — the measured point");
+static_assert(k3_mla_min_slice_len(1, 1, 1 << 20) >= kMlaCtxTile,
+              "the floor is never below one tile");
 
 // Largest head batch that divides n_head and whose staged queries fit the default
 // shared budget. 1 means "not worth it / does not fit" and selects the per-head kernel.
@@ -1815,7 +1898,16 @@ __global__ void mla_decode_combine_kernel(float* __restrict__ out,
 
     const float* pml = part_ml + (size_t)h * splits * 2;
 
-    // m = max over slices. Small (splits <= 64), so thread 0 is cheaper than a reduction.
+    // m = max over slices, on ONE thread while the other BLOCK-1 wait at the barrier.
+    //
+    // This said "Small (splits <= 64), so thread 0 is cheaper than a reduction" when
+    // the cap was 32. It is no longer small: the budget permits 512 (k3_mla_max_splits)
+    // and the launcher's fill target asks for 256 at the scored context, so this is a
+    // 2*splits serial walk in a grid of only n_head = 12 blocks. It is still ~1% of the
+    // attention pass it merges, which is why it is not the binding term today and is
+    // left alone — but it is O(splits) at 1/BLOCK parallelism, so it is the term that
+    // bites first if splits is ever widened again. Convert it to a block reduction
+    // before raising kMlaBlocksPerSm or the budget, not after.
     if (threadIdx.x == 0) {
         float m = -1e30f;
         for (int i = 0; i < splits; ++i) m = fmaxf(m, pml[2 * i]);
@@ -2141,6 +2233,86 @@ __global__ void proj_q8_0_q8_0_multirow_kernel(float* __restrict__ y,
     for (int r = 0; r < ROWS; ++r) {
         const float v = block_sum<BLOCK>(acc[r], shm);
         if (threadIdx.x == 0 && n0 + r < n_rows) y[n0 + r] = v;
+    }
+}
+
+
+// Q8 ACTIVATION x FOUR Q8_0 WEIGHT MATRICES, one launch.
+//
+// attn_q / attn_k / attn_v / ssm_g all read the SAME s.normed at the same
+// [qkv, H] shape on every one of the 69 KDA layers. The f32-activation path has
+// had proj_q8_0_fused4_kernel for exactly this; the Q8-activation path did not,
+// so turning on quantised activations silently dropped those layers to four
+// separate projections -- and k3_proj_ggml_f32 quantises its input per call, so
+// the identical vector was quantised four times per layer per rank.
+//
+// That is what made quantize_q8_0 59,696 launches and 8.7% of GPU time at
+// ~4.9 us for ~36 KB apiece -- roughly 7 GB/s on a 4.8 TB/s part. It was not
+// doing work; it was paying launch overhead.
+//
+// The obvious fix -- quantise once and let the other three reuse the scratch --
+// was tried and REVERTED: it needed the caller to promise the activation had not
+// changed, the guard I wrote checked the wrong thing (which pointer the scratch
+// was last written from, not whether the bytes behind it still matched), and the
+// model emitted top1 0.0 while getting faster. This shape needs no promise. One
+// kernel stages one activation block and consumes it four times before it can go
+// anywhere, so there is no window in which it can go stale.
+template <int BLOCK, int ROWS>
+__global__ void proj_q8_0_q8_0_fused4_kernel(float* __restrict__ y0,
+                                             float* __restrict__ y1,
+                                             float* __restrict__ y2,
+                                             float* __restrict__ y3,
+                                             const BlockQ8_0* __restrict__ x,
+                                             const BlockQ8_0* __restrict__ W0,
+                                             const BlockQ8_0* __restrict__ W1,
+                                             const BlockQ8_0* __restrict__ W2,
+                                             const BlockQ8_0* __restrict__ W3,
+                                             int blocks_per_row, int n_rows) {
+    const int n0 = blockIdx.x * ROWS;
+    __shared__ float shm[BLOCK / 32 + 1];
+
+    const BlockQ8_0* const Wt[4] = {W0, W1, W2, W3};
+    float* const Yt[4] = {y0, y1, y2, y3};
+
+    float acc[4][ROWS];
+#pragma unroll
+    for (int t = 0; t < 4; ++t)
+#pragma unroll
+        for (int r = 0; r < ROWS; ++r) acc[t][r] = 0.0f;
+
+    for (int b = threadIdx.x; b < blocks_per_row; b += BLOCK) {
+        // ONE staged activation block, consumed by 4 tensors x ROWS rows. The
+        // separate-launch path re-read (and re-quantised) this per tensor.
+        int xq[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) xq[i] = get_int_b2(x[b].qs, i);
+        const float dx = __half2float(__ushort_as_half(x[b].d));
+
+#pragma unroll
+        for (int t = 0; t < 4; ++t) {
+#pragma unroll
+            for (int r = 0; r < ROWS; ++r) {
+                if (n0 + r >= n_rows) continue;
+                const BlockQ8_0* row = Wt[t] + (size_t)(n0 + r) * blocks_per_row;
+                int sumi = 0;
+#pragma unroll
+                for (int i = 0; i < 8; ++i)
+                    sumi = __dp4a(get_int_b2(row[b].qs, i), xq[i], sumi);
+                const float dw = __half2float(__ushort_as_half(row[b].d));
+                acc[t][r] += (float)sumi * (dw * dx);
+            }
+        }
+    }
+
+    // block_sum contains __syncthreads(), so every thread must reach every call;
+    // only the store is guarded. Same contract as the multirow kernel.
+#pragma unroll
+    for (int t = 0; t < 4; ++t) {
+#pragma unroll
+        for (int r = 0; r < ROWS; ++r) {
+            const float v = block_sum<BLOCK>(acc[t][r], shm);
+            if (threadIdx.x == 0 && n0 + r < n_rows) Yt[t][n0 + r] = v;
+        }
     }
 }
 
@@ -2650,15 +2822,30 @@ void mla_decode_attn_f32(float* out, const float* q, const float* k_cache,
     const size_t hshm = ((size_t)hpb * key_length + (size_t)hpb * kMlaCtxTile +
                          3 * (size_t)hpb) * sizeof(float);
     if (hpb > 1 && rslots <= kMlaMaxRSlots) {
-        // Dividing the grid by HPB also divides the block count, so give the slice
-        // count back what the head axis lost: ~4 blocks per SM, never slicing below
-        // kMlaMinSliceLen tokens (below that the combine's per-slice loop and the
-        // extra partials outweigh the parallelism).
+        // FILL THE MACHINE; SHORTEN SLICES ONLY WHEN THE CONTEXT IS TOO SHORT TO.
+        //
+        // Dividing the grid by HPB also divides the block count, so the slice count
+        // has to give back what the head axis lost. `fill` is the whole objective —
+        // kMlaBlocksPerSm resident blocks on every SM, one wave — and it is the term
+        // that already tracks the shard policy, because groups and the device's SM
+        // count are both in it.
+        //
+        // The slice floor is a CONSTRAINT ON THAT OBJECTIVE, not a competing target:
+        // it caps how finely n_ctx can be cut before each slice stops amortising the
+        // partial it writes. It therefore binds only when n_ctx < fill * min_slice,
+        // i.e. when there is genuinely not enough context to feed the machine at a
+        // workable slice length — at which point no split count can fill it and
+        // taking the largest workable one is the best available. Writing the two in
+        // this order is the point: the previous version read as a flat token
+        // constant beside the target, and when head-sharding moved `fill` from 33 to
+        // 264 the constant quietly became the binding term and cost 4%.
         const int groups = n_head / hpb;
         const int sm     = k3_sm_count(dev);
         if (sm > 0) {
-            const int want = (kMlaBlocksPerSm * sm + groups - 1) / groups;
-            splits = std::max(splits, std::min(want, n_ctx / kMlaMinSliceLen));
+            const int fill      = (kMlaBlocksPerSm * sm + groups - 1) / groups;
+            const int min_slice = k3_mla_min_slice_len(hpb, key_length, kv_lora);
+            const int by_len    = std::max(1, n_ctx / min_slice);
+            splits = std::max(splits, std::min(fill, by_len));
             splits = std::min(std::max(splits, 1), k3_mla_max_splits(n_head));
         }
         dim3 hgrid((unsigned)groups, (unsigned)splits);
@@ -2863,6 +3050,44 @@ bool k3_proj_f32(float* y, const float* x, const void* W, int wtype,
         default:
             return false;
     }
+}
+
+bool k3_proj_ggml_f32_x4(float* y0, float* y1, float* y2, float* y3, const float* x,
+                         const void* W0, const void* W1, const void* W2, const void* W3,
+                         int wtype, int N, int K, void* q8_scratch,
+                         cudaStream_t stream) {
+    // Same narrow contract as the f32-activation x4 below: Q8_0 weights, four
+    // identical shapes, false means "use the slow path" rather than an error.
+    if (N <= 0 || K <= 0 || wtype != 8 || K % 32 != 0) return false;
+    if (!y0 || !y1 || !y2 || !y3 || !W0 || !W1 || !W2 || !W3 || !q8_scratch) return false;
+
+    constexpr int ROWS = 4;
+    if (N < ROWS) return false;
+    const int nb = K / 32;
+
+    // ONE quantisation for all four projections. This is the whole point: the
+    // per-call path quantised the identical activation four times per layer per
+    // rank, which is 8.7% of GPU time in 59,696 launches. The quantise and the
+    // consumer go out back-to-back on one stream, so no caller has to promise
+    // anything about the activation's lifetime -- the reuse cannot outlive the
+    // launch that produced it.
+    constexpr int QT = 128;
+    quantize_q8_0_kernel<<<(nb + QT - 1) / QT, QT, 0, stream>>>(
+        (BlockQ8_0*)q8_scratch, x, nb);
+
+    const unsigned grid = (unsigned)((N + ROWS - 1) / ROWS);
+    const BlockQ8_0* xq = (const BlockQ8_0*)q8_scratch;
+#define K3_QQ4_LAUNCH(BS)                                                        \
+    proj_q8_0_q8_0_fused4_kernel<BS, ROWS><<<grid, BS, 0, stream>>>(             \
+        y0, y1, y2, y3, xq, (const BlockQ8_0*)W0, (const BlockQ8_0*)W1,          \
+        (const BlockQ8_0*)W2, (const BlockQ8_0*)W3, nb, N)
+    switch (proj_block_for(nb)) {
+        case 32:  K3_QQ4_LAUNCH(32);  break;
+        case 64:  K3_QQ4_LAUNCH(64);  break;
+        default:  K3_QQ4_LAUNCH(128); break;
+    }
+#undef K3_QQ4_LAUNCH
+    return true;
 }
 
 bool k3_proj_f32_x4(float* y0, float* y1, float* y2, float* y3, const float* x,
