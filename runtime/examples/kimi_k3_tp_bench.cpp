@@ -50,7 +50,7 @@ namespace {
 
 // .spkl: magic | u32 version | u32 n_tokens | u32 n_vocab | f32[n_tokens][n_vocab].
 // Byte-identical to kimi_k3_generate's writer so compare_logits.py reads both.
-bool write_spkl(const char* path, const std::vector<float>& logits, int n_vocab) {
+bool write_spkl(const char* path, const float* logits, int n_vocab) {
     std::FILE* f = std::fopen(path, "wb");
     if (!f) return false;
     const uint32_t ver = 1, ntok = 1, nv = (uint32_t)n_vocab;
@@ -58,7 +58,7 @@ bool write_spkl(const char* path, const std::vector<float>& logits, int n_vocab)
                     std::fwrite(&ver, 4, 1, f) == 1 &&
                     std::fwrite(&ntok, 4, 1, f) == 1 &&
                     std::fwrite(&nv, 4, 1, f) == 1 &&
-                    std::fwrite(logits.data(), sizeof(float), logits.size(), f) == logits.size();
+                    std::fwrite(logits, sizeof(float), (size_t)n_vocab, f) == (size_t)n_vocab;
     std::fclose(f);
     return ok;
 }
@@ -170,7 +170,14 @@ int main(int argc, char** argv) {
         std::printf("seek: position -> %d (ctx alloc %d)\n", target, max_ctx);
     }
 
-    std::vector<float> logits((size_t)cfg.vocab);
+    // Pinned: the per-token device->host logits copy inside forward_token otherwise
+    // stages 640 KB through a pageable-memory bounce buffer every timed token.
+    float* logits = nullptr;
+    if (cudaHostAlloc(&logits, (size_t)cfg.vocab * sizeof(float),
+                      cudaHostAllocPortable) != cudaSuccess) {
+        std::printf("cudaHostAlloc logits failed\n");
+        return 1;
+    }
 
     // --ids: feed the exact prompt, no warm-up, no synthetic tokens. The recurrent
     // state and KV cache must see the reference's ids in the reference's order, so a
@@ -178,7 +185,7 @@ int main(int argc, char** argv) {
     if (!ids.empty()) {
         std::printf("prompt: %zu ids from --ids\n", ids.size());
         for (size_t i = 0; i < ids.size(); ++i) {
-            if (!kimi_k3_tp_forward_token(p, ids[i], logits.data())) {
+            if (!kimi_k3_tp_forward_token(p, ids[i], logits)) {
                 std::printf("prompt token %zu (id %d) failed\n", i, ids[i]); return 1;
             }
         }
@@ -201,12 +208,12 @@ int main(int argc, char** argv) {
     // the capture's one-time cost lands here rather than inside the timed loop. Both
     // timed runs of the eval discard the same two tokens, so the wall-clock
     // differential is unaffected.
-    if (!kimi_k3_tp_forward_token(p, 1000, logits.data())) { std::printf("warmup failed\n"); return 1; }
-    if (!kimi_k3_tp_forward_token(p, 1001, logits.data())) { std::printf("warmup failed\n"); return 1; }
+    if (!kimi_k3_tp_forward_token(p, 1000, logits)) { std::printf("warmup failed\n"); return 1; }
+    if (!kimi_k3_tp_forward_token(p, 1001, logits)) { std::printf("warmup failed\n"); return 1; }
 
     const auto t0 = std::chrono::steady_clock::now();
     for (int t = 0; t < n_tokens; ++t) {
-        if (!kimi_k3_tp_forward_token(p, 1000 + t, logits.data())) {
+        if (!kimi_k3_tp_forward_token(p, 1000 + t, logits)) {
             std::printf("token %d failed\n", t); return 1;
         }
     }
