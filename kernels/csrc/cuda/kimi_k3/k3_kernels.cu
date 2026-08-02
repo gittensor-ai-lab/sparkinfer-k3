@@ -187,6 +187,122 @@ __global__ void kda_decode_step_smem_kernel(float* __restrict__ out,
     if (j < head_dim) out[(size_t)h * head_dim + j] = o;
 }
 
+// Value-tiled KDA decode step. Same arithmetic as kda_decode_step_smem_kernel, same
+// stored layout, same accumulation order — it only adds a SECOND grid axis.
+//
+// WHY: the grid was `n_head`, and #63 head-sharded KDA, so n_head went 96 -> 12 at tp=8.
+// That is 12 blocks on a 132-SM H200 — 9% of the device — for 11.8% of all GPU kernel
+// time (nsys, ctx 131072). The kernel moves ~3.1 MB per launch and takes 87 us against a
+// ~0.9 us bandwidth floor, with a 982 ns stddev: it is not bandwidth-bound or contended,
+// it is starved of blocks. #63 budgeted the MLA split cap for exactly this reason
+// (kMlaSplitBudget) and left the kernel beside it at one block per head.
+//
+// WHY THIS DECOMPOSITION IS LEGAL: every step is column-local. For a state column j the
+// decay, sk[j] = sum_i S[i][j]*k[i], d[j], the rank-1 update and o[j] all touch only
+// column j plus the per-head vectors k/q/g, which are read-only and shared. So columns
+// split across blocks with NO extra reduction and NO duplicated state traffic — a block
+// reads exactly its own BV rows of the j-major buffer.
+//
+// This is also what the reference implementations do: FLA's fused_recurrent_gated_delta_rule
+// (the kernel vLLM ships for decode) launches grid = (cdiv(V, BV) * N * HV) with BV = 32,
+// one program per sequence, value head, and 32-wide VALUE TILE. BV = 32 here is theirs.
+//
+// ONE THREAD PER COLUMN, deliberately, even though it makes the block 32 threads wide.
+// It keeps each thread accumulating i in increasing order across and within chunks, so
+// this stays BIT-IDENTICAL to the kernel it replaces. Splitting the i-reduction across
+// R threads would parallelise further but turns a sequential sum into a tree, and a
+// change that moves the logits is a different change that has to be argued separately.
+template <int BV>
+__global__ void kda_decode_step_vt_kernel(float* __restrict__ out,
+                                          float* __restrict__ state,
+                                          const float* __restrict__ q,
+                                          const float* __restrict__ k,
+                                          const float* __restrict__ v,
+                                          const float* __restrict__ g,
+                                          const float* __restrict__ beta,
+                                          int head_dim) {
+    constexpr int IC = 32;
+    const int SP = IC + 1;
+    const int h  = blockIdx.x;
+    const int j0 = blockIdx.y * BV;      // this block's value tile
+    const int jl = threadIdx.x;          // column within the tile
+    const int j  = j0 + jl;
+
+    float* S = state + (size_t)h * head_dim * head_dim;
+    const float* qh = q + (size_t)h * head_dim;
+    const float* kh = k + (size_t)h * head_dim;
+    const float* vh = v + (size_t)h * head_dim;
+    const float* gh = g + (size_t)h * head_dim;
+    const float  b  = beta[h];
+
+    extern __shared__ float smem[];
+    float* s_k  = smem;                  // full head_dim: every column needs every i
+    float* s_q  = s_k + head_dim;
+    float* s_ge = s_q + head_dim;
+    float* s_T  = s_ge + head_dim;       // BV rows of SP
+
+    // Cooperative over BV threads, not head_dim — the tile is narrower than the vectors.
+    for (int t = jl; t < head_dim; t += BV) {
+        s_k[t]  = kh[t];
+        s_q[t]  = qh[t];
+        s_ge[t] = __expf(gh[t]);
+    }
+    __syncthreads();
+
+    // Step 1 + 2: decay by exp(g[i]) and sk = sum_i S[i][j]*k[i].
+    //
+    // THE DECAYED STATE IS NOT WRITTEN BACK HERE. The staged kernel stored S*exp(g) to
+    // global at the end of this pass and re-read it in the next one; pass 2 below simply
+    // recomputes the product from the untouched S. That drops a full write of the state
+    // per launch — a quarter of this kernel's global traffic — plus one staging loop and
+    // one barrier per chunk, and the recomputed multiply is free next to the load it
+    // replaces.
+    //
+    // __fmul_rn, not `*`, and that is load-bearing. The old pass 1 stored the product to
+    // shared, which forced it to be materialised as a rounded f32. Here it feeds an add
+    // directly, so nvcc (--fmad=true by default) would happily contract it into an fma
+    // and skip the intermediate rounding — giving a different result in the last bits and
+    // silently costing the bit-identity this whole change is claiming.
+    float sk = 0.0f;
+    for (int i0 = 0; i0 < head_dim; i0 += IC) {
+        for (int t = jl; t < BV * IC; t += BV)
+            s_T[(t / IC) * SP + (t % IC)] =
+                S[(size_t)(j0 + t / IC) * head_dim + i0 + (t % IC)];
+        __syncthreads();
+        for (int c = 0; c < IC; ++c)
+            sk += __fmul_rn(s_T[jl * SP + c], s_ge[i0 + c]) * s_k[i0 + c];
+        __syncthreads();
+    }
+
+    // Step 3: d = beta * (v[j] - sk). Column-local, so it stays in a register — the
+    // staged kernel routed this through shared only because it had a wider block.
+    const float d_j = b * (vh[j] - sk);
+
+    // Step 4 + 5: rank-1 update, then o = sum_i S[i][j]*q[i].
+    float o = 0.0f;
+    for (int i0 = 0; i0 < head_dim; i0 += IC) {
+        for (int t = jl; t < BV * IC; t += BV)
+            s_T[(t / IC) * SP + (t % IC)] =
+                S[(size_t)(j0 + t / IC) * head_dim + i0 + (t % IC)];
+        __syncthreads();
+        for (int c = 0; c < IC; ++c) {
+            // S here is the ORIGINAL state, because pass 1 no longer wrote its decayed
+            // copy — so the decay is reapplied, to exactly the same operands with exactly
+            // the same rounding, and the sum below sees the identical f32 the staged
+            // kernel read back from global.
+            const float sv = __fmul_rn(s_T[jl * SP + c], s_ge[i0 + c]) + s_k[i0 + c] * d_j;
+            s_T[jl * SP + c] = sv;
+            o += sv * s_q[i0 + c];
+        }
+        __syncthreads();
+        for (int t = jl; t < BV * IC; t += BV)
+            S[(size_t)(j0 + t / IC) * head_dim + i0 + (t % IC)] =
+                s_T[(t / IC) * SP + (t % IC)];
+        __syncthreads();
+    }
+    out[(size_t)h * head_dim + j] = o;
+}
+
 template <int BLOCK>
 __global__ void kda_decode_step_kernel(float* __restrict__ out, float* __restrict__ state,
                                        const float* __restrict__ q,
@@ -2409,6 +2525,27 @@ void kda_decode_step_f32(float* out, float* state,
     constexpr int IC = 32, SMEM_BLOCK = 128;
     const size_t shm_staged =
         ((size_t)4 * head_dim + (size_t)head_dim * (IC + 1)) * sizeof(float);
+
+    // Value tiling. grid (n_head,) -> (n_head, head_dim/BV): see the kernel comment for
+    // why one block per head strands the device once KDA is head-sharded.
+    //
+    // SPARKINFER_K3_KDA_VT=0 restores the single-tile launch, which is how the two are
+    // A/B'd on ONE binary. It defaults ON because the eval harness runs a default build
+    // and an env-gated win scores as zero — the same trap that made #63's qact path and
+    // #67's fusion guard invisible until someone read the profile.
+    constexpr int BV = 32;
+    static const bool want_vt = [] {
+        const char* e = std::getenv("SPARKINFER_K3_KDA_VT");
+        return !(e && e[0] == '0');
+    }();
+    if (want_vt && head_dim == SMEM_BLOCK && head_dim % IC == 0 && head_dim % BV == 0) {
+        const size_t shm_vt =
+            ((size_t)3 * head_dim + (size_t)BV * (IC + 1)) * sizeof(float);
+        const dim3 grid((unsigned)n_head, (unsigned)(head_dim / BV));
+        kda_decode_step_vt_kernel<BV><<<grid, BV, shm_vt, stream>>>(
+            out, state, q, k, v, g, beta, head_dim);
+        return;
+    }
     if (head_dim == SMEM_BLOCK && head_dim % IC == 0) {
         kda_decode_step_smem_kernel<SMEM_BLOCK><<<(unsigned)n_head, T, shm_staged, stream>>>(
             out, state, q, k, v, g, beta, head_dim);
