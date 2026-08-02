@@ -45,6 +45,7 @@ import io
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -80,6 +81,28 @@ REBASE_LABEL = "needs-rebase"
 # the ticked box, because that is the author's attestation that they ran it.
 TICKED = re.compile(r"-\s*\[\s*[xX]\s*\]")
 H200 = re.compile(r"h200", re.I)
+NODE_RUN_HEADING = re.compile(r"^##\s+node run\s*$", re.I)
+ANY_HEADING = re.compile(r"^##\s+")
+
+
+def node_run_section(body):
+    """Only the text between '## Node run' and the next '##' heading.
+
+    Same bug, same fix as node-attestation.yml (#78): a body-wide TICKED+H200 scan matched
+    the PR-template Checklist boilerplate '- [x] `...--node h200x8 --dry-run` resolves' --
+    ticked on nearly every PR and containing 'h200' -- so a PR read as attested while the
+    real Node run box sat unticked. Here the consequence was bounded (the bot still
+    measures for real) but live: #71 was evaluated in two rounds and #74 queued, neither
+    ever having attested a node run. The attestation is a claim made in ONE place; read
+    only that place. No section => not attested, which fails closed.
+    """
+    lines = (body or "").split("\n")
+    start = next((i for i, ln in enumerate(lines) if NODE_RUN_HEADING.match(ln)), -1)
+    if start == -1:
+        return ""
+    end = next((i for i in range(start + 1, len(lines)) if ANY_HEADING.match(lines[i])),
+               len(lines))
+    return "\n".join(lines[start + 1:end])
 
 
 def gh(args, timeout=120):
@@ -104,7 +127,7 @@ def sh(cmd, timeout=7200):
 
 def list_prs(repo):
     r = gh(["pr", "list", "-R", repo, "--state", "open", "--limit", "50", "--json",
-            "number,title,isDraft,headRefOid,body,author,labels,isCrossRepository"])
+            "number,title,isDraft,headRefOid,body,author,labels,isCrossRepository,mergeable"])
     if r.returncode != 0:
         raise SystemExit(f"k3_eval_bot: gh pr list failed: {r.stderr.strip()}")
     return json.loads(r.stdout or "[]")
@@ -117,8 +140,38 @@ def eligibility(pr):
     labels = {l.get("name", "") for l in pr.get("labels") or []}
     if "hold" in labels:
         return False, "hold label set"
-    body = pr.get("body") or ""
-    ticked = any(TICKED.search(ln) and H200.search(ln) for ln in body.splitlines())
+
+    # A conflicted branch cannot be brought current, so it cannot be measured against a
+    # frontier that is about to move under it, and it cannot be merged at the end. #64 sat in
+    # a round as CONFLICTING: update_pr_branch could not advance it -- the round log shows
+    # #77, #74 and #71 updated and #64 simply absent -- so anything it measured would have
+    # described a tree that does not exist on main. That is ~40 GPU-minutes spent on a result
+    # nobody can act on.
+    #
+    # Only an explicit CONFLICTING skips. GitHub computes mergeability lazily and answers
+    # UNKNOWN while recomputing, which is the normal state for every open PR in the seconds
+    # after main moves -- treating that as a conflict would skip the entire field. UNKNOWN
+    # falls through to the merge path, where wait_mergeable_state() already blocks for a real
+    # answer.
+    if pr.get("mergeable") == "CONFLICTING":
+        return False, "conflicts with main — rebase before it can be evaluated or merged"
+
+    # CI's own verdict on the attestation, re-derived by node-attestation.yml on every edit
+    # and synchronize, so it does not go stale. It is already in NEVER_MERGE_LABELS: a PR
+    # carrying it cannot merge at the end of the round however fast it measures, so booking
+    # the node for it is spending GPU on a foregone conclusion.
+    #
+    # It is also a cross-check on the scan below. Both read the same checkbox out of the same
+    # body, so a disagreement means one of them is broken -- which is exactly the state this
+    # file was in before the fix below: the label said #74 and #71 had no node run, the bot
+    # said they did, and the bot was wrong. Two independent readings that must agree beat one
+    # reading trusted absolutely.
+    if "needs-node-run" in labels:
+        return False, ("needs-node-run — node-attestation.yml found no ticked node box "
+                       "in '## Node run'")
+
+    section = node_run_section(pr.get("body") or "")
+    ticked = any(TICKED.search(ln) and H200.search(ln) for ln in section.splitlines())
     if not ticked:
         return False, "the 8x H200 box is not ticked — the author has not attested a node run"
     return True, "eligible"
@@ -300,6 +353,21 @@ def _box_eval(what, frontier=None, seal=False, top1=None, kl=None):
     """
     seal_flag = " --seal" if seal else ""
     front_flag = "" if frontier is None else f" --frontier {frontier}"
+    # Harness knobs set on the CONTROLLER, forwarded to the box. bench/scripts is restored
+    # from origin/main before every build, so the harness the box runs is whatever is on the
+    # protected branch -- there is otherwise no way to run a round against a tuned constant
+    # without merging it first. That is the right default for anything a PR could influence,
+    # and the wrong one for an operator fixing a harness bug the round is currently hitting.
+    #
+    # PRINTED, not silent. These change how a number was produced, so a round log that does
+    # not name them describes a measurement nobody can reproduce. The value goes in the log
+    # that ships to sparkinfer-k3-log, next to the result it produced.
+    passthru = {k: v for k, v in sorted(os.environ.items())
+                if k.startswith("KIMI_K3_") and k not in ("KIMI_K3_MODELS_DIR",)}
+    if passthru:
+        print("   harness overrides from the controller: "
+              + " ".join(f"{k}={v}" for k, v in passthru.items()))
+    env_prefix = "".join(f"{k}={shlex.quote(v)} " for k, v in passthru.items())
     # Accuracy graded on THIS machine, handed to the harness. Without these the harness
     # falls back to comparing on the box against a reference the binary can read.
     acc_flag = "" if top1 is None or kl is None else f" --top1 {top1} --kl {kl}"
@@ -312,6 +380,7 @@ def _box_eval(what, frontier=None, seal=False, top1=None, kl=None):
         # $SPARKINFER_BUILD/kimi_k3_tp_bench, so pointing this at build/ makes it exit 2 with
         # "not built" immediately after a build that in fact succeeded.
         f"KIMI_K3_MODELS_DIR={BOX_MODELS_DIR} SPARKINFER_BUILD={BOX_REPO_DIR}/build/runtime "
+        f"{env_prefix}"
         f"bash bench/scripts/kimi_k3_eval.sh --node {NODE} --devices {DEVICES}"
         f"{front_flag}{acc_flag}{seal_flag}"
     )
