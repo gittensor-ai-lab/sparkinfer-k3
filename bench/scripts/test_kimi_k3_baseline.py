@@ -2069,6 +2069,112 @@ class CiWorkflowTest(unittest.TestCase):
         ok, _ = bot.eligibility(pr(crlf))
         self.assertTrue(ok, "CRLF line endings broke the section scan")
 
+    def test_a_transient_box_failure_does_not_discard_the_whole_round(self):
+        """One frontier failure used to throw away every PR in the round.
+
+        measure_frontier raises -> main() bails -> nothing is evaluated, however healthy the
+        PRs were. Two rounds in the ledger died exactly there: rounds/66955446f62f, and
+        rounds/11eb5e4d02b7 on `ncclCommInitAll(n=8): unhandled cuda error` / `init failed at
+        tp=8`. A collective that failed to initialise says nothing about anyone's code."""
+        bot = self._bot()
+        orig_sleep = time.sleep
+        try:
+            bot.time.sleep = lambda s: None
+            calls = []
+
+            def flaky(fails, exc_text):
+                def _f():
+                    calls.append(1)
+                    if len(calls) <= fails:
+                        raise RuntimeError(exc_text)
+                    return "measured"
+                return _f
+
+            # The real NCCL failure from rounds/11eb5e4d02b7, recovering on attempt 2.
+            ncc = ("no RESULT_JSON from the harness for main — kimi_k3_eval: bench failed\n"
+                   "[tp] FATAL: ncclCommInitAll(n=8): unhandled cuda error\n"
+                   "init failed at tp=8, 93 layers")
+            calls.clear()
+            self.assertEqual(bot.with_box_retry("frontier", flaky(1, ncc), tries=3, delay=0),
+                             "measured")
+            self.assertEqual(len(calls), 2, "the retry did not happen")
+
+            # Persistent failure still stops the round -- it must not fall back to the pin.
+            calls.clear()
+            with self.assertRaises(RuntimeError):
+                bot.with_box_retry("frontier", flaky(99, ncc), tries=3, delay=0)
+            self.assertEqual(len(calls), 3, "gave up before using its attempts")
+        finally:
+            bot.time.sleep = orig_sleep
+
+    def test_a_guard_refusal_is_never_retried(self):
+        """A GUARD THAT CAN BE RETRIED IS NOT A GUARD.
+
+        The harness refusing to score is an ANSWER, not a glitch. Re-running it until it
+        passes is sampling until the result is convenient, and every one of these guards
+        exists because the number could otherwise be fabricated. Each refusal below must
+        surface on the FIRST attempt."""
+        bot = self._bot()
+        orig_sleep = time.sleep
+        try:
+            bot.time.sleep = lambda s: None
+            refusals = [
+                # the one that refused #77, and the one that refused round 66955446
+                "kimi_k3_eval: 128 extra tokens took 2.96 s ...\n"
+                "  refusing to score: the longer run did not do the extra work",
+                "kimi_k3_eval: the bench claims 4.55 tok/s but wall clock allows 3.45.\n"
+                "  refusing to score: ... signature of a fabricated number.",
+                "harness measured commit 'abc1234' but main is 'def5678'",
+                "the bench reported no ms/token line — nothing to score",
+                "non-positive time delta (-3 ns over 128 tokens)",
+            ]
+            for text in refusals:
+                calls = []
+
+                def _f():
+                    calls.append(1)
+                    raise RuntimeError(text)
+
+                self.assertFalse(bot.is_transient(RuntimeError(text)),
+                                 f"classified as transient, so it would be retried: {text[:60]}")
+                with self.assertRaises(RuntimeError):
+                    bot.with_box_retry("x", _f, tries=4, delay=0)
+                self.assertEqual(len(calls), 1,
+                                 f"a verdict was retried {len(calls)}x: {text[:60]}")
+
+            # A verdict marker wins even when transient-looking words share the message --
+            # the error carries a 1200-char tail of box output, so this overlap is normal.
+            mixed = ("no RESULT_JSON — kimi_k3_eval: bench failed\n"
+                     "  refusing to score: the longer run did not do the extra work")
+            self.assertFalse(bot.is_transient(RuntimeError(mixed)),
+                             "a refusal buried under box noise became retryable")
+        finally:
+            bot.time.sleep = orig_sleep
+
+    def test_transient_signatures_cover_what_actually_broke(self):
+        bot = self._bot()
+        for text in ("ncclCommInitAll(n=8): unhandled cuda error",
+                     "init failed at tp=8, 93 layers",
+                     "[k3] cudaMalloc failed for blk.92.attn_kv_a_norm.weight",
+                     "[k3-tp] rank 3: weight load failed",
+                     "kimi_k3_eval: bench failed",
+                     "ssh timeout after 7200s",
+                     "kex_exchange_identification: Connection closed by remote host"):
+            self.assertTrue(bot.is_transient(RuntimeError(text)),
+                            f"a real box failure would not be retried: {text}")
+
+    def test_both_the_frontier_and_each_pr_are_retried(self):
+        """Wiring, not behaviour: the helper above is worthless if nothing calls it."""
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        frontier_call = src[src.index("if args.frontier is not None:"):src.index("for pr in eligible:")]
+        self.assertIn("with_box_retry(", frontier_call,
+                      "one transient box failure still discards every PR in the round")
+        self.assertIn("measure_frontier(", frontier_call)
+        pr_loop = src[src.index("for pr in eligible:"):]
+        self.assertIn("with_box_retry(", pr_loop,
+                      "a PR still loses its round to one transient box failure")
+        self.assertIn("evaluate(pr,", pr_loop)
+
     def test_unknown_mergeability_is_settled_before_the_node_is_booked(self):
         """The CONFLICTING skip was decorative in the one case it had to work.
 
