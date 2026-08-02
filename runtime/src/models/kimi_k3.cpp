@@ -999,11 +999,27 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
     const bool ggml_qact_proj = qact_proj();
     const bool ggml_qact_moe = qact_moe();
 
+    // Quantise each activation once, not once per projection. s.proj_q8 is the one
+    // scratch every wrapper call writes, so after a Q8_0 projection of (x, K) the
+    // scratch still holds exactly that activation — the next projection of the same
+    // (x, K) can skip its quantise. The memo is phase-local (these locals die with
+    // the call), which is what makes it safe: nothing else touches the scratch inside a
+    // phase, in-place rewrites (the q_lora rms) all happen BEFORE their buffer is
+    // first projected, and a projection that writes over a memoed buffer drops it. The x4 fusion below also
+    // quantises s.normed into the same scratch and seeds the memo the same way.
+    const float* q8_x = nullptr;
+    int q8_K = 0;
     auto proj = [&](float* y, const float* x, const KimiK3Tensor& W, int N, int K) {
         if (!W.ok()) return false;
-        if (ggml_qact_proj)
-            return k3k::k3_proj_ggml_f32(y, x, W.data, W.type, N, K,
-                                         s.proj_q8, stream);
+        if (ggml_qact_proj) {
+            const bool pre = (W.type == 8 && x == q8_x && K == q8_K);
+            if (!k3k::k3_proj_ggml_f32(y, x, W.data, W.type, N, K,
+                                       s.proj_q8, stream, pre))
+                return false;
+            if (y == q8_x) { q8_x = nullptr; q8_K = 0; }   // y aliased the memoed x
+            if (W.type == 8) { q8_x = x; q8_K = K; }
+            return true;
+        }
         return k3k::k3_proj_f32(y, x, W.data, W.type, N, K, stream);
     };
 
@@ -1091,6 +1107,12 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
                                            s.normed, L.attn_q.data, L.attn_k.data,
                                            L.attn_v.data, L.ssm_g.data,
                                            L.attn_q.type, qkv, H, stream));
+            if (fused_qkvg && ggml_qact_proj) {
+                // The x4 wrapper quantised s.normed into s.proj_q8 — seed the memo
+                // so the ssm_* projections of the same activation skip theirs.
+                q8_x = s.normed;
+                q8_K = H;
+            }
             if (!fused_qkvg) {
                 if (!proj(s.qkv_q, s.normed, L.attn_q, qkv, H)) return false;
                 if (!proj(s.qkv_k, s.normed, L.attn_k, qkv, H)) return false;

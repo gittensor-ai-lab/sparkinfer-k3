@@ -511,8 +511,13 @@ bool k3_proj_f32_x4(float* y0, float* y1, float* y2, float* y3, const float* x,
 //
 // This entry point preserves F32 weights exactly and applies llama's Q8_0 activation
 // conversion only for Q8_0 weights. q8_scratch must hold (K/32)*34 bytes.
+// x_prequantized: q8_scratch already holds this x at this K — quantised by the
+// immediately preceding call on the same stream — so the quantise step is skipped.
+// Only the caller can prove that; the wrapper trusts it. Same kernel, same input,
+// same bytes: the skip is bit-free.
 bool k3_proj_ggml_f32(float* y, const float* x, const void* W, int wtype,
-                      int N, int K, void* q8_scratch, cudaStream_t stream);
+                      int N, int K, void* q8_scratch, cudaStream_t stream,
+                      bool x_prequantized = false);
 
 // Scratch sizing helpers for the two reference-compatible activation paths.
 // K must be divisible by the corresponding block size (32 or 256).

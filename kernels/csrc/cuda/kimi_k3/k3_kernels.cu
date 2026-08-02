@@ -1354,6 +1354,7 @@ constexpr int kMlaTokensPerWarp = 4;
 static constexpr int kMlaMaxDevices = 16;
 static float* g_mla_part_acc[kMlaMaxDevices] = {nullptr};
 static float* g_mla_part_ml [kMlaMaxDevices] = {nullptr};
+static float* g_mla_latent  [kMlaMaxDevices] = {nullptr};  // folded latent, [n_head, kv_lora]
 static size_t g_mla_part_cap[kMlaMaxDevices] = {0};
 
 static bool k3_mla_split_scratch(int n_head, int kv_lora, int* dev_out) {
@@ -1375,6 +1376,13 @@ static bool k3_mla_split_scratch(int n_head, int kv_lora, int* dev_out) {
     if (cudaMalloc((void**)&g_mla_part_ml[dev],
                    (size_t)n_head * ms * 2 * sizeof(float)) != cudaSuccess) {
         cudaFree(g_mla_part_acc[dev]); g_mla_part_acc[dev] = nullptr; return false;
+    }
+    cudaFree(g_mla_latent[dev]);
+    if (cudaMalloc((void**)&g_mla_latent[dev],
+                   (size_t)n_head * kv_lora * sizeof(float)) != cudaSuccess) {
+        cudaFree(g_mla_part_acc[dev]); g_mla_part_acc[dev] = nullptr;
+        cudaFree(g_mla_part_ml[dev]);  g_mla_part_ml[dev]  = nullptr;
+        return false;
     }
     g_mla_part_cap[dev] = need;
     return true;
@@ -2061,6 +2069,73 @@ __global__ void mla_decode_combine_kernel(float* __restrict__ out,
         const float* wr = wh + (size_t)v * kv_lora;
         float acc = 0.0f;
         for (int r = lane; r < kv_lora; r += 32) acc += wr[r] * s_acc[r];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            acc += __shfl_down_sync(0xffffffff, acc, off);
+        if (lane == 0) oh[v] = acc;
+    }
+}
+
+// The fused combine runs n_head (12 under 8-way head sharding) blocks on a 132-SM
+// device — 9% of the machine for an O(splits * kv_lora + v_dim * kv_lora) job whose
+// two halves are r- and v-parallel. Split it into two kernels and widen each grid.
+//
+// BIT-IDENTITY over speed, same discipline as everything here: every fold block
+// redoes the SAME serial m/l walk (identical inputs -> identical floats; the
+// redundancy buys occupancy with ALU we have to spare), folds its r-slice over
+// splits in the same order, and the projection walks r in the same lane-strided
+// sequence the fused kernel used. The only change is WHERE the latent parks
+// between the halves: global scratch instead of one block's shared memory.
+template <int BLOCK>
+__global__ void mla_decode_combine_fold_kernel(float* __restrict__ latent,
+                                               const float* __restrict__ part_acc,
+                                               const float* __restrict__ part_ml,
+                                               int kv_lora, int splits, int r_chunk) {
+    const int h  = blockIdx.x;
+    const int r0 = blockIdx.y * r_chunk;
+    const int r1 = min(kv_lora, r0 + r_chunk);
+    extern __shared__ float smem[];
+    float* s_w = smem;                                    // splits + 1
+    const float* pml = part_ml + (size_t)h * splits * 2;
+    if (threadIdx.x == 0) {
+        float m = -1e30f;
+        for (int i = 0; i < splits; ++i) m = fmaxf(m, pml[2 * i]);
+        float l = 0.0f;
+        for (int i = 0; i < splits; ++i) {
+            const float w = __expf(pml[2 * i] - m);
+            s_w[i] = w;
+            l += pml[2 * i + 1] * w;
+        }
+        s_w[splits] = l > 0.0f ? 1.0f / l : 0.0f;
+    }
+    __syncthreads();
+    const float inv = s_w[splits];
+    for (int r = r0 + threadIdx.x; r < r1; r += BLOCK) {
+        float a = 0.0f;
+        for (int i = 0; i < splits; ++i)
+            a += part_acc[((size_t)h * splits + i) * kv_lora + r] * s_w[i];
+        latent[(size_t)h * kv_lora + r] = a * inv;
+    }
+}
+
+template <int BLOCK>
+__global__ void mla_decode_combine_project_kernel(float* __restrict__ out,
+                                                  const float* __restrict__ latent,
+                                                  const float* __restrict__ wv_b,
+                                                  int kv_lora, int v_dim, int v_chunk) {
+    constexpr int NWARP = BLOCK / 32;
+    const int h    = blockIdx.x;
+    const int v0   = blockIdx.y * v_chunk;
+    const int v1   = min(v_dim, v0 + v_chunk);
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const float* lh = latent + (size_t)h * kv_lora;
+    const float* wh = wv_b + (size_t)h * (size_t)kv_lora * v_dim;
+    float* oh = out + (size_t)h * v_dim;
+    for (int v = v0 + warp; v < v1; v += NWARP) {
+        const float* wr = wh + (size_t)v * kv_lora;
+        float acc = 0.0f;
+        for (int r = lane; r < kv_lora; r += 32) acc += wr[r] * lh[r];
 #pragma unroll
         for (int off = 16; off > 0; off >>= 1)
             acc += __shfl_down_sync(0xffffffff, acc, off);
@@ -2997,6 +3072,24 @@ void mla_absorb_q_f32(float* out, const float* q_nope, const float* q_pe,
         out, q_nope, q_pe, wk_b, qk_nope, kv_lora, rope_dim);
 }
 
+// Both split paths end in the same two-kernel combine; one launcher keeps the
+// chunking policy (and any future tuning of it) in a single place.
+template <int BLOCK>
+static void launch_combine_split(float* out, const float* wv_b, int kv_lora,
+                                 int v_dim, int n_head, int splits, int dev,
+                                 cudaStream_t stream) {
+    const int r_chunk = 64;                               // 512/64 = 8 r-slices
+    const int v_chunk = 16;                               // 128/16 = 8 v-slices
+    const size_t fshm = ((size_t)splits + 1) * sizeof(float);
+    dim3 fgrid((unsigned)n_head, (unsigned)((kv_lora + r_chunk - 1) / r_chunk));
+    mla_decode_combine_fold_kernel<BLOCK><<<fgrid, BLOCK, fshm, stream>>>(
+        g_mla_latent[dev], g_mla_part_acc[dev], g_mla_part_ml[dev],
+        kv_lora, splits, r_chunk);
+    dim3 pgrid((unsigned)n_head, (unsigned)((v_dim + v_chunk - 1) / v_chunk));
+    mla_decode_combine_project_kernel<BLOCK><<<pgrid, BLOCK, 0, stream>>>(
+        out, g_mla_latent[dev], wv_b, kv_lora, v_dim, v_chunk);
+}
+
 int mla_decode_attn_splits(int n_head, int key_length, int kv_lora, int n_ctx) {
     if (n_head <= 0 || n_ctx <= 0 || key_length <= 0 || kv_lora <= 0) return 1;
     int dev = 0;
@@ -3118,9 +3211,8 @@ void mla_decode_attn_f32(float* out, const float* q, const float* k_cache,
             default: launched = false; break;
         }
         if (launched) {
-            const size_t cshm = ((size_t)kv_lora + (size_t)splits + 1) * sizeof(float);
-            mla_decode_combine_kernel<BLOCK><<<(unsigned)n_head, BLOCK, cshm, stream>>>(
-                out, g_mla_part_acc[dev], g_mla_part_ml[dev], wv_b, kv_lora, v_dim, splits);
+            launch_combine_split<BLOCK>(out, wv_b, kv_lora, v_dim, n_head, splits,
+                                        dev, stream);
             return;
         }
     }
@@ -3129,10 +3221,7 @@ void mla_decode_attn_f32(float* out, const float* q, const float* k_cache,
     mla_decode_attn_split_kernel<BLOCK><<<grid, BLOCK, shm, stream>>>(
         g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora,
         n_ctx, scale, splits, n_ctx_dev);
-    // s_acc + s_w, where s_w needs splits + 1 slots (the last holds 1/l).
-    const size_t cshm = ((size_t)kv_lora + (size_t)splits + 1) * sizeof(float);
-    mla_decode_combine_kernel<BLOCK><<<(unsigned)n_head, BLOCK, cshm, stream>>>(
-        out, g_mla_part_acc[dev], g_mla_part_ml[dev], wv_b, kv_lora, v_dim, splits);
+    launch_combine_split<BLOCK>(out, wv_b, kv_lora, v_dim, n_head, splits, dev, stream);
 }
 
 // Threads that would run ZERO iterations of the block loop are not free.
@@ -3367,15 +3456,20 @@ bool k3_proj_f32_x4(float* y0, float* y1, float* y2, float* y3, const float* x,
 }
 
 bool k3_proj_ggml_f32(float* y, const float* x, const void* W, int wtype,
-                      int N, int K, void* q8_scratch, cudaStream_t stream) {
+                      int N, int K, void* q8_scratch, cudaStream_t stream,
+                      bool x_prequantized) {
     if (N <= 0 || K <= 0) return false;
     if (wtype == 0)
         return k3_proj_f32(y, x, W, wtype, N, K, stream);
     if (wtype != 8 || !q8_scratch || K % 32 != 0) return false;
     const int nb = K / 32;
     constexpr int QT = 128;
-    quantize_q8_0_kernel<<<(nb + QT - 1) / QT, QT, 0, stream>>>(
-        (BlockQ8_0*)q8_scratch, x, nb);
+    // x_prequantized: the caller proved q8_scratch already holds THIS x at THIS K
+    // (same buffer, quantised by the immediately preceding call on the same stream).
+    // Same kernel, same input -> same bytes, so skipping the re-run is bit-free.
+    if (!x_prequantized)
+        quantize_q8_0_kernel<<<(nb + QT - 1) / QT, QT, 0, stream>>>(
+            (BlockQ8_0*)q8_scratch, x, nb);
     // Same idle-thread sizing as the f32-activation path above.
     constexpr int BLOCK = 128;
     const int TB = proj_block_for(nb);
