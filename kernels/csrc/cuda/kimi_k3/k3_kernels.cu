@@ -3078,6 +3078,19 @@ template <int BLOCK>
 static void launch_combine_split(float* out, const float* wv_b, int kv_lora,
                                  int v_dim, int n_head, int splits, int dev,
                                  cudaStream_t stream) {
+    // SPARKINFER_K3_MLA_COMBINE_SPLIT=0 restores the single fused combine kernel, so
+    // the split can be A/B'd on ONE binary and reported as its own number rather than
+    // lumped into a stack total.
+    static const bool split_combine = [] {
+        const char* e = std::getenv("SPARKINFER_K3_MLA_COMBINE_SPLIT");
+        return !(e && e[0] == '0');
+    }();
+    if (!split_combine) {
+        const size_t cshm = ((size_t)kv_lora + (size_t)splits + 1) * sizeof(float);
+        mla_decode_combine_kernel<BLOCK><<<(unsigned)n_head, BLOCK, cshm, stream>>>(
+            out, g_mla_part_acc[dev], g_mla_part_ml[dev], wv_b, kv_lora, v_dim, splits);
+        return;
+    }
     const int r_chunk = 64;                               // 512/64 = 8 r-slices
     const int v_chunk = 16;                               // 128/16 = 8 v-slices
     const size_t fshm = ((size_t)splits + 1) * sizeof(float);
