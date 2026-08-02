@@ -80,7 +80,22 @@ fi
 
 # --no-bos: kimi_k3_generate feeds the ids verbatim and adds nothing, so a BOS here
 # would be a token the reference never saw. Matches how bench/refdata was captured.
-IDS_RAW="$(printf '%s' "$PROMPT" | "$TOK" -m "$MODEL" --stdin --ids --no-bos 2>/dev/null | tail -1)"
+# llama-tokenize is noisy on stderr even when it succeeds (model metadata), so its
+# output is captured rather than shown. Capture rather than discard: under
+# `set -o pipefail` a non-zero llama-tokenize aborts the script at this assignment,
+# so the "produced no ids" check below never runs — with stderr sent to /dev/null
+# that surfaced as a bare exit code and no message at all.
+TOK_LOG="$(mktemp)"
+trap 'rm -f "$TOK_LOG"' EXIT
+if ! IDS_RAW="$(printf '%s' "$PROMPT" | "$TOK" -m "$MODEL" --stdin --ids --no-bos 2>"$TOK_LOG" | tail -1)"; then
+    echo "kimi_k3_run: llama-tokenize failed on $MODEL" >&2
+    [[ -s "$TOK_LOG" ]] && sed 's/^/  /' "$TOK_LOG" >&2
+    exit 1
+fi
+# This script ends in `exec`, which replaces the process without running the EXIT
+# trap — drop the log explicitly now that it is no longer needed.
+rm -f "$TOK_LOG"
+trap - EXIT
 IDS="$(printf '%s' "$IDS_RAW" | tr -d '[]' | tr ',' ' ' | tr -s ' ')"
 
 if [[ -z "${IDS// /}" ]]; then
