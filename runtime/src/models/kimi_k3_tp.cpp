@@ -298,6 +298,12 @@ bool kimi_k3_tp_init(const GGUF& g, const KimiK3Config& cfg, const K3PlanOptions
             rank_err[(size_t)r] = "cudaMalloc logits failed";
             return false;
         }
+        if (r == 0 && cfg.attn_res_block_size > 0 &&
+            cudaMalloc(&R.res_scores,
+                       (size_t)(R.state.max_ckpt + 1) * sizeof(float)) != cudaSuccess) {
+            rank_err[(size_t)r] = "cudaMalloc res_scores failed";
+            return false;
+        }
 
         // Buffered, not printed: eight ranks writing stderr concurrently interleaves
         // mid-line. Emitted in rank order after the join so the log reads as before.
@@ -536,12 +542,17 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
     // launcher's own, so this comparison cannot drift from what a launch would do;
     // a mismatch drops back to one eager token, which recaptures at the new plan.
     if (p.graph_ready) {
+        // The plan helper reads the CURRENT device's SM count and may lazily grow
+        // split scratch there — pin it to rank 0 rather than inheriting whatever
+        // this thread last touched.
+        if (cudaSetDevice(p.ranks[0].device) != cudaSuccess) return false;
         const int plan_now = k3k::mla_decode_attn_splits(
             p.ranks[0].weights.mla.n_heads, cfg.key_length, cfg.kv_lora_rank,
             p.ranks[0].state.position + 1);
         if (plan_now != p.graph_splits) {
             for (int r = 0; r < tp_size; ++r) {
                 cudaSetDevice(p.ranks[(size_t)r].device);
+                cudaStreamSynchronize(p.streams[(size_t)r]);   // rare; not on the hot path
                 if (p.graph_exec[(size_t)r]) cudaGraphExecDestroy(p.graph_exec[(size_t)r]);
                 if (p.graph[(size_t)r]) cudaGraphDestroy(p.graph[(size_t)r]);
                 p.graph_exec[(size_t)r] = nullptr;
@@ -589,6 +600,27 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
         }
     }
     const bool capture_live = capturing && !p.graph_dead;
+
+    // Any failure between BeginCapture and EndCapture must not strand the streams
+    // in capture state: later "eager" launches would be silently recorded instead
+    // of executed, and every subsequent token would fail confusingly. This guard
+    // ends and discards the captures on ANY early return; the completion path
+    // disarms it before running its own EndCapture.
+    struct CaptureBail {
+        KimiK3TP* p = nullptr;
+        ~CaptureBail() {
+            if (!p) return;
+            for (std::size_t r = 0; r < p->streams.size(); ++r) {
+                cudaGraph_t g = nullptr;
+                cudaStreamEndCapture(p->streams[r], &g);
+                if (g) cudaGraphDestroy(g);
+            }
+            p->graph_dead = true;
+            std::fprintf(stderr, "[k3-tp] token failed mid-capture — captures "
+                                 "discarded, eager from here on\n");
+        }
+    } capture_bail;
+    if (capture_live) capture_bail.p = &p;
 
     // The cross-layer residual bank is PER TOKEN on every rank — same lifetime rule
     // as the single-GPU path, and forgetting it here fails on token 2 rather than
@@ -802,9 +834,14 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
 
     if (cfg.attn_res_block_size > 0) {
         if (!w.has_output_res_score || !w.output_res_score.ok()) return false;
+        // res_scores: the owned-alloc fallback inside attn_res_mix_f32 is a
+        // cudaMallocAsync/cudaFreeAsync pair, which a capture would bake into the
+        // graph as memory nodes — the persistent buffer keeps the graph clonable
+        // and instantiate-safe.
         k3k::attn_res_mix_f32(R0.x_next, R0.state.res_bank, R0.x,
                               (const float*)w.output_res_score.data, H,
-                              R0.state.n_ckpt, cfg.rms_eps, R0.stream);
+                              R0.state.n_ckpt, cfg.rms_eps, R0.stream,
+                              R0.res_scores);
         std::swap(R0.x, R0.x_next);
     }
     if (!w.output_norm.ok()) return false;
@@ -819,6 +856,7 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
     // recorded the token, nothing has executed yet. The launch is also the capture's
     // first live validation; any failure discards the graphs and re-runs eager.
     if (capture_live) {
+        capture_bail.p = nullptr;   // this block owns the captures now
         bool ok = true;
         for (int r = 0; r < tp_size; ++r) {
             cudaGraph_t g = nullptr;
@@ -841,6 +879,7 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
         if (!ok) {
             for (int r = 0; r < tp_size; ++r) {
                 cudaSetDevice(p.ranks[(size_t)r].device);
+                cudaStreamSynchronize(p.streams[(size_t)r]);
                 if (p.graph_exec[(size_t)r]) cudaGraphExecDestroy(p.graph_exec[(size_t)r]);
                 if (p.graph[(size_t)r]) cudaGraphDestroy(p.graph[(size_t)r]);
                 p.graph_exec[(size_t)r] = nullptr;
@@ -853,6 +892,7 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
             // The recorded launches never ran; the token must actually happen.
             return kimi_k3_tp_forward_token(p, token_id, out_logits);
         }
+        cudaSetDevice(p.ranks[0].device);   // issue_all's serial arm parks on rank 7
         p.graph_splits = k3k::mla_decode_attn_splits(
             p.ranks[0].weights.mla.n_heads, cfg.key_length, cfg.kv_lora_rank,
             p.ranks[0].state.position + 1);
@@ -892,6 +932,7 @@ void kimi_k3_tp_free(KimiK3TP& p) {
         if (R.x) cudaFree(R.x);
         if (R.x_next) cudaFree(R.x_next);
         if (R.logits) cudaFree(R.logits);
+        if (R.res_scores) cudaFree(R.res_scores);
         kimi_k3_forward_free_scratch(R.fwd);
         kimi_k3_free_state(R.state);
         kimi_k3_free_weights(R.weights);

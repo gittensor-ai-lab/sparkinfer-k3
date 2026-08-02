@@ -130,6 +130,10 @@ struct KimiK3TPRank {
     float* logits = nullptr;         // [vocab], rank 0 only
     int* scalars_dev = nullptr;      // [3]: token id, position, n_ctx — see
                                      // KimiK3Forward::scalars_dev
+    float* res_scores = nullptr;     // [max_ckpt+1], rank 0 only: persistent scores
+                                     // scratch for the head's residual mix — the
+                                     // owned-alloc fallback would put cudaMallocAsync
+                                     // inside the captured graph
 };
 
 struct KimiK3TP {
