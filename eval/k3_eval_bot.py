@@ -45,6 +45,7 @@ import io
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -352,6 +353,21 @@ def _box_eval(what, frontier=None, seal=False, top1=None, kl=None):
     """
     seal_flag = " --seal" if seal else ""
     front_flag = "" if frontier is None else f" --frontier {frontier}"
+    # Harness knobs set on the CONTROLLER, forwarded to the box. bench/scripts is restored
+    # from origin/main before every build, so the harness the box runs is whatever is on the
+    # protected branch -- there is otherwise no way to run a round against a tuned constant
+    # without merging it first. That is the right default for anything a PR could influence,
+    # and the wrong one for an operator fixing a harness bug the round is currently hitting.
+    #
+    # PRINTED, not silent. These change how a number was produced, so a round log that does
+    # not name them describes a measurement nobody can reproduce. The value goes in the log
+    # that ships to sparkinfer-k3-log, next to the result it produced.
+    passthru = {k: v for k, v in sorted(os.environ.items())
+                if k.startswith("KIMI_K3_") and k not in ("KIMI_K3_MODELS_DIR",)}
+    if passthru:
+        print("   harness overrides from the controller: "
+              + " ".join(f"{k}={v}" for k, v in passthru.items()))
+    env_prefix = "".join(f"{k}={shlex.quote(v)} " for k, v in passthru.items())
     # Accuracy graded on THIS machine, handed to the harness. Without these the harness
     # falls back to comparing on the box against a reference the binary can read.
     acc_flag = "" if top1 is None or kl is None else f" --top1 {top1} --kl {kl}"
@@ -364,6 +380,7 @@ def _box_eval(what, frontier=None, seal=False, top1=None, kl=None):
         # $SPARKINFER_BUILD/kimi_k3_tp_bench, so pointing this at build/ makes it exit 2 with
         # "not built" immediately after a build that in fact succeeded.
         f"KIMI_K3_MODELS_DIR={BOX_MODELS_DIR} SPARKINFER_BUILD={BOX_REPO_DIR}/build/runtime "
+        f"{env_prefix}"
         f"bash bench/scripts/kimi_k3_eval.sh --node {NODE} --devices {DEVICES}"
         f"{front_flag}{acc_flag}{seal_flag}"
     )

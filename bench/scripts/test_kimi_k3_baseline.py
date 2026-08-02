@@ -2068,6 +2068,30 @@ class CiWorkflowTest(unittest.TestCase):
         ok, _ = bot.eligibility(pr(crlf))
         self.assertTrue(ok, "CRLF line endings broke the section scan")
 
+    def test_harness_overrides_are_forwarded_and_recorded(self):
+        """bench/scripts is restored from origin/main before every build, so the harness the
+        box runs is whatever is on the protected branch. That is right for anything a PR could
+        influence and wrong for an operator fixing a harness bug the round is hitting: without
+        a forward, a constant cannot be exercised without merging it first.
+
+        The recording half is the part that matters for the ledger. #77's merged tier was
+        produced under KIMI_K3_MARGIN_TOKENS=512 while main still said 128 -- a number nobody
+        could reproduce from main alone unless the log says so. So the override must reach the
+        box AND be printed into the round log that ships to sparkinfer-k3-log."""
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        box_eval = src[src.index("def _box_eval"):src.index("def measure_frontier")]
+        self.assertIn("KIMI_K3_", box_eval)
+        self.assertIn("env_prefix", box_eval,
+                      "controller-side harness knobs never reach the box")
+        self.assertIn("harness overrides from the controller", box_eval,
+                      "an override that is not logged makes the round unreproducible")
+        self.assertIn("shlex.quote", box_eval,
+                      "override values are interpolated into an ssh command line")
+        # KIMI_K3_MODELS_DIR is set explicitly by the command itself; forwarding it too would
+        # emit the variable twice and let the controller silently repoint the weights.
+        self.assertIn('"KIMI_K3_MODELS_DIR"', box_eval)
+        self.assertIn("import shlex", src)
+
     def test_eligibility_skips_prs_that_cannot_be_evaluated_or_merged(self):
         """The node is a scarce serial resource, so the round must not book ~40 GPU-minutes
         for a PR whose result nobody can act on. Two such classes, both live in one round:
