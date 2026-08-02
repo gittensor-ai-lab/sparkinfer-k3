@@ -226,6 +226,11 @@ jobs:
 
           env = dict(os.environ)
           env["SPARKINFER_DIFFICULTY_REF"] = str(ref)
+          # Same bars the harness used. label.py's defaults are the Qwen track's (0.20)
+          # and must stay loose for it; K3 pins 0.05. If these two ever disagree the
+          # workflow re-derives a different verdict from the same numbers.
+          env["SPARKINFER_KL_BAR"] = "0.05"
+          env["SPARKINFER_KL_PREFER"] = "0.02"
           out = subprocess.run(
               [sys.executable, "bench/scripts/label.py", str(d["tps"]), str(frontier),
                "0", str(d["top1"]), str(d["kl"]), str(d["commit"])],

@@ -1208,7 +1208,7 @@ class CiWorkflowTest(unittest.TestCase):
         the repo root -- meant a bench could open bench/refdata/hello.spkl and write it back
         out as its own --logits dump: top1 1.0, KL 0.0, no work done. Nothing rejected a
         suspiciously exact result either, since label.py only bounds top1 >= 0.90 and
-        KL <= 0.20 while honest main measures 0.004."""
+        KL <= 0.01 while honest main measures 0.004."""
         src = (ROOT / "eval/k3_eval_bot.py").read_text()
         self.assertIn("git checkout -q origin/main -- bench/scripts", src,
                       "the bot grades with the PR's own harness")
@@ -1623,17 +1623,40 @@ class CiWorkflowTest(unittest.TestCase):
         The shell this replaced ran it with `|| true` and read the JSON. Porting it to
         Python without that turned every round into "compare_logits failed" with an empty
         stderr -- which is exactly how the first hardened round died. The gate that decides
-        anything is label.py's (top1 >= 0.90, kl <= 0.20), applied downstream."""
+        anything is label.py's (top1 >= 0.90, kl <= 0.01), applied downstream."""
         src = (ROOT / "eval/k3_eval_bot.py").read_text()
         acc = src[src.index("def measure_accuracy("):src.index("def _box_eval(")]
         self.assertNotIn("if p.returncode != 0 or not", acc,
                          "a non-zero exit here is the normal, healthy K3 result")
         self.assertIn("if not out:", acc,
                       "only a MISSING payload is a real failure — the tool did not run")
-        # and the real bars still live in label.py, unchanged
+        # and the real bars still live in label.py
         lbl = (ROOT / "bench/scripts/label.py").read_text()
         self.assertIn('SPARKINFER_TOP1_BAR",  "0.90"', lbl)
+        # The shared DEFAULT stays loose because label.py also scores the inherited Qwen
+        # track, whose honest runs measure KL 0.0175-0.03. Tightening it here would REJECT
+        # every one of them.
         self.assertIn('SPARKINFER_KL_BAR",    "0.20"', lbl)
+
+    def test_k3_pins_its_own_kl_bar_in_both_places(self):
+        """K3's accuracy policy is 0.05, and it must be pinned where K3 is scored rather than
+        in the shared default -- label.py also grades the Qwen track at KL 0.0175-0.03.
+
+        BOTH places, or neither counts. The harness computes the verdict and eval-label.yml
+        RE-DERIVES it from the same numbers on the protected branch; if they disagree about
+        KL_BAR they disagree about REJECT, which is the same class of bug as disagreeing
+        about the frontier -- and it would surface as 'reported label != re-derived'.
+
+        Why tighter than the default matters: K3's main measures 0.004046, so under 0.20 a PR
+        could degrade parity forty-fold and still pass clean. #63 doubled the KLD to 0.008075
+        and no automated check said a word."""
+        ev = (ROOT / "bench/scripts/kimi_k3_eval.sh").read_text()
+        self.assertIn('SPARKINFER_KL_BAR="${KIMI_K3_KL_BAR:-0.05}"', ev)
+        self.assertIn('SPARKINFER_KL_PREFER="${KIMI_K3_KL_PREFER:-0.02}"', ev)
+        wf = (ROOT / ".github/workflows/eval-label.yml").read_text()
+        self.assertIn('env["SPARKINFER_KL_BAR"] = "0.05"', wf,
+                      "the trusted re-derivation would use the Qwen default and disagree")
+        self.assertIn('env["SPARKINFER_KL_PREFER"] = "0.02"', wf)
 
     def test_a_failed_round_still_has_a_log_path(self):
         """rounds/<main_sha>/ exists for the round that seals nothing -- and the first one
