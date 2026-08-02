@@ -67,7 +67,11 @@ BOX_RECEIPTS = os.environ.get("K3_BOX_RECEIPTS", f"{BOX_REPO_DIR}/bench/results/
 # that carries a payout tier. Every one of them is a reason a human would have wanted to
 # look, and none can be satisfied by the PR simply being fast.
 NEVER_MERGE_LABELS = {"hold", "copycat", "copycat-warn", "flagged:gaming", "penalty",
-                      "needs-benchmark", "needs-node-run", "llm-judge", "needs-rebase"}
+                      "needs-benchmark", "needs-node-run", "llm-judge", "needs-rebase",
+                      # Applied by the round itself when a PR's KL is >= KL_RATCHET_REJECT x
+                      # main's, measured on the same box minutes apart. A speed win bought
+                      # with parity is a trade a human should make on purpose.
+                      "accuracy-regression"}
 # Paths that decide payouts. sensitive-paths-guard already fails a non-maintainer PR that
 # touches these, but a bot that merges without anyone reading should not depend on another
 # check having run correctly.
@@ -547,7 +551,54 @@ def measure_frontier(repo):
     if not sha.lower().startswith(got) or len(got) < 7:
         raise RuntimeError(f"harness measured commit {got!r} but main is {sha[:12]!r}")
     print(f"main: frontier = {tps} tok/s @ {sha[:8]}")
-    return sha, tps, str(res.get("quant") or "UD-IQ1_S")
+    # main's KL is the round's PARITY BASELINE, measured on the same box minutes before every
+    # PR in the round. The absolute bars cannot see drift; only this can. See kl_ratchet().
+    return sha, tps, str(res.get("quant") or "UD-IQ1_S"), float(kl or 0)
+
+
+# THE ACCURACY GATE WAS A FLOOR, NOT A RATCHET.
+#
+# label.py asks "is KL under the bar?" and never "is it worse than main?". At K3's bars that
+# left a lot of room: main measures 0.0038674, KL_PREFER is 0.02 and KL_BAR is 0.05, so a PR
+# can degrade parity 5x and still pass CLEAN -- not even annotated. #74 did exactly that,
+# measuring 0.0059102 (1.53x main) and merging with nothing said, which moved main's baseline
+# permanently. The next 1.53x then lands at 0.0089 and also passes clean. Roughly five such
+# merges fit under the warn line, each individually "fine", and parity drifts with no round
+# ever reporting a problem.
+#
+# A ratchet compares against what main measured THIS ROUND, on THIS BOX, minutes earlier --
+# the only comparison that can see drift at all.
+#
+# NOT set to 1.0. Changing float reduction order changes the numbers legitimately: #74 swaps
+# the TP collective to peer-oneshot, and #77/#81 were bit-identical only because they did not
+# touch reduction order. A ratchet at parity would reject honest work. These factors are wide
+# enough for that and far tighter than the 13x the absolute bar allows.
+KL_RATCHET_WARN = float(os.environ.get("K3_KL_RATCHET_WARN", "1.25"))
+KL_RATCHET_REJECT = float(os.environ.get("K3_KL_RATCHET_REJECT", "2.0"))
+KL_REGRESSION_LABEL = "accuracy-regression"
+
+
+def kl_ratchet(pr_kl, main_kl):
+    """Return (verdict, ratio, note) comparing a PR's parity against main's this round.
+
+    verdict is "ok", "warn" or "reject". A missing or zero baseline yields "ok" with a note --
+    an unmeasurable baseline must not become a silent reject, and the absolute bars still
+    apply underneath. This only ever ADDS a constraint; it never lets through anything the
+    floor would have caught.
+    """
+    try:
+        pr_kl, main_kl = float(pr_kl), float(main_kl)
+    except (TypeError, ValueError):
+        return "ok", 0.0, "parity vs main: unavailable (unparseable KL)"
+    if main_kl <= 0 or pr_kl < 0:
+        return "ok", 0.0, "parity vs main: unavailable (no baseline measured this round)"
+    ratio = pr_kl / main_kl
+    note = f"KLD {pr_kl:.7f} vs main {main_kl:.7f} — {ratio:.2f}x"
+    if ratio >= KL_RATCHET_REJECT:
+        return "reject", ratio, f"{note} (>= {KL_RATCHET_REJECT}x — accuracy regression)"
+    if ratio >= KL_RATCHET_WARN:
+        return "warn", ratio, f"{note} (>= {KL_RATCHET_WARN}x — worse than main)"
+    return "ok", ratio, note
 
 
 LOCK_PATH = "bench/scripts/reference.lock"
@@ -785,7 +836,7 @@ DERIVED_BY_CI = ("label", "speed_label", "frontier_tps", "note", "pct_over_front
                  "pct_of_ceiling", "effective_pct")
 
 
-def post(repo, num, res, dry_run):
+def post(repo, num, res, dry_run, parity=None):
     res = {k: v for k, v in res.items() if k not in DERIVED_BY_CI}
     # RESULT_JSON must stay on the FIRST line: eval-label.yml gates on
     # startsWith(comment.body, '/eval') and then sed-scrapes the object off one line. The
@@ -802,11 +853,27 @@ def post(repo, num, res, dry_run):
         ("quant", res.get("quant")),
         ("receipt", f"`{rid}`" if rid else "_unsealed_"),
     ]
+    # Parity against main measured THIS ROUND, printed whatever the verdict. The absolute
+    # bars cannot show drift, so an unannotated "passes clean" is exactly how #74 moved main's
+    # baseline 1.53x with no round reporting anything. A number a human can see beats a
+    # threshold nobody is told about.
+    if parity:
+        verdict, ratio, note = parity
+        rows.append(("parity vs main", note))
     table = "\n".join(f"| {k} | {v} |" for k, v in rows if v not in (None, ""))
+    banner = ""
+    if parity and parity[0] == "reject":
+        banner = (f"\n> **Accuracy regression.** {parity[2]}\n>\n"
+                  f"> Labelled `{KL_REGRESSION_LABEL}`, which blocks the automatic merge. A "
+                  "speed win bought with parity is a trade a maintainer should make on "
+                  "purpose; remove the label to allow it.\n")
+    elif parity and parity[0] == "warn":
+        banner = (f"\n> **Note:** {parity[2]}. Under the absolute bar, so not blocking — "
+                  "recorded so the drift is visible.\n")
     body = (
         "/eval RESULT_JSON " + json.dumps(res, separators=(",", ":")) + "\n\n"
         "### Node measurement\n\n"
-        "| metric | value |\n|---|--:|\n" + table + "\n\n"
+        "| metric | value |\n|---|--:|\n" + table + "\n" + banner + "\n"
         "Measured on the pinned 8x H200 node by `eval/k3_eval_bot.py`. **These are inputs, "
         "not the verdict** — the tier is re-derived from `bench/scripts/reference.lock` on "
         "`main` by `eval-label.yml`, so nothing this comment claims can set a payout.\n\n"
@@ -1563,14 +1630,19 @@ def main():
         if args.frontier is not None:
             main_tps = float(args.frontier)
             quant = "UD-IQ1_S"
-            print(f">> frontier: {main_tps} tok/s (--frontier, main not re-measured)")
+            # --frontier skips the main measurement, so there is NO parity baseline for this
+            # round. 0 makes kl_ratchet report "unavailable" rather than inventing a
+            # comparison; the absolute KL bars still apply underneath, unchanged.
+            main_kl = 0.0
+            print(f">> frontier: {main_tps} tok/s (--frontier, main not re-measured; "
+                  "no parity baseline, so the KL ratchet is inactive this round)")
             r = gh(["api", f"repos/{args.repo}/commits/main", "--jq", ".sha"])
             main_sha = (r.stdout or "").strip()
         else:
             # Retried, because this one failure discards every PR in the round. A persistent
             # failure still stops it -- falling back to the pinned lock value would score the
             # round against a number main has already beaten, which is the #20 mispricing.
-            main_sha, main_tps, quant = with_box_retry(
+            main_sha, main_tps, quant, main_kl = with_box_retry(
                 "frontier", lambda: measure_frontier(args.repo))
     except RuntimeError as exc:
         print(f"frontier measurement failed after retries — {exc}", file=sys.stderr)
@@ -1634,6 +1706,25 @@ def main():
             continue
         print(f"#{num}: tps={res.get('tps')} top1={res.get('top1')} kl={res.get('kl')} "
               f"ms/token={res.get('ms_per_token')} — tier is eval-label.yml's to derive")
+        # Parity against main measured minutes ago on this same box. Reported every time,
+        # blocking only past KL_RATCHET_REJECT.
+        parity = kl_ratchet(res.get("kl"), main_kl)
+        print(f"#{num}: {parity[2]}")
+        if parity[0] == "reject":
+            print(f"!! #{num}: accuracy regression — labelling {KL_REGRESSION_LABEL}, which "
+                  "blocks the automatic merge", file=sys.stderr)
+            if args.dry_run:
+                print(f"--- dry-run: would label #{num} {KL_REGRESSION_LABEL}")
+            else:
+                lr = gh(["pr", "edit", str(num), "-R", args.repo,
+                         "--add-label", KL_REGRESSION_LABEL])
+                if lr.returncode != 0:
+                    # The label is what stops the merge, so failing to apply it must not
+                    # leave the round merging the PR anyway.
+                    print(f"!! #{num}: could not apply {KL_REGRESSION_LABEL} "
+                          f"({lr.stderr.strip()[:120]}) — excluding it from the merge decision",
+                          file=sys.stderr)
+                    unsafe_tier.add(num)
         if res.get("receipt_id"):
             publish_receipt(LOG_REPO, num, res, BOX_RECEIPTS, args.dry_run)
         # This evaluation IS the re-measurement a leftover needs-rebase demanded, so clear
@@ -1646,7 +1737,7 @@ def main():
         tier_cleared = True
         if args.merge_admin or args.auto_merge:
             tier_cleared = clear_stale_tier(args.repo, num, args.dry_run)
-        post(args.repo, num, res, args.dry_run)
+        post(args.repo, num, res, args.dry_run, parity=parity)
         # eval-label.yml applies the tier asynchronously. Wait for it here, once, rather
         # than letting the merge decision below read a label that has not landed yet.
         if not args.dry_run and (args.merge_admin or args.auto_merge):
