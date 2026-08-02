@@ -2068,6 +2068,45 @@ class CiWorkflowTest(unittest.TestCase):
         ok, _ = bot.eligibility(pr(crlf))
         self.assertTrue(ok, "CRLF line endings broke the section scan")
 
+    def test_settle_gpus_cannot_kill_the_eval_it_exists_to_protect(self):
+        """settle_gpus waits for the driver to reclaim ~1.1 TiB between the two timed runs,
+        because a run that starts too early dies in cudaMalloc and costs the PR its whole
+        eval. The script runs under `set -euo pipefail`, so the nvidia-smi pipeline needs
+        `|| true`: without it a single non-zero nvidia-smi -- a driver hiccup, an ECC scrub --
+        fails the pipeline, fails the assignment, and `set -e` kills the eval. Verified: the
+        version without `|| true` exits 15 here and never reaches the runs it was guarding.
+
+        Exercises the real function extracted from the harness, not a paraphrase."""
+        import tempfile, textwrap, stat as _stat
+        ev = (ROOT / "bench/scripts/kimi_k3_eval.sh").read_text()
+        fn = ev[ev.index("settle_gpus() {"):]
+        fn = fn[:fn.index("\n}\n") + 3]
+        self.assertIn("|| true", fn, "the pipefail escape hatch is gone")
+
+        d = tempfile.mkdtemp()
+        script = Path(d) / "sg.sh"
+        script.write_text("set -euo pipefail\n" + fn + "\nsettle_gpus\necho SURVIVED\n")
+        binn = Path(d) / "bin"
+        binn.mkdir()
+        smi = binn / "nvidia-smi"
+
+        def run(stub):
+            smi.write_text(stub)
+            smi.chmod(smi.stat().st_mode | _stat.S_IEXEC)
+            env = dict(os.environ, PATH=f"{binn}:{os.environ['PATH']}",
+                       KIMI_K3_SETTLE_TRIES="2")
+            return subprocess.run(["bash", str(script)], capture_output=True, text=True,
+                                  env=env)
+
+        for label, stub in (
+                ("nvidia-smi exits non-zero", "#!/bin/bash\nexit 15\n"),
+                ("nvidia-smi prints garbage", '#!/bin/bash\necho "ERR: driver mismatch"\n'),
+                ("all devices free", '#!/bin/bash\nprintf "%s\\n" 0 0 0 0 0 0 0 0\n'),
+                ("one device pinned", '#!/bin/bash\nprintf "%s\\n" 92160 0 0 0 0 0 0 0\n')):
+            r = run(stub)
+            self.assertEqual(r.returncode, 0, f"{label}: settle_gpus aborted the eval\n{r.stderr}")
+            self.assertIn("SURVIVED", r.stdout, f"{label}: the timed runs were never reached")
+
     def test_harness_overrides_are_forwarded_and_recorded(self):
         """bench/scripts is restored from origin/main before every build, so the harness the
         box runs is whatever is on the protected branch. That is right for anything a PR could

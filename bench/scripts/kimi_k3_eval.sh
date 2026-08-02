@@ -264,8 +264,14 @@ settle_gpus() {  # wait until every device is ~free, or give up and let the run 
     command -v nvidia-smi >/dev/null 2>&1 || { sleep 5; return 0; }
     local i busy
     for i in $(seq 1 "${KIMI_K3_SETTLE_TRIES:-30}"); do
+        # `|| true` is load-bearing: this script runs under `set -euo pipefail`, so without
+        # it a single non-zero nvidia-smi -- a driver hiccup, an ECC scrub, a transient --
+        # fails the pipeline, fails the assignment, and kills the whole eval. A wait added to
+        # stop a PR losing its eval would then be a new way for a PR to lose its eval.
+        # Failing here degrades to "assume free" (wc -l prints 0 on empty input), which is
+        # exactly what the no-nvidia-smi path above does.
         busy="$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null \
-                | awk -v lim="${KIMI_K3_SETTLE_MIB:-2048}" '$1 > lim' | wc -l)"
+                | awk -v lim="${KIMI_K3_SETTLE_MIB:-2048}" '$1 > lim' | wc -l || true)"
         [[ "$busy" == "0" ]] && { [[ "$i" == "1" ]] || echo ">> GPUs settled after ${i}s" >&2; return 0; }
         sleep 1
     done
