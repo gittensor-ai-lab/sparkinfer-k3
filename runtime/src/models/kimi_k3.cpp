@@ -1007,12 +1007,21 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
     // phase, in-place rewrites (the q_lora rms) all happen BEFORE their buffer is
     // first projected, and a projection that writes over a memoed buffer drops it. The x4 fusion below also
     // quantises s.normed into the same scratch and seeds the memo the same way.
+    // SPARKINFER_K3_QACT_MEMO=0 disables the skip so it can be A/B'd on ONE binary.
+    // #81 was reverted in #84 for a -31.5% interaction with #74's peer-oneshot
+    // collective; this is a structurally different change (no buffer, no hoist window
+    // — see the note above), and the switch is here so that claim is checkable rather
+    // than argued.
+    static const bool qact_memo = [] {
+        const char* e = std::getenv("SPARKINFER_K3_QACT_MEMO");
+        return !(e && e[0] == '0');
+    }();
     const float* q8_x = nullptr;
     int q8_K = 0;
     auto proj = [&](float* y, const float* x, const KimiK3Tensor& W, int N, int K) {
         if (!W.ok()) return false;
         if (ggml_qact_proj) {
-            const bool pre = (W.type == 8 && x == q8_x && K == q8_K);
+            const bool pre = qact_memo && (W.type == 8 && x == q8_x && K == q8_K);
             if (!k3k::k3_proj_ggml_f32(y, x, W.data, W.type, N, K,
                                        s.proj_q8, stream, pre))
                 return false;
@@ -1107,7 +1116,7 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
                                            s.normed, L.attn_q.data, L.attn_k.data,
                                            L.attn_v.data, L.ssm_g.data,
                                            L.attn_q.type, qkv, H, stream));
-            if (fused_qkvg && ggml_qact_proj) {
+            if (fused_qkvg && ggml_qact_proj && qact_memo) {
                 // The x4 wrapper quantised s.normed into s.proj_q8 — seed the memo
                 // so the ssm_* projections of the same activation skip theirs.
                 q8_x = s.normed;
