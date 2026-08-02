@@ -2152,6 +2152,52 @@ class CiWorkflowTest(unittest.TestCase):
         finally:
             bot.gh = old
 
+    def test_push_triggered_label_clear_is_safe_and_narrow(self):
+        """rebase-label-sync.yml clears needs-rebase the moment a push answers it, so the
+        'clears by itself' sentence in the bot's comment is true between sweeps.
+
+        Its safety rests on ONE invariant: pull_request_target runs with base-repo WRITE
+        access, which is only acceptable because the workflow never checks out or executes
+        PR code — event payload and API calls, nothing else. A checkout of the head in this
+        file hands a hostile fork write access to the repo, so that is the first thing this
+        test refuses.
+
+        Narrowness is the other half: it only REMOVES the label (adding is the sweep's job,
+        tied to tier presence and frontier movement a push knows nothing about), decides
+        from compare/behind_by (immediate and exact) rather than the UNKNOWN-settling
+        mergeStateStatus, and verifies the delete rather than trusting the call."""
+        import yaml as _y
+        p = ROOT / ".github/workflows/rebase-label-sync.yml"
+        self.assertTrue(p.exists(), "the push-triggered clear does not exist")
+        txt = p.read_text()
+        wf = _y.safe_load(txt)
+        # THE invariant: write-context workflow, zero PR code. Asserted on the parsed
+        # steps, not the text — the file's own warning comment names the footgun.
+        steps = [s for job in wf["jobs"].values() for s in job.get("steps", [])]
+        self.assertFalse([s for s in steps if "checkout" in str(s.get("uses", ""))],
+                         "pull_request_target + checkout of PR code = write access for a "
+                         "hostile fork; this workflow must stay API-only")
+        self.assertFalse([s for s in steps if "github.event.pull_request.head.sha" in
+                          str(s.get("run", "")) and "fetch" in str(s.get("run", ""))],
+                         "fetching the head by sha is checkout by another name")
+        trig = wf.get(True) or wf.get("on")
+        self.assertIn("pull_request_target", trig,
+                      "fork PRs get a read-only token under plain pull_request — the "
+                      "decision would be right and the delete would fail")
+        self.assertEqual(trig["pull_request_target"]["types"], ["synchronize"],
+                         "only a push answers the label; other events are the sweep's job")
+        # Narrow: removes only, decides by behind_by, fork-safe compare form, verified delete.
+        self.assertIn("behind_by", txt, "mergeStateStatus reads UNKNOWN right after a push")
+        self.assertIn("head.label", txt, "owner:branch is the fork-safe compare form")
+        self.assertNotIn("labels[]=needs-rebase", txt, "this workflow must never ADD the label")
+        self.assertIn('-X DELETE', txt)
+        self.assertIn('index("needs-rebase")', txt, "an issued DELETE is not a removed label")
+        # Rapid force-pushes race; only the newest head may decide.
+        self.assertEqual(wf["concurrency"]["cancel-in-progress"], True)
+        # No label, no work — and if the gate is dropped, every push on every PR runs this.
+        self.assertIn("contains(github.event.pull_request.labels.*.name, 'needs-rebase')",
+                      wf["jobs"]["sync"]["if"])
+
     def test_a_failed_round_still_has_a_log_path(self):
         """rounds/<main_sha>/ exists for the round that seals nothing -- and the first one
         that needed it published nothing anyway.
