@@ -127,10 +127,9 @@ public:
 
     // False when this backend has no f32 reduce. Checked at SETUP, not per call:
     // a forward that needs f32 must refuse a backend that cannot do it rather than
-    // discover it 186 collectives into a token. The owned-buffer backends currently
-    // report false — their kernels are templated on __nv_bfloat16 (8 per 128-bit
-    // transaction); an f32 variant is 4 per transaction and is a straight mirror,
-    // but it is not written yet and claiming support would be worse than refusing.
+    // discover it 186 collectives into a token. peer-oneshot reports true — its
+    // f32 kernel mirrors the bf16 one at 4 elements per 128-bit transaction;
+    // multimem still reports false (no f32 kernel written).
     virtual bool supports_f32() const { return false; }
 
     // Mode B. False for NCCL and the no-op; true for the peer/multimem backends.
@@ -147,6 +146,16 @@ public:
     // exist to change. `streams` size must equal size(). False if unsupported.
     virtual bool allreduce_group(std::size_t count,
                                  const std::vector<cudaStream_t>& streams) {
+        (void)count; (void)streams; return false;
+    }
+
+    // Mode B, f32: allreduce_group's f32 twin. The caller has already written
+    // rank r's f32 partial into reduce_in(r) and reads the sum from
+    // reduce_out(r) — no staging copies. This, not the staged
+    // allreduce_f32_group above, is the path the "372 extra copies" comment at
+    // the top of this file is about. False if unsupported.
+    virtual bool allreduce_f32_owned(std::size_t count,
+                                     const std::vector<cudaStream_t>& streams) {
         (void)count; (void)streams; return false;
     }
 

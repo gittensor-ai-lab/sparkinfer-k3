@@ -417,6 +417,17 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
 float* kimi_k3_partial_buffer(KimiK3Forward& fwd, int layer, K3LayerPhase phase,
                              int* count);
 
+// Repoint the buffer kimi_k3_partial_buffer() exposes for `phase`; returns the
+// previous pointer. The TP driver uses this to aim a phase's partial straight at
+// a Mode-B collective's reduce_in() before the phase runs, then at reduce_out()
+// after the reduce — the downstream phase reads the sum where the collective
+// wrote it and the staging copies disappear. Safe against teardown: scratch
+// frees via its owned-pointer list, never via these fields. Attn swaps the
+// attention partial; FfnPartial swaps the MoE accumulator (the leading dense
+// layer's FFN partial is replicated, never reduced, and stays where it is).
+float* kimi_k3_swap_partial_buffer(KimiK3Forward& fwd, K3LayerPhase phase,
+                                  float* buf);
+
 // Print the SPARKINFER_K3_PROFILE=1 phase breakdown to stderr (no-op when unset).
 void kimi_k3_profile_report();
 
