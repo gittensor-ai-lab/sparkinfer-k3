@@ -1514,7 +1514,12 @@ __global__ void mla_decode_attn_kernel(float* __restrict__ out,
                                        const float* __restrict__ k_cache,
                                        const float* __restrict__ wv_b,
                                        int key_length, int kv_lora, int v_dim,
-                                       int n_ctx, float scale) {
+                                       int n_ctx, float scale,
+                                       const int* __restrict__ n_ctx_dev) {
+    // Under graph replay the context length is the one per-token scalar this kernel
+    // depends on; reading it from device memory (identical value -> identical math)
+    // is what lets one captured launch serve every token.
+    if (n_ctx_dev) n_ctx = *n_ctx_dev;
     constexpr int NWARP = BLOCK / 32;
     const int h    = blockIdx.x;
     const int lane = threadIdx.x & 31;
@@ -1721,7 +1726,9 @@ __global__ void mla_decode_attn_split_kernel(float* __restrict__ part_acc,
                                              const float* __restrict__ q,
                                              const float* __restrict__ k_cache,
                                              int key_length, int kv_lora,
-                                             int n_ctx, float scale, int splits) {
+                                             int n_ctx, float scale, int splits,
+                                             const int* __restrict__ n_ctx_dev) {
+    if (n_ctx_dev) n_ctx = *n_ctx_dev;
     constexpr int NWARP = BLOCK / 32;
     const int h    = blockIdx.x;
     const int sp   = blockIdx.y;
@@ -1831,7 +1838,9 @@ __global__ void mla_decode_attn_hbatch_kernel(float* __restrict__ part_acc,
                                               const float* __restrict__ q,
                                               const float* __restrict__ k_cache,
                                               int key_length, int kv_lora,
-                                              int n_ctx, float scale, int splits) {
+                                              int n_ctx, float scale, int splits,
+                                              const int* __restrict__ n_ctx_dev) {
+    if (n_ctx_dev) n_ctx = *n_ctx_dev;
     constexpr int NWARP = BLOCK / 32;
     const int h0   = blockIdx.x * HPB;
     const int sp   = blockIdx.y;
@@ -2452,6 +2461,47 @@ __global__ void dequant_f32_passthrough_kernel(float* __restrict__ out,
     if (i < n) out[i] = src[i];
 }
 
+// Token-indexed embedding gather: same math as the two dequant kernels above, but
+// the row is selected by a token id read from DEVICE memory. A captured CUDA graph
+// bakes every host-computed pointer, so `table + token_id * row` cannot be formed on
+// the host if the graph is to be replayed for a different token — the indirection
+// has to happen where the current token id lives.
+__global__ void embed_row_f32_kernel(float* __restrict__ out,
+                                     const float* __restrict__ table,
+                                     const int* __restrict__ tok, int n) {
+    const float* src = table + (size_t)(*tok) * n;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = src[i];
+}
+
+__global__ void embed_row_q8_0_kernel(float* __restrict__ out,
+                                      const BlockQ8_0* __restrict__ table,
+                                      const int* __restrict__ tok, int nb) {
+    const BlockQ8_0* blocks = table + (size_t)(*tok) * nb;
+    const int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= nb) return;
+    const float d = __half2float(__ushort_as_half(blocks[b].d));
+    float* dst = out + b * 32;
+#pragma unroll
+    for (int j = 0; j < 32; ++j) dst[j] = (float)blocks[b].qs[j] * d;
+}
+
+// Device-indexed K-cache row store: replaces the two host-addressed cudaMemcpyAsync
+// calls (cache + position*key_length) with one kernel that reads the position from
+// device memory, for the same graph-capture reason as the embed gather. Layout is
+// the row's own: [0, kv_lora) from the normed compressed KV, [kv_lora, key_length)
+// the RAW k_pe tail, read at the same offset it occupies in kv_a.
+__global__ void mla_kv_store_kernel(float* __restrict__ cache,
+                                    const float* __restrict__ cmpr,
+                                    const float* __restrict__ kv_a,
+                                    const int* __restrict__ pos,
+                                    int key_length, int kv_lora) {
+    float* row = cache + (size_t)(*pos) * key_length;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < kv_lora) row[i] = cmpr[i];
+    else if (i < key_length) row[i] = kv_a[i];
+}
+
 template <int BLOCK>
 __global__ void proj_f32_kernel(float* __restrict__ y, const float* __restrict__ x,
                                 const float* __restrict__ W, int K) {
@@ -2811,6 +2861,35 @@ bool dequant_f32_by_type(float* out, const void* src, int64_t n, int ggml_type,
     }
 }
 
+bool k3_embed_row_f32(float* out, const void* table, int ggml_type,
+                      const int* tok_dev, int n, cudaStream_t stream) {
+    if (n <= 0 || !tok_dev) return false;
+    const int T = 256;
+    switch (ggml_type) {
+        case 0:
+            embed_row_f32_kernel<<<(unsigned)((n + T - 1) / T), T, 0, stream>>>(
+                out, (const float*)table, tok_dev, n);
+            return true;
+        case 8: {
+            if (n % 32 != 0) return false;
+            const int nb = n / 32;
+            embed_row_q8_0_kernel<<<(unsigned)((nb + T - 1) / T), T, 0, stream>>>(
+                out, (const BlockQ8_0*)table, tok_dev, nb);
+            return true;
+        }
+        default: return false;   // same coverage dequant_f32_by_type's callers had
+    }
+}
+
+void mla_kv_store_f32(float* cache, const float* kv_cmpr_normed, const float* kv_a,
+                      const int* pos_dev, int key_length, int kv_lora,
+                      cudaStream_t stream) {
+    if (key_length <= 0 || kv_lora <= 0 || kv_lora > key_length || !pos_dev) return;
+    const int T = 256;
+    mla_kv_store_kernel<<<(unsigned)((key_length + T - 1) / T), T, 0, stream>>>(
+        cache, kv_cmpr_normed, kv_a, pos_dev, key_length, kv_lora);
+}
+
 bool moe_expert_ffn_f32_by_type(float* out, float* scratch,
                                 const float* x, const int* ids, const float* w,
                                 const void* gate_exps, const void* up_exps,
@@ -2918,46 +2997,16 @@ void mla_absorb_q_f32(float* out, const float* q_nope, const float* q_pe,
         out, q_nope, q_pe, wk_b, qk_nope, kv_lora, rope_dim);
 }
 
-void mla_decode_attn_f32(float* out, const float* q, const float* k_cache,
-                         const float* wv_b, int key_length, int kv_lora,
-                         int v_dim, int n_head, int n_ctx, float scale,
-                         cudaStream_t stream) {
-    if (n_head <= 0 || n_ctx <= 0 || key_length <= 0 || kv_lora <= 0 || v_dim <= 0) return;
-    constexpr int BLOCK = 256;
-    // O(key_length + kv_lora + tile) and NOT O(n_ctx) — 4.8 KB at K3's real dims,
-    // the same at 128 tokens of context and at 1M. See the kernel's header note on
-    // what the n_ctx-proportional version did past 11,767 tokens.
-    const size_t shm = ((size_t)key_length + (size_t)kv_lora + kMlaCtxTile +
-                        BLOCK / 32 + 1) * sizeof(float);
-
-    // SPLIT THE CONTEXT when one block per head cannot fill the machine.
-    //
-    // n_head is 96 and K3 runs on 132-SM H200s, so the un-split grid leaves ~27% of the
-    // device idle before occupancy is even considered — and each block then walks n_ctx
-    // serially. Splitting trades one extra kernel and a scratch buffer for a grid of
-    // n_head * splits.
-    //
-    // Only above kMlaSplitMinCtx: below it the slice is short enough that the combine
-    // pass and the extra global round trip cost more than the parallelism buys, and the
-    // un-split kernel is also the one the numeric test pins bit-for-bit.
+int mla_decode_attn_splits(int n_head, int key_length, int kv_lora, int n_ctx) {
+    if (n_head <= 0 || n_ctx <= 0 || key_length <= 0 || kv_lora <= 0) return 1;
     int dev = 0;
     int splits = (n_ctx >= kMlaSplitMinCtx && k3_mla_split_scratch(n_head, kv_lora, &dev))
                ? std::min(k3_mla_max_splits(n_head), (n_ctx + kMlaSplitMinCtx - 1) / kMlaSplitMinCtx)
                : 1;
-    if (splits <= 1) {
-        mla_decode_attn_kernel<BLOCK><<<(unsigned)n_head, BLOCK, shm, stream>>>(
-            out, q, k_cache, wv_b, key_length, kv_lora, v_dim, n_ctx, scale);
-        return;
-    }
-
-    // Batch heads per block where the shape allows it, so each cached row is loaded
-    // once for HPB heads instead of once per head. RSLOTS must cover kv_lora from a
-    // single BLOCK-strided pass, and both it and HPB are template parameters because
-    // the accumulators only stay in registers when every index is a compile-time one.
-    const int rslots  = (kv_lora + BLOCK - 1) / BLOCK;
-    const int hpb     = k3_mla_heads_per_block(n_head, key_length);
-    const size_t hshm = ((size_t)hpb * key_length + (size_t)hpb * kMlaCtxTile +
-                         3 * (size_t)hpb) * sizeof(float);
+    if (splits <= 1) return 1;
+    constexpr int BLOCK = 256;
+    const int rslots = (kv_lora + BLOCK - 1) / BLOCK;
+    const int hpb    = k3_mla_heads_per_block(n_head, key_length);
     if (hpb > 1 && rslots <= kMlaMaxRSlots) {
         // FILL THE MACHINE; SHORTEN SLICES ONLY WHEN THE CONTEXT IS TOO SHORT TO.
         //
@@ -2985,33 +3034,87 @@ void mla_decode_attn_f32(float* out, const float* q, const float* k_cache,
             splits = std::max(splits, std::min(fill, by_len));
             splits = std::min(std::max(splits, 1), k3_mla_max_splits(n_head));
         }
+    }
+    return splits;
+}
+
+void mla_decode_attn_f32(float* out, const float* q, const float* k_cache,
+                         const float* wv_b, int key_length, int kv_lora,
+                         int v_dim, int n_head, int n_ctx, float scale,
+                         cudaStream_t stream, const int* n_ctx_dev) {
+    if (n_head <= 0 || n_ctx <= 0 || key_length <= 0 || kv_lora <= 0 || v_dim <= 0) return;
+    constexpr int BLOCK = 256;
+    // O(key_length + kv_lora + tile) and NOT O(n_ctx) — 4.8 KB at K3's real dims,
+    // the same at 128 tokens of context and at 1M. See the kernel's header note on
+    // what the n_ctx-proportional version did past 11,767 tokens.
+    const size_t shm = ((size_t)key_length + (size_t)kv_lora + kMlaCtxTile +
+                        BLOCK / 32 + 1) * sizeof(float);
+
+    // SPLIT THE CONTEXT when one block per head cannot fill the machine.
+    //
+    // n_head is 96 and K3 runs on 132-SM H200s, so the un-split grid leaves ~27% of the
+    // device idle before occupancy is even considered — and each block then walks n_ctx
+    // serially. Splitting trades one extra kernel and a scratch buffer for a grid of
+    // n_head * splits.
+    //
+    // Only above kMlaSplitMinCtx: below it the slice is short enough that the combine
+    // pass and the extra global round trip cost more than the parallelism buys, and the
+    // un-split kernel is also the one the numeric test pins bit-for-bit.
+    //
+    // The split PLAN comes from mla_decode_attn_splits — the same function graph
+    // capture consults to decide whether a context change invalidates a captured
+    // grid — so the launcher and the capture logic cannot disagree about it. The
+    // grid is host-shaped from n_ctx; the kernels' loop bounds read n_ctx_dev when
+    // given, which is what keeps a baked grid correct as the context grows.
+    int dev = 0;
+    const int splits = (n_ctx >= kMlaSplitMinCtx && k3_mla_split_scratch(n_head, kv_lora, &dev))
+                     ? mla_decode_attn_splits(n_head, key_length, kv_lora, n_ctx)
+                     : 1;
+    if (splits <= 1) {
+        mla_decode_attn_kernel<BLOCK><<<(unsigned)n_head, BLOCK, shm, stream>>>(
+            out, q, k_cache, wv_b, key_length, kv_lora, v_dim, n_ctx, scale, n_ctx_dev);
+        return;
+    }
+
+    // Batch heads per block where the shape allows it, so each cached row is loaded
+    // once for HPB heads instead of once per head. RSLOTS must cover kv_lora from a
+    // single BLOCK-strided pass, and both it and HPB are template parameters because
+    // the accumulators only stay in registers when every index is a compile-time one.
+    const int rslots  = (kv_lora + BLOCK - 1) / BLOCK;
+    const int hpb     = k3_mla_heads_per_block(n_head, key_length);
+    const size_t hshm = ((size_t)hpb * key_length + (size_t)hpb * kMlaCtxTile +
+                         3 * (size_t)hpb) * sizeof(float);
+    if (hpb > 1 && rslots <= kMlaMaxRSlots) {
+        // Fill/slice-floor reasoning lives in mla_decode_attn_splits, which already
+        // folded it into `splits`.
+        const int groups = n_head / hpb;
         dim3 hgrid((unsigned)groups, (unsigned)splits);
         bool launched = true;
         switch (hpb * 8 + rslots) {
             case 12 * 8 + 1: mla_decode_attn_hbatch_kernel<BLOCK, 12, 1><<<hgrid, BLOCK, hshm, stream>>>(
-                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits); break;
+                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits, n_ctx_dev); break;
             case 12 * 8 + 2: mla_decode_attn_hbatch_kernel<BLOCK, 12, 2><<<hgrid, BLOCK, hshm, stream>>>(
-                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits); break;
+                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits, n_ctx_dev); break;
             case 12 * 8 + 3: mla_decode_attn_hbatch_kernel<BLOCK, 12, 3><<<hgrid, BLOCK, hshm, stream>>>(
-                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits); break;
+                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits, n_ctx_dev); break;
             case 12 * 8 + 4: mla_decode_attn_hbatch_kernel<BLOCK, 12, 4><<<hgrid, BLOCK, hshm, stream>>>(
-                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits); break;
+                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits, n_ctx_dev); break;
             case 8 * 8 + 1: mla_decode_attn_hbatch_kernel<BLOCK, 8, 1><<<hgrid, BLOCK, hshm, stream>>>(
-                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits); break;
+                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits, n_ctx_dev); break;
             case 8 * 8 + 2: mla_decode_attn_hbatch_kernel<BLOCK, 8, 2><<<hgrid, BLOCK, hshm, stream>>>(
-                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits); break;
+                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits, n_ctx_dev); break;
             case 8 * 8 + 3: mla_decode_attn_hbatch_kernel<BLOCK, 8, 3><<<hgrid, BLOCK, hshm, stream>>>(
-                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits); break;
+                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits, n_ctx_dev); break;
             case 8 * 8 + 4: mla_decode_attn_hbatch_kernel<BLOCK, 8, 4><<<hgrid, BLOCK, hshm, stream>>>(
-                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits); break;
+                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits, n_ctx_dev); break;
             case 4 * 8 + 1: mla_decode_attn_hbatch_kernel<BLOCK, 4, 1><<<hgrid, BLOCK, hshm, stream>>>(
-                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits); break;
+                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits, n_ctx_dev); break;
             case 4 * 8 + 2: mla_decode_attn_hbatch_kernel<BLOCK, 4, 2><<<hgrid, BLOCK, hshm, stream>>>(
-                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits); break;
+                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits, n_ctx_dev); break;
             case 4 * 8 + 3: mla_decode_attn_hbatch_kernel<BLOCK, 4, 3><<<hgrid, BLOCK, hshm, stream>>>(
-                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits); break;
+                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits, n_ctx_dev); break;
             case 4 * 8 + 4: mla_decode_attn_hbatch_kernel<BLOCK, 4, 4><<<hgrid, BLOCK, hshm, stream>>>(
-                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits); break;
+                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits, n_ctx_dev); break;
             default: launched = false; break;
         }
         if (launched) {
@@ -3020,13 +3123,12 @@ void mla_decode_attn_f32(float* out, const float* q, const float* k_cache,
                 out, g_mla_part_acc[dev], g_mla_part_ml[dev], wv_b, kv_lora, v_dim, splits);
             return;
         }
-        splits = std::min(splits, k3_mla_max_splits(n_head));
     }
 
     dim3 grid((unsigned)n_head, (unsigned)splits);
     mla_decode_attn_split_kernel<BLOCK><<<grid, BLOCK, shm, stream>>>(
         g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora,
-        n_ctx, scale, splits);
+        n_ctx, scale, splits, n_ctx_dev);
     // s_acc + s_w, where s_w needs splits + 1 slots (the last holds 1/l).
     const size_t cshm = ((size_t)kv_lora + (size_t)splits + 1) * sizeof(float);
     mla_decode_combine_kernel<BLOCK><<<(unsigned)n_head, BLOCK, cshm, stream>>>(

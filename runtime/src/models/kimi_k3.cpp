@@ -1195,12 +1195,20 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             if (fwd.debug) fwd.debug("dbg_kvcmpr", layer, s.kv_cmpr_normed, cfg.kv_lora_rank);
 
             // K-cache row for this position: concat(normed kv_cmpr, RAW k_pe).
-            float* row = st.mla_kv_cache[mla_ord] + (size_t)st.position * cfg.key_length;
-            cudaMemcpyAsync(row, s.kv_cmpr_normed, (size_t)cfg.kv_lora_rank * sizeof(float),
-                            cudaMemcpyDeviceToDevice, stream);
-            cudaMemcpyAsync(row + cfg.kv_lora_rank, s.kv_a_out + cfg.kv_lora_rank,
-                            (size_t)cfg.rope_dim * sizeof(float),
-                            cudaMemcpyDeviceToDevice, stream);
+            // Graph mode selects the row on the device; the memcpy pair would bake
+            // this token's row pointer into the capture.
+            if (fwd.scalars_dev) {
+                k3k::mla_kv_store_f32(st.mla_kv_cache[mla_ord], s.kv_cmpr_normed,
+                                      s.kv_a_out, fwd.scalars_dev + 1,
+                                      cfg.key_length, cfg.kv_lora_rank, stream);
+            } else {
+                float* row = st.mla_kv_cache[mla_ord] + (size_t)st.position * cfg.key_length;
+                cudaMemcpyAsync(row, s.kv_cmpr_normed, (size_t)cfg.kv_lora_rank * sizeof(float),
+                                cudaMemcpyDeviceToDevice, stream);
+                cudaMemcpyAsync(row + cfg.kv_lora_rank, s.kv_a_out + cfg.kv_lora_rank,
+                                (size_t)cfg.rope_dim * sizeof(float),
+                                cudaMemcpyDeviceToDevice, stream);
+            }
 
             if (!L.attn_k_b.ok() || !L.attn_v_b.ok()) return false;
             k3k::mla_absorb_q_f32(s.absorbed_q, s.q_nope, s.q_pe,
@@ -1212,7 +1220,8 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             k3k::mla_decode_attn_f32(s.mla_attn_out, s.absorbed_q, st.mla_kv_cache[mla_ord],
                                      (const float*)L.attn_v_b.data, cfg.key_length,
                                      cfg.kv_lora_rank, cfg.value_length_mla, qh,
-                                     st.position + 1, mla_scale, stream);
+                                     st.position + 1, mla_scale, stream,
+                                     fwd.scalars_dev ? fwd.scalars_dev + 2 : nullptr);
             if (fwd.debug) fwd.debug("dbg_preattn", layer, s.mla_attn_out, qh * cfg.value_length_mla);
 
             if (L.has_attn_gate) {

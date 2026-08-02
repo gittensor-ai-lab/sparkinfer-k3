@@ -346,6 +346,13 @@ struct KimiK3Forward {
     cudaStream_t stream = nullptr;   // null = the default stream
     KimiK3DebugFn debug;             // may be empty
 
+    // Device scalars for CUDA-graph decode: [0] token id, [1] position, [2] n_ctx
+    // (= position + 1). When set, the forward's per-token values are read from here
+    // by the kernels instead of being baked into launch arguments/pointers on the
+    // host — the indirection that lets one captured token replay for every token.
+    // Null keeps the original host-scalar path, byte for byte.
+    const int* scalars_dev = nullptr;
+
     // Scratch buffers, sized once and reused every call. Allocated by
     // kimi_k3_forward_alloc_scratch(); forward_token() assumes they exist.
     struct Scratch;

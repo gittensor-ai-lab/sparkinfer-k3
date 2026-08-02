@@ -128,6 +128,8 @@ struct KimiK3TPRank {
     float* x = nullptr;              // [hidden]
     float* x_next = nullptr;         // [hidden]
     float* logits = nullptr;         // [vocab], rank 0 only
+    int* scalars_dev = nullptr;      // [3]: token id, position, n_ctx — see
+                                     // KimiK3Forward::scalars_dev
 };
 
 struct KimiK3TP {
@@ -157,6 +159,23 @@ struct KimiK3TP {
     bool zero_copy = false;
     std::vector<float*> zc_in, zc_out;   // reduce_in/out, rank order
     std::vector<float*> orig_moe;        // scratch pointer, restored at free
+
+    // CUDA-graph decode (SPARKINFER_K3_GRAPH, default on at tp>1): each rank's whole
+    // token — embed, 93 layers, collectives, head — is captured once on its own
+    // stream and replayed thereafter. Per token the host rewrites the pinned scalar
+    // mirror (a captured H2D node re-reads it) and launches 8 graphs; the ~2,500
+    // per-rank kernel launches and their pool barriers collapse into one epoch.
+    // The end-of-token drain in forward_token is what makes one mirror per rank
+    // safe to reuse: token N's copy node has executed before N+1's host write.
+    std::vector<cudaGraph_t> graph;          // per rank, null until captured
+    std::vector<cudaGraphExec_t> graph_exec;
+    int* scalars_host = nullptr;             // pinned, 4 ints per rank
+    bool graph_ready = false;
+    bool graph_dead = false;                 // capture failed once — stay eager
+    int graph_splits = -1;                   // MLA split plan the capture baked
+    long graph_collectives = 0;              // collectives inside one captured token
+    long n_forwards = 0;                     // first token stays eager: it pays the
+                                             // one-time lazy allocs capture must not see
 };
 
 // Load the model once per rank, banding the routed experts. `devices` gives tp_size.

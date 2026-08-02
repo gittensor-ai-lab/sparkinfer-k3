@@ -311,6 +311,21 @@ void moe_expert_ffn_iq1s_f32(float* out, float* scratch,
 bool dequant_f32_by_type(float* out, const void* src, int64_t n, int ggml_type,
                          cudaStream_t stream);
 
+// Token-indexed embedding row gather: dequant_f32_by_type restricted to one row,
+// with the row chosen by a token id in DEVICE memory. Exists for CUDA-graph decode:
+// a captured graph bakes host-computed pointers, so the per-token row selection has
+// to happen on the device. Same math as the row copy it replaces; F32 and Q8_0, the
+// two types token_embd.weight uses, everything else refused.
+bool k3_embed_row_f32(float* out, const void* table, int ggml_type,
+                      const int* tok_dev, int n, cudaStream_t stream);
+
+// Device-indexed MLA K-cache row store: writes concat(kv_cmpr_normed[0..kv_lora),
+// kv_a[kv_lora..key_length)) to cache row *pos_dev. Replaces two host-addressed
+// cudaMemcpyAsync calls for the same graph-capture reason as k3_embed_row_f32.
+void mla_kv_store_f32(float* cache, const float* kv_cmpr_normed, const float* kv_a,
+                      const int* pos_dev, int key_length, int kv_lora,
+                      cudaStream_t stream);
+
 bool moe_expert_ffn_f32_by_type(float* out, float* scratch,
                                 const float* x, const int* ids, const float* w,
                                 const void* gate_exps, const void* up_exps,
@@ -417,10 +432,19 @@ void mla_absorb_q_f32(float* out, const float* q_nope, const float* q_pe,
 // k_cache: [key_length, n_ctx]      token-major rows; MQA (one K shared by heads)
 // wv_b:    [kv_lora, v_dim, n_head]  kv_lora fastest
 // out:     [v_dim, n_head]
+// n_ctx_dev, when non-null, is a device int the kernels read their loop bound from
+// (identical value -> identical arithmetic -> identical bits). The GRID is still
+// shaped from the host n_ctx via mla_decode_attn_splits below; the device read is
+// what keeps a CUDA-graph-baked grid correct while the context grows underneath it.
 void mla_decode_attn_f32(float* out, const float* q, const float* k_cache,
                          const float* wv_b, int key_length, int kv_lora,
                          int v_dim, int n_head, int n_ctx, float scale,
-                         cudaStream_t stream);
+                         cudaStream_t stream, const int* n_ctx_dev = nullptr);
+
+// The split plan mla_decode_attn_f32 will use at this context. Graph capture compares
+// plan(captured ctx) with plan(current ctx) to decide when a recapture is due; sharing
+// the function is what makes "the launcher and the capture logic disagree" impossible.
+int mla_decode_attn_splits(int n_head, int key_length, int kv_lora, int n_ctx);
 
 // ---------------------------------------------------------------------------
 // 14. Generic projection (GEMV), f32 activation in, f32 out
