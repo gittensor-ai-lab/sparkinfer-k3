@@ -2902,16 +2902,36 @@ bool k3_proj_f32_x4(float* y0, float* y1, float* y2, float* y3, const float* x,
     return true;
 }
 
+bool k3_quantize_act_q8_0(void* xq8, const float* x, int K, cudaStream_t stream) {
+    if (!xq8 || !x || K <= 0 || K % 32 != 0) return false;
+    const int nb = K / 32;
+    constexpr int QT = 128;
+    quantize_q8_0_kernel<<<(nb + QT - 1) / QT, QT, 0, stream>>>(
+        (BlockQ8_0*)xq8, x, nb);
+    return true;
+}
+
 bool k3_proj_ggml_f32(float* y, const float* x, const void* W, int wtype,
                       int N, int K, void* q8_scratch, cudaStream_t stream) {
     if (N <= 0 || K <= 0) return false;
     if (wtype == 0)
         return k3_proj_f32(y, x, W, wtype, N, K, stream);
     if (wtype != 8 || !q8_scratch || K % 32 != 0) return false;
+    if (!k3_quantize_act_q8_0(q8_scratch, x, K, stream)) return false;
+    // The GEMV lives in ONE place so the shared-activation path cannot drift from
+    // this one: quantise-then-project and project-a-pre-quantised-activation run
+    // literally the same launches over the same bytes.
+    return k3_proj_ggml_pre_f32(y, q8_scratch, W, wtype, N, K, stream);
+}
+
+bool k3_proj_ggml_pre_f32(float* y, const void* xq8, const void* W, int wtype,
+                          int N, int K, cudaStream_t stream) {
+    if (N <= 0 || K <= 0) return false;
+    // F32 weights go through k3_proj_f32, which reads the f32 activation this entry
+    // point is not given. False = "use the slow path", per the contract in the header.
+    if (wtype != 8 || !xq8 || K % 32 != 0) return false;
     const int nb = K / 32;
-    constexpr int QT = 128;
-    quantize_q8_0_kernel<<<(nb + QT - 1) / QT, QT, 0, stream>>>(
-        (BlockQ8_0*)q8_scratch, x, nb);
+    const void* const q8_scratch = xq8;
     // Same idle-thread sizing as the f32-activation path above.
     constexpr int BLOCK = 128;
     const int TB = proj_block_for(nb);

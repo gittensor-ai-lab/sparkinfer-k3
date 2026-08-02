@@ -290,6 +290,90 @@ int main() {
         cudaFree(dW); cudaFree(dx); cudaFree(dy);
     }
 
+    // ---- one activation conversion, many projections ----
+    //
+    // k3_quantize_act_q8_0 + k3_proj_ggml_pre_f32 is what the KDA block's six readers of
+    // the normed hidden state take, instead of six k3_proj_ggml_f32 calls that each
+    // re-derive the same block_q8_0 bytes. The claim is that this changes WHEN the
+    // conversion happens and nothing else, so the test is equality against the per-call
+    // path — BIT-FOR-BIT, not within a tolerance, because both routes run the identical
+    // launches over identical bytes and any difference at all would mean they do not.
+    //
+    // Three different N exercise all three ROWS widths the dispatch picks between
+    // (>=4096 -> 16, >=2048 -> 8, >=1024 -> 4), since the whole point is that ONE
+    // conversion feeds consumers of differing shape.
+    {
+        const int K = 2048, bpr = K / 32;
+        const int Ns[3] = {4128, 2080, 1030};
+        std::vector<float> x(K); for (auto& v : x) v = U(rng);
+
+        void* dx = nullptr; void* dq = nullptr;
+        CU(cudaMalloc(&dx, K * sizeof(float)));
+        CU(cudaMalloc(&dq, k3_q8_0_bytes(K)));
+        CU(cudaMemcpy(dx, x.data(), K * sizeof(float), cudaMemcpyHostToDevice));
+
+        // Convert ONCE, ahead of every projection below.
+        const bool qok = k3_quantize_act_q8_0(dq, (const float*)dx, K, 0);
+        CU(cudaDeviceSynchronize());
+        if (!qok) { std::printf("[shared] k3_quantize_act_q8_0 refused -- BUG\n"); ++fail; }
+
+        int mismatch = 0;
+        for (int t = 0; t < 3 && qok; ++t) {
+            const int N = Ns[t];
+            std::vector<BlockQ8_0> W((size_t)N * bpr);
+            for (auto& b : W) {
+                const uint16_t exp = (uint16_t)(9 + (rng() % 8));
+                b.d = (uint16_t)(((rng() & 1) << 15) | (exp << 10) | (rng() % 1024));
+                for (auto& q : b.qs) q = (int8_t)((int)(rng() % 256) - 128);
+            }
+            void *dW, *dy_pre, *dy_ref, *dscratch;
+            CU(cudaMalloc(&dW, W.size() * sizeof(BlockQ8_0)));
+            CU(cudaMalloc(&dy_pre, N * sizeof(float)));
+            CU(cudaMalloc(&dy_ref, N * sizeof(float)));
+            CU(cudaMalloc(&dscratch, k3_q8_0_bytes(K)));
+            CU(cudaMemcpy(dW, W.data(), W.size() * sizeof(BlockQ8_0), cudaMemcpyHostToDevice));
+
+            const bool a = k3_proj_ggml_pre_f32((float*)dy_pre, dq, dW, 8, N, K, 0);
+            const bool b = k3_proj_ggml_f32((float*)dy_ref, (const float*)dx, dW, 8, N, K,
+                                            dscratch, 0);
+            CU(cudaDeviceSynchronize());
+            std::vector<float> pre(N), ref(N);
+            CU(cudaMemcpy(pre.data(), dy_pre, N * sizeof(float), cudaMemcpyDeviceToHost));
+            CU(cudaMemcpy(ref.data(), dy_ref, N * sizeof(float), cudaMemcpyDeviceToHost));
+
+            int diff = 0;
+            for (int n = 0; n < N; ++n)
+                if (std::memcmp(&pre[n], &ref[n], sizeof(float)) != 0) ++diff;
+            std::printf("[shared] N=%-5d K=%d accepted=%s bitwise-diff=%d\n",
+                        N, K, (a && b) ? "yes" : "NO", diff);
+            if (!a || !b || diff) { ++mismatch; }
+            cudaFree(dW); cudaFree(dy_pre); cudaFree(dy_ref); cudaFree(dscratch);
+        }
+        if (mismatch) ++fail;
+        cudaFree(dx); cudaFree(dq);
+    }
+
+    // ---- the pre-quantised path must refuse what it cannot do ----
+    //
+    // F32 weights have no activation conversion to reuse: k3_proj_ggml_f32 hands them to
+    // k3_proj_f32, which needs the f32 pointer this entry point never receives. Returning
+    // false is what sends the caller back to the per-call path; returning true would
+    // project against whatever the quantised buffer happened to hold.
+    {
+        float* dy = nullptr; void *dW = nullptr, *dq = nullptr;
+        cudaMalloc(&dy, 4); cudaMalloc(&dW, 4 * 32); cudaMalloc(&dq, k3_q8_0_bytes(32));
+        const bool f32_ok = k3_proj_ggml_pre_f32(dy, dq, dW, /*wtype=*/0, 1, 32, 0);
+        const bool null_ok = k3_proj_ggml_pre_f32(dy, nullptr, dW, /*wtype=*/8, 1, 32, 0);
+        // K not a whole number of Q8_0 blocks: the buffer cannot hold this activation.
+        const bool ragged_ok = k3_proj_ggml_pre_f32(dy, dq, dW, /*wtype=*/8, 1, 48, 0);
+        std::printf("[refuse] pre_f32 F32=%s null-buf=%s ragged-K=%s\n",
+                    f32_ok ? "YES -- BUG" : "no (correct)",
+                    null_ok ? "YES -- BUG" : "no (correct)",
+                    ragged_ok ? "YES -- BUG" : "no (correct)");
+        if (f32_ok || null_ok || ragged_ok) ++fail;
+        cudaFree(dy); cudaFree(dW); cudaFree(dq);
+    }
+
     // ---- unsupported type must be refused ----
     {
         float *dy=nullptr, *dx=nullptr; void* dW=nullptr;

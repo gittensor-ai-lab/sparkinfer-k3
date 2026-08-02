@@ -477,6 +477,38 @@ bool k3_proj_f32_x4(float* y0, float* y1, float* y2, float* y3, const float* x,
 bool k3_proj_ggml_f32(float* y, const float* x, const void* W, int wtype,
                       int N, int K, void* q8_scratch, cudaStream_t stream);
 
+// The same projection, split so an activation that many tensors share is converted
+// ONCE instead of once per consumer.
+//
+// K3's blocks project the same activation repeatedly. The KDA block takes attn_q,
+// attn_k, attn_v, ssm_f_a, ssm_beta and ssm_g from one normed hidden state; the MLA
+// block takes attn_q_a, attn_kv_a_mqa and attn_gate from it; the FFN block takes the
+// router, ffn_routed_down and the shared-expert gate/up from normed2. Under
+// k3_proj_ggml_f32 each of those re-derives bytes the previous call already produced
+// — same input, same K, same output — so all but the first are pure overhead.
+//
+// WHY THIS IS A SECOND ENTRY POINT AND NOT A CACHE INSIDE k3_proj_ggml_f32. The
+// scratch that entry point quantises into is shared by every projection in the layer,
+// and the consumers of one activation are NOT contiguous: ssm_f_b projects a
+// DIFFERENT activation at a DIFFERENT K between ssm_f_a and ssm_beta, overwriting the
+// scratch midway. A cache keyed on "already quantised this layer" therefore serves
+// the tail of the block an activation it never asked for, at the wrong length. That
+// is not a crash — it is fluent, confidently wrong output. Making the buffer the
+// caller's, and making the caller name the activation and length it holds, is what
+// takes that failure out of the space of things the code can express.
+//
+// k3_proj_ggml_pre_f32 returns FALSE for anything outside its contract — F32 weights
+// especially, which never had an activation conversion to reuse and need the f32
+// pointer this entry point does not receive. As with k3_proj_f32_x4, callers must read
+// false as "use the slow path", not as an error.
+//
+// xq8 must hold k3_q8_0_bytes(K) bytes, filled by k3_quantize_act_q8_0 from the same
+// activation at the same K.
+bool k3_quantize_act_q8_0(void* xq8, const float* x, int K, cudaStream_t stream);
+
+bool k3_proj_ggml_pre_f32(float* y, const void* xq8, const void* W, int wtype,
+                          int N, int K, cudaStream_t stream);
+
 // Scratch sizing helpers for the two reference-compatible activation paths.
 // K must be divisible by the corresponding block size (32 or 256).
 size_t k3_q8_0_bytes(int K);

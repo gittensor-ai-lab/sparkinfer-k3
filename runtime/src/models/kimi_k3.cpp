@@ -726,6 +726,25 @@ struct KimiK3Forward::Scratch {
     float* res_scores = nullptr;       // [ceil(n_layers / attn_res_block_size) + 1]
     void* proj_q8 = nullptr;           // optional llama CPU-compat block_q8_0 scratch
     void* moe_q8 = nullptr;            // optional llama CPU-compat block_q8_K scratch
+    // A block_q8_0 copy of one activation, tagged with what it actually holds.
+    //
+    // SEPARATE from proj_q8 because proj_q8 is rewritten by every projection in the
+    // layer, including ones that run BETWEEN two consumers of the same activation and
+    // at a different length — so a copy kept there is stale by the time the tail of the
+    // block reads it, and stale here means fluent, confidently wrong tokens rather than
+    // a crash.
+    //
+    // The tag carries the layer as well as K because the phases are separate CALLS:
+    // normed2 is converted in FfnPartial and still read in FfnFinish, so "this buffer
+    // holds a hidden-wide activation" is not on its own enough to prove it holds THIS
+    // layer's. A reader that cannot match both takes the per-call path.
+    struct QuantAct {
+        void* buf = nullptr;           // [k3_q8_0_bytes(H)]
+        int k = 0;                     // 0 = holds nothing usable
+        int layer = -1;
+    };
+    QuantAct normed_q8;
+    QuantAct normed2_q8;
 
     std::vector<void*> owned;
 };
@@ -810,6 +829,10 @@ bool kimi_k3_forward_alloc_scratch(const KimiK3Config& cfg, KimiK3Forward& fwd) 
                                  cfg.attn_res_block_size) + 1
                       : 1);
     ok &= alloc_bytes(s.proj_q8, k3k::k3_q8_0_bytes(cfg.dense_ffn));
+    // Both shared activations are hidden-wide; dense_ffn above is the largest K in the
+    // model and covers proj_q8's general case, not these.
+    ok &= alloc_bytes(s.normed_q8.buf, k3k::k3_q8_0_bytes(H));
+    ok &= alloc_bytes(s.normed2_q8.buf, k3k::k3_q8_0_bytes(H));
     ok &= alloc_bytes(s.moe_q8,
                       k3k::k3_moe_q8_k_bytes(cfg.expert_latent, cfg.moe_ffn, cfg.top_k));
 
@@ -951,6 +974,30 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
         return k3k::k3_proj_f32(y, x, W.data, W.type, N, K, stream);
     };
 
+    // Convert one activation for the several projections that read it. On the
+    // f32-activation path there is nothing to share, so the tag is left invalid and
+    // every reader below falls back to proj() — the old behaviour, unchanged.
+    auto quantize_shared = [&](KimiK3Forward::Scratch::QuantAct& a,
+                               const float* x, int K) {
+        a.k = (ggml_qact_proj && k3k::k3_quantize_act_q8_0(a.buf, x, K, stream)) ? K : 0;
+        a.layer = layer;
+    };
+
+    // Projection from an activation this block already converted. The tag is CHECKED,
+    // not assumed: a consumer that moves to a point where the buffer no longer holds
+    // its activation — a different length, a different layer, a phase that ran without
+    // its producer — takes the per-call path instead of reading someone else's bytes.
+    // k3_proj_ggml_pre_f32 returning false (F32 weights) lands in the same place.
+    auto proj_shared = [&](float* y, const float* x,
+                           const KimiK3Forward::Scratch::QuantAct& a,
+                           const KimiK3Tensor& W, int N, int K) {
+        if (!W.ok()) return false;
+        if (a.buf && a.k == K && a.layer == layer &&
+            k3k::k3_proj_ggml_pre_f32(y, a.buf, W.data, W.type, N, K, stream))
+            return true;
+        return proj(y, x, W, N, K);
+    };
+
     // ---- phase 1: attention. Ends holding a FULL-WIDTH PARTIAL SUM,
     // because attn_output is ColShard. The driver reduces it before phase 2. ----
     if (do_attn) {
@@ -975,6 +1022,12 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
         if (!L.attn_norm.ok()) return false;
         k3k::rms_norm_f32(s.normed, s.mixed, (const float*)L.attn_norm.data, H, eps, stream);
         if (fwd.debug) fwd.debug("attn_norm", layer, s.normed, H);
+
+        // s.normed is written here and read by every projection in this phase — six of
+        // them on a KDA layer, three on an MLA one, all at K=H. Converting it once is
+        // the whole change: nothing below writes s.normed again, so all of them are
+        // entitled to the same bytes.
+        quantize_shared(s.normed_q8, s.normed, H);
 
         k3_profiler().start(L.is_kda ? "attn_kda" : "attn_mla", stream);
         if (L.is_kda) {
@@ -1016,9 +1069,12 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
                                     L.attn_q.data, L.attn_k.data, L.attn_v.data,
                                     L.ssm_g.data, L.attn_q.type, qkv, H, stream);
             if (!fused_qkvg) {
-                if (!proj(s.qkv_q, s.normed, L.attn_q, qkv, H)) return false;
-                if (!proj(s.qkv_k, s.normed, L.attn_k, qkv, H)) return false;
-                if (!proj(s.qkv_v, s.normed, L.attn_v, qkv, H)) return false;
+                if (!proj_shared(s.qkv_q, s.normed, s.normed_q8,
+                                 L.attn_q, qkv, H)) return false;
+                if (!proj_shared(s.qkv_k, s.normed, s.normed_q8,
+                                 L.attn_k, qkv, H)) return false;
+                if (!proj_shared(s.qkv_v, s.normed, s.normed_q8,
+                                 L.attn_v, qkv, H)) return false;
             }
 
             if (!L.ssm_conv1d_q.ok() || !L.ssm_conv1d_k.ok() || !L.ssm_conv1d_v.ok())
@@ -1042,7 +1098,11 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             k3k::l2_norm_heads_f32(s.conv_k, s.conv_k, head_dim, n_head, 1.0f, eps, stream);
             if (fwd.debug) fwd.debug("dbg_l2_q", layer, s.conv_q, qkv);
 
-            if (!proj(s.f_a_out, s.normed, L.ssm_f_a, head_dim, H)) return false;
+            if (!proj_shared(s.f_a_out, s.normed, s.normed_q8,
+                             L.ssm_f_a, head_dim, H)) return false;
+            // NOT shared: a different activation at a different K. This is the call
+            // that overwrites the general proj_q8 scratch between two readers of
+            // s.normed, which is exactly why s.normed's copy is not kept there.
             if (!proj(s.g_raw, s.f_a_out, L.ssm_f_b, qkv, head_dim)) return false;
             if (!L.ssm_dt_bias.ok()) return false;
             k3k::k3_add_f32(s.g_raw, s.g_raw, w_dt, qkv, stream);
@@ -1056,7 +1116,8 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             // all cfg.n_q_heads rows and read this rank's band -- 96 rows of a
             // 7168-wide Q8_0 matrix is 0.7 MB against 468 MB of projections, so the
             // duplicated work is not worth a rule that would change another model.
-            if (!proj(s.beta_out, s.normed, L.ssm_beta, cfg.n_q_heads, H)) return false;
+            if (!proj_shared(s.beta_out, s.normed, s.normed_q8,
+                             L.ssm_beta, cfg.n_q_heads, H)) return false;
             // beta is the delta-rule update rate: llama.cpp's build_kda_layer applies
             // a sigmoid to the projection before the scan consumes it. Omitting this
             // left beta unbounded (rms ~1.7 vs the correct ~0.75) and scaled the whole
@@ -1072,7 +1133,9 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             if (fwd.debug) fwd.debug("dbg_delta_out", layer, s.delta_out, qkv);
 
             // Already computed above when the q/k/v/g fusion took the fast path.
-            if (!fused_qkvg && !proj(s.g_proj_out, s.normed, L.ssm_g, qkv, H)) return false;
+            if (!fused_qkvg &&
+                !proj_shared(s.g_proj_out, s.normed, s.normed_q8,
+                             L.ssm_g, qkv, H)) return false;
             if (!L.ssm_norm.ok()) return false;
             k3k::kda_gate_out_f32(s.gate_out, s.delta_out, (const float*)L.ssm_norm.data,
                                   s.g_proj_out, head_dim, n_head, eps, stream);
@@ -1085,7 +1148,8 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             if (mla_ord < 0) return false;
 
             if (L.has_q_lora) {
-                if (!proj(s.q_lora_out, s.normed, L.attn_q_a, cfg.q_lora_rank, H)) return false;
+                if (!proj_shared(s.q_lora_out, s.normed, s.normed_q8,
+                                 L.attn_q_a, cfg.q_lora_rank, H)) return false;
                 if (!L.attn_q_a_norm.ok()) return false;
                 k3k::rms_norm_f32(s.q_lora_out, s.q_lora_out,
                                   (const float*)L.attn_q_a_norm.data, cfg.q_lora_rank, eps,
@@ -1094,7 +1158,8 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
                          cfg.q_lora_rank))
                     return false;
             } else {
-                if (!proj(s.q_proj_out, s.normed, L.attn_q_dense, qh * cfg.key_length_mla, H))
+                if (!proj_shared(s.q_proj_out, s.normed, s.normed_q8,
+                                 L.attn_q_dense, qh * cfg.key_length_mla, H))
                     return false;
             }
 
@@ -1111,7 +1176,8 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
                               (size_t)cfg.rope_dim * sizeof(float), qh,
                               cudaMemcpyDeviceToDevice, stream);
 
-            if (!proj(s.kv_a_out, s.normed, L.attn_kv_a_mqa, cfg.key_length, H)) return false;
+            if (!proj_shared(s.kv_a_out, s.normed, s.normed_q8,
+                             L.attn_kv_a_mqa, cfg.key_length, H)) return false;
             if (!L.attn_kv_a_norm.ok()) return false;
             k3k::rms_norm_f32(s.kv_cmpr_normed, s.kv_a_out,
                               (const float*)L.attn_kv_a_norm.data, cfg.kv_lora_rank, eps,
@@ -1140,7 +1206,8 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             if (fwd.debug) fwd.debug("dbg_preattn", layer, s.mla_attn_out, qh * cfg.value_length_mla);
 
             if (L.has_attn_gate) {
-                if (!proj(s.gate_proj_out, s.normed, L.attn_gate, qh * cfg.value_length_mla, H))
+                if (!proj_shared(s.gate_proj_out, s.normed, s.normed_q8,
+                                 L.attn_gate, qh * cfg.value_length_mla, H))
                     return false;
                 if (fwd.debug) fwd.debug("dbg_gateproj", layer, s.gate_proj_out, qh * cfg.value_length_mla);
                 k3k::mla_gate_out_f32(s.mla_attn_out, s.mla_attn_out, s.gate_proj_out,
@@ -1182,10 +1249,17 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
         k3k::rms_norm_f32(s.normed2, s.mixed2, (const float*)L.ffn_norm.data, H, eps, stream);
         if (fwd.debug) fwd.debug("ffn_norm", layer, s.normed2, H);
 
+        // Same shape of saving as attn_norm above: the router, ffn_routed_down and the
+        // shared-expert gate/up all project this one activation at K=H, and on the
+        // leading dense layer so do ffn_gate and ffn_up.
+        quantize_shared(s.normed2_q8, s.normed2, H);
+
         k3_profiler().start(layer < cfg.leading_dense ? "ffn_dense" : "ffn_moe", stream);
         if (layer < cfg.leading_dense) {
-            if (!proj(s.dense_gate, s.normed2, L.ffn_gate, cfg.dense_ffn, H)) return false;
-            if (!proj(s.dense_up, s.normed2, L.ffn_up, cfg.dense_ffn, H)) return false;
+            if (!proj_shared(s.dense_gate, s.normed2, s.normed2_q8,
+                             L.ffn_gate, cfg.dense_ffn, H)) return false;
+            if (!proj_shared(s.dense_up, s.normed2, s.normed2_q8,
+                             L.ffn_up, cfg.dense_ffn, H)) return false;
             if (fwd.debug) fwd.debug("dbg_dense_gate", layer, s.dense_gate, cfg.dense_ffn);
             if (fwd.debug) fwd.debug("dbg_dense_up", layer, s.dense_up, cfg.dense_ffn);
             k3k::situ_f32(s.dense_situ, s.dense_gate, s.dense_up, cfg.dense_ffn,
@@ -1193,7 +1267,8 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             if (fwd.debug) fwd.debug("dbg_dense_situ", layer, s.dense_situ, cfg.dense_ffn);
             if (!proj(s.ffn_out, s.dense_situ, L.ffn_down, H, cfg.dense_ffn)) return false;
         } else {
-            if (!proj(s.router_logits, s.normed2, L.ffn_gate_inp, cfg.n_experts, H))
+            if (!proj_shared(s.router_logits, s.normed2, s.normed2_q8,
+                             L.ffn_gate_inp, cfg.n_experts, H))
                 return false;
             if (fwd.debug) fwd.debug("dbg_router_logits", layer, s.router_logits, cfg.n_experts);
             if (!L.exp_probs_b.ok()) return false;
@@ -1209,7 +1284,8 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             // moe_out = build_norm(moe_out, ...)", and only after that does
             // ffn_routed_up run. Getting this backwards (norm between routed_down and
             // the dispatch) was an earlier version's bug, same class as the ssm_norm fix.
-            if (!proj(s.routed_down_out, s.normed2, L.ffn_routed_down, cfg.expert_latent, H))
+            if (!proj_shared(s.routed_down_out, s.normed2, s.normed2_q8,
+                             L.ffn_routed_down, cfg.expert_latent, H))
                 return false;
 
             if (!L.ffn_gate_exps.ok() || !L.ffn_up_exps.ok() || !L.ffn_down_exps.ok())
@@ -1267,9 +1343,11 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
                 if (!L.ffn_gate_shexp.ok() || !L.ffn_up_shexp.ok() || !L.ffn_down_shexp.ok())
                     return false;
                 const int n_ff_shexp = cfg.moe_ffn * cfg.n_shared;
-                if (!proj(s.dense_gate, s.normed2, L.ffn_gate_shexp, n_ff_shexp, H))
+                if (!proj_shared(s.dense_gate, s.normed2, s.normed2_q8,
+                                 L.ffn_gate_shexp, n_ff_shexp, H))
                     return false;
-                if (!proj(s.dense_up, s.normed2, L.ffn_up_shexp, n_ff_shexp, H))
+                if (!proj_shared(s.dense_up, s.normed2, s.normed2_q8,
+                                 L.ffn_up_shexp, n_ff_shexp, H))
                     return false;
                 k3k::situ_f32(s.dense_situ, s.dense_gate, s.dense_up, n_ff_shexp,
                              cfg.situ_beta, cfg.situ_linear_beta, stream);
