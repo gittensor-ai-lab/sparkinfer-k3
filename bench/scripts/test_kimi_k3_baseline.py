@@ -1566,8 +1566,9 @@ class CiWorkflowTest(unittest.TestCase):
         The defaults must overlap. If the ceiling sat above the crossover there would be a
         band where a fabricated claim is both timing-free and scorable, which is the original
         hole in a narrower window."""
-        MARGIN, JITTER, WORK_TOL, LLAMA, MULT = 128, 2.0, 2.0, 16.70, 3.0
-        crossover = MARGIN / (JITTER * WORK_TOL)      # 32 tok/s: timing stops being evidence
+        MARGIN = self._margin_default()               # read from the harness, not restated
+        JITTER, WORK_TOL, LLAMA, MULT = 2.0, 2.0, 16.70, 3.0
+        crossover = MARGIN / (JITTER * WORK_TOL)      # tok/s: timing stops being evidence
         ceiling = LLAMA * MULT                        # 50.1 tok/s: plausibility takes over
         self.assertLessEqual(
             ceiling, crossover * 2,
@@ -1585,16 +1586,85 @@ class CiWorkflowTest(unittest.TestCase):
         self.assertEqual(rc.returncode, 0, f"a real 20 tok/s run was refused:\n{rc.stderr}")
 
     def test_jitter_never_trips_the_work_check(self):
-        """Load jitter INFLATES d_ns (the differential reads slower than truth), so it can
-        only make the work check pass more easily. The check must therefore never fire on an
-        honest run, however unlucky the load -- a false refusal here costs a real PR its
-        tier, which is exactly how the 8-and-24-token version broke on trusted main."""
+        """A false refusal here costs an honest PR its tier, so the work check must survive
+        the worst load the box actually produces.
+
+        The docstring here used to claim jitter is one-directional -- 'it only ever makes the
+        differential read SLOWER than truth, so it can only make the work check pass more
+        easily'. That is false, and #77 is the counterexample. d_ns is a DIFFERENCE of two
+        loads: when the SECOND run loads faster than the first, the difference is negative and
+        it is subtracted from the decode signal. The old cases only passed because they were
+        written at ~1 tok/s, where 128 tokens is 128 s of signal and a few seconds of jitter
+        cannot reach it. Measured on the h200x8 box the load spread is 7.0 s (33.25-40.27 s
+        over five runs), so the jitter range below is the real one."""
+        MARGIN = self._margin_default()
         LOAD, MS = 150e9, 1000.0
-        for jitter_s in (-2, -1, 0, 1, 2, 5):
+        for jitter_s in (-7, -5, -2, 0, 2, 5, 7):
             rc = self._run_guard(LOAD + 8e9, LOAD + 8e9 + 128e9 + jitter_s * 1e9,
                                  8, 136, 1.0, MS)
             self.assertEqual(rc.returncode, 0,
                              f"{jitter_s:+} s of load jitter refused an honest run:\n{rc.stderr}")
+
+        # And at the speed main ACTUALLY runs at now, where the signal is small enough for
+        # 7 s to matter. This is the case that refused #77.
+        ms = 1000.0 / 18.88                       # main: 18.88 tok/s at 128k
+        for jitter_s in (-7, -3.4, 0, 7):
+            signal = MARGIN * ms / 1000.0
+            rc = self._run_guard(LOAD + 8e9, LOAD + 8e9 + (signal + jitter_s) * 1e9,
+                                 8, 8 + MARGIN, 18.88, ms)
+            self.assertEqual(rc.returncode, 0,
+                             f"at {MARGIN} marginal tokens, {jitter_s:+} s of jitter refused "
+                             f"an honest 18.88 tok/s run:\n{rc.stderr}")
+
+    def _margin_default(self):
+        """MARGIN_TOKENS as the harness actually defaults it — read, not restated, so this
+        file cannot drift from the value that gates PRs."""
+        import re as _re
+        ev = (ROOT / "bench/scripts/kimi_k3_eval.sh").read_text()
+        m = _re.search(r'MARGIN_TOKENS="\$\{KIMI_K3_MARGIN_TOKENS:-(\d+)\}"', ev)
+        self.assertIsNotNone(m, "MARGIN_TOKENS default no longer parses")
+        return int(m.group(1))
+
+    def test_the_margin_outruns_the_measured_load_jitter(self):
+        """THE MARGIN HAS TO TRACK THE ENGINE.
+
+        The decode signal is MARGIN_TOKENS x ms/token, so every speedup this loop pays for
+        shrinks it, while the load jitter it must clear does not move. 128 tokens was a 28 s
+        signal when main ran at 4.53 tok/s and a 6.8 s one by 18.88 tok/s -- below the 7.0 s
+        spread measured on the box, at which point the guard refuses honest work. #77 was
+        refused exactly there: 128 tokens that should have cost 6.36 s measured 2.96 s.
+
+        work_tol tolerates a shortfall of signal/work_tol, so that is what must clear the
+        jitter -- with real headroom, because this only gets tighter as the frontier rises."""
+        MARGIN = self._margin_default()
+        JITTER_S, WORK_TOL, FRONTIER = 7.0, 2.0, 18.88
+        signal = MARGIN * (1000.0 / FRONTIER) / 1000.0
+        self.assertGreater(
+            signal / WORK_TOL, JITTER_S * 1.5,
+            f"MARGIN_TOKENS={MARGIN} gives {signal:.1f} s of decode at {FRONTIER} tok/s; "
+            f"work_tol absorbs {signal / WORK_TOL:.1f} s against {JITTER_S} s of measured "
+            "load jitter — too little headroom, honest PRs will be refused")
+
+    def test_77s_exact_numbers_are_the_regression_case(self):
+        """The real refusal, replayed. #77 self-reported 49.70 ms/token (20.12 tok/s, a
+        +6.6% win over main's 18.88) and its 128 marginal tokens measured 2.96 s against the
+        6.36 s the claim implies. Corroborated by the sweep: five runs of main on the same
+        box self-reported 52.98/53.11/53.07/53.02/53.50 ms/token, spread 1.0%, so the
+        self-report was not the unreliable half."""
+        LOAD, SELF_MS, D_MEASURED = 150e9, 49.70, 2.96
+        rc = self._run_guard(LOAD + 8e9, LOAD + 8e9 + D_MEASURED * 1e9,
+                             8, 136, 1000.0 / SELF_MS, SELF_MS)
+        self.assertEqual(rc.returncode, 1, "the historical refusal no longer reproduces")
+        self.assertIn("did not do the extra work", rc.stderr)
+
+        # Same jitter in seconds, same claim, at the margin the harness now defaults to.
+        MARGIN = self._margin_default()
+        shortfall = SELF_MS * 128 / 1000.0 - D_MEASURED         # 3.40 s of adverse jitter
+        d = MARGIN * SELF_MS / 1000.0 - shortfall
+        rc = self._run_guard(LOAD + 8e9, LOAD + 8e9 + d * 1e9, 8, 8 + MARGIN,
+                             1000.0 / SELF_MS, SELF_MS)
+        self.assertEqual(rc.returncode, 0,
+                         f"MARGIN_TOKENS={MARGIN} still refuses #77's honest run:\n{rc.stderr}")
 
     def test_a_faster_claim_than_elapsed_time_is_still_refused(self):
         """The original one-sided check must survive the second side being added."""
@@ -1997,6 +2067,55 @@ class CiWorkflowTest(unittest.TestCase):
         crlf = base.replace("- [ ] Tested", "- [x] Tested").replace("\n", "\r\n")
         ok, _ = bot.eligibility(pr(crlf))
         self.assertTrue(ok, "CRLF line endings broke the section scan")
+
+    def test_eligibility_skips_prs_that_cannot_be_evaluated_or_merged(self):
+        """The node is a scarce serial resource, so the round must not book ~40 GPU-minutes
+        for a PR whose result nobody can act on. Two such classes, both live in one round:
+        #64 was CONFLICTING (update_pr_branch could not advance it), and #74/#71 carried
+        needs-node-run, which is in NEVER_MERGE_LABELS and so forecloses the merge."""
+        import textwrap
+        bot = self._bot()
+        body = textwrap.dedent("""\
+            ## Node run
+            - [x] Tested on **8× H200** (`sm_90`)
+        """)
+        pr = lambda **kw: {"isDraft": False, "labels": [], "body": body, **kw}
+
+        ok, _ = bot.eligibility(pr())
+        self.assertTrue(ok, "the control case must be eligible or this test proves nothing")
+
+        ok, reason = bot.eligibility(pr(mergeable="CONFLICTING"))
+        self.assertFalse(ok, "a conflicted PR was booked onto the node (#64)")
+        self.assertIn("conflicts with main", reason)
+
+        # UNKNOWN is the normal answer while GitHub recomputes after main moves. Skipping on
+        # it would empty the field every round; the merge path waits for a real answer.
+        self.assertTrue(bot.eligibility(pr(mergeable="UNKNOWN"))[0],
+                        "UNKNOWN mergeability must not skip — it is the post-push default")
+        self.assertTrue(bot.eligibility(pr(mergeable="MERGEABLE"))[0])
+
+        ok, reason = bot.eligibility(pr(labels=[{"name": "needs-node-run"}]))
+        self.assertFalse(ok, "a label that already blocks the merge must not book the node")
+        self.assertIn("needs-node-run", reason)
+
+    def test_every_never_merge_label_that_forecloses_a_merge_is_checked_early(self):
+        """needs-node-run is skipped up front because it can never clear during the round.
+        needs-rebase deliberately is NOT: the bot rebases PRs itself and then clears it, so
+        skipping on it would make the label self-fulfilling."""
+        bot = self._bot()
+        self.assertIn("needs-node-run", bot.NEVER_MERGE_LABELS)
+        self.assertIn("needs-rebase", bot.NEVER_MERGE_LABELS)
+        body = "## Node run\n- [x] Tested on **8× H200** (`sm_90`)\n"
+        ok, _ = bot.eligibility({"isDraft": False, "body": body,
+                                 "labels": [{"name": "needs-rebase"}]})
+        self.assertTrue(ok, "needs-rebase must stay evaluable — the bot clears it by rebasing")
+
+    def test_bot_asks_github_for_mergeability(self):
+        """The CONFLICTING check is dead code unless the field is actually requested."""
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        listing = src[src.index("def list_prs"):src.index("def eligibility")]
+        self.assertIn("mergeable", listing,
+                      "eligibility() reads pr['mergeable'] but list_prs never asks for it")
 
     # ---- clearing the previous round's tier -------------------------------------------
     def _bot(self):

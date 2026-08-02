@@ -126,7 +126,7 @@ def sh(cmd, timeout=7200):
 
 def list_prs(repo):
     r = gh(["pr", "list", "-R", repo, "--state", "open", "--limit", "50", "--json",
-            "number,title,isDraft,headRefOid,body,author,labels,isCrossRepository"])
+            "number,title,isDraft,headRefOid,body,author,labels,isCrossRepository,mergeable"])
     if r.returncode != 0:
         raise SystemExit(f"k3_eval_bot: gh pr list failed: {r.stderr.strip()}")
     return json.loads(r.stdout or "[]")
@@ -139,6 +139,36 @@ def eligibility(pr):
     labels = {l.get("name", "") for l in pr.get("labels") or []}
     if "hold" in labels:
         return False, "hold label set"
+
+    # A conflicted branch cannot be brought current, so it cannot be measured against a
+    # frontier that is about to move under it, and it cannot be merged at the end. #64 sat in
+    # a round as CONFLICTING: update_pr_branch could not advance it -- the round log shows
+    # #77, #74 and #71 updated and #64 simply absent -- so anything it measured would have
+    # described a tree that does not exist on main. That is ~40 GPU-minutes spent on a result
+    # nobody can act on.
+    #
+    # Only an explicit CONFLICTING skips. GitHub computes mergeability lazily and answers
+    # UNKNOWN while recomputing, which is the normal state for every open PR in the seconds
+    # after main moves -- treating that as a conflict would skip the entire field. UNKNOWN
+    # falls through to the merge path, where wait_mergeable_state() already blocks for a real
+    # answer.
+    if pr.get("mergeable") == "CONFLICTING":
+        return False, "conflicts with main — rebase before it can be evaluated or merged"
+
+    # CI's own verdict on the attestation, re-derived by node-attestation.yml on every edit
+    # and synchronize, so it does not go stale. It is already in NEVER_MERGE_LABELS: a PR
+    # carrying it cannot merge at the end of the round however fast it measures, so booking
+    # the node for it is spending GPU on a foregone conclusion.
+    #
+    # It is also a cross-check on the scan below. Both read the same checkbox out of the same
+    # body, so a disagreement means one of them is broken -- which is exactly the state this
+    # file was in before the fix below: the label said #74 and #71 had no node run, the bot
+    # said they did, and the bot was wrong. Two independent readings that must agree beat one
+    # reading trusted absolutely.
+    if "needs-node-run" in labels:
+        return False, ("needs-node-run — node-attestation.yml found no ticked node box "
+                       "in '## Node run'")
+
     section = node_run_section(pr.get("body") or "")
     ticked = any(TICKED.search(ln) and H200.search(ln) for ln in section.splitlines())
     if not ticked:
