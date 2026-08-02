@@ -80,6 +80,28 @@ REBASE_LABEL = "needs-rebase"
 # the ticked box, because that is the author's attestation that they ran it.
 TICKED = re.compile(r"-\s*\[\s*[xX]\s*\]")
 H200 = re.compile(r"h200", re.I)
+NODE_RUN_HEADING = re.compile(r"^##\s+node run\s*$", re.I)
+ANY_HEADING = re.compile(r"^##\s+")
+
+
+def node_run_section(body):
+    """Only the text between '## Node run' and the next '##' heading.
+
+    Same bug, same fix as node-attestation.yml (#78): a body-wide TICKED+H200 scan matched
+    the PR-template Checklist boilerplate '- [x] `...--node h200x8 --dry-run` resolves' --
+    ticked on nearly every PR and containing 'h200' -- so a PR read as attested while the
+    real Node run box sat unticked. Here the consequence was bounded (the bot still
+    measures for real) but live: #71 was evaluated in two rounds and #74 queued, neither
+    ever having attested a node run. The attestation is a claim made in ONE place; read
+    only that place. No section => not attested, which fails closed.
+    """
+    lines = (body or "").split("\n")
+    start = next((i for i, ln in enumerate(lines) if NODE_RUN_HEADING.match(ln)), -1)
+    if start == -1:
+        return ""
+    end = next((i for i in range(start + 1, len(lines)) if ANY_HEADING.match(lines[i])),
+               len(lines))
+    return "\n".join(lines[start + 1:end])
 
 
 def gh(args, timeout=120):
@@ -117,8 +139,8 @@ def eligibility(pr):
     labels = {l.get("name", "") for l in pr.get("labels") or []}
     if "hold" in labels:
         return False, "hold label set"
-    body = pr.get("body") or ""
-    ticked = any(TICKED.search(ln) and H200.search(ln) for ln in body.splitlines())
+    section = node_run_section(pr.get("body") or "")
+    ticked = any(TICKED.search(ln) and H200.search(ln) for ln in section.splitlines())
     if not ticked:
         return False, "the 8x H200 box is not ticked — the author has not attested a node run"
     return True, "eligible"

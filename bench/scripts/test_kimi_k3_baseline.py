@@ -1962,6 +1962,42 @@ class CiWorkflowTest(unittest.TestCase):
         self.assertIn("clocks_pinned=False", at,
                       "the sealer must keep recording the truth, not start pinning on paper")
 
+    def test_bot_eligibility_scan_is_scoped_to_the_node_run_section(self):
+        """eligibility() had the exact bug #78 fixed in node-attestation.yml, unfixed: a
+        body-wide TICKED+H200 scan that the ticked Checklist boilerplate ('--node h200x8
+        --dry-run resolves') satisfies with the real Node run box unticked. Live impact:
+        #71 was evaluated in two rounds and #74 queued, neither ever attesting a node run.
+        The bot must mirror the workflow's rule, and now mirrors its fix."""
+        import textwrap
+        bot = self._bot()
+        base = textwrap.dedent("""\
+            ## Summary
+            x
+            ## Node run
+            - [ ] Tested on **8× H200** (`sm_90`)
+            ## Checklist
+            - [x] `bench/scripts/kimi_k3_baseline.sh --node h200x8 --dry-run` resolves
+        """)
+        pr = lambda body: {"isDraft": False, "labels": [], "body": body}
+
+        ok, reason = bot.eligibility(pr(base))
+        self.assertFalse(ok, "the ticked Checklist boilerplate attested a node run again")
+        self.assertIn("not ticked", reason)
+
+        ok, _ = bot.eligibility(pr(base.replace("- [ ] Tested", "- [x] Tested")))
+        self.assertTrue(ok, "a genuinely ticked Node run box must still be eligible")
+
+        ok, _ = bot.eligibility(pr(base.replace("## Node run", "## Runs")))
+        self.assertFalse(ok, "no Node run section must fail closed, not fall back to the body")
+
+        ok, _ = bot.eligibility(pr(""))
+        self.assertFalse(ok, "an empty body was eligible")
+
+        # CRLF bodies (GitHub web edits) must not defeat the section boundaries
+        crlf = base.replace("- [ ] Tested", "- [x] Tested").replace("\n", "\r\n")
+        ok, _ = bot.eligibility(pr(crlf))
+        self.assertTrue(ok, "CRLF line endings broke the section scan")
+
     # ---- clearing the previous round's tier -------------------------------------------
     def _bot(self):
         """Import the bot module itself. The structural tests read its source; this one has
