@@ -79,6 +79,21 @@ NEVER_MERGE_PATHS = ("eval/", ".github/", ".gittensor/", "bench/scripts/", "benc
                      "bench/refdata/", "dashboard/", "CODEOWNERS")
 REBASE_LABEL = "needs-rebase"
 
+# THE TIERS THAT MEAN A PR ACTUALLY WON SOMETHING.
+#
+# merge_blockers used to accept any label starting with "eval:" as proof the PR had passed the
+# gate. `eval:none` starts with "eval:". So the one label whose entire meaning is "no
+# significant gain" satisfied the check that exists to require a gain.
+#
+# #81 merged through that hole and cost main 31.5%. It had been measured honestly at +4.17%
+# against a 20.14 main in an earlier round; #74 then landed underneath it, the two changes
+# conflicted, and the re-measurement on current main came back 14.54 against a 21.24 frontier.
+# Every part of the loop that was supposed to catch this DID: needs-rebase forced the
+# re-measurement, and eval-label.yml correctly applied eval:none. The merge decision then
+# ignored both.
+SCORING_TIERS = {"eval:xs", "eval:s", "eval:m", "eval:l", "eval:xl"}
+NO_GAIN_TIER = "eval:none"
+
 # The PR template's hardware attestation. Matched loosely on purpose -- the template uses a
 # multiplication sign (8x H200) that is easy to retype as an ASCII x, and failing a real
 # submission over a homoglyph is worse than accepting a near-miss. What must be exact is
@@ -1267,7 +1282,12 @@ def merge_blockers(repo, num, pr, waiting_is_blocking=True, mode="strict"):
     hit = labels & NEVER_MERGE_LABELS
     if hit:
         bad.append(f"labels {sorted(hit)}")
-    if not any(l.startswith("eval:") for l in labels):
+    # Membership, not startswith. `eval:none` starts with "eval:" and means the OPPOSITE of
+    # having passed -- it is eval-label.yml saying the gain did not clear the significance
+    # gate. Accepting it merged #81 at -31.5%.
+    if NO_GAIN_TIER in labels:
+        bad.append(f"{NO_GAIN_TIER} — measured no significant gain over the current frontier")
+    elif not (labels & SCORING_TIERS):
         bad.append("no eval:* tier — it has not passed the gate")
     r = gh(["pr", "diff", str(num), "-R", repo, "--name-only"])
     files = [f for f in (r.stdout or "").split() if f]
@@ -1765,6 +1785,20 @@ def main():
     # else -- posting, sealing, the round log -- still sees every result.
     mergeable = [r for r in results if r[0] not in unsafe_tier]
 
+    # A WINNER HAS TO HAVE WON. Ranking by absolute tok/s makes the least-bad result of a bad
+    # round the "largest verified gain": with one result, a REGRESSION is trivially the
+    # maximum. That is how #81 merged at 14.54 against a 21.24 frontier and cost main 31.5%.
+    #
+    # Compared against the frontier this round measured, which is the same baseline the tier
+    # is derived from -- so this agrees with eval-label.yml by construction rather than by
+    # coincidence. Reported per PR, because "nothing merged" and "nothing was faster than
+    # main" are different rounds and the operator needs to know which one happened.
+    losers = [(n, r) for n, r in mergeable if float(r.get("tps") or 0) <= frontier]
+    for num, res in losers:
+        print(f">> #{num}: {res.get('tps')} tok/s does not beat the {frontier} tok/s frontier "
+              "— not a merge candidate")
+    mergeable = [(n, r) for n, r in mergeable if float(r.get("tps") or 0) > frontier]
+
     if args.merge_first or args.auto_merge or args.merge_admin:
         mark_merge_first(args.repo, mergeable, args.dry_run,
                          queue_auto_merge=args.auto_merge, prs=prs)
@@ -1784,7 +1818,11 @@ def main():
     elif args.merge_admin:
         # "no results" and "results, none of them safe to merge on" are different rounds and
         # the operator reading this needs to know which one happened.
-        if unsafe_tier:
+        if losers:
+            beaten = ", ".join(f"#{n} at {r.get('tps')}" for n, r in losers)
+            print(f"nothing merged — no PR beat the {frontier} tok/s frontier this round "
+                  f"({beaten})", file=sys.stderr)
+        elif unsafe_tier:
             print(f"no results safe to merge — {len(unsafe_tier)} PR(s) still carry a tier "
                   f"from an earlier round: {', '.join(f'#{n}' for n in sorted(unsafe_tier))}",
                   file=sys.stderr)
