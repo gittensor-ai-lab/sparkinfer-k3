@@ -16,9 +16,13 @@ namespace tp {
 
 enum class Backend {
     None,          // tp_size == 1: no collective is issued at all
-    Nccl,          // default whenever tp_size > 1
-    PeerOneShot,   // peer-read one-shot with an in-kernel barrier (not vendored)
-    Multimem,      // NVSwitch multimem.ld_reduce (not vendored)
+    Nccl,          // portable fallback; what an unset backend used to mean
+    PeerOneShot,   // peer-read one-shot with an in-kernel barrier
+    Multimem,      // NVSwitch multimem.ld_reduce (still unvalidated on hardware)
+    Auto,          // resolve at select_backend(): fastest the box can run.
+                   // This is what an UNSET SPARKINFER_TP_BACKEND now means —
+                   // see backend_from_string() for why the old default cost
+                   // the frontier 7%.
 };
 
 const char* backend_name(Backend b);
