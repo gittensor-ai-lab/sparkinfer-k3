@@ -764,6 +764,52 @@ class CiWorkflowTest(unittest.TestCase):
         self.assertIn("needs-node-run", text)
         self.assertNotIn("state: 'closed'", text)
 
+    @unittest.skipUnless(shutil.which("node"), "node not available")
+    def test_node_attestation_scan_is_scoped_to_the_node_run_section(self):
+        """A body-wide ticked-checkbox scan matched the PR-template Checklist boilerplate
+        '- [x] `...kimi_k3_baseline.sh --node h200x8 --dry-run` resolves' -- ticked on
+        nearly every PR and containing 'h200' -- so it read as 'attested on 8x H200' while
+        the real Node run box sat unticked. #74 cleared its needs-node-run label this way
+        with no node run behind it (#78 fixed it).
+
+        Tested by running the REAL functions extracted from the workflow's github-script
+        block, against a body shaped like the PR template -- not a paraphrase that can
+        drift. The fixture keeps the exact colliding Checklist line."""
+        import yaml as _y, tempfile, textwrap
+        wf = _y.safe_load((self.WF / "node-attestation.yml").read_text())
+        script = wf["jobs"]["gate"]["steps"][0]["with"]["script"]
+        self.assertIn("function nodeRunSection", script,
+                      "the section scoper is gone — the body-wide scan is back")
+        fns = script[script.index("const NODES"):script.index("const { owner, repo }")]
+
+        fixture = textwrap.dedent("""\
+            ## Summary
+            x
+            ## Node run
+            - [ ] Tested on **8× H200** (`sm_90`)
+            ## Checklist
+            - [x] `bench/scripts/kimi_k3_baseline.sh --node h200x8 --dry-run` resolves
+        """)
+        driver = fns + textwrap.dedent("""
+            const cases = [
+              tickedNodes(process.argv[2]),                                   // boilerplate only
+              tickedNodes(process.argv[2].replace('- [ ] Tested', '- [x] Tested')),  // real tick
+              tickedNodes(process.argv[2].replace('## Node run', '## Runs')), // heading gone
+            ];
+            console.log(JSON.stringify(cases));
+        """)
+        f = tempfile.NamedTemporaryFile("w", suffix=".js", delete=False)
+        f.write(driver); f.close()
+        out = subprocess.run(["node", f.name, fixture], capture_output=True, text=True)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        boilerplate_only, real_tick, no_heading = json.loads(out.stdout)
+        self.assertEqual(boilerplate_only, [],
+                         "the ticked Checklist boilerplate attested a node again (#74)")
+        self.assertEqual(real_tick, ["8x H200 (sm_90)"],
+                         "a genuinely ticked Node run box must still attest")
+        self.assertEqual(no_heading, [],
+                         "no Node run section must fail closed, not fall back to the body")
+
     def test_sensitive_paths_no_longer_guards_the_whole_harness(self):
         # bench/scripts/ IS the deliverable here; guarding all of it would gate every
         # contribution the repo exists to receive.
