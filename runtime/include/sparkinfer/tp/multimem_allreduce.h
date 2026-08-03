@@ -39,17 +39,18 @@ namespace sparkinfer::tp {
 bool multimem_allreduce_supported(const std::vector<int>& devices) noexcept;
 
 // Owns a multicast object bound across `devices`, plus per-device unicast +
-// multicast mappings of a single hidden-sized BF16 scratch. Reused across all
-// decode all-reduces (allocate once).
+// multicast mappings of a single hidden-sized scratch sized for f32 (the wider
+// of the two dtypes this class reduces; bf16 uses the front half). Reused across
+// all decode all-reduces (allocate once).
 //
-// The class owns the all-reduce buffers (one physical multicast-bound BF16
-// scratch per device, holding a distinct input and output region) and exposes
-// each rank's via rank_buffer(rank)/rank_result(rank). The caller writes rank
-// r's input into rank_buffer(r) on device devices[r], calls allreduce_bf16(),
-// then reads the reduced sum from rank_result(r). Owning the buffers is what
-// makes this copy-free: only multicast-bound physical allocations can back
-// multimem.* loads, so an integration writes the AR input straight into
-// rank_buffer() rather than copying an external buffer in/out.
+// The class owns the all-reduce buffers (one physical multicast-bound scratch
+// per device, holding a distinct input and output region) and exposes each
+// rank's via rank_buffer(rank)/rank_result(rank). The caller writes rank r's
+// input into rank_buffer(r) on device devices[r], calls allreduce_bf16() or
+// allreduce_f32(), then reads the reduced sum from rank_result(r). Owning the
+// buffers is what makes this copy-free: only multicast-bound physical
+// allocations can back multimem.* loads, so an integration writes the AR input
+// straight into rank_buffer() rather than copying an external buffer in/out.
 //
 // Input and output are SEPARATE regions on purpose: a one-shot multimem reduce
 // has each rank load-reduce across every rank's input while writing its own
@@ -62,10 +63,11 @@ bool multimem_allreduce_supported(const std::vector<int>& devices) noexcept;
 // at startup) and that callers serialize concurrent all-reduces on the buffers.
 class MultimemAllreduce {
 public:
-    // No f32 path yet: multimem.ld_reduce does support .f32 on sm_90, but the
-    // vendored kernels are bf16-typed throughout. Kept false so the adapter
-    // refuses rather than quietly casting K3's f32 stream.
-    static constexpr bool kSupportsF32 = false;
+    // Consulted by the collective adapter at compile time. True once the f32
+    // multimem.ld_reduce path exists — Kimi K3 keeps its residual stream f32 by
+    // design, so a bf16-only surface forced every K3 multimem request down to
+    // NCCL before construction.
+    static constexpr bool kSupportsF32 = true;
 
     // Unusable instance if unsupported; check ok() before use. `count` = max
     // elements (e.g. hidden_size); buffers are sized for this.
@@ -78,12 +80,12 @@ public:
     bool ok() const noexcept { return ok_; }
 
     // Rank r's input device pointer (on devices[r]): write the rank's input
-    // here before allreduce_bf16(). nullptr if !ok().
+    // here before allreduce_bf16()/allreduce_f32(). nullptr if !ok().
     void* rank_buffer(int rank) const noexcept;
 
     // Rank r's output device pointer (on devices[r]): holds the reduced sum
-    // after allreduce_bf16(). Distinct region from rank_buffer(r). nullptr if
-    // !ok().
+    // after allreduce_bf16()/allreduce_f32(). Distinct region from
+    // rank_buffer(r). nullptr if !ok().
     void* rank_result(int rank) const noexcept;
 
     // All-reduce (sum) of `count` BF16 elements across all ranks' rank_buffer()
@@ -92,6 +94,12 @@ public:
     // written before any rank issues its multimem.ld_reduce — no host events,
     // no cross-stream graph edges. streams size must equal the device count.
     void allreduce_bf16(std::size_t count, const std::vector<void*>& streams);
+
+    // f32 mirror of allreduce_bf16 — same one-shot kernel shape, 128-bit packs of
+    // 4 floats via multimem.ld_reduce.global.add.v4.f32. `count` must be a
+    // multiple of 4 (the ctor's multiple-of-8 gate already guarantees it). Exists
+    // because Kimi K3 keeps its residual stream f32 by design.
+    void allreduce_f32(std::size_t count, const std::vector<void*>& streams);
 
     // Opaque PIMPL, defined in the .cu. Declared public so the file-local
     // setup/launch helpers can name the type; impl_ itself stays private.

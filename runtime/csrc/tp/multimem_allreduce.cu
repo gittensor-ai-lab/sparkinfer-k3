@@ -46,6 +46,7 @@ using tpar::barrier_at_end;
 namespace {
 
 constexpr int kVecBf16 = 8;  // bf16 per uint4 (one multimem.ld_reduce.v4.bf16x2)
+constexpr int kVecF32  = 4;  // f32  per uint4 (one multimem.ld_reduce.v4.f32)
 
 #if SPARKINFER_TP_MULTIMEM_DRIVER_OK
 // Log + return false on driver-API error (setup is allowed to fail → fallback).
@@ -97,6 +98,35 @@ __global__ void multimem_allreduce_kernel(const uint4* __restrict__ mc_in,
     }
 #else
     // multimem requires SM90+; host gates on multimem_allreduce_supported().
+    (void)mc_in; (void)uc_out;
+#endif
+    barrier_at_end<N, true>(sg, self_sg, rank);
+}
+
+// f32 one-shot: same barrier shape as the bf16 kernel, but each thread reduces
+// 4 floats (one uint4) via multimem.ld_reduce.global.add.v4.f32. Exists because
+// Kimi K3 keeps its residual stream f32 by design — without this path every
+// SPARKINFER_TP_BACKEND=multimem request fell back to NCCL at construction.
+template <int N>
+__global__ void multimem_allreduce_f32_kernel(const float* __restrict__ mc_in,
+                                              float* __restrict__ uc_out,
+                                              RankSignals<N> sg, Signal* self_sg,
+                                              int rank, std::size_t n_vec) {
+    barrier_at_start<N>(sg, self_sg, rank);
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    for (std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < n_vec; i += static_cast<std::size_t>(gridDim.x) * blockDim.x) {
+        const float* addr = mc_in + i * 4;
+        float v0, v1, v2, v3;
+        asm volatile(
+            "multimem.ld_reduce.global.add.v4.f32 {%0,%1,%2,%3}, [%4];"
+            : "=f"(v0), "=f"(v1), "=f"(v2), "=f"(v3)
+            : "l"(addr)
+            : "memory");
+        float* out = uc_out + i * 4;
+        out[0] = v0; out[1] = v1; out[2] = v2; out[3] = v3;
+    }
+#else
     (void)mc_in; (void)uc_out;
 #endif
     barrier_at_end<N, true>(sg, self_sg, rank);
@@ -223,8 +253,10 @@ struct MultimemAllreduce::Impl {
 static bool setup_multicast(MultimemAllreduce::Impl* s) {
     const int N = static_cast<int>(s->devices.size());
 
-    // Region: count bf16, two regions (input + output) per device.
-    s->region_bytes = s->count * sizeof(__nv_bfloat16);
+    // Region: sized for f32, the wider of the two element types this class now
+    // reduces; bf16 uses the front half. One allocation serves both — same
+    // discipline as PeerOneShotAllreduce.
+    s->region_bytes = s->count * sizeof(float);
     const std::size_t want_bytes = s->region_bytes * 2;
 
     // Per-device PINNED allocation prop, reused for cuMemCreate below.
@@ -435,6 +467,44 @@ void MultimemAllreduce::allreduce_bf16(std::size_t count,
         case 2: launch_mm<2>(impl_, n_vec, grid, block, streams); break;
         case 4: launch_mm<4>(impl_, n_vec, grid, block, streams); break;
         case 8: launch_mm<8>(impl_, n_vec, grid, block, streams); break;
+        default: break;
+    }
+#else
+    (void)count; (void)streams;
+#endif
+}
+
+#if SPARKINFER_TP_MULTIMEM_DRIVER_OK
+template <int N>
+static void launch_mm_f32(MultimemAllreduce::Impl* s, std::size_t n_vec, int grid,
+                          int block, const std::vector<void*>& streams) {
+    RankSignals<N> sg{};
+    for (int r = 0; r < N; ++r) sg.sg[r] = s->sig[r];
+    for (int r = 0; r < N; ++r) {
+        cudaSetDevice(s->devices[r]);
+        const auto* mc_in = reinterpret_cast<const float*>(s->mc_va[r]);
+        auto* uc_out = reinterpret_cast<float*>(s->uc_va[r] + s->region_bytes);
+        detail::multimem_allreduce_f32_kernel<N><<<grid, block, 0,
+            reinterpret_cast<cudaStream_t>(streams[r])>>>(
+            mc_in, uc_out, sg, s->sig[r], r, n_vec);
+    }
+}
+#endif
+
+void MultimemAllreduce::allreduce_f32(std::size_t count,
+                                      const std::vector<void*>& streams) {
+#if SPARKINFER_TP_MULTIMEM_DRIVER_OK
+    if (!ok_) return;
+    const int N = static_cast<int>(impl_->devices.size());
+    const std::size_t n_vec = count / kVecF32;
+    const int block = 512;
+    int grid = static_cast<int>((n_vec + block - 1) / block);
+    if (grid > tpar::kMaxBlocks) grid = tpar::kMaxBlocks;
+
+    switch (N) {
+        case 2: launch_mm_f32<2>(impl_, n_vec, grid, block, streams); break;
+        case 4: launch_mm_f32<4>(impl_, n_vec, grid, block, streams); break;
+        case 8: launch_mm_f32<8>(impl_, n_vec, grid, block, streams); break;
         default: break;
     }
 #else
