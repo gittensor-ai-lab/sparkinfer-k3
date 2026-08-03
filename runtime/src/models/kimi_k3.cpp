@@ -622,6 +622,33 @@ bool kimi_k3_alloc_state(const KimiK3Config& cfg, int max_ctx, KimiK3RuntimeStat
         return (float*)p;
     };
 
+    // The device's position. Four bytes, allocated here so it lives exactly as long as
+    // the KV cache it indexes — a d_pos that outlived or predeceased the cache would be
+    // a use-after-free that only manifests under capture.
+    {
+        void* p = nullptr;
+        if (cudaMalloc(&p, sizeof(int)) != cudaSuccess) return false;
+        out.owned.push_back(p);
+        out.d_pos = (int*)p;
+    }
+
+    // Pre-warm the MLA split scratch while allocation is still legal. Inside a stream
+    // capture this same call would fail the CAPTURE rather than the allocation, from a
+    // call site nowhere near the graph code.
+    // Warmed at the model-wide MAXIMUM head count on purpose: the scratch is sized
+    // n_head * max_splits * kv_lora, so warming large means every in-capture call hits
+    // `need <= cap` and returns without allocating. Warming at the exact per-layer width
+    // would leave a wider layer to allocate mid-capture.
+    if (n_mla > 0) k3k::k3_mla_prewarm_split_scratch(cfg.n_q_heads, cfg.kv_lora_rank);
+
+    // The IQ lattice tables, for the same reason and with worse symptoms: they upload
+    // lazily with a synchronous cudaMemcpyToSymbol on first use, and under IQ1_S that
+    // first use is the first MoE layer — so a capture sails through the leading dense
+    // layer and dies at layer 1, blaming the MoE dispatch. Unconditional: the cost is one
+    // small upload per device at init, and gating it on the quant type would just mean
+    // rediscovering this the next time a weight type changed.
+    k3k::k3_prewarm_quant_tables();
+
     // The state vectors stay indexed by GLOBAL ordinal (kimi_k3_kda_ordinal /
     // kimi_k3_mla_ordinal), so they keep their full length — but only the slots for
     // layers this stage actually owns are allocated; the rest stay null and are never
@@ -666,8 +693,30 @@ bool kimi_k3_alloc_state(const KimiK3Config& cfg, int max_ctx, KimiK3RuntimeStat
     return true;
 }
 
+// THE ONLY SANCTIONED WAY TO MOVE THE POSITION.
+//
+// position exists twice — a host mirror that picks the launch plan and a device copy the
+// kernels index with — and any caller that writes one without the other desyncs them.
+// kimi_k3_tp_bench's --seek did exactly that: it set the host to ~131040 while d_pos stayed
+// 0, so the host planned splits=32 for a full context while the kernels attended over ONE
+// position and wrote KV row 0. Both arms then measured a token that was barely doing any
+// attention, and the resulting "+19%" was measuring almost nothing.
+//
+// Making the two-write an API rather than a convention is the fix; leaving it to callers is
+// what produced a fast, wrong benchmark that looked like a result.
+bool kimi_k3_set_position(KimiK3RuntimeState& s, int pos) {
+    if (pos < 0) return false;
+    s.position = pos;
+    if (s.d_pos && cudaMemcpy(s.d_pos, &pos, sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess)
+        return false;
+    return true;
+}
+
 void kimi_k3_reset_state(KimiK3RuntimeState& s) {
     s.position = 0;
+    // The device mirror resets with the host one. A reset that moved only the host would
+    // leave the kernels attending over a stale length while the plan said otherwise.
+    if (s.d_pos) cudaMemset(s.d_pos, 0, sizeof(int));
     s.n_ckpt = 0;
     auto z = [](float* p, size_t n_elems) {
         if (p && n_elems > 0) cudaMemset(p, 0, n_elems * sizeof(float));
@@ -1252,12 +1301,15 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             if (fwd.debug) fwd.debug("dbg_kvcmpr", layer, s.kv_cmpr_normed, cfg.kv_lora_rank);
 
             // K-cache row for this position: concat(normed kv_cmpr, RAW k_pe).
-            float* row = st.mla_kv_cache[mla_ord] + (size_t)st.position * cfg.key_length;
-            cudaMemcpyAsync(row, s.kv_cmpr_normed, (size_t)cfg.kv_lora_rank * sizeof(float),
-                            cudaMemcpyDeviceToDevice, stream);
-            cudaMemcpyAsync(row + cfg.kv_lora_rank, s.kv_a_out + cfg.kv_lora_rank,
-                            (size_t)cfg.rope_dim * sizeof(float),
-                            cudaMemcpyDeviceToDevice, stream);
+            //
+            // The row ADDRESS used to be computed here, on the host, from st.position —
+            // which a captured graph freezes. One kernel that derives the row from d_pos
+            // replaces the two memcpys; it moves the same bytes in the same order, so it
+            // is bit-identical, and it is the reason replay 2 writes a different row from
+            // replay 1 instead of overwriting replay 1's.
+            k3k::k3_mla_kv_store_f32(st.mla_kv_cache[mla_ord], s.kv_cmpr_normed,
+                                     s.kv_a_out, st.d_pos, cfg.kv_lora_rank,
+                                     cfg.rope_dim, cfg.key_length, stream);
 
             if (!L.attn_k_b.ok() || !L.attn_v_b.ok()) return false;
             k3k::mla_absorb_q_f32(s.absorbed_q, s.q_nope, s.q_pe,
@@ -1269,7 +1321,9 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             k3k::mla_decode_attn_f32(s.mla_attn_out, s.absorbed_q, st.mla_kv_cache[mla_ord],
                                      (const float*)L.attn_v_b.data, cfg.key_length,
                                      cfg.kv_lora_rank, cfg.value_length_mla, qh,
-                                     st.position + 1, mla_scale, stream);
+                                     // host length: picks the launch plan only.
+                                     // device length: what the kernel attends over.
+                                     st.position + 1, st.d_pos, mla_scale, stream);
             if (fwd.debug) fwd.debug("dbg_preattn", layer, s.mla_attn_out, qh * cfg.value_length_mla);
 
             if (L.has_attn_gate) {
@@ -1564,6 +1618,10 @@ bool kimi_k3_forward_token(KimiK3Forward& fwd, int token_id, float* out_logits) 
         cudaMemcpy(out_logits, logits_dev, (size_t)cfg.vocab * sizeof(float),
                   cudaMemcpyDeviceToHost);
         ++fwd.state->position;
+        // Device mirror advances with the host one on every path, not just the TP one.
+        // A single-GPU run that advanced only the host would desync the moment anything
+        // read the position from device memory.
+        if (fwd.state->d_pos) k3k::k3_bump_pos(fwd.state->d_pos, stream);
     }
 
     if (logits_dev) cudaFree(logits_dev);
@@ -1788,7 +1846,15 @@ bool kimi_k3_pipeline_forward_token(KimiK3Pipeline& p, int token_id, float* out_
     if (cudaMemcpy(out_logits, sl.logits, (size_t)cfg.vocab * sizeof(float),
                   cudaMemcpyDeviceToHost) != cudaSuccess) return false;
 
-    for (auto& st : p.stages) ++st.state.position;
+    for (auto& st : p.stages) {
+        ++st.state.position;
+        // Each stage owns a different device, so the bump has to be issued with that
+        // device current — d_pos lives in the stage's memory, not the caller's.
+        if (st.state.d_pos) {
+            if (cudaSetDevice(st.device) != cudaSuccess) return false;
+            k3k::k3_bump_pos(st.state.d_pos, st.fwd.stream);
+        }
+    }
     return true;
 }
 
