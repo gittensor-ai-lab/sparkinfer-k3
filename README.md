@@ -31,7 +31,7 @@ $ KIMI_K3_MODEL=.../Kimi-K3-UD-IQ1_S-00001-of-00014.gguf \
 | ✅ **End to end** | text → ids → 93 layers × 8 GPUs → text ([`kimi_k3_run.sh`](bench/scripts/kimi_k3_run.sh)) |
 | ✅ **llama.cpp baseline** | **Measured on 8× H200**, pinned, backed by a committed sweep JSON |
 | ✅ **Eval + scoring** | Deterministic `eval:XS`..`eval:XL` from measured speed **and** KL/top-1 parity |
-| ✅ **Speed** | **1.91× faster than llama.cpp at the scored 128k context** (35.14 vs 18.44). Started 18× behind on 2026-08-01 |
+| ✅ **Speed** | **2.24× faster than llama.cpp at the scored 128k context** (41.39 vs 18.44). Started 18× behind on 2026-08-01 |
 | ❌ **Prefill** | No batched prefill. Prompt ingestion is one forward per token |
 | ❌ **Vision** | `mmproj` wired up, no image benchmark — M4 |
 
@@ -40,10 +40,10 @@ $ KIMI_K3_MODEL=.../Kimi-K3-UD-IQ1_S-00001-of-00014.gguf \
 | decode tok/s at the scored 128k context | |
 |---|---:|
 | llama.cpp (unsloth fork @ `efc8bc38`) | 18.44 |
-| **sparkinfer, tensor-parallel tp=8** | **35.14** |
+| **sparkinfer, tensor-parallel tp=8** | **41.39** |
 
 8× H200, UD-IQ1_S, ctx 131,072, same weights, same box, both numbers measured on that box:
-**sparkinfer is 1.91× llama.cpp, +90.5%.**
+**sparkinfer is 2.24× llama.cpp, +124.4%.**
 
 It did not start there. The first measurement at this context was **1.00 tok/s** against
 llama.cpp's 18.44 — 18× behind — and the whole ladder is in the sealed log:
@@ -56,7 +56,8 @@ llama.cpp's 18.44 — 18× behind — and the whole ladder is in the sealed log:
 | after #89 (per-rank CUDA graphs) | 26.09 |
 | after #90 (decode fast paths) | 29.93 |
 | after #96 (2-D MoE sharding) | 33.58 |
-| **after #86 (F16 latent cache, epilogue routing)** | **35.14** |
+| after #86 (F16 latent cache, epilogue routing) | 35.63 |
+| **after #107 (warp-budget projection tier)** | **41.39** |
 
 Every row is a Polaris-sealed receipt in
 [sparkinfer-k3-log](https://github.com/gittensor-ai-lab/sparkinfer-k3-log), measured on one
@@ -67,7 +68,7 @@ keeps a compressed MLA cache (kv_lora 512, f16). sparkinfer's early 90% falloff 
 to 1.00 was the opposite shape, and closing it is what the ladder above is.
 
 Accuracy against llama.cpp on identical weights and ids: **top-1 100%, top-5 100%,
-mean KLD 7.51e-03.** Above the 1e-5 same-implementation bar; the remaining gap is
+mean KLD 6.69e-03.** Above the 1e-5 same-implementation bar; the remaining gap is
 activation quantization (llama.cpp quantizes activations before quantized mat-vecs,
 sparkinfer keeps f32 by design).
 
@@ -326,7 +327,7 @@ Tests need no GPU: `python3 bench/scripts/test_kimi_k3_baseline.py` (117).
 
 ## Powered by SN74 — moving at the speed of ⚡
 
-Contributors submit PRs; the eval verifies correctness and speed **on an 8x H200 node**; SN74 rewards verified marginal speedups. The Qwen3.6 track this forks from reached **+86% decode / +127% prefill @ 32k** that way. K3 started 18x behind llama.cpp at the scored 128k context and is now **1.91x ahead** (35.14 vs 18.44) — every round a sealed receipt, reproducible from the log without trusting us.
+Contributors submit PRs; the eval verifies correctness and speed **on an 8x H200 node**; SN74 rewards verified marginal speedups. The Qwen3.6 track this forks from reached **+86% decode / +127% prefill @ 32k** that way. K3 started 18x behind llama.cpp at the scored 128k context and is now **2.24x ahead** (41.39 vs 18.44) — every round a sealed receipt, reproducible from the log without trusting us.
 
 1. Pick a narrow bottleneck in the Hopper decode path.
 2. Submit a PR with source changes and benchmark evidence.
@@ -347,7 +348,7 @@ that already works, not the thing that makes it work.
 `KIMI_K3_NODE=h200x8` · `PRIMARY_QUANT=UD-IQ1_S` — both defaults
 
 - Native runtime, multi-GPU, end-to-end generation, llama.cpp baseline, eval + tiers — **landed**
-- **Beat llama.cpp at 128k — done.** llama.cpp 18.44, sparkinfer **35.14** (+90.5%). The
+- **Beat llama.cpp at 128k — done.** llama.cpp 18.44, sparkinfer **41.39** (+124.4%). The
   lever below is what got there, and it is not exhausted.
 - **Long-context attention was the lever, and it moved.** MLA decode reduced over 576 f32
   per token in a kernel with one block per head — once the entire reason the gap widened
@@ -361,7 +362,7 @@ that already works, not the thing that makes it work.
 - **CUDA-graph capture — landed (#89).** ~4,100 graph nodes per rank replay one captured
   token, re-planned as the MLA split count grows with depth. The single largest step in the
   ladder (+18%).
-- **Close the last KL gap.** 7.51e-03 vs the 1e-5 bar — activation quantization
+- **Close the last KL gap.** 6.69e-03 vs the 1e-5 bar — activation quantization
   (`IQ1_S → Q8_K`, `Q8_0 → Q8_0`), which is a deliberate design fork, not a bug.
 
 ### Then · UD-Q2_K_XL — the accuracy target
