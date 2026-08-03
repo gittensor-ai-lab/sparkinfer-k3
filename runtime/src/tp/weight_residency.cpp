@@ -100,6 +100,13 @@ Rule resolve_rule(const std::string& name, const TensorPlan& p, Rule table_rule,
         if (note) *note = "experts not divisible by tp_size — ffn-width shard instead";
         return Rule::ColShard;
     }
+    // 2-D MoE: the three routed-expert matrices get a SECOND band on top of the
+    // expert one. Checked after the not-divisible fallback above, so a shape that
+    // could not do 1-D expert sharding never silently arrives here.
+    if (d.moe_2d && table_rule == Rule::ExpertShard) {
+        const Rule two_d = routed_expert_2d_rule(name);
+        if (two_d != Rule::Unknown) return two_d;
+    }
     return table_rule;
 }
 
@@ -285,6 +292,82 @@ TensorResidency plan_tensor_residency(const std::string& name,
             r.copy.src_stride = r.copy.row_bytes;
             r.copy.dst_stride = r.copy.row_bytes;
             r.copy.n_rows     = ne3;
+            break;
+        }
+
+        case Rule::ExpertRow2D:
+        case Rule::ExpertCol2D: {
+            // 2-D MoE. Both bands come from ShardDims rather than being re-derived
+            // here, for the reason the KDA loader states: the kernel reads its
+            // geometry from the same struct, and a residency that re-divided could
+            // disagree with it. A disagreement here does not fault — it silently
+            // feeds the GEMV another expert's weights.
+            const Band eb = d.expert_band;      // over ne2
+            const Band fb = d.moe_ffn_band;     // over ne1 (row) or ne0 (col)
+            if (ne3 != 1) {
+                r.error = ResidencyError::BadShape;
+                r.note  = "2-D MoE expects ne3=1 on a routed-expert tensor";
+                return r;
+            }
+            if (eb.extent <= 0 || fb.extent <= 0 || eb.end() > ne2) {
+                r.error = ResidencyError::EmptyShard;
+                r.note  = "2-D MoE band empty or past the expert axis";
+                return r;
+            }
+            // One expert's matrix, in bytes. Both cases stride by this to walk the
+            // expert axis; it is also the ne1 row-run for the col case.
+            const std::size_t mat_bytes = row_bytes_full * static_cast<std::size_t>(ne1);
+            r.rank_ne[2] = eb.extent;
+
+            if (r.rule == Rule::ExpertRow2D) {
+                // ne1 = the FFN output rows. Whole memory rows, so no alignment
+                // constraint — the band is a contiguous run inside each expert.
+                r.split_axis = SplitAxis::Ne1_Output;
+                if (fb.end() > ne1) {
+                    r.error = ResidencyError::BadShape;
+                    r.note  = "2-D MoE ffn band past ne1 on a gate/up tensor";
+                    return r;
+                }
+                r.rank_ne[1] = fb.extent;
+                r.copy.row_bytes  = row_bytes_full * static_cast<std::size_t>(fb.extent);
+                r.copy.src_offset = mat_bytes * static_cast<std::size_t>(eb.offset) +
+                                    row_bytes_full * static_cast<std::size_t>(fb.offset);
+                r.copy.src_stride = mat_bytes;                 // next expert
+                r.copy.n_rows     = eb.extent;
+            } else {
+                // ne0 = the FFN width this tensor CONTRACTS over, which is the axis
+                // quant blocks tile. The cut must be a whole number of blocks; the
+                // group count is validated in moe_2d_dims, and this is the assertion
+                // that it stayed true for THIS tensor's block size.
+                r.split_axis = SplitAxis::Ne0_Input;
+                if (fb.end() > ne0) {
+                    r.error = ResidencyError::BadShape;
+                    r.note  = "2-D MoE ffn band past ne0 on a down tensor";
+                    return r;
+                }
+                if (fb.offset % r.block_elems != 0 || fb.extent % r.block_elems != 0) {
+                    r.error = ResidencyError::NotBlockAligned;
+                    char buf[160];
+                    std::snprintf(buf, sizeof(buf),
+                                  "2-D MoE ffn band [%d,%d) is not block-aligned to "
+                                  "%ld elements", fb.offset, fb.end(), r.block_elems);
+                    r.note = buf;
+                    return r;
+                }
+                r.rank_ne[0] = fb.extent;
+                r.copy.row_bytes  = blocked_bytes(fb.extent, r.block_elems, r.block_bytes);
+                r.copy.src_offset = mat_bytes * static_cast<std::size_t>(eb.offset) +
+                                    static_cast<std::size_t>(fb.offset / r.block_elems) *
+                                        static_cast<std::size_t>(r.block_bytes);
+                r.copy.src_stride = row_bytes_full;            // next output row
+                // The expert band is contiguous, so its ne1 rows and the experts
+                // themselves form ONE uniform run of rows — 1.6M of them at eg=2,
+                // which is a single cudaMemcpy2D rather than the "millions of tiny
+                // copies" the StridedCopy comment warns about.
+                r.copy.n_rows     = static_cast<long>(ne1) * eb.extent;
+            }
+            r.copy.dst_offset = 0;
+            r.copy.dst_stride = r.copy.row_bytes;              // packed
             break;
         }
 

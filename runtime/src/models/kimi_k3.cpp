@@ -244,6 +244,16 @@ bool upload_sliced(const GGUF& g, const std::string& name, KimiK3Weights& w,
         // ColShard: a sub-range within EVERY row, so ne1 separate runs. cudaMemcpy2D
         // rather than a loop — for a 3-D expert tensor the loop would be millions of
         // tiny transfers.
+        //
+        // A HOST-SIDE GATHER WAS TRIED HERE AND IS SLOWER. 2-D MoE's down slice is the
+        // narrowest case in the model (1.6M rows of ~150 B), so staging it contiguously
+        // before one flat H2D looked like the obvious win. Measured on 8x H200 it took
+        // model load from 30.9 s to 48.3 s: the gather is 1.6M small memcpys per rank,
+        // single-threaded, first-touching mmap'd page-cache pages, plus a second full
+        // pass over the bytes — against which the driver's own strided walk is simply
+        // better. Decode was identical, so it was correct and just slower. Left as this
+        // note rather than deleted, so the next person sizing up this line does not
+        // spend the same afternoon on it.
         e = cudaMemcpy2D(dst + c.dst_offset, c.dst_stride,
                          src + c.src_offset, c.src_stride,
                          c.row_bytes, (size_t)c.n_rows,
@@ -803,6 +813,20 @@ struct KimiK3Forward::Scratch {
     std::vector<void*> owned;
 };
 
+// This rank's per-expert FFN width: the model's under whole-expert sharding, its
+// band under 2-D MoE.
+//
+// Read from the WEIGHTS' own ShardDims, never re-derived from cfg and tp_size. The
+// weights were cut with this struct, the kernels are launched from it, and the one
+// failure mode that does not announce itself is the two disagreeing — a scratch
+// sized 3072 with weights packed 768 wide runs at full speed and reads three
+// experts' worth of neighbouring memory as if it were this expert's.
+int k3_moe_ffn_local(const KimiK3Forward& fwd, const KimiK3Config& cfg) {
+    if (fwd.w && fwd.w->shard.moe_2d && fwd.w->shard.moe_ffn > 0)
+        return fwd.w->shard.moe_ffn;
+    return cfg.moe_ffn;
+}
+
 bool kimi_k3_forward_alloc_scratch(const KimiK3Config& cfg, KimiK3Forward& fwd) {
     fwd.s = new KimiK3Forward::Scratch();
     auto& s = *fwd.s;
@@ -867,7 +891,12 @@ bool kimi_k3_forward_alloc_scratch(const KimiK3Config& cfg, KimiK3Forward& fwd) 
     ok &= alloc_f(s.router_w, cfg.top_k);
     ok &= alloc_i(s.router_ids, cfg.top_k);
     ok &= alloc_f(s.routed_down_out, cfg.expert_latent);
-    ok &= alloc_f(s.moe_scratch, (size_t)cfg.top_k * cfg.moe_ffn);
+    // THE SCRATCH IS THE RANK'S FFN WIDTH, NOT THE MODEL'S. Under 2-D MoE this rank
+    // evaluates only its band of each expert's intermediate, so top_k * band is all
+    // that is ever written — and sizing it from cfg would leave 3/4 of the buffer
+    // untouched while the gate/up memset below still paid to clear it.
+    const int moe_ffn_local = k3_moe_ffn_local(fwd, cfg);
+    ok &= alloc_f(s.moe_scratch, (size_t)cfg.top_k * moe_ffn_local);
     // ONE ALLOCATION, TWO TENSORS, BECAUSE ONE COLLECTIVE COVERS BOTH.
     //
     // The expert accumulator (expert_latent) and the shared-expert partial (hidden)
@@ -901,7 +930,7 @@ bool kimi_k3_forward_alloc_scratch(const KimiK3Config& cfg, KimiK3Forward& fwd) 
     // one allocation covers every activation this hoists.
     ok &= alloc_bytes(s.act_q8, k3k::k3_q8_0_bytes(cfg.dense_ffn));
     ok &= alloc_bytes(s.moe_q8,
-                      k3k::k3_moe_q8_k_bytes(cfg.expert_latent, cfg.moe_ffn, cfg.top_k));
+                      k3k::k3_moe_q8_k_bytes(cfg.expert_latent, moe_ffn_local, cfg.top_k));
 
     if (!ok) { kimi_k3_forward_free_scratch(fwd); return false; }
     return true;
@@ -1514,10 +1543,18 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             const int expert_begin  = fwd.w->shard.expert_band.offset;
             const int n_local_exp   = fwd.w->shard.tp_size > 1
                                         ? fwd.w->shard.expert_band.extent : 0;
+            // UNDER 2-D MoE THE BAND ABOVE IS WIDER AND THIS WIDTH IS NARROWER, and
+            // the kernels need no other change: they already index the packed weights
+            // as (e * ffn + j) and (e * latent + o) with `ffn` as the stride, so
+            // handing them the rank's 768-row band addresses the rank's own buffer
+            // exactly as 3072 addressed the whole one. The expert-band test is
+            // likewise unchanged — the group is still a CONTIGUOUS id range, just a
+            // longer one. What changes is only which bytes the loader packed.
+            const int moe_ffn_rank = k3_moe_ffn_local(fwd, cfg);
             const bool moe_ok = k3k::moe_expert_ffn_f32_by_type(
                 s.moe_out, s.moe_scratch, s.routed_down_out, s.router_ids, s.router_w,
                 L.ffn_gate_exps.data, L.ffn_up_exps.data, L.ffn_down_exps.data,
-                cfg.expert_latent, cfg.moe_ffn, cfg.top_k, cfg.situ_beta,
+                cfg.expert_latent, moe_ffn_rank, cfg.top_k, cfg.situ_beta,
                 cfg.situ_linear_beta, L.ffn_gate_exps.type, stream,
                 expert_begin, n_local_exp, ggml_qact_moe ? s.moe_q8 : nullptr);
             if (!moe_ok) return false;
