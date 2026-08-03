@@ -2069,6 +2069,36 @@ class CiWorkflowTest(unittest.TestCase):
         ok, _ = bot.eligibility(pr(crlf))
         self.assertTrue(ok, "CRLF line endings broke the section scan")
 
+    def test_the_round_serves_the_oldest_pr_first(self):
+        """`gh pr list` returns newest-first, so a round served the most recent submission
+        first and the longest-waiting one last -- backwards for a queue that pays people.
+
+        It matters most exactly when it is least visible: #86, #87, #89 and #90 all capture
+        the decode token as a CUDA graph, only one can win, and the rest re-measure against a
+        main that already has it and score eval:none. Serving newest-first would hand that
+        outcome to whoever submitted last.
+
+        Order does NOT decide the winner -- mark_merge_first ranks by measured tok/s against
+        the shared frontier. It decides who gets measured at all if the round dies partway."""
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        head = src[src.index("prs = list_prs(args.repo)"):src.index("if args.list:")]
+        self.assertIn('prs.sort(key=lambda p: p["number"])', head,
+                      "the round is back to newest-first")
+        # ...and before anything consumes the list.
+        self.assertLess(head.index("prs.sort("), head.index("resolve_mergeability("),
+                        "sorted after the list was already walked")
+
+        prs = [{"number": n} for n in (90, 89, 88, 87, 86, 76, 71, 55)]   # gh's real order
+        prs.sort(key=lambda p: p["number"])
+        self.assertEqual([p["number"] for p in prs], [55, 71, 76, 86, 87, 88, 89, 90])
+
+        # The winner is still the fastest, not the oldest.
+        bot = self._bot()
+        results = [(55, {"tps": 21.0}), (90, {"tps": 26.0})]
+        self.assertEqual(max(results, key=lambda r: r[1]["tps"])[0], 90,
+                         "ordering leaked into the merge decision")
+        self.assertIn("ranked = sorted(results", src)
+
     # ---- #81: a regression was merged as "the round's largest verified gain" -------------
     def test_eval_none_is_not_a_passing_tier(self):
         """merge_blockers accepted any label starting with 'eval:' as proof of passing.

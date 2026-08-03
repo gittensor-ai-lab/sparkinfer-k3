@@ -1585,6 +1585,18 @@ def main():
                                 args.dry_run, rid) else 1
 
     prs = list_prs(args.repo)
+    # OLDEST FIRST. `gh pr list` returns newest-first, so a round served the most recent
+    # submission first and the longest-waiting one last. That ordering is backwards for a
+    # queue that pays people: when several PRs implement the SAME idea -- #86, #87, #89 and
+    # #90 are all "capture the decode token as a CUDA graph" -- only one can win, and the
+    # rest re-measure against a main that already has it and score eval:none. Whoever is
+    # served first should be whoever submitted first.
+    #
+    # Order does not decide the winner: mark_merge_first ranks by measured tok/s against the
+    # shared frontier, not by position. What it decides is who gets measured at all if the
+    # round dies partway, and who eats whatever box state the frontier measurement left
+    # behind. Both of those should go to the earliest submission.
+    prs.sort(key=lambda p: p["number"])
     if args.only_pr:
         prs = [p for p in prs if p["number"] == args.only_pr]
         if not prs:
