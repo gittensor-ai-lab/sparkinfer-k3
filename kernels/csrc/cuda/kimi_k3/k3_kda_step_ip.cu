@@ -78,7 +78,11 @@ namespace k3 {
 namespace {
 
 // CPB = columns (warps) per block. VPL = float4s per lane = head_dim / 128.
-template <int CPB, int VPL>
+//
+// DEFER moves the recurrent-state write-back BELOW the output write and signals
+// programmatic completion between them. See the note above the write for why that is
+// sound here and is not sound for most kernels.
+template <int CPB, int VPL, bool DEFER>
 __global__ void kda_step_ip_kernel(float* __restrict__ out,
                                    float* __restrict__ state,
                                    const float* __restrict__ q,
@@ -92,6 +96,13 @@ __global__ void kda_step_ip_kernel(float* __restrict__ out,
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
     const int j    = blockIdx.y * CPB + warp;
+    // UNDER DEFER THIS RETURN MUST BE UNREACHABLE, and the launcher is what guarantees
+    // it: the programmatic-completion port fires when every BLOCK has triggered or
+    // terminated, so a block where some warps exited before the trigger and others had
+    // not yet reached it is exactly the race this whole factor must not introduce.
+    // Rather than rewrite the return as a predicate and pay for it on every shape,
+    // k3_kda_decode_step_ip declines DEFER unless head_dim % CPB == 0 — at which point
+    // j < head_dim for every warp of every block and this line is dead code.
     if (j >= head_dim) return;
 
     // Row j of this head's state. i is the fast axis, so the warp's float4 reads are
@@ -140,6 +151,7 @@ __global__ void kda_step_ip_kernel(float* __restrict__ out,
 
     // --- pass 2: rank-1 update in place, and o = sum_i S'[i][j] * q[i] ---
     float o = 0.0f;
+    float4 s2v[VPL];
 #pragma unroll
     for (int u = 0; u < VPL; ++u) {
         float4 s2;
@@ -147,7 +159,8 @@ __global__ void kda_step_ip_kernel(float* __restrict__ out,
         s2.y = __fmul_rn(sv[u].y, ge[u].y) + kv[u].y * d_j;
         s2.z = __fmul_rn(sv[u].z, ge[u].z) + kv[u].z * d_j;
         s2.w = __fmul_rn(sv[u].w, ge[u].w) + kv[u].w * d_j;
-        Srow[u * 32 + lane] = s2;
+        // Same value, same rounding, either way — only WHEN it reaches memory moves.
+        if constexpr (DEFER) s2v[u] = s2; else Srow[u * 32 + lane] = s2;
         o += s2.x * qv[u].x;
         o += s2.y * qv[u].y;
         o += s2.z * qv[u].z;
@@ -157,6 +170,45 @@ __global__ void kda_step_ip_kernel(float* __restrict__ out,
     for (int off = 16; off > 0; off >>= 1) o += __shfl_xor_sync(0xffffffff, o, off);
 
     if (lane == 0) out[(size_t)h * head_dim + j] = o;
+
+    if constexpr (DEFER) {
+        // ---------------------------------------------------------------------
+        // THE ONE PLACE IN THIS DECODE WHERE EARLY COMPLETION IS PROVABLY SOUND
+        // ---------------------------------------------------------------------
+        // This kernel writes two things, and they are wildly different sizes and have
+        // wildly different readers:
+        //
+        //   out    n_head * head_dim floats     6 KiB    read by the very next kernel
+        //   state  n_head * head_dim^2 floats 768 KiB    read by NOTHING until the
+        //                                                SAME kernel, one token later
+        //
+        // So 99% of the store traffic is not on any successor's critical path, and
+        // above it was being issued BEFORE the 6 KiB the successor is actually waiting
+        // for. Swapping the order and signalling completion in between hands the whole
+        // state write-back to the successor as overlap.
+        //
+        // WHY THE DEFERRED WRITE CANNOT RACE, which is the question that killed the
+        // same idea on the TP collective. There, the deferred-past buffer was read by
+        // the seven PEER ranks inside the same token, and a programmatic edge is
+        // pairwise — releasing one successor releases the whole chain behind it, so
+        // nothing downstream re-established the order. Here the deferred buffer is
+        // st.delta_state, which is rank-private and is touched by exactly two call
+        // sites in the entire forward: this kernel and the tiled kernel it replaces
+        // (kimi_k3.cpp:1350 and :1357), plus the zero-fill at reset. The next read is
+        // the next token's launch, and tokens are separated by a graph boundary and a
+        // stream synchronise. Unbounded run-ahead inside this token therefore cannot
+        // reach it — there is no reader to reach.
+        //
+        // The fence publishes `out`, not the state: the state is written after, and no
+        // one is waiting for it. __syncthreads() is what makes the trigger a whole-block
+        // event, since the port needs every BLOCK and a block that triggered from one
+        // warp while another was still storing `out` would be a torn read.
+        __threadfence();
+        __syncthreads();
+        k3_pdl_launch_complete();
+#pragma unroll
+        for (int u = 0; u < VPL; ++u) Srow[u * 32 + lane] = s2v[u];
+    }
 }
 
 inline bool aligned16(const void* p) { return ((uintptr_t)p & 15u) == 0; }
@@ -199,18 +251,37 @@ bool k3_kda_decode_step_ip(float* out, float* state,
         return (v == 1 || v == 2 || v == 4 || v == 8) ? v : 4;
     }();
 
-#define K3_KDA_LAUNCH(C)                                                            \
+    // Defer the 768 KiB state write-back past the 6 KiB output write and signal
+    // programmatic completion between them. SPARKINFER_K3_KDA_DEFER=0 restores the
+    // original write order on the same binary, which is what makes this an A/B of one
+    // process rather than of two builds.
+    //
+    // The divisibility test is a CORRECTNESS gate, not a tuning one: the deferring
+    // kernel's trigger sits below the `j >= head_dim` return, and a block that split
+    // between exited warps and triggering warps is undefined. head_dim % cpb == 0 makes
+    // that return unreachable. At K3's shape (128 % 4) it always holds; a shape where
+    // it does not simply keeps the original order.
+    static const bool want_defer = [] {
+        const char* e = std::getenv("SPARKINFER_K3_KDA_DEFER");
+        return !(e && e[0] == '0');
+    }();
+    const bool defer = want_defer && (head_dim % cpb == 0);
+
+#define K3_KDA_LAUNCH(C, D)                                                         \
     do {                                                                            \
         const dim3 g_((unsigned)n_head, (unsigned)((head_dim + (C) - 1) / (C)));     \
-        k3_pdl_launch(g_, dim3((C) * 32), 0, stream, kda_step_ip_kernel<(C), 1>,     \
+        k3_pdl_launch(g_, dim3((C) * 32), 0, stream, kda_step_ip_kernel<(C), 1, D>,  \
                       out, state, q, k, v, g, beta, head_dim, beta_sigmoid);        \
     } while (0)
+#define K3_KDA_DISPATCH(C) \
+    do { if (defer) K3_KDA_LAUNCH(C, true); else K3_KDA_LAUNCH(C, false); } while (0)
     switch (cpb) {
-        case 1: K3_KDA_LAUNCH(1); break;
-        case 2: K3_KDA_LAUNCH(2); break;
-        case 8: K3_KDA_LAUNCH(8); break;
-        default: K3_KDA_LAUNCH(4); break;
+        case 1: K3_KDA_DISPATCH(1); break;
+        case 2: K3_KDA_DISPATCH(2); break;
+        case 8: K3_KDA_DISPATCH(8); break;
+        default: K3_KDA_DISPATCH(4); break;
     }
+#undef K3_KDA_DISPATCH
 #undef K3_KDA_LAUNCH
     return true;
 }

@@ -3,6 +3,8 @@
 #include "sparkinfer/models/kimi_k3_tp.h"
 
 #include "sparkinfer/kernels/kimi_k3.h"
+#include "sparkinfer/models/k3_head_band.h"
+#include "sparkinfer/tp/k3_coll_1bar.h"
 #include "sparkinfer/tp/shard.h"
 
 #include <chrono>
@@ -340,8 +342,17 @@ bool kimi_k3_tp_init(const GGUF& g, const KimiK3Config& cfg, const K3PlanOptions
         // addresses would be right on one token and inverted on the next.
         R.x_canon      = R.x;
         R.x_next_canon = R.x_next;
-        if (r == 0 &&
-            cudaMalloc(&R.logits, (size_t)cfg.vocab * sizeof(float)) != cudaSuccess) {
+        // Rank 0 keeps the FULL vocab buffer whatever the band decides, so
+        // SPARKINFER_K3_HEAD_BAND=0 restores the single-rank head on the same binary
+        // without a second allocation path. Ranks 1-7 get exactly their band — 82 KB
+        // against rank 0's 655 KB — and nothing at all when the band declines.
+        K3HeadBand hb;
+        const size_t n_logits =
+            (r == 0) ? (size_t)cfg.vocab
+                     : (k3_head_band(cfg.vocab, (size_t)R.weights.output.n_bytes,
+                                     tp_size, r, &hb) ? (size_t)hb.rows : 0);
+        if (n_logits &&
+            cudaMalloc(&R.logits, n_logits * sizeof(float)) != cudaSuccess) {
             rank_err[(size_t)r] = "cudaMalloc logits failed";
             return false;
         }
@@ -483,6 +494,54 @@ bool kimi_k3_tp_init(const GGUF& g, const KimiK3Config& cfg, const K3PlanOptions
             std::fprintf(stderr, "[k3-tp] f32 zero-copy: the expert partial writes the "
                                  "collective's peer buffers directly (no staging)\n");
     }
+
+    // ---- rotating input slots, so the reduce needs only its ENTRY barrier -----
+    //
+    // The count of collectives per token is what decides whether the rotation is
+    // sound, because a captured graph restarts it at slot 0 every token and the
+    // wrap is therefore the binding case (k3_coll_1bar.h). Derive that count from
+    // the SAME predicates the forward uses — a second copy of the arithmetic is
+    // how a formula like this goes stale — and decline the whole factor if it
+    // does not clear the check, rather than rotating anyway on a geometry the
+    // proof does not cover.
+    if (out.zero_copy && tp_size > 1) {
+        int per_token = 0;
+        for (int L = 0; L < cfg.n_layers; ++L) {
+            const bool kda = cfg.is_kda_layer(L);
+            const bool ar =
+                (kda && KimiK3Weights::shards_kda(out.ranks[0].weights.policy)) ||
+                (!kda && KimiK3Weights::shards_mla(out.ranks[0].weights.policy));
+            if (ar) ++per_token;
+            if (L >= cfg.leading_dense) ++per_token;
+        }
+        const int slots = out.coll->reduce_slots();
+        if (slots > 1 && tp::k3_coll_1bar_ok(per_token, slots)) {
+            const int n = (int)out.ranks.size();
+            out.zc_in_slot.assign((size_t)slots, std::vector<float*>((size_t)n, nullptr));
+            bool ok = true;
+            for (int s = 0; s < slots && ok; ++s)
+                for (int r = 0; r < n; ++r) {
+                    out.zc_in_slot[(size_t)s][(size_t)r] =
+                        (float*)out.coll->reduce_in_slot(r, s);
+                    if (!out.zc_in_slot[(size_t)s][(size_t)r]) { ok = false; break; }
+                }
+            // Slot 0 must BE zc_in, or the two ways of naming the same buffer have
+            // diverged and the swap sites would aim at one while the kernel reads
+            // the other.
+            if (ok)
+                for (int r = 0; r < n; ++r)
+                    if (out.zc_in_slot[0][(size_t)r] != out.zc_in[(size_t)r]) ok = false;
+            if (ok) {
+                out.n_coll_slots = slots;
+                std::fprintf(stderr, "[k3-tp] collective: 1 barrier/reduce over %d "
+                                     "rotating input slots (%d collectives/token)\n",
+                             slots, per_token);
+            } else {
+                out.zc_in_slot.clear();
+            }
+        }
+        if (out.n_coll_slots <= 1) out.zc_in_slot.clear();
+    }
     return true;
 }
 
@@ -536,6 +595,15 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
     for (auto& R : p.ranks) {
         if (R.x_canon) { R.x = R.x_canon; R.x_next = R.x_next_canon; }
     }
+
+    // Token-local index of the next collective, and therefore which input slot it
+    // reduces out of. Reset here, beside the x_canon reset it mirrors and for the
+    // same reason: a captured graph bakes the pointers it recorded, so every token
+    // has to present the identical sequence. That reset is also exactly what makes
+    // the WRAP the case the rotation has to survive — see k3_coll_1bar.h, and note
+    // the check in kimi_k3_tp_init that refuses the rotation when it would not.
+    int coll_k = 0;
+    const int n_slots = p.n_coll_slots;
 
     // GRAPH CAPTURE. Off with SPARKINFER_K3_GRAPH=0, which is the A/B control: same
     // binary, same kernels, only the submission mechanism differs.
@@ -670,11 +738,28 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
         // calls retarget scratch pointers the workers dereference, so performing
         // them from inside a worker — or while one is running — would be a race.
         const bool zc_attn = p.zero_copy && attn_reduce;
+
+        // WHICH INPUT SLOT EACH OF THIS LAYER'S TWO COLLECTIVES REDUCES OUT OF.
+        // Both partials are aimed at their buffer HERE, at the top of the layer,
+        // before either phase runs — so the MoE slot has to be known before the
+        // attention reduce has happened. It is: the indices are a running count,
+        // and the attention reduce, when it exists, is the one immediately before.
+        // n_slots == 1 gives slot -1 everywhere, which is main's kernel over
+        // main's single buffer.
+        const int k_attn = coll_k;
+        const int k_moe  = coll_k + (attn_reduce ? 1 : 0);
+        const int slot_attn = n_slots > 1 ? (k_attn % n_slots) : -1;
+        const int slot_moe  = n_slots > 1 ? (k_moe  % n_slots) : -1;
+        float* const* in_attn = slot_attn >= 0
+            ? p.zc_in_slot[(size_t)slot_attn].data() : p.zc_in.data();
+        float* const* in_moe = slot_moe >= 0
+            ? p.zc_in_slot[(size_t)slot_moe].data() : p.zc_in.data();
+
         if (p.zero_copy && tp_size > 1 && (is_moe || zc_attn)) {
             for (std::size_t r = 0; r < p.ranks.size(); ++r) {
                 if (is_moe)
                     kimi_k3_swap_partial_buffer(p.ranks[r].fwd, K3LayerPhase::FfnPartial,
-                                                p.zc_in[r]);
+                                                in_moe[r]);
                 // The attention partial rides the SAME owned pair. The reuse is
                 // safe for the same reason 185 sequential collectives already
                 // share it: the attn value is written to zc_in, reduced into
@@ -684,7 +769,7 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
                 // finished reading before that.
                 if (zc_attn)
                     kimi_k3_swap_partial_buffer(p.ranks[r].fwd, K3LayerPhase::Attn,
-                                                p.zc_in[r]);
+                                                in_attn[r]);
             }
         }
 
@@ -727,7 +812,7 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
             // FfnPartial even though kimi_k3_partial_buffer has always handled
             // Attn.
             const bool okk = zc_attn
-                ? p.coll->allreduce_f32_owned((size_t)count, p.streams)
+                ? p.coll->allreduce_f32_owned_slot((size_t)count, p.streams, slot_attn)
                 : p.coll->allreduce_f32_group(p.reduce_bufs, (size_t)count,
                                               p.streams);
             if (ip.on) ip.t_coll += secs_since(tk);
@@ -736,6 +821,7 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
                 return false;
             }
             ++p.n_collectives;
+            ++coll_k;
             // FfnPartial reads the reduced attention output where the
             // collective wrote it.
             if (zc_attn) {
@@ -806,7 +892,7 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
                 // staging copies. The gather above still ran: it is what validates
                 // the width every rank agrees on.
                 const bool okc = p.zero_copy
-                    ? p.coll->allreduce_f32_owned((size_t)count, p.streams)
+                    ? p.coll->allreduce_f32_owned_slot((size_t)count, p.streams, slot_moe)
                     : p.coll->allreduce_f32_group(p.reduce_bufs, (size_t)count,
                                                   p.streams);
                 if (ip.on) ip.t_coll += secs_since(tc);
@@ -816,6 +902,7 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
                 }
             }
             ++p.n_collectives;
+            ++coll_k;
             // Phase 3's routed_norm reads (and normalises in place) the reduced
             // sum where the collective wrote it. In-place writes to reduce_out are
             // rank-private: peers only ever read inputs.
@@ -845,12 +932,90 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
         }
     }
 
-    // --- head: every rank holds the identical hidden state, so rank 0 suffices ---
+    // --- head: every rank holds the identical hidden state ---------------------
+    //
+    // "so rank 0 suffices" is what this used to say, and it is true — but suffices
+    // is not the same as costs nothing. The head is the largest single projection in
+    // the model by a wide margin: at vocab 163840 x hidden 7168 the Q8_0 weight is
+    // (7168/32) * 34 * 163840 = 1.25 GB, 45x the biggest per-layer projection, and
+    // it ran on ONE device while the other seven sat idle holding the same hidden
+    // state. It is also completely exposed — the driver blocks on this stream a few
+    // lines below with nothing else in flight — so it is the one place in the token
+    // where a saving transfers 1:1 instead of being hidden behind other work.
+    //
+    // Every rank already HOLDS output.weight. weight_plan.cpp declares it RowShard,
+    // but upload_sliced only consults the rule table for the expert/KDA/MLA stacks,
+    // so the head short-circuits to a full replica on all eight devices — VRAM they
+    // pay for and never read. Banding it is therefore a pointer offset and a smaller
+    // N: no loader change, no new collective, no change to which numbers exist.
+    //
+    // The mix and the norm are recomputed on every rank rather than broadcast. They
+    // are two small kernels over one 7168-float vector, against the 28 KB that a
+    // broadcast plus its rendezvous would cost, and the inputs are provably identical
+    // across ranks: R.x at the head is the last layer's output, which every rank
+    // reads back from the same all-reduce, and res_bank holds snapshots of that same
+    // post-reduce hidden state (kimi_k3.cpp: the bank push copies `hidden_in`, which
+    // enters phase 1 straight out of the previous layer's reduced result). n_ckpt is
+    // host bookkeeping advanced identically on every rank by the same code path.
     KimiK3TPRank& R0 = p.ranks[0];
     if (cudaSetDevice(R0.device) != cudaSuccess) return false;
     const KimiK3Weights& w = R0.weights;
 
+    // Decided once per token from rank 0, and every rank is then required to agree:
+    // a band that resolved on some ranks and not others would leave a hole in the
+    // logits rather than a slow token.
+    K3HeadBand hb0;
+    bool band_head = w.output.ok() &&
+                     k3_head_band(cfg.vocab, (size_t)w.output.n_bytes, tp_size, 0, &hb0);
+    if (band_head) {
+        for (int r = 1; r < tp_size; ++r) {
+            K3HeadBand hbr;
+            const KimiK3Weights& wr = p.ranks[(size_t)r].weights;
+            if (p.ranks[(size_t)r].logits && wr.output.ok() &&
+                wr.output.n_bytes == w.output.n_bytes &&
+                k3_head_band(cfg.vocab, (size_t)wr.output.n_bytes, tp_size, r, &hbr))
+                continue;
+            band_head = false;
+            break;
+        }
+    }
+
     if (!replaying) {
+    if (band_head) {
+        for (int r = 0; r < tp_size; ++r) {
+            KimiK3TPRank& R = p.ranks[(size_t)r];
+            const KimiK3Weights& wr = R.weights;
+            K3HeadBand hb;
+            if (!k3_head_band(cfg.vocab, (size_t)wr.output.n_bytes, tp_size, r, &hb))
+                return false;
+            if (cudaSetDevice(R.device) != cudaSuccess) return false;
+            if (cfg.attn_res_block_size > 0) {
+                if (!wr.has_output_res_score || !wr.output_res_score.ok()) return false;
+                k3k::attn_res_mix_f32(R.x_next, R.state.res_bank, R.x,
+                                      (const float*)wr.output_res_score.data, H,
+                                      R.state.n_ckpt, cfg.rms_eps, R.stream);
+                // Every rank now takes the extra swap rank 0 alone used to take. The
+                // per-token reset to x_canon is what keeps a captured graph's baked
+                // addresses valid, and it already runs for every rank.
+                std::swap(R.x, R.x_next);
+            }
+            if (!wr.output_norm.ok()) return false;
+            k3k::rms_norm_f32(R.x_next, R.x, (const float*)wr.output_norm.data, H,
+                              cfg.rms_eps, R.stream);
+            // BIT-IDENTICAL. Logit n is one dot product over the whole of K, and the
+            // kernel accumulates it the same way whatever N is: rows [0,N) map to
+            // blocks, a row's accumulator sums quant blocks b = threadIdx.x, +BLOCK,
+            // ... in that order, and N only decides how many rows a grid carries.
+            // N = 163840 and N = 20480 both land in the same ROWS=16 tier, so the
+            // same kernel with the same block width computes each row identically —
+            // only on a different device.
+            if (!k3k::k3_proj_f32(R.logits, R.x_next,
+                                  (const void*)((const char*)wr.output.data + hb.byte_off),
+                                  wr.output.type, hb.rows, H, R.stream))
+                return false;
+        }
+        if (cudaSetDevice(R0.device) != cudaSuccess) return false;
+    } else {
     if (cfg.attn_res_block_size > 0) {
         if (!w.has_output_res_score || !w.output_res_score.ok()) return false;
         k3k::attn_res_mix_f32(R0.x_next, R0.state.res_bank, R0.x,
@@ -865,6 +1030,7 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
     if (!k3k::k3_proj_f32(R0.logits, R0.x_next, w.output.data, w.output.type,
                           cfg.vocab, H, R0.stream))
         return false;
+    }
 
     // THE DEVICE POSITION ADVANCES INSIDE THE GRAPH. This is the single line that makes a
     // replay a different token rather than the same one again: the KV store indexes with
@@ -952,10 +1118,30 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
     }
 
     const IClock::time_point t_s0 = ip.on ? IClock::now() : IClock::time_point{};
+    if (band_head) {
+        // Eight disjoint 82 KB copies instead of one 655 KB copy, dispatched through
+        // the pool so they run on eight threads with eight devices current rather
+        // than serialising behind rank 0. The sync moves inside for the same reason:
+        // the ranks finish within a few microseconds of each other (the last layer's
+        // all-reduce is a rendezvous), so waiting on them in parallel costs about
+        // what waiting on rank 0 alone used to.
+        if (!issue_all([&](int r) {
+                KimiK3TPRank& R = p.ranks[(size_t)r];
+                K3HeadBand hb;
+                if (!k3_head_band(cfg.vocab, (size_t)R.weights.output.n_bytes,
+                                  tp_size, r, &hb)) return false;
+                if (cudaStreamSynchronize(R.stream) != cudaSuccess) return false;
+                return cudaMemcpy(out_logits + hb.offset, R.logits,
+                                  (size_t)hb.rows * sizeof(float),
+                                  cudaMemcpyDeviceToHost) == cudaSuccess;
+            })) return false;
+        if (ip.on) ip.t_sync += secs_since(t_s0);
+    } else {
     if (cudaStreamSynchronize(R0.stream) != cudaSuccess) return false;
     if (ip.on) ip.t_sync += secs_since(t_s0);
     if (cudaMemcpy(out_logits, R0.logits, (size_t)cfg.vocab * sizeof(float),
                    cudaMemcpyDeviceToHost) != cudaSuccess) return false;
+    }
 
     if (ip.on) {
         ip.t_total += secs_since(t_tok0);
@@ -1023,6 +1209,8 @@ void kimi_k3_tp_free(KimiK3TP& p) {
     p.streams.clear();
     p.reduce_bufs.clear();
     p.zc_in.clear();
+    p.zc_in_slot.clear();
+    p.n_coll_slots = 1;
     p.zc_out.clear();
     p.orig_moe.clear();
     p.orig_attn.clear();

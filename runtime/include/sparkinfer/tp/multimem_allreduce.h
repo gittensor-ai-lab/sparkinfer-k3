@@ -66,6 +66,9 @@ public:
     // vendored kernels are bf16-typed throughout. Kept false so the adapter
     // refuses rather than quietly casting K3's f32 stream.
     static constexpr bool kSupportsF32 = false;
+    // No rotating input slots: this backend keeps its exit barrier and its single
+    // peer-visible input. See sparkinfer/tp/k3_coll_1bar.h.
+    static constexpr int kInputSlots = 1;
 
     // Unusable instance if unsupported; check ok() before use. `count` = max
     // elements (e.g. hidden_size); buffers are sized for this.

@@ -42,11 +42,47 @@ constexpr int kMaxBlocks = 36;
 // Per-rank synchronization buffer, peer-accessible from every rank. Two counter
 // sets (start/end) are needed because a peer block can reach the second sync
 // before this block has passed the first; alternating arrays avoid the race.
+//
+// A THIRD ARRAY, for the single-barrier f32 kernel. The two-barrier kernels get
+// their alternation for free: start and end are used strictly in turn, so a rank
+// racing ahead always writes the array its peers are not spinning on. Delete the
+// exit barrier and that property has to be supplied deliberately, because the
+// spin compares for EQUALITY — a rank that stores flag v+1 to a peer still
+// waiting for v does not merely reorder the two, it hangs the peer forever.
+// Rotating the array by the same index that rotates the input buffer restores
+// the guarantee: consecutive barriers never share an array, and the rotation
+// period is 3, which is also what the buffer needs (see kSlotCount).
 struct Signal {
     alignas(128) FlagType start[kMaxBlocks][8];
     alignas(128) FlagType end[kMaxBlocks][8];
+    alignas(128) FlagType mid[kMaxBlocks][8];
     alignas(128) FlagType _flag[kMaxBlocks];  // per-rank incremental flag
 };
+
+// How many input slots the ping-pong rotates through, and therefore how many
+// counter arrays. THREE, NOT TWO, and the reason is the token boundary.
+//
+// A captured CUDA graph bakes the pointers it saw, so the slot sequence RESETS
+// every token instead of running free. K3 issues an ODD number of collectives
+// per token (93 attention + 92 MoE = 185 under the default policy), so with two
+// slots the last collective of token N and the first of token N+1 land on the
+// same slot with NOTHING between them — no barrier, no reduce, and (see
+// kimi_k3_tp.cpp) no cross-rank sync at the token boundary either, because only
+// rank 0's stream is joined. A fast rank's layer-0 attention output would then
+// overwrite a buffer a slow peer is still summing. Note which way round this is:
+// the EAGER path is safe (the counter runs free and parity keeps alternating);
+// it is graph capture that creates the collision.
+//
+// The requirement is a minimum reuse distance of 2 across the wrap as well as
+// within the token: with C collectives and P slots that is (C-1) % P >= 1.
+// 184 % 2 == 0 fails; 184 % 3 == 1 holds. The host asserts it rather than
+// trusting this arithmetic to survive a policy change — see k3_coll_1bar.h.
+constexpr int kSlotCount = 3;
+
+// Which counter array a given rotation index uses.
+__device__ __forceinline__ FlagType* flag_row(Signal* s, int arr, int blk) {
+    return arr == 0 ? s->start[blk] : (arr == 1 ? s->end[blk] : s->mid[blk]);
+}
 
 template <int N>
 struct RankSignals {
@@ -85,13 +121,17 @@ __device__ __forceinline__ FlagType ld_flag_volatile(FlagType* addr) {
 // First barrier: no visibility guarantees needed for prior accesses, so volatile
 // flags suffice. Each of the first N threads signals its peer and spins on its
 // own counter. After this returns, every rank's input is guaranteed written.
+// `arr` selects the counter array (0 start, 1 end, 2 mid). It defaults to 0, so
+// every existing two-barrier caller keeps exactly the arrays and the ordering it
+// had; only the single-barrier f32 kernel passes a rotating index.
 template <int N>
 __device__ __forceinline__ void barrier_at_start(const RankSignals<N>& sg,
-                                                  Signal* self_sg, int rank) {
+                                                  Signal* self_sg, int rank,
+                                                  int arr = 0) {
     uint32_t flag = self_sg->_flag[blockIdx.x] + 1;
     if (threadIdx.x < N) {
-        FlagType* peer = &sg.sg[threadIdx.x]->start[blockIdx.x][rank];
-        FlagType* self = &self_sg->start[blockIdx.x][threadIdx.x];
+        FlagType* peer = &flag_row(sg.sg[threadIdx.x], arr, blockIdx.x)[rank];
+        FlagType* self = &flag_row(self_sg, arr, blockIdx.x)[threadIdx.x];
         st_flag_volatile(peer, flag);
         while (ld_flag_volatile(self) != flag);
     }

@@ -189,6 +189,11 @@ struct KimiK3TP {
     // the workers read, so doing them anywhere else would be a data race.
     bool zero_copy = false;
     std::vector<float*> zc_in, zc_out;   // reduce_in/out, rank order
+    // zc_in one row per rotating input slot (sparkinfer/tp/k3_coll_1bar.h). Row 0
+    // IS zc_in, so a backend offering one slot leaves every pointer where main
+    // put it. n_coll_slots is 1 whenever the rotation is off or unproven.
+    std::vector<std::vector<float*>> zc_in_slot;
+    int n_coll_slots = 1;
     std::vector<float*> orig_moe;        // scratch pointer, restored at free
     std::vector<float*> orig_attn;       // same, for the attention partial
 };
