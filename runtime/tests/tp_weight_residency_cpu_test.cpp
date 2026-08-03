@@ -104,6 +104,83 @@ static void check_conservation(const std::string& name, const long ne[4], int n_
              name + " sum of per-rank bytes == full tensor bytes");
 }
 
+// 2-D MoE conservation, checked at the BYTE level rather than on a band index.
+//
+// The 1-D helper above can reason about a single split axis as an interval. A 2-D
+// shard has no such interval: rank r owns a rectangle (expert band x ffn band), and
+// the thing that can go wrong is precisely the arithmetic that turns that rectangle
+// into a StridedCopy — a stride that should have been the expert pitch and was the
+// row pitch instead still produces the right BYTE COUNT while reading the wrong
+// bytes. Counting bytes therefore proves nothing; only walking the actual source
+// ranges the loader will hand cudaMemcpy2D does.
+//
+// So this replays every rank's copy descriptor over a byte map and demands each
+// byte be touched exactly once. A gap is weight no rank holds; an overlap is weight
+// two ranks both apply and the all-reduce then double-counts.
+static void check_conservation_2d(const std::string& name, const long ne[4],
+                                  int n_dims, int ggml_type, int tp_size,
+                                  int expert_groups, int n_experts, int moe_ffn,
+                                  SplitAxis want_axis) {
+    std::size_t full_bytes = 0, sum_bytes = 0;
+    std::vector<unsigned char> hits;
+    bool planned = true;
+
+    for (int rank = 0; rank < tp_size; ++rank) {
+        ShardDims d = dims8(rank, n_experts);
+        d.tp_size = tp_size;
+        const ShardError se = moe_2d_dims(n_experts, moe_ffn, tp_size, rank,
+                                          expert_groups, /*block_elems=*/256, &d);
+        if (!se.ok()) {
+            std::printf("  FAIL  %s rank %d: moe_2d_dims: %s\n", name.c_str(), rank,
+                        se.message.c_str());
+            ++g_fail; ++g_checks; planned = false; break;
+        }
+        const TensorResidency r =
+            plan_tensor_residency(name, ne, n_dims, ggml_type, d);
+        if (!r.ok()) {
+            std::printf("  FAIL  %s rank %d: %s — %s\n", name.c_str(), rank,
+                        residency_error_name(r.error), r.note.c_str());
+            ++g_fail; ++g_checks; planned = false; break;
+        }
+        check(r.split_axis == want_axis,
+              name + " rank " + std::to_string(rank) + " split axis is " +
+                  split_axis_name(r.split_axis));
+        if (hits.empty()) {
+            full_bytes = r.full_bytes;
+            hits.assign(full_bytes, 0);
+        }
+        // The descriptor must be self-consistent before it is replayed: rank_bytes
+        // is what the loader cudaMallocs, and a copy that writes more than that is
+        // a heap overflow rather than a wrong answer.
+        check_eq((long)r.copy.total_bytes(), (long)r.rank_bytes,
+                 name + " rank " + std::to_string(rank) + " copy fills rank_bytes");
+        for (long row = 0; row < r.copy.n_rows; ++row) {
+            const std::size_t base = r.copy.src_offset +
+                                     static_cast<std::size_t>(row) * r.copy.src_stride;
+            if (base + r.copy.row_bytes > full_bytes) {
+                check(false, name + " rank " + std::to_string(rank) +
+                                 " copy runs past the end of the tensor");
+                planned = false;
+                break;
+            }
+            for (std::size_t b = 0; b < r.copy.row_bytes; ++b) ++hits[base + b];
+        }
+        sum_bytes += r.rank_bytes;
+        if (!planned) break;
+    }
+    if (!planned) return;
+
+    check_eq((long)sum_bytes, (long)full_bytes,
+             name + " sum of per-rank bytes == full tensor bytes");
+    std::size_t gaps = 0, overlaps = 0;
+    for (unsigned char h : hits) {
+        if (h == 0) ++gaps;
+        else if (h > 1) ++overlaps;
+    }
+    check_eq((long)gaps, 0, name + " bytes covered by no rank");
+    check_eq((long)overlaps, 0, name + " bytes covered by more than one rank");
+}
+
 int main() {
     std::printf("=== tp weight residency (GGUF bytes -> per-rank buffers) ===\n\n");
 
@@ -325,6 +402,89 @@ int main() {
         check(!ts.ok() && ts.error == ResidencyError::EmptyShard,
               "1 block over 8 ranks is refused for the empty ranks");
         check(!ts.note.empty(), "EmptyShard carries an actionable note");
+    }
+
+    // ------------------------------------------------------------- 2-D MoE
+    std::printf("\n[2-D MoE: expert groups x ffn band]\n");
+    {
+        // Shapes scaled down from K3's real ones but structurally identical: the
+        // down tensor contracts over the FFN width, so ITS ne0 is the axis that must
+        // stay block-aligned when fs cuts it. ffn=1024 is 4 blocks of 256, so fs=4
+        // gives each rank exactly one whole block — the tightest legal case, which
+        // is the one worth testing.
+        const int n_experts = 16, moe_ffn = 1024, latent = 256;
+        const long gate_ne[4] = {latent, moe_ffn, n_experts, 1};
+        const long down_ne[4] = {moe_ffn, latent, n_experts, 1};
+
+        check_conservation_2d("blk.1.ffn_gate_exps.weight", gate_ne, 3, TY_IQ2_XS,
+                              8, /*eg=*/2, n_experts, moe_ffn, SplitAxis::Ne1_Output);
+        check_conservation_2d("blk.1.ffn_up_exps.weight", gate_ne, 3, TY_IQ2_XS,
+                              8, /*eg=*/2, n_experts, moe_ffn, SplitAxis::Ne1_Output);
+        check_conservation_2d("blk.1.ffn_down_exps.weight", down_ne, 3, TY_IQ2_XS,
+                              8, /*eg=*/2, n_experts, moe_ffn, SplitAxis::Ne0_Input);
+
+        // eg=4 (4 groups x 2 ffn shards) must tile just as exactly — the point of
+        // the descriptor is that the group count is a tuning knob, not a special case.
+        check_conservation_2d("blk.1.ffn_down_exps.weight", down_ne, 3, TY_IQ2_XS,
+                              8, /*eg=*/4, n_experts, moe_ffn, SplitAxis::Ne0_Input);
+
+        // The bands themselves, at K3's real numbers.
+        ShardDims d;
+        d.tp_size = 8; d.rank = 5;
+        const ShardError se = moe_2d_dims(896, 3072, 8, 5, 2, 256, &d);
+        check(se.ok(), "K3 shape 896x3072 splits 2x4 at tp=8");
+        check(d.moe_2d, "moe_2d is set");
+        check_eq(d.moe_expert_groups, 2, "expert groups");
+        check_eq(d.moe_ffn_shards, 4, "ffn shards");
+        // rank 5 = group 1, shard 1 -> experts [448,896), ffn [768,1536)
+        check_eq(d.expert_band.offset, 448, "rank 5 expert band offset");
+        check_eq(d.expert_band.extent, 448, "rank 5 owns half the experts");
+        check_eq(d.moe_ffn_band.offset, 768, "rank 5 ffn band offset");
+        check_eq(d.moe_ffn_band.extent, 768, "rank 5 ffn band extent");
+
+        // The DEFAULT policy. This is a behavioural default, not a flag, so it is
+        // pinned by a test: an accidental change here silently re-shards every
+        // deployment's experts.
+        check_eq(k3_default_moe_expert_groups(8), 2, "tp=8 defaults to 2 expert groups");
+        check_eq(k3_default_moe_expert_groups(4), 2, "tp=4 defaults to 2 expert groups");
+        check_eq(k3_default_moe_expert_groups(2), 1, "tp=2 stays whole-expert");
+        check_eq(k3_default_moe_expert_groups(1), 1, "tp=1 stays whole-expert");
+
+        // A shape that cannot take the default must leave the ShardDims ALONE, because
+        // the loader's fallback is simply to keep using the whole-expert band it wrote
+        // earlier. If moe_2d_dims mutated before validating, that fallback would run on
+        // a half-written descriptor.
+        ShardDims keep;
+        keep.tp_size = 8; keep.rank = 2;
+        keep.expert_band = even_band(896, 8, 2);
+        keep.n_experts = 112;
+        // 900 over 8 groups leaves 4 over. (900 over *2* would be fine — 450 each —
+        // which is why the indivisible case has to be chosen against the group count
+        // actually being asked for, not against the tensor looking odd.)
+        const ShardError bad_shape = moe_2d_dims(900, 3072, 8, 2, 8, 256, &keep);
+        check(!bad_shape.ok(), "indivisible expert count is refused");
+        check(!keep.moe_2d, "refusal leaves moe_2d false");
+        check_eq(keep.expert_band.offset, 224, "refusal leaves the 1-D band untouched");
+        check_eq(keep.n_experts, 112, "refusal leaves n_experts untouched");
+
+        // eg=1 is the identity: it must not set moe_2d or disturb the 1-D band.
+        ShardDims id;
+        id.tp_size = 8; id.rank = 3;
+        id.expert_band = even_band(896, 8, 3);
+        const ShardError se1 = moe_2d_dims(896, 3072, 8, 3, 1, 256, &id);
+        check(se1.ok() && !id.moe_2d, "expert_groups=1 leaves whole-expert sharding");
+        check_eq(id.expert_band.offset, 336, "eg=1 does not touch the 1-D band");
+
+        // Refusals, each naming the axis that failed rather than clamping.
+        ShardDims bad;
+        bad.tp_size = 8; bad.rank = 0;
+        check(!moe_2d_dims(896, 3072, 8, 0, 3, 256, &bad).ok(),
+              "eg must divide tp_size");
+        check(!moe_2d_dims(900, 3072, 8, 0, 8, 256, &bad).ok(),
+              "eg must divide n_experts");
+        // fs=4 over an ffn of 3080 leaves 770, not a whole 256-block.
+        check(!moe_2d_dims(896, 3080, 8, 0, 2, 256, &bad).ok(),
+              "ffn shard must be a whole number of quant blocks");
     }
 
     // ------------------------------------------------- whole-model aggregation

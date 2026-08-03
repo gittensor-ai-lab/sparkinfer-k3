@@ -50,10 +50,23 @@ enum class Rule {
     RowShard,      // split output rows; no collective
     ColShard,      // split input cols; REQUIRES an all-reduce after
     ExpertShard,   // split the expert axis
+    // 2-D MoE (ShardDims::moe_2d). Both split the expert axis into eg groups AND a
+    // second axis into fs bands; they differ only in WHICH second axis, which is
+    // decided by what the tensor contracts over:
+    //   ExpertRow2D  ne2 experts x ne1 output rows   — ffn_gate_exps / ffn_up_exps
+    //   ExpertCol2D  ne2 experts x ne0 input cols    — ffn_down_exps
+    // ExpertCol2D is the one that needs an all-reduce, and it already has one: the
+    // expert partial is reduced at expert_latent regardless of how it was banded.
+    ExpertRow2D,
+    ExpertCol2D,
     Unknown,       // no rule — a hard load error, never a guess
 };
 
 const char* rule_name(Rule r);
+
+// The 2-D MoE rule for one of the three ROUTED-expert matrices, or Rule::Unknown
+// when `tensor_name` is not one of them. Only consulted when ShardDims::moe_2d.
+Rule routed_expert_2d_rule(const std::string& tensor_name);
 
 // True when a tensor's rule means the layer must all-reduce after using it.
 bool rule_needs_reduce(Rule r);
