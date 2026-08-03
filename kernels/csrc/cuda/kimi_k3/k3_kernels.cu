@@ -2936,11 +2936,18 @@ static void moe_expert_ffn_launch(float* out, float* scratch,
     // the band test must never reject. INT_MAX makes it a no-op rather than a branch.
     const int n_local = n_local_experts > 0 ? n_local_experts : INT_MAX;
 
-    // Holds the "foreign slots read as zero" invariant the gate/up kernel used to
-    // maintain per-CTA. Only a banded rank can leave a slot untouched; at tp_size 1
-    // every slot is written, so memsetting there would be pure added work.
-    if (n_local_experts > 0 || expert_begin != 0)
-        cudaMemsetAsync(scratch, 0, (size_t)top_k * ffn * sizeof(float), stream);
+    // The "foreign slots read as zero" invariant is now established ONCE, when the
+    // scratch is allocated (kimi_k3.cpp), not on every layer.
+    //
+    // It holds just as strongly there, and the reason is that the set of foreign slots
+    // never changes: a rank's expert band is fixed for the run, and moe_gate_up writes
+    // only its OWN slots. A slot foreign to this rank is therefore written by nobody,
+    // ever — so a single zeroing at allocation leaves it zero for the whole run, which
+    // is exactly what re-zeroing it 92 times a token was buying. (Owned slots are fully
+    // overwritten before they are read, so clearing them was never load-bearing either.)
+    //
+    // That removes 92 launches and ~18 MB of writes per token per rank from the critical
+    // path while keeping the guarantee moe_down_combine's band re-test relies on.
 
     // float4 activation reads need 16-byte alignment. Both pointers are cudaMalloc
     // bases in every K3 caller and the per-block offsets are multiples of 1024 bytes,

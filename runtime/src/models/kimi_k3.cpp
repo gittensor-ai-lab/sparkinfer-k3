@@ -915,6 +915,13 @@ bool kimi_k3_forward_alloc_scratch(const KimiK3Config& cfg, KimiK3Forward& fwd) 
     // untouched while the gate/up memset below still paid to clear it.
     const int moe_ffn_local = k3_moe_ffn_local(fwd, cfg);
     ok &= alloc_f(s.moe_scratch, (size_t)cfg.top_k * moe_ffn_local);
+    // Establish the "foreign expert slots read as zero" invariant ONCE here, instead of
+    // re-establishing it with a cudaMemsetAsync on every MoE layer. A rank's expert band
+    // is fixed for the run and moe_gate_up writes only owned slots, so a foreign slot is
+    // written by nobody and stays zero from this memset onward.
+    if (ok && s.moe_scratch)
+        cudaMemset(s.moe_scratch, 0,
+                   (size_t)cfg.top_k * moe_ffn_local * sizeof(float));
     // ONE ALLOCATION, TWO TENSORS, BECAUSE ONE COLLECTIVE COVERS BOTH.
     //
     // The expert accumulator (expert_latent) and the shared-expert partial (hidden)
