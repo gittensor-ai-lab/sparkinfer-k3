@@ -63,6 +63,13 @@ bool qact_proj()   { return !env_zero("SPARKINFER_K3_GGML_QACT_PROJ"); }
 bool qact_moe()    { return qact_all() || env_one("SPARKINFER_K3_GGML_QACT_MOE"); }
 bool qact_output() { return qact_all() || env_one("SPARKINFER_K3_GGML_QACT_OUTPUT"); }
 
+// F16 latent KV cache, ON by default for the same reason qact_proj is: the
+// reference this model is scored against (llama.cpp, default type_k = F16)
+// already stores its cache in half precision, so the f32 cache was paying twice
+// the reference's KV bytes to hold MORE precision than the scoring bar assumes.
+// SPARKINFER_K3_KV_F16=0 restores the f32 layout — the same-binary control.
+bool kv_f16_on()   { return !env_zero("SPARKINFER_K3_KV_F16"); }
+
 // Upload one GGUF tensor's raw bytes to the device, native quant format preserved.
 // This is the WHOLE loader primitive — every K3 weight is read natively at forward
 // time (k3_proj_f32 / the MoE dispatch kernels decode Q8_0 / IQ1_S / IQ2_XS / F32
@@ -622,6 +629,7 @@ bool kimi_k3_alloc_state(const KimiK3Config& cfg, int max_ctx, KimiK3RuntimeStat
     const int lo = first_layer < 0 ? 0 : first_layer;
     const int hi = last_layer < 0 ? cfg.n_layers - 1 : last_layer;
     out.max_ctx = max_ctx;
+    out.kv_f16 = kv_f16_on();
     out.max_ckpt = cfg.attn_res_block_size > 0
         ? (cfg.n_layers + cfg.attn_res_block_size - 1) / cfg.attn_res_block_size
         : 0;
@@ -685,7 +693,11 @@ bool kimi_k3_alloc_state(const KimiK3Config& cfg, int max_ctx, KimiK3RuntimeStat
                 return false;
         } else {
             const int k = kimi_k3_mla_ordinal(cfg, layer);
-            out.mla_kv_cache[k] = alloc((size_t)cfg.key_length * max_ctx);
+            // f16 rows are half the bytes; alloc() counts floats, so round the
+            // half-element count up. key_length is even at every real config,
+            // making this exact, but the +1 keeps an odd config safe.
+            const size_t elems = (size_t)cfg.key_length * max_ctx;
+            out.mla_kv_cache[k] = alloc(out.kv_f16 ? (elems + 1) / 2 : elems);
             if (!out.mla_kv_cache[k]) return false;
         }
     }
@@ -736,7 +748,13 @@ void kimi_k3_reset_state(KimiK3RuntimeState& s) {
     for (float* p : s.conv_state_k) z(p, (size_t)s.conv_state_elems);
     for (float* p : s.conv_state_v) z(p, (size_t)s.conv_state_elems);
     for (float* p : s.delta_state)  z(p, (size_t)s.delta_state_elems);
-    for (float* p : s.mla_kv_cache) z(p, (size_t)s.kv_cache_elems);
+    // kv_cache_elems counts CACHE ELEMENTS, which are 2 bytes under kv_f16 —
+    // zeroed by bytes here so the f16 arm doesn't memset past its allocation.
+    // (All-zero bits is 0.0 in both f32 and f16, so the cleared state means the
+    // same thing on either arm.)
+    const size_t kv_bytes = (size_t)s.kv_cache_elems * (s.kv_f16 ? 2 : 4);
+    for (float* p : s.mla_kv_cache)
+        if (p && kv_bytes > 0) cudaMemset(p, 0, kv_bytes);
     // res_bank is not zeroed — n_ckpt=0 means no row is read until pushed, and a
     // push always writes the full row before n_ckpt is incremented, so stale bytes
     // in unused rows are never observed.
@@ -897,6 +915,13 @@ bool kimi_k3_forward_alloc_scratch(const KimiK3Config& cfg, KimiK3Forward& fwd) 
     // untouched while the gate/up memset below still paid to clear it.
     const int moe_ffn_local = k3_moe_ffn_local(fwd, cfg);
     ok &= alloc_f(s.moe_scratch, (size_t)cfg.top_k * moe_ffn_local);
+    // Establish the "foreign expert slots read as zero" invariant ONCE here, instead of
+    // re-establishing it with a cudaMemsetAsync on every MoE layer. A rank's expert band
+    // is fixed for the run and moe_gate_up writes only owned slots, so a foreign slot is
+    // written by nobody and stays zero from this memset onward.
+    if (ok && s.moe_scratch)
+        cudaMemset(s.moe_scratch, 0,
+                   (size_t)cfg.top_k * moe_ffn_local * sizeof(float));
     // ONE ALLOCATION, TWO TENSORS, BECAUSE ONE COLLECTIVE COVERS BOTH.
     //
     // The expert accumulator (expert_latent) and the shared-expert partial (hidden)
@@ -1132,8 +1157,32 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
     // takes the ordinary path.
     auto proj_h = [&](float* y, const float* x, const KimiK3Tensor& W, int N, int K) {
         if (!W.ok()) return false;
-        if (hoisted_src == x && W.type == 8)
+        if (hoisted_src == x && W.type == 8) {
+            // THE HOIST WAS SHORT-CIRCUITING THE ONE-BARRIER EPILOGUE.
+            //
+            // #90 added k3_proj_q8_multirow_1bar to replace the per-row block_sum --
+            // two __syncthreads each -- with a single fold, and its own comment names
+            // ffn_routed_down (N 3584, K 7168, ROWS 8, 2 main-loop iterations) as a
+            // target shape. But this lambda returned k3_proj_q8act_f32 before the 1bar
+            // path could ever be reached, so routed_down kept paying 16 serialised
+            // block-wide barriers on all 92 MoE layers -- at 448 CTAs over 132 SMs
+            // there is nothing resident to hide them behind. attn_q_a and attn_gate
+            // (N 1536, ROWS 4, 8 barriers) lost it on all 24 MLA layers for the same
+            // reason. The two optimisations were mutually exclusive and the hoist won
+            // silently.
+            //
+            // x_pre_q8 is what reconciles them, and it already existed with no caller:
+            // k3_quantize_act_f32 is a thin wrapper over the SAME k3_quantize_q8_0 the
+            // 1bar path would call itself, so s.act_q8 already holds byte-identical
+            // Q8_0 and the kernel simply skips re-quantising. BIT-IDENTICAL, and it
+            // does not write the scratch, so later proj_h calls on the same hoisted
+            // activation are unaffected. k3_proj_q8_fused4_1bar at the KDA group is
+            // the precedent -- it has passed qkvg_pre this way since #94.
+            if (k3k::k3_proj_q8_multirow_1bar(y, x, W.data, W.type, N, K,
+                                              s.act_q8, stream, /*x_pre_q8=*/true))
+                return true;
             return k3k::k3_proj_q8act_f32(y, s.act_q8, W.data, W.type, N, K, stream);
+        }
         return proj(y, x, W, N, K);
     };
 
@@ -1420,10 +1469,16 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             // which a captured graph freezes. One kernel that derives the row from d_pos
             // replaces the two memcpys; it moves the same bytes in the same order, so it
             // is bit-identical, and it is the reason replay 2 writes a different row from
-            // replay 1 instead of overwriting replay 1's.
-            k3k::k3_mla_kv_store_f32(st.mla_kv_cache[mla_ord], s.kv_cmpr_normed,
-                                     s.kv_a_out, st.d_pos, cfg.kv_lora_rank,
-                                     cfg.rope_dim, cfg.key_length, stream);
+            // replay 1 instead of overwriting replay 1's. The f16 twin narrows on the way
+            // in and is otherwise the same kernel, same d_pos, same row layout.
+            if (st.kv_f16)
+                k3k::k3_mla_kv_store_f16(st.mla_kv_cache[mla_ord], s.kv_cmpr_normed,
+                                         s.kv_a_out, st.d_pos, cfg.kv_lora_rank,
+                                         cfg.rope_dim, cfg.key_length, stream);
+            else
+                k3k::k3_mla_kv_store_f32(st.mla_kv_cache[mla_ord], s.kv_cmpr_normed,
+                                         s.kv_a_out, st.d_pos, cfg.kv_lora_rank,
+                                         cfg.rope_dim, cfg.key_length, stream);
 
             if (!L.attn_k_b.ok() || !L.attn_v_b.ok()) return false;
             absorb_strided = k3k::k3_mla_absorb_q_strided(
@@ -1448,13 +1503,20 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             if (fwd.debug) fwd.debug("mla_absorb_q", layer, s.absorbed_q, qh * cfg.key_length);
 
             const float mla_scale = 1.0f / std::sqrt((float)cfg.key_length_mla);
-            k3k::mla_decode_attn_f32(s.mla_attn_out, s.absorbed_q,
-                                     st.mla_kv_cache[mla_ord],
-                                     (const float*)L.attn_v_b.data, cfg.key_length,
-                                     cfg.kv_lora_rank, cfg.value_length_mla, qh,
-                                     // host length: picks the launch plan only.
-                                     // device length: what the kernel attends over.
-                                     st.position + 1, st.d_pos, mla_scale, stream);
+            // host length: picks the launch plan only.
+            // device length: what the kernel attends over.
+            if (st.kv_f16)
+                k3k::mla_decode_attn_kvf16(s.mla_attn_out, s.absorbed_q,
+                                           st.mla_kv_cache[mla_ord],
+                                           (const float*)L.attn_v_b.data, cfg.key_length,
+                                           cfg.kv_lora_rank, cfg.value_length_mla, qh,
+                                           st.position + 1, st.d_pos, mla_scale, stream);
+            else
+                k3k::mla_decode_attn_f32(s.mla_attn_out, s.absorbed_q,
+                                         st.mla_kv_cache[mla_ord],
+                                         (const float*)L.attn_v_b.data, cfg.key_length,
+                                         cfg.kv_lora_rank, cfg.value_length_mla, qh,
+                                         st.position + 1, st.d_pos, mla_scale, stream);
             if (fwd.debug) fwd.debug("dbg_preattn", layer, s.mla_attn_out, qh * cfg.value_length_mla);
 
             if (L.has_attn_gate) {

@@ -21,7 +21,10 @@
 
 #include "sparkinfer/kernels/kimi_k3.h"
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
+
+#include <cstring>
 
 #include <cmath>
 #include <cstdio>
@@ -687,6 +690,46 @@ static void test_mla_decode_attn(int n_ctx, int H) {
                                "mla decode attn ignores d_pos (device length not obeyed)");
     }
 
+    // ---- F16-cache arm, same shapes so it takes the same kernel path ----
+    // The device cache is built by mla_kv_store_row_f16 itself (cmpr/k_pe fed
+    // from slices of the f32 rows), then pinned BYTE-FOR-BYTE against host
+    // round-to-nearest — so the store kernel is verified, not just used.
+    __half* dk16 = nullptr;
+    CU(cudaMalloc(&dk16, k_cache.size() * sizeof(__half)));
+    for (int t = 0; t < n_ctx; ++t) {
+        CU(cudaMemcpy(d_pos, &t, sizeof(int), cudaMemcpyHostToDevice));
+        k3_mla_kv_store_f16(dk16, dk + (size_t)t * key_length,
+                            dk + (size_t)t * key_length, d_pos,
+                            kv_lora, key_length - kv_lora, key_length, 0);
+    }
+    CU(cudaMemcpy(d_pos, &pos_host, sizeof(int), cudaMemcpyHostToDevice));
+    CU(cudaDeviceSynchronize());
+    CU(cudaGetLastError());
+    std::vector<__half> hk(k_cache.size()), hk_dev(k_cache.size());
+    for (size_t i = 0; i < k_cache.size(); ++i) hk[i] = __float2half_rn(k_cache[i]);
+    CU(cudaMemcpy(hk_dev.data(), dk16, k_cache.size() * sizeof(__half),
+                  cudaMemcpyDeviceToHost));
+    ++g_case;
+    if (std::memcmp(hk.data(), hk_dev.data(), k_cache.size() * sizeof(__half)) != 0) {
+        ++g_fail;
+        std::printf("  FAIL  f16 store rows != host round-to-nearest\n");
+    } else {
+        std::printf("  ok    f16 store rows == host round-to-nearest (bitwise)\n");
+    }
+
+    // The reference for this arm is rebuilt FROM THE ROUNDED cache, so the
+    // kernel is held to the same float64 bar as the f32 arm above and the
+    // storage rounding is not laundered into the kernel's error budget.
+    for (size_t i = 0; i < k_cache.size(); ++i) k_cache[i] = __half2float(hk[i]);
+    auto ref16 = run_ref(scale);
+    mla_decode_attn_kvf16(dout, dq, dk16, dw, key_length, kv_lora, v_dim, H,
+                          n_ctx, d_pos, scale, 0);
+    CU(cudaDeviceSynchronize());
+    CU(cudaGetLastError());
+    close_enough(from_dev(dout, (size_t)v_dim * H), ref16,
+                 "mla decode attn (f16 cache) vs float64 ref on rounded cache");
+
+    CU(cudaFree(dk16));
     CU(cudaFree(dq)); CU(cudaFree(dk)); CU(cudaFree(dw)); CU(cudaFree(dout));
     CU(cudaFree(d_pos));
 }

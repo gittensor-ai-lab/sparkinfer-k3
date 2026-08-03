@@ -195,6 +195,7 @@ struct KimiK3TP {
     bool zero_copy = false;
     std::vector<float*> zc_in, zc_out;   // reduce_in/out, rank order
     std::vector<float*> orig_moe;        // scratch pointer, restored at free
+    std::vector<float*> orig_attn;       // same, for the attention partial
 };
 
 // Load the model once per rank, banding the routed experts. `devices` gives tp_size.

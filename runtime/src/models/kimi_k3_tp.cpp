@@ -461,15 +461,20 @@ bool kimi_k3_tp_init(const GGUF& g, const KimiK3Config& cfg, const K3PlanOptions
         out.zc_in.resize((size_t)n);
         out.zc_out.resize((size_t)n);
         out.orig_moe.resize((size_t)n);
+        out.orig_attn.resize((size_t)n);
         for (int r = 0; r < n; ++r) {
             out.zc_in[(size_t)r]  = (float*)out.coll->reduce_in(r);
             out.zc_out[(size_t)r] = (float*)out.coll->reduce_out(r);
             out.orig_moe[(size_t)r] = kimi_k3_partial_buffer(
                 out.ranks[(size_t)r].fwd, cfg.leading_dense,
                 K3LayerPhase::FfnPartial, nullptr);
+            out.orig_attn[(size_t)r] = kimi_k3_partial_buffer(
+                out.ranks[(size_t)r].fwd, cfg.leading_dense,
+                K3LayerPhase::Attn, nullptr);
             if (!out.zc_in[(size_t)r] || !out.zc_out[(size_t)r] ||
-                !out.orig_moe[(size_t)r]) {
-                out.zc_in.clear(); out.zc_out.clear(); out.orig_moe.clear();
+                !out.orig_moe[(size_t)r] || !out.orig_attn[(size_t)r]) {
+                out.zc_in.clear(); out.zc_out.clear();
+                out.orig_moe.clear(); out.orig_attn.clear();
                 break;
             }
         }
@@ -664,10 +669,23 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
         // Done HERE, by the submitting thread, with the issue pool parked. These
         // calls retarget scratch pointers the workers dereference, so performing
         // them from inside a worker — or while one is running — would be a race.
-        if (p.zero_copy && is_moe && tp_size > 1) {
-            for (std::size_t r = 0; r < p.ranks.size(); ++r)
-                kimi_k3_swap_partial_buffer(p.ranks[r].fwd, K3LayerPhase::FfnPartial,
-                                            p.zc_in[r]);
+        const bool zc_attn = p.zero_copy && attn_reduce;
+        if (p.zero_copy && tp_size > 1 && (is_moe || zc_attn)) {
+            for (std::size_t r = 0; r < p.ranks.size(); ++r) {
+                if (is_moe)
+                    kimi_k3_swap_partial_buffer(p.ranks[r].fwd, K3LayerPhase::FfnPartial,
+                                                p.zc_in[r]);
+                // The attention partial rides the SAME owned pair. The reuse is
+                // safe for the same reason 185 sequential collectives already
+                // share it: the attn value is written to zc_in, reduced into
+                // zc_out, and fully consumed by the FfnPartial kernels before
+                // the expert dispatch (stream-ordered behind them) overwrites
+                // zc_in — and the one-shot's exit barrier proves every peer
+                // finished reading before that.
+                if (zc_attn)
+                    kimi_k3_swap_partial_buffer(p.ranks[r].fwd, K3LayerPhase::Attn,
+                                                p.zc_in[r]);
+            }
         }
 
         const IClock::time_point t_p12 = ip.on ? IClock::now() : IClock::time_point{};
@@ -701,14 +719,30 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
                 p.reduce_bufs[(size_t)r] = buf;
             }
             const IClock::time_point tk = ip.on ? IClock::now() : IClock::time_point{};
-            const bool okk = p.coll->allreduce_f32_group(p.reduce_bufs, (size_t)count,
-                                                         p.streams);
+            // Owned (no staging copies) when the partial was aimed at zc_in
+            // above; the staged group call otherwise. Same reduce kernel, same
+            // bits — only the two D2D copies around it disappear. All 93
+            // attention collectives paid those copies while the MoE reduce
+            // beside them ran with none, because every swap site passed
+            // FfnPartial even though kimi_k3_partial_buffer has always handled
+            // Attn.
+            const bool okk = zc_attn
+                ? p.coll->allreduce_f32_owned((size_t)count, p.streams)
+                : p.coll->allreduce_f32_group(p.reduce_bufs, (size_t)count,
+                                              p.streams);
             if (ip.on) ip.t_coll += secs_since(tk);
             if (!okk) {
                 std::fprintf(stderr, "[k3-tp] attention all-reduce failed at layer %d\n", layer);
                 return false;
             }
             ++p.n_collectives;
+            // FfnPartial reads the reduced attention output where the
+            // collective wrote it.
+            if (zc_attn) {
+                for (std::size_t r = 0; r < p.ranks.size(); ++r)
+                    kimi_k3_swap_partial_buffer(p.ranks[r].fwd, K3LayerPhase::Attn,
+                                                p.zc_out[r]);
+            }
 
             const IClock::time_point t_fp = ip.on ? IClock::now() : IClock::time_point{};
             if (!issue_all([&](int r) {
@@ -967,9 +1001,12 @@ void kimi_k3_tp_free(KimiK3TP& p) {
     // today (scratch frees via its owned list, not this field) but keeps the
     // struct truthful for anything that walks it during shutdown.
     if (p.zero_copy) {
-        for (std::size_t r = 0; r < p.ranks.size(); ++r)
+        for (std::size_t r = 0; r < p.ranks.size(); ++r) {
             kimi_k3_swap_partial_buffer(p.ranks[r].fwd, K3LayerPhase::FfnPartial,
                                         p.orig_moe[r]);
+            kimi_k3_swap_partial_buffer(p.ranks[r].fwd, K3LayerPhase::Attn,
+                                        p.orig_attn[r]);
+        }
         p.zero_copy = false;
     }
     for (auto& R : p.ranks) {
@@ -988,6 +1025,7 @@ void kimi_k3_tp_free(KimiK3TP& p) {
     p.zc_in.clear();
     p.zc_out.clear();
     p.orig_moe.clear();
+    p.orig_attn.clear();
     p.coll.reset();
 }
 

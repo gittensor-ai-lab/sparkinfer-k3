@@ -451,6 +451,23 @@ void k3_mla_kv_store_f32(float* cache, const float* kv_cmpr_normed,
 // Advance the device's position, inside the captured region.
 void k3_bump_pos(int* d_pos, cudaStream_t stream);
 
+// Same computation over an F16 latent cache — k_cache holds IEEE half rows in
+// the identical [key_length, n_ctx] layout (void* because half is a CUDA type
+// this header keeps out of the runtime's face). Arithmetic is f32; only the
+// cache element narrows, which is llama.cpp's own default (type_k = F16), so
+// the f32 layout above is the MORE precise of the two, not this one.
+void mla_decode_attn_kvf16(float* out, const float* q, const void* k_cache,
+                           const float* wv_b, int key_length, int kv_lora,
+                           int v_dim, int n_head, int n_ctx, const int* d_pos,
+                           float scale, cudaStream_t stream);
+
+// F16 twin of k3_mla_kv_store_f32 — same device-held position, same row layout,
+// narrowing with round-to-nearest as ggml does for its own F16 type_k.
+void k3_mla_kv_store_f16(void* cache, const float* kv_cmpr_normed,
+                         const float* kv_a_out, const int* d_pos,
+                         int kv_lora, int rope_dim, int key_length,
+                         cudaStream_t stream);
+
 // ---------------------------------------------------------------------------
 // 14. Generic projection (GEMV), f32 activation in, f32 out
 // ---------------------------------------------------------------------------
