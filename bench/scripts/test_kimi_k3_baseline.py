@@ -2201,6 +2201,69 @@ class CiWorkflowTest(unittest.TestCase):
                          "invisible and cmake --build would proceed on whatever cache exists")
         self.assertIn("configure FAILED", cfg, "a failed configure no longer aborts")
 
+    def test_conflicted_prs_are_labelled_and_the_label_clears_itself(self):
+        """The conflict skip was correct but invisible: it printed a line in a log only the
+        operator reads, so #55, #87 and #90 each sat out a full round with nothing on the PR
+        saying why. The label is the contributor-facing half of a decision the round was
+        already making.
+
+        Self-clearing, like needs-rebase — mergeability is re-resolved every round before
+        this runs, so a rebased PR loses the label without anyone asking."""
+        bot = self._bot()
+        calls = []
+        orig_gh = bot.gh
+
+        class R:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        def fake_gh(args, timeout=120):
+            calls.append(args)
+            return R()
+
+        try:
+            bot.gh = fake_gh
+            prs = [
+                {"number": 90, "mergeable": "CONFLICTING", "labels": []},              # add
+                {"number": 55, "mergeable": "CONFLICTING",
+                 "labels": [{"name": bot.CONFLICT_LABEL}]},                            # already
+                {"number": 86, "mergeable": "MERGEABLE",
+                 "labels": [{"name": bot.CONFLICT_LABEL}]},                            # clear
+                {"number": 71, "mergeable": "MERGEABLE", "labels": []},                # nothing
+                {"number": 96, "mergeable": "UNKNOWN", "labels": []},                  # nothing
+            ]
+            bot.sync_conflict_labels("r", prs, dry_run=False)
+        finally:
+            bot.gh = orig_gh
+
+        posts = [c for c in calls if "-X" in c and "POST" in c and "labels" in " ".join(c)]
+        dels = [c for c in calls if "-X" in c and "DELETE" in c]
+        self.assertEqual(len(posts), 1, f"expected exactly one add, got {posts}")
+        self.assertIn("issues/90/labels", " ".join(posts[0]), "labelled the wrong PR")
+        self.assertEqual(len(dels), 1, f"expected exactly one clear, got {dels}")
+        self.assertIn("issues/86/labels", " ".join(dels[0]),
+                      "the label does not clear once a PR is mergeable again")
+        # UNKNOWN must not be labelled — it is the normal answer while GitHub recomputes.
+        self.assertNotIn("issues/96", " ".join(" ".join(c) for c in calls),
+                         "labelled a PR whose mergeability GitHub had not computed")
+        # NOT `gh pr edit --add-label`: it hits deprecated projectCards and exits 1.
+        self.assertFalse([c for c in calls if c[:2] == ["pr", "edit"]],
+                         "used the projectCards path that silently fails")
+
+    def test_the_conflict_label_never_blocks_a_merge(self):
+        """GitHub already refuses to merge a conflicted branch, so putting this in
+        NEVER_MERGE_LABELS adds nothing — and a stale one would block a PR that is now
+        perfectly mergeable. The state is the authority; the label only reports it."""
+        bot = self._bot()
+        self.assertNotIn(bot.CONFLICT_LABEL, bot.NEVER_MERGE_LABELS)
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        head = src[src.index("resolve_mergeability(args.repo, prs)"):src.index("if args.rebase_sweep")]
+        self.assertIn("sync_conflict_labels(", head,
+                      "conflicted PRs are skipped silently again")
+        self.assertLess(head.index("resolve_mergeability("), head.index("sync_conflict_labels("),
+                        "labelled before mergeability was settled — would label on UNKNOWN")
+
     def test_the_round_serves_the_oldest_pr_first(self):
         """`gh pr list` returns newest-first, so a round served the most recent submission
         first and the longest-waiting one last -- backwards for a queue that pays people.
