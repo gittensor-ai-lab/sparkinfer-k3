@@ -278,6 +278,58 @@ settle_gpus() {  # wait until every device is ~free, or give up and let the run 
     echo ">> warning: GPUs still busy after ${KIMI_K3_SETTLE_TRIES:-30}s — running anyway" >&2
 }
 
+# THE FIRST BENCH ON A FRESH BOX RUNS SLOW, AND IT IS ALWAYS main's.
+#
+# The bot measures main first, then each PR. So the run that pays to pull 554 GiB off disk
+# into page cache is the one that sets the frontier -- and an understated frontier makes
+# every PR in that round look better than it is. On a loop that pays emissions, the bias
+# points the wrong way.
+#
+# Measured on this box: first bench after provisioning loads in 40.27 s, the next four in
+# 33.25-33.49 s. Here that 7 s lands in model LOAD, which the scored self-report excludes
+# (52.98 cold vs 53.02-53.50 warm -- flat to 1%), so it is not currently moving tiers. It
+# did move the wall-clock differential, which is what falsely refused #77. A contributor on
+# #87 hit it far harder -- "the first measurement on a fresh box runs ~15% slow regardless
+# of configuration; everything after is stable to ~0.3%" -- on a box whose RAM is smaller
+# than the model, so paging bleeds into decode rather than stopping after load.
+#
+# Warming by READING THE WEIGHTS, not by running the bench: the cause is page cache, and a
+# throwaway bench run would spend 8 GPUs and risk the cudaMalloc race settle_gpus exists for
+# to fix a disk problem.
+#
+# Once per box, not per eval. The marker lives in /tmp, which a re-provisioned container
+# loses -- exactly the event that makes the cache cold again. Best-effort throughout: a
+# failed warm-up must never fail an eval, since it is an optimisation of the measurement,
+# not part of it.
+warm_page_cache() {
+    [[ -n "${KIMI_K3_NO_WARM:-}" ]] && return 0
+    local marker="${KIMI_K3_WARM_MARKER:-/tmp/.kimi_k3_page_cache_warmed}"
+    [[ -e "$marker" ]] && return 0
+    local dir ram_kb model_kb
+    dir="$(dirname "$MODEL")"
+    # If RAM cannot hold the weights the cache will thrash no matter what we do, and reading
+    # them would just evict whatever IS cached. Say so and skip rather than make it worse.
+    ram_kb="$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+    model_kb="$(du -sk "$dir" 2>/dev/null | awk '{print $1}' || echo 0)"
+    if [[ "$ram_kb" -gt 0 && "$model_kb" -gt 0 && "$model_kb" -gt "$ram_kb" ]]; then
+        echo ">> warm-up skipped: weights ($((model_kb/1048576)) GiB) exceed RAM ($((ram_kb/1048576)) GiB) — the cache cannot hold them" >&2
+        : > "$marker" 2>/dev/null || true
+        return 0
+    fi
+    echo ">> warming the page cache (first bench on this box; discarded, not timed) ..." >&2
+    local t0 t1
+    t0="$(date +%s%N)"
+    for f in "$dir"/*.gguf; do
+        [[ -r "$f" ]] || continue
+        dd if="$f" of=/dev/null bs=16M status=none 2>/dev/null || true
+    done
+    t1="$(date +%s%N)"
+    printf '>> page cache warmed in %.1f s\n' "$(( t1 - t0 ))e-9" >&2
+    : > "$marker" 2>/dev/null || true
+}
+
+warm_page_cache
+
 echo ">> timing sparkinfer decode at ctx $SCORED_CTX (2 runs, ${TOKENS_LO} and ${TOKENS_HI} tokens) ..."
 SPEED_OUT="$(mktemp -t k3speed_XXXXXX)"
 trap 'rm -f "$SPEED_OUT"' EXIT
