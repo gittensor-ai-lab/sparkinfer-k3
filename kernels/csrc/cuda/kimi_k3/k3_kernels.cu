@@ -1352,6 +1352,7 @@ constexpr int kMlaTokensPerWarp = 4;
 // Each slot is touched by exactly one rank thread (a rank owns its device for the whole
 // run), so the slots need no lock; the array itself is only ever read by index.
 static constexpr int kMlaMaxDevices = 16;
+static float* g_mla_merged  [kMlaMaxDevices] = {nullptr};
 static float* g_mla_part_acc[kMlaMaxDevices] = {nullptr};
 static float* g_mla_part_ml [kMlaMaxDevices] = {nullptr};
 static size_t g_mla_part_cap[kMlaMaxDevices] = {0};
@@ -1375,6 +1376,15 @@ static bool k3_mla_split_scratch(int n_head, int kv_lora, int* dev_out) {
     if (cudaMalloc((void**)&g_mla_part_ml[dev],
                    (size_t)n_head * ms * 2 * sizeof(float)) != cudaSuccess) {
         cudaFree(g_mla_part_acc[dev]); g_mla_part_acc[dev] = nullptr; return false;
+    }
+    // Merged latent, one row per head. Allocated on the SAME path as the partials so it
+    // is covered by the same pre-warm and can never cudaMalloc inside a stream capture.
+    cudaFree(g_mla_merged[dev]); g_mla_merged[dev] = nullptr;
+    if (cudaMalloc((void**)&g_mla_merged[dev],
+                   (size_t)n_head * (size_t)kv_lora * sizeof(float)) != cudaSuccess) {
+        cudaFree(g_mla_part_acc[dev]); g_mla_part_acc[dev] = nullptr;
+        cudaFree(g_mla_part_ml [dev]); g_mla_part_ml [dev] = nullptr;
+        return false;
     }
     g_mla_part_cap[dev] = need;
     return true;
@@ -2073,6 +2083,119 @@ __global__ void mla_decode_combine_kernel(float* __restrict__ out,
             acc += __shfl_down_sync(0xffffffff, acc, off);
         if (lane == 0) oh[v] = acc;
     }
+}
+
+// WIDE COMBINE. mla_decode_combine_kernel above runs grid = n_head = 12 blocks on a
+// 132-SM part -- about 9% of the machine -- and its thread 0 walks O(splits) serially
+// while the other BLOCK-1 threads wait at the barrier (the comment on that walk already
+// flags it as the term that bites first). Splitting merge from projection lets BOTH
+// fill the grid: 12 -> n_head*RChunks and n_head*VChunks blocks.
+//
+// The single-kernel form was the right call BEFORE: two kernels means a second launch,
+// and at 93 layers plus ~185 collectives per token that mattered. Once the decode is
+// captured as one CUDA graph that launch is a baked graph node and costs essentially
+// nothing, so the decomposition becomes free. This is downstream of the graph capture
+// in this same PR, not independent of it.
+//
+// SUMMATION ORDER IS UNCHANGED in both stages -- the slice sum still runs i ascending
+// and the projection dot still strides r by 32 across the warp -- so this is
+// bit-identical to the kernel it replaces, not a re-rounding of it.
+constexpr int kMlaCombineVChunks = 16;
+constexpr int kMlaCombineRChunks = 8;
+
+template <int BLOCK>
+__global__ void mla_decode_merge_kernel(float* __restrict__ merged,
+                                        const float* __restrict__ part_acc,
+                                        const float* __restrict__ part_ml,
+                                        int kv_lora, int splits) {
+    const int h  = blockIdx.x;
+    const int rc = blockIdx.y;
+    extern __shared__ float smem[];
+    float* s_w = smem;                       // splits + 1, last slot holds 1/l
+
+    const float* pml = part_ml + (size_t)h * splits * 2;
+    if (threadIdx.x == 0) {
+        float m = -1e30f;
+        for (int i = 0; i < splits; ++i) m = fmaxf(m, pml[2 * i]);
+        float l = 0.0f;
+        for (int i = 0; i < splits; ++i) {
+            const float w = __expf(pml[2 * i] - m);
+            s_w[i] = w;
+            l += pml[2 * i + 1] * w;
+        }
+        s_w[splits] = l > 0.0f ? 1.0f / l : 0.0f;
+    }
+    __syncthreads();
+    const float inv = s_w[splits];
+
+    const int per = (kv_lora + kMlaCombineRChunks - 1) / kMlaCombineRChunks;
+    const int r0  = rc * per;
+    const int r1  = min(kv_lora, r0 + per);
+    for (int r = r0 + (int)threadIdx.x; r < r1; r += BLOCK) {
+        float a = 0.0f;
+        for (int i = 0; i < splits; ++i)
+            a += part_acc[((size_t)h * splits + i) * kv_lora + r] * s_w[i];
+        merged[(size_t)h * kv_lora + r] = a * inv;
+    }
+}
+
+template <int BLOCK>
+__global__ void mla_decode_project_kernel(float* __restrict__ out,
+                                          const float* __restrict__ merged,
+                                          const float* __restrict__ wv_b,
+                                          int kv_lora, int v_dim) {
+    constexpr int NWARP = BLOCK / 32;
+    const int h    = blockIdx.x;
+    const int vc   = blockIdx.y;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+
+    extern __shared__ float smem[];
+    float* s_acc = smem;                     // kv_lora
+    for (int r = (int)threadIdx.x; r < kv_lora; r += BLOCK)
+        s_acc[r] = merged[(size_t)h * kv_lora + r];
+    __syncthreads();
+
+    const int per = (v_dim + kMlaCombineVChunks - 1) / kMlaCombineVChunks;
+    const int v0  = vc * per;
+    const int v1  = min(v_dim, v0 + per);
+    const float* wh = wv_b + (size_t)h * (size_t)kv_lora * v_dim;
+    float* oh = out + (size_t)h * v_dim;
+    for (int v = v0 + warp; v < v1; v += NWARP) {
+        const float* wr = wh + (size_t)v * kv_lora;
+        float acc = 0.0f;
+        for (int r = lane; r < kv_lora; r += 32) acc += wr[r] * s_acc[r];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            acc += __shfl_down_sync(0xffffffff, acc, off);
+        if (lane == 0) oh[v] = acc;
+    }
+}
+
+// SPARKINFER_K3_MLA_WIDE_COMBINE=0 restores the single-kernel combine on one binary.
+static bool k3_mla_wide_combine() {
+    static const int v = [] {
+        const char* e = std::getenv("SPARKINFER_K3_MLA_WIDE_COMBINE");
+        return (e && std::atoi(e) == 0) ? 0 : 1;   // default ON
+    }();
+    return v != 0;
+}
+
+template <int BLOCK>
+static void k3_mla_launch_combine(float* out, int dev, const float* wv_b, int n_head,
+                                  int kv_lora, int v_dim, int splits, cudaStream_t stream) {
+    if (k3_mla_wide_combine() && g_mla_merged[dev] != nullptr) {
+        dim3 mg((unsigned)n_head, (unsigned)kMlaCombineRChunks);
+        mla_decode_merge_kernel<BLOCK><<<mg, BLOCK, ((size_t)splits + 1) * sizeof(float), stream>>>(
+            g_mla_merged[dev], g_mla_part_acc[dev], g_mla_part_ml[dev], kv_lora, splits);
+        dim3 pg((unsigned)n_head, (unsigned)kMlaCombineVChunks);
+        mla_decode_project_kernel<BLOCK><<<pg, BLOCK, (size_t)kv_lora * sizeof(float), stream>>>(
+            out, g_mla_merged[dev], wv_b, kv_lora, v_dim);
+        return;
+    }
+    const size_t cshm = ((size_t)kv_lora + (size_t)splits + 1) * sizeof(float);
+    mla_decode_combine_kernel<BLOCK><<<(unsigned)n_head, BLOCK, cshm, stream>>>(
+        out, g_mla_part_acc[dev], g_mla_part_ml[dev], wv_b, kv_lora, v_dim, splits);
 }
 
 template <int BLOCK>
@@ -3130,9 +3253,8 @@ void mla_decode_attn_f32(float* out, const float* q, const float* k_cache,
             default: launched = false; break;
         }
         if (launched) {
-            const size_t cshm = ((size_t)kv_lora + (size_t)splits + 1) * sizeof(float);
-            mla_decode_combine_kernel<BLOCK><<<(unsigned)n_head, BLOCK, cshm, stream>>>(
-                out, g_mla_part_acc[dev], g_mla_part_ml[dev], wv_b, kv_lora, v_dim, splits);
+            k3_mla_launch_combine<BLOCK>(out, dev, wv_b, n_head, kv_lora, v_dim,
+                                         splits, stream);
             return;
         }
         splits = std::min(splits, k3_mla_max_splits(n_head));
@@ -3142,10 +3264,7 @@ void mla_decode_attn_f32(float* out, const float* q, const float* k_cache,
     mla_decode_attn_split_kernel<BLOCK><<<grid, BLOCK, shm, stream>>>(
         g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora,
         d_pos, scale, splits);
-    // s_acc + s_w, where s_w needs splits + 1 slots (the last holds 1/l).
-    const size_t cshm = ((size_t)kv_lora + (size_t)splits + 1) * sizeof(float);
-    mla_decode_combine_kernel<BLOCK><<<(unsigned)n_head, BLOCK, cshm, stream>>>(
-        out, g_mla_part_acc[dev], g_mla_part_ml[dev], wv_b, kv_lora, v_dim, splits);
+    k3_mla_launch_combine<BLOCK>(out, dev, wv_b, n_head, kv_lora, v_dim, splits, stream);
 }
 
 // Threads that would run ZERO iterations of the block loop are not free.
