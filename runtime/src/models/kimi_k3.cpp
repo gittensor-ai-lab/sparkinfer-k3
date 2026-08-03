@@ -1479,23 +1479,44 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
 
             if (!L.ssm_conv1d_q.ok() || !L.ssm_conv1d_k.ok() || !L.ssm_conv1d_v.ok())
                 return false;
-            k3k::kda_conv_step_f32(s.conv_q, st.conv_state_q[kda_ord], s.qkv_q,
-                                   w_cq, cfg.kda_conv_kernel,
-                                   qkv, stream);
-            k3k::kda_conv_step_f32(s.conv_k, st.conv_state_k[kda_ord], s.qkv_k,
-                                   w_ck, cfg.kda_conv_kernel,
-                                   qkv, stream);
-            k3k::kda_conv_step_f32(s.conv_v, st.conv_state_v[kda_ord], s.qkv_v,
-                                   w_cv, cfg.kda_conv_kernel,
-                                   qkv, stream);
-            if (fwd.debug) fwd.debug("dbg_conv_q", layer, s.conv_q, qkv);
-            if (fwd.debug) fwd.debug("dbg_conv_v", layer, s.conv_v, qkv);
-
             // q gets the extra 1/sqrt(head_dim) scale the reference applies before the
             // scan; k does not (see kda_decode_step_f32's contract on pre-scaled q).
-            k3k::l2_norm_heads_f32(s.conv_q, s.conv_q, head_dim, n_head,
-                                   1.0f / std::sqrt((float)head_dim), eps, stream);
-            k3k::l2_norm_heads_f32(s.conv_k, s.conv_k, head_dim, n_head, 1.0f, eps, stream);
+            const float q_l2_scale = 1.0f / std::sqrt((float)head_dim);
+
+            // FIVE DEPENDENT LAUNCHES FOR ~330 KB, ON ALL 69 KDA LAYERS.
+            //
+            // The three convs are mutually independent, and the q/k norms reduce over
+            // exactly the channels their own conv just wrote — so the group is one
+            // kernel over grid (n_head, 3). The two norms are the reason this is worth
+            // doing: they ran at n_head = 12 blocks on a 132-SM part.
+            //
+            // The debug taps below still see the same values; they just observe the
+            // fused kernel's output. The fused path declines (and we fall through to
+            // the five launches) for any head_dim wider than the block.
+            const bool kda_fused = !fwd.debug &&
+                k3k::k3_kda_conv_l2_fused(
+                    s.conv_q, s.conv_k, s.conv_v,
+                    st.conv_state_q[kda_ord], st.conv_state_k[kda_ord],
+                    st.conv_state_v[kda_ord],
+                    s.qkv_q, s.qkv_k, s.qkv_v, w_cq, w_ck, w_cv,
+                    cfg.kda_conv_kernel, head_dim, n_head, q_l2_scale, eps, stream);
+
+            if (!kda_fused) {
+                k3k::kda_conv_step_f32(s.conv_q, st.conv_state_q[kda_ord], s.qkv_q,
+                                       w_cq, cfg.kda_conv_kernel,
+                                       qkv, stream);
+                k3k::kda_conv_step_f32(s.conv_k, st.conv_state_k[kda_ord], s.qkv_k,
+                                       w_ck, cfg.kda_conv_kernel,
+                                       qkv, stream);
+                k3k::kda_conv_step_f32(s.conv_v, st.conv_state_v[kda_ord], s.qkv_v,
+                                       w_cv, cfg.kda_conv_kernel,
+                                       qkv, stream);
+                if (fwd.debug) fwd.debug("dbg_conv_q", layer, s.conv_q, qkv);
+                if (fwd.debug) fwd.debug("dbg_conv_v", layer, s.conv_v, qkv);
+                k3k::l2_norm_heads_f32(s.conv_q, s.conv_q, head_dim, n_head,
+                                       q_l2_scale, eps, stream);
+                k3k::l2_norm_heads_f32(s.conv_k, s.conv_k, head_dim, n_head, 1.0f, eps, stream);
+            }
             if (fwd.debug) fwd.debug("dbg_l2_q", layer, s.conv_q, qkv);
 
             if (!proj_h_on(l_dec, s.f_a_out, s.normed, L.ssm_f_a, head_dim, H)) return false;

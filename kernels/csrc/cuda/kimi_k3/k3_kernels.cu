@@ -1230,6 +1230,80 @@ __global__ void l2_norm_heads_kernel(float* __restrict__ out,
         oh[d] = xh[d] * inv;
 }
 
+// KDA short-conv x3 + the q/k L2 norms, in ONE launch.
+//
+// Five dependent launches per KDA layer, on all 69 of them, for ~330 KB of work: three
+// convs at (d_inner/256) = 6 blocks each, then two l2_norm_heads at n_head = 12 blocks
+// on a 132-SM part. The three convs are mutually independent (separate state, weight,
+// input and output pointers), and the L2 norm for q and k reduces over exactly the
+// head_dim channels the matching conv just wrote — so the whole group is one kernel
+// with grid (n_head, 3).
+//
+// BIT-IDENTICAL, and the mapping is what makes it so:
+//   * the conv is per-channel and untouched — same window order, same wc[d_conv-1] on
+//     the current sample, same silu after, same left-shift of the history.
+//   * l2_norm_heads_kernel<128> strides `for (d = threadIdx.x; d < head_dim; d += BLOCK)`
+//     at BLOCK = 128 and K3's kda_head_dim = 128, so it already ran exactly one element
+//     per thread over one head. This keeps that: thread d owns channel d of head h, and
+//     block_sum<BLOCK> folds the same 128 partials through the same tree.
+//   * v is written without a norm, exactly as before.
+// Threads past head_dim contribute +0.0f to the reduction, which is what the strided
+// loop did for them too.
+template <int BLOCK>
+__global__ void kda_conv_l2_fused_kernel(float* __restrict__ out_q,
+                                         float* __restrict__ out_k,
+                                         float* __restrict__ out_v,
+                                         float* __restrict__ st_q,
+                                         float* __restrict__ st_k,
+                                         float* __restrict__ st_v,
+                                         const float* __restrict__ x_q,
+                                         const float* __restrict__ x_k,
+                                         const float* __restrict__ x_v,
+                                         const float* __restrict__ w_q,
+                                         const float* __restrict__ w_k,
+                                         const float* __restrict__ w_v,
+                                         int d_conv, int head_dim,
+                                         float q_scale, float eps) {
+    k3_pdl_sync();
+    const int h  = blockIdx.x;
+    const int sl = blockIdx.y;            // 0 = q, 1 = k, 2 = v
+    const int d  = threadIdx.x;
+
+    float* out        = (sl == 0) ? out_q : (sl == 1) ? out_k : out_v;
+    float* state      = (sl == 0) ? st_q  : (sl == 1) ? st_k  : st_v;
+    const float* x    = (sl == 0) ? x_q   : (sl == 1) ? x_k   : x_v;
+    const float* wgt  = (sl == 0) ? w_q   : (sl == 1) ? w_k   : w_v;
+
+    const int c = h * head_dim + d;       // global channel
+
+    float v = 0.0f;
+    if (d < head_dim) {
+        float* st       = state + (size_t)c * (d_conv - 1);
+        const float* wc = wgt + (size_t)c * d_conv;
+        float acc = 0.0f;
+#pragma unroll 4
+        for (int t = 0; t < d_conv - 1; ++t) acc += st[t] * wc[t];
+        const float xc = x[c];
+        acc += xc * wc[d_conv - 1];
+        v = acc * sigmoidf_(acc);         // silu AFTER the convolution
+#pragma unroll 4
+        for (int t = 0; t < d_conv - 2; ++t) st[t] = st[t + 1];
+        st[d_conv - 2] = xc;
+    }
+
+    if (sl == 2) {                        // v is not normalised
+        if (d < head_dim) out[c] = v;
+        return;
+    }
+
+    // block_sum contains __syncthreads(), so every thread must reach it.
+    __shared__ float shm[BLOCK / 32 + 1];
+    const float ss  = block_sum<BLOCK>(v * v, shm);
+    const float sc  = (sl == 0) ? q_scale : 1.0f;
+    const float inv = sc * rsqrtf(ss + eps);
+    if (d < head_dim) out[c] = v * inv;
+}
+
 // ---------------------------------------------------------------------------
 // 9. MLA absorb Q
 // ---------------------------------------------------------------------------
@@ -3012,6 +3086,32 @@ void attn_res_mix_f32(float* out, const float* ckpts, const float* cur,
         out, ckpts, cur, sc, n_embd, n_ckpt);
 
     if (owned) cudaFreeAsync(sc, stream);
+}
+
+bool k3_kda_conv_l2_fused(float* out_q, float* out_k, float* out_v,
+                          float* st_q, float* st_k, float* st_v,
+                          const float* x_q, const float* x_k, const float* x_v,
+                          const float* w_q, const float* w_k, const float* w_v,
+                          int d_conv, int head_dim, int n_head,
+                          float q_scale, float eps, cudaStream_t stream) {
+    // SPARKINFER_K3_KDACONV=0 restores the five separate launches on ONE binary, so
+    // this fold's contribution can be isolated from everything else in the same
+    // measurement session rather than inferred from a bundle.
+    static const bool want = [] {
+        const char* e = std::getenv("SPARKINFER_K3_KDACONV");
+        return !(e && e[0] == '0');
+    }();
+    if (!want) return false;
+    // One element per thread per head is what makes the reduction identical to the
+    // kernel this replaces; wider heads would need the strided form, so decline and
+    // let the caller keep the five-launch path.
+    constexpr int BLOCK = 128;
+    if (d_conv < 2 || head_dim <= 0 || head_dim > BLOCK || n_head <= 0) return false;
+    dim3 grid((unsigned)n_head, 3u);
+    k3_pdl_launch(grid, BLOCK, 0, stream, kda_conv_l2_fused_kernel<BLOCK>,
+        out_q, out_k, out_v, st_q, st_k, st_v, x_q, x_k, x_v, w_q, w_k, w_v,
+        d_conv, head_dim, q_scale, eps);
+    return true;
 }
 
 void kda_conv_step_f32(float* out, float* state, const float* x, const float* w,
