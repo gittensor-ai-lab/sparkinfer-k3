@@ -61,7 +61,18 @@ NODE="$(kimi_k3_node)"
 # reference.lock prefix: h200x8 -> KIMI_K3_H200X8_*. Per-node so M1/M2/M3 cannot overwrite
 # each other's reference — they run the same quant at the same context, so the node is the
 # only variable and a shared slot would silently conflate them.
-LOCK_PREFIX="KIMI_K3_$(printf '%s' "$NODE" | tr 'a-z' 'A-Z')"
+# THE WRITER AND THE READER MUST DERIVE THIS THE SAME WAY.
+#
+# _kimi_k3.sh states the convention outright: "The reference.lock slots keep the quant
+# in their NAME for exactly this reason (KIMI_K3_H200X8_IQ1S_LLAMA_128), so a number
+# measured under this default can never be read as a Q2_K_XL result." This script did
+# not implement it -- it emitted KIMI_K3_H200X8_LLAMA_* whatever PRIMARY_QUANT said,
+# while kimi_k3_eval.sh reads KIMI_K3_H200X8_IQ1S_LLAMA_128K. So a correct measurement
+# landed in a slot nothing scores from, and the unqualified slots it did write are the
+# all-zero ones whose emptiness once made every PR score BASELINE.
+#
+# Same derivation as kimi_k3_eval.sh, character for character, so the two cannot drift.
+LOCK_PREFIX="KIMI_K3_$(printf '%s' "$NODE" | tr 'a-z' 'A-Z')_$(printf '%s' "${PRIMARY_QUANT:-UD-IQ1_S}" | sed 's/^UD-//' | tr -cd 'A-Za-z0-9' | tr 'a-z' 'A-Z')"
 OUT_DIR="${KIMI_K3_OUT_DIR:-$ROOT/bench/results}"
 STAMP="${KIMI_K3_STAMP:-$(date -u +%Y%m%dT%H%M%SZ)}"
 OUT_JSON="$OUT_DIR/kimi_k3_${QUANT}_${NODE}_baseline_${STAMP}.json"
