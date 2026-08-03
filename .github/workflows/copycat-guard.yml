@@ -65,8 +65,13 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           YUNWEI_API_KEY: ${{ secrets.YUNWEI_API_KEY }}
-          COPYCAT_LLM_PROVIDER: ${{ vars.COPYCAT_LLM_PROVIDER || 'openai' }}
-          COPYCAT_LLM_MODEL: gpt-4o-mini
+          # Left EMPTY on purpose when the repo variable is unset: _llm_provider() falls
+          # through to autodetect and picks the provider whose key is actually present.
+          # Forcing 'openai' here selected a provider with no key and silently disabled
+          # the judge. Same for the model -- hardcoding gpt-4o-mini overrode the yunwei
+          # provider default (deepseek-v4-pro), which is the configured judge.
+          COPYCAT_LLM_PROVIDER: ${{ vars.COPYCAT_LLM_PROVIDER }}
+          COPYCAT_LLM_MODEL: ${{ vars.COPYCAT_LLM_MODEL }}
           PR_NUM: ${{ github.event.pull_request.number }}
         run: |
           PR_NUM="$PR_NUM" python3 eval/copycat_guard.py
