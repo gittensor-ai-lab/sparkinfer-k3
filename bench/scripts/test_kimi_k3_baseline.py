@@ -2069,6 +2069,38 @@ class CiWorkflowTest(unittest.TestCase):
         ok, _ = bot.eligibility(pr(crlf))
         self.assertTrue(ok, "CRLF line endings broke the section scan")
 
+    def test_every_eval_builds_from_scratch_with_a_pinned_compiler(self):
+        """build/ is gitignored, so `git clean -qfd` leaves it (that needs -x) and every PR
+        was compiled on top of the previous PR's objects, round after round.
+
+        On 2026-08-03 that path produced numbers no fresh build can reproduce: #81 measured
+        14.54 in a round against 22.17 on six clean builds, and main measured 14.14 through
+        the same build directory against 21.25 clean. #84 reverted #81 on that reading, and
+        the PR was a genuine +4.1%.
+
+        A single incremental step is not obviously at fault (main->#81 in isolation gives
+        22.18); the bot does a dozen. The cure is ~20 s per build, so the argument is not
+        worth having."""
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        bb = src[src.index("def _box_build"):src.index("def _box_eval")]
+
+        self.assertIn('"rm -rf build"', bb, "builds are incremental again")
+        self.assertLess(bb.index("rm -rf build"), bb.index("cmake -B build"),
+                        "the clean must happen before configure, or it does nothing")
+
+        # The compiler must not be chosen by a symlink the box owner can move -- and it DID
+        # move today, 12.8 -> 13.0 under /usr/local/cuda.
+        self.assertIn("-DCMAKE_CUDA_COMPILER=", bb, "the CUDA compiler is unpinned again")
+        self.assertIn("--version", bb, "the toolchain version is not recorded in the log")
+
+        # A failed configure must not fall through to a build against a stale cache.
+        cfg = bb[bb.index("cmake -B build"):]
+        cfg = cfg[:cfg.index("cmake --build")]
+        self.assertNotIn(">/dev/null", cfg,
+                         "configure output is discarded again — a failed configure would be "
+                         "invisible and cmake --build would proceed on whatever cache exists")
+        self.assertIn("configure FAILED", cfg, "a failed configure no longer aborts")
+
     def test_the_round_serves_the_oldest_pr_first(self):
         """`gh pr list` returns newest-first, so a round served the most recent submission
         first and the longest-waiting one last -- backwards for a queue that pays people.
