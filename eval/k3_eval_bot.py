@@ -78,6 +78,7 @@ NEVER_MERGE_LABELS = {"hold", "copycat", "copycat-warn", "flagged:gaming", "pena
 NEVER_MERGE_PATHS = ("eval/", ".github/", ".gittensor/", "bench/scripts/", "bench/results/",
                      "bench/refdata/", "dashboard/", "CODEOWNERS")
 REBASE_LABEL = "needs-rebase"
+CONFLICT_LABEL = "merge-conflict"
 
 # THE TIERS THAT MEAN A PR ACTUALLY WON SOMETHING.
 #
@@ -263,6 +264,49 @@ def with_box_retry(what, fn, tries=3, delay=20):
             print(f"   retrying in {delay}s; the next attempt rebuilds and clears stray "
                   "compute processes first", file=sys.stderr)
             time.sleep(delay)
+
+
+def sync_conflict_labels(repo, prs, dry_run):
+    """Label the PRs the round skipped for conflicting with main, and clear the rest.
+
+    The skip was already correct but invisible: it printed a line in a log only the operator
+    reads, so a contributor saw their PR sit out round after round with nothing on the PR
+    saying why. #55, #87 and #90 all sat conflicted through a full round like that.
+
+    SELF-CLEARING, like needs-rebase. Mergeability is re-resolved every round before this
+    runs, so a PR that has been rebased loses the label on the next round without anyone
+    asking. A label only a maintainer can remove turns a mechanical state into a queue
+    somebody has to babysit.
+
+    Deliberately NOT in NEVER_MERGE_LABELS. GitHub already refuses to merge a conflicted
+    branch, so the label would add nothing there -- and if it ever went stale it would block
+    a PR that is now perfectly mergeable. The state is the authority; the label only reports it.
+    """
+    for pr in prs:
+        num = pr["number"]
+        has = CONFLICT_LABEL in {l.get("name", "") for l in pr.get("labels") or []}
+        conflicted = pr.get("mergeable") == "CONFLICTING"
+        if conflicted == has:
+            continue
+        if dry_run:
+            print(f"--- dry-run: would {'add' if conflicted else 'remove'} "
+                  f"{CONFLICT_LABEL} on #{num}")
+            continue
+        if conflicted:
+            gh(["label", "create", CONFLICT_LABEL, "-R", repo, "--color", "B60205",
+                "--description", "conflicts with main — rebase and the round picks it up"])
+            # NOT `gh pr edit --add-label`: it queries projectCards, which GitHub has
+            # deprecated, so it exits 1 even where the repo has no projects.
+            q = gh(["api", "-X", "POST", f"repos/{repo}/issues/{num}/labels",
+                    "-f", f"labels[]={CONFLICT_LABEL}"])
+            if q.returncode != 0:
+                print(f"!! #{num}: could not label {CONFLICT_LABEL}: {q.stderr.strip()[:120]}",
+                      file=sys.stderr)
+                continue
+            print(f">> #{num}: {CONFLICT_LABEL} (conflicts with main — not evaluated)")
+        else:
+            gh(["api", "-X", "DELETE", f"repos/{repo}/issues/{num}/labels/{CONFLICT_LABEL}"])
+            print(f">> #{num}: {CONFLICT_LABEL} cleared — no longer conflicting")
 
 
 def resolve_mergeability(repo, prs, tries=8, delay=5):
@@ -1693,6 +1737,11 @@ def main():
     # recomputes, and the previous round's own frontier commit is what set it recomputing --
     # so the conflict skip has to wait for a real answer or it is decorative.
     resolve_mergeability(args.repo, prs)
+    # After mergeability is settled, before the round books anything: the label reports a
+    # state the round has just established, and it is the only place a contributor can see
+    # why their PR was skipped. --list stays read-only, so it reports and does not label.
+    if not args.list:
+        sync_conflict_labels(args.repo, prs, args.dry_run)
 
     if args.list:
         for pr in prs:

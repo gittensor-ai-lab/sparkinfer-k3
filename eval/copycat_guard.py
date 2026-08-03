@@ -337,10 +337,11 @@ def _llm_api_key(provider):
 
 
 def _llm_model(provider):
-    return os.environ.get(
-        "COPYCAT_LLM_MODEL",
-        PROVIDER_DEFAULTS.get(provider, {}).get("model", "gpt-4o-mini"),
-    ).strip()
+    # `or`, not a get() default: a workflow that passes COPYCAT_LLM_MODEL through from
+    # an unset repo variable sets it to the EMPTY STRING, and get(k, default) returns
+    # "" for a key that exists. That asked the gateway for a model named "".
+    return (os.environ.get("COPYCAT_LLM_MODEL", "").strip()
+            or PROVIDER_DEFAULTS.get(provider, {}).get("model", "gpt-4o-mini"))
 
 
 def _build_judge_prompt(copy_func_body, orig_func_body, copy_sig, orig_sig):
