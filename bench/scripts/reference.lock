@@ -170,8 +170,8 @@ KIMI_K3_H200X8_IQ1S_LLAMA_128K="${KIMI_K3_H200X8_IQ1S_LLAMA_128K:-16.7026}"
 # raise-only, so a slow box cannot deflate it and mint tiers for everyone behind it.
 # 1.00 tok/s (995.65 ms/token) measured on main @ 37d4219 via the committed --ctx/--seek
 # path, which reproduces the throwaway seek_patch.py measurement (1.01 / 991.75) to 0.4%.
-# frontier: measured by eval/k3_eval_bot.py on main @ 0563a6cd56ff (h200x8, UD-IQ1_S). Do not hand-edit — the bot rewrites this each round.
-KIMI_K3_H200X8_IQ1S_SPARKINFER_128K="${KIMI_K3_H200X8_IQ1S_SPARKINFER_128K:-21.24}"
+# frontier: measured by eval/k3_eval_bot.py on main @ f60dcd3eda6b (h200x8, UD-IQ1_S). Do not hand-edit — the bot rewrites this each round.
+KIMI_K3_H200X8_IQ1S_SPARKINFER_128K="${KIMI_K3_H200X8_IQ1S_SPARKINFER_128K:-22.12}"
 
 KIMI_K3_H200X8_LLAMA_128="${KIMI_K3_H200X8_LLAMA_128:-0}"
 KIMI_K3_H200X8_LLAMA_512="${KIMI_K3_H200X8_LLAMA_512:-0}"

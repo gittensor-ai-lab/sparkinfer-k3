@@ -2069,6 +2069,68 @@ class CiWorkflowTest(unittest.TestCase):
         ok, _ = bot.eligibility(pr(crlf))
         self.assertTrue(ok, "CRLF line endings broke the section scan")
 
+    def test_every_eval_builds_from_scratch_with_a_pinned_compiler(self):
+        """build/ is gitignored, so `git clean -qfd` leaves it (that needs -x) and every PR
+        was compiled on top of the previous PR's objects, round after round.
+
+        On 2026-08-03 that path produced numbers no fresh build can reproduce: #81 measured
+        14.54 in a round against 22.17 on six clean builds, and main measured 14.14 through
+        the same build directory against 21.25 clean. #84 reverted #81 on that reading, and
+        the PR was a genuine +4.1%.
+
+        A single incremental step is not obviously at fault (main->#81 in isolation gives
+        22.18); the bot does a dozen. The cure is ~20 s per build, so the argument is not
+        worth having."""
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        bb = src[src.index("def _box_build"):src.index("def _box_eval")]
+
+        self.assertIn('"rm -rf build"', bb, "builds are incremental again")
+        self.assertLess(bb.index("rm -rf build"), bb.index("cmake -B build"),
+                        "the clean must happen before configure, or it does nothing")
+
+        # The compiler must not be chosen by a symlink the box owner can move -- and it DID
+        # move today, 12.8 -> 13.0 under /usr/local/cuda.
+        self.assertIn("-DCMAKE_CUDA_COMPILER=", bb, "the CUDA compiler is unpinned again")
+        self.assertIn("--version", bb, "the toolchain version is not recorded in the log")
+
+        # A failed configure must not fall through to a build against a stale cache.
+        cfg = bb[bb.index("cmake -B build"):]
+        cfg = cfg[:cfg.index("cmake --build")]
+        self.assertNotIn(">/dev/null", cfg,
+                         "configure output is discarded again — a failed configure would be "
+                         "invisible and cmake --build would proceed on whatever cache exists")
+        self.assertIn("configure FAILED", cfg, "a failed configure no longer aborts")
+
+    def test_the_round_serves_the_oldest_pr_first(self):
+        """`gh pr list` returns newest-first, so a round served the most recent submission
+        first and the longest-waiting one last -- backwards for a queue that pays people.
+
+        It matters most exactly when it is least visible: #86, #87, #89 and #90 all capture
+        the decode token as a CUDA graph, only one can win, and the rest re-measure against a
+        main that already has it and score eval:none. Serving newest-first would hand that
+        outcome to whoever submitted last.
+
+        Order does NOT decide the winner -- mark_merge_first ranks by measured tok/s against
+        the shared frontier. It decides who gets measured at all if the round dies partway."""
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        head = src[src.index("prs = list_prs(args.repo)"):src.index("if args.list:")]
+        self.assertIn('prs.sort(key=lambda p: p["number"])', head,
+                      "the round is back to newest-first")
+        # ...and before anything consumes the list.
+        self.assertLess(head.index("prs.sort("), head.index("resolve_mergeability("),
+                        "sorted after the list was already walked")
+
+        prs = [{"number": n} for n in (90, 89, 88, 87, 86, 76, 71, 55)]   # gh's real order
+        prs.sort(key=lambda p: p["number"])
+        self.assertEqual([p["number"] for p in prs], [55, 71, 76, 86, 87, 88, 89, 90])
+
+        # The winner is still the fastest, not the oldest.
+        bot = self._bot()
+        results = [(55, {"tps": 21.0}), (90, {"tps": 26.0})]
+        self.assertEqual(max(results, key=lambda r: r[1]["tps"])[0], 90,
+                         "ordering leaked into the merge decision")
+        self.assertIn("ranked = sorted(results", src)
+
     # ---- #81: a regression was merged as "the round's largest verified gain" -------------
     def test_eval_none_is_not_a_passing_tier(self):
         """merge_blockers accepted any label starting with 'eval:' as proof of passing.
@@ -2385,6 +2447,81 @@ class CiWorkflowTest(unittest.TestCase):
         main = src[src.index("prs = list_prs("):]
         self.assertLess(main.index("resolve_mergeability("), main.index("if args.list:"),
                         "mergeability must be settled before anything reads it")
+
+    def test_the_first_bench_on_a_fresh_box_does_not_set_the_frontier(self):
+        """The bot measures main FIRST, so the run that pays to pull 554 GiB off disk into
+        page cache is the one that sets the frontier -- and an understated frontier makes
+        every PR in that round look better than it is. On this box: first bench loads in
+        40.27 s, the next four in 33.25-33.49 s.
+
+        Warms by READING THE WEIGHTS, not by running the bench: the cause is page cache, and
+        a throwaway bench run would spend 8 GPUs and risk the cudaMalloc race settle_gpus
+        exists for, to fix a disk problem.
+
+        Exercises the real function extracted from the harness."""
+        import tempfile, stat as _stat
+        ev = (ROOT / "bench/scripts/kimi_k3_eval.sh").read_text()
+        fn = ev[ev.index("warm_page_cache() {"):]
+        fn = fn[:fn.index("\n}\n") + 3]
+        self.assertIn("dd if=", fn, "warming no longer reads the weights")
+        self.assertNotIn("$BENCH", fn, "warming must not run the bench — that is 8 GPUs")
+
+        d = Path(tempfile.mkdtemp())
+        models = d / "models"
+        models.mkdir()
+        for i in (1, 2):
+            (models / f"m-0000{i}-of-00002.gguf").write_bytes(b"x" * 4096)
+        marker = d / "marker"
+
+        def run(extra_env=None, path_prefix=None, model=None):
+            script = d / "w.sh"
+            script.write_text(
+                "set -euo pipefail\n"
+                f'MODEL="{model or models / "m-00001-of-00002.gguf"}"\n'
+                + fn + "\nwarm_page_cache\necho SURVIVED\n")
+            env = dict(os.environ, KIMI_K3_WARM_MARKER=str(marker))
+            if path_prefix:
+                env["PATH"] = f"{path_prefix}:{env['PATH']}"
+            env.update(extra_env or {})
+            return subprocess.run(["bash", str(script)], capture_output=True, text=True,
+                                  env=env)
+
+        r = run()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("warming the page cache", r.stderr)
+        self.assertTrue(marker.exists(), "no marker — it would re-warm on every eval")
+
+        # Once per box, not per eval: the second call must be silent.
+        r = run()
+        self.assertNotIn("warming the page cache", r.stderr,
+                         "re-warmed with the marker present — that is 35 s per eval")
+
+        # Weights bigger than RAM: warming would evict what IS cached. Skip and say so.
+        marker.unlink()
+        stub = d / "stub"
+        stub.mkdir()
+        du = stub / "du"
+        du.write_text('#!/bin/bash\necho "999999999999\t/fake"\n')
+        du.chmod(du.stat().st_mode | _stat.S_IEXEC)
+        r = run(path_prefix=str(stub))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("exceed RAM", r.stderr)
+        self.assertNotIn("warming the page cache", r.stderr)
+        self.assertTrue(marker.exists(), "would re-probe every eval")
+
+        # A failed warm-up must never fail an eval — it optimises the measurement, it is
+        # not part of it.
+        marker.unlink()
+        r = run(model="/nonexistent/dir/m-00001-of-00002.gguf")
+        self.assertEqual(r.returncode, 0, f"an unreadable weights dir failed the eval\n{r.stderr}")
+        self.assertIn("SURVIVED", r.stdout)
+
+        # And an operator can turn it off outright.
+        marker.unlink()
+        r = run(extra_env={"KIMI_K3_NO_WARM": "1"})
+        self.assertEqual(r.returncode, 0)
+        self.assertNotIn("warming the page cache", r.stderr)
+        self.assertFalse(marker.exists(), "the kill switch still wrote a marker")
 
     def test_settle_gpus_cannot_kill_the_eval_it_exists_to_protect(self):
         """settle_gpus waits for the driver to reclaim ~1.1 TiB between the two timed runs,
