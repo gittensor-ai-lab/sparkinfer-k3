@@ -27,6 +27,65 @@ void add_err(std::ostringstream& os, bool& any, const std::string& msg) {
 
 }  // namespace
 
+int k3_default_moe_expert_groups(int tp_size) {
+    return tp_size >= 4 ? 2 : 1;
+}
+
+ShardError moe_2d_dims(int n_experts, int moe_ffn, int tp_size, int rank,
+                       int expert_groups, int block_elems, ShardDims* d) {
+    if (!d) return ShardError{"moe_2d_dims: null out"};
+    if (tp_size <= 0) return ShardError{"moe_2d_dims: tp_size must be >= 1"};
+    if (rank < 0 || rank >= tp_size) return ShardError{"moe_2d_dims: rank out of range"};
+
+    // eg == 1 is the identity. Leave every field alone, including moe_2d, so the
+    // caller's existing whole-expert band survives untouched.
+    if (expert_groups == 1) return ShardError{};
+
+    std::ostringstream os;
+    if (expert_groups < 1 || expert_groups > tp_size) {
+        os << "expert_groups=" << expert_groups << " outside [1," << tp_size << "]";
+        return ShardError{os.str()};
+    }
+    if (tp_size % expert_groups != 0) {
+        os << "expert_groups=" << expert_groups << " does not divide tp_size=" << tp_size;
+        return ShardError{os.str()};
+    }
+    const int fs = tp_size / expert_groups;
+    if (!divisible(n_experts, expert_groups)) {
+        os << "n_experts=" << n_experts << " not divisible by expert_groups="
+           << expert_groups;
+        return ShardError{os.str()};
+    }
+    if (!divisible(moe_ffn, fs)) {
+        os << "moe_ffn=" << moe_ffn << " not divisible by ffn_shards=" << fs;
+        return ShardError{os.str()};
+    }
+    // THE CUT MUST LAND ON A QUANT BLOCK. The FFN width is ne0 of ffn_down_exps,
+    // and ne0 is the axis blocks tile — so an fs that splits it mid-block would
+    // hand a rank half a block: a scale with no codepoints, which dequantises to
+    // noise rather than failing. weight_residency refuses that at plan time, but
+    // refusing it HERE names the actual cause (the group count) instead of
+    // surfacing as NotBlockAligned on a tensor the caller did not choose.
+    // block_elems <= 0 means "caller has no quantised down tensor" — skip.
+    if (block_elems > 0 && (moe_ffn / fs) % block_elems != 0) {
+        os << "ffn shard width " << (moe_ffn / fs) << " is not a multiple of the "
+           << block_elems << "-element quant block";
+        return ShardError{os.str()};
+    }
+
+    d->moe_2d = true;
+    d->moe_expert_groups = expert_groups;
+    d->moe_ffn_shards = fs;
+    d->expert_band = even_band(n_experts, expert_groups, rank / fs);
+    d->n_experts = d->expert_band.extent;
+    d->experts_sharded = true;
+    d->moe_ffn_band = even_band(moe_ffn, fs, rank % fs);
+    d->moe_ffn = d->moe_ffn_band.extent;
+    d->moe_ffn_total = moe_ffn;
+    d->n_experts_total = n_experts;
+    return ShardError{};
+}
+
 ShardError shard_dims(const ModelShape& shape, const Config& cfg, int rank,
                       ShardDims* out) {
     std::ostringstream os;

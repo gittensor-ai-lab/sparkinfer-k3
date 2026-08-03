@@ -200,6 +200,10 @@ bool kimi_k3_tp_init(const GGUF& g, const KimiK3Config& cfg, const K3PlanOptions
     // own failure mode (pinning tens of GiB can starve the host).
     std::vector<std::string> rank_err((size_t)tp_size);
     std::vector<std::string> rank_log((size_t)tp_size);
+    // Why a rank fell back from the 2-D MoE default to whole-expert sharding. Buffered
+    // like rank_log so eight ranks do not interleave mid-line, and reported rather than
+    // swallowed: a silent fallback is a silent perf cliff.
+    std::vector<std::string> moe_2d_note((size_t)tp_size);
 
     auto load_rank = [&](int r) -> bool {
         KimiK3TPRank& R = out.ranks[(size_t)r];
@@ -261,6 +265,47 @@ bool kimi_k3_tp_init(const GGUF& g, const KimiK3Config& cfg, const K3PlanOptions
         R.weights.shard.expert_band = tp_size > 1
             ? tp::even_band(cfg.n_experts, tp_size, r)
             : tp::Band{0, cfg.n_experts};
+        R.weights.shard.moe_ffn_total = cfg.moe_ffn;
+
+        // 2-D MoE: SPARKINFER_K3_MOE_2D = number of EXPERT GROUPS. Read once per rank
+        // here so the weights, the state and the kernels all derive their geometry
+        // from this single ShardDims — see moe_2d_dims.
+        //
+        // ON BY DEFAULT, AND THAT IS THE POINT. As an opt-in env flag this was
+        // unmeasurable: the eval builds the tree and runs the bench, it does not set
+        // anything, so it scored the whole-expert path and reported the change as
+        // 0.1% over frontier. A perf change that the harness cannot reach is not a
+        // perf change. Set the variable to 0 or 1 to get the old sharding back.
+        bool moe_2d_explicit = false;
+        int  moe_2d_groups   = tp::k3_default_moe_expert_groups(tp_size);
+        if (const char* e = std::getenv("SPARKINFER_K3_MOE_2D")) {
+            if (e[0]) {
+                moe_2d_explicit = true;
+                moe_2d_groups   = std::atoi(e);
+                if (moe_2d_groups < 1) moe_2d_groups = 1;
+            }
+        }
+        if (tp_size > 1 && moe_2d_groups > 1) {
+            // 256 is the K-quant block every K3 expert tensor uses; a coarser block
+            // than the tensor's own only makes the check stricter, never wrong.
+            const tp::ShardError se =
+                tp::moe_2d_dims(cfg.n_experts, cfg.moe_ffn, tp_size, r,
+                                moe_2d_groups, /*block_elems=*/256, &R.weights.shard);
+            if (!se.ok()) {
+                // ASKED FOR: hard error. CHOSEN FOR YOU: fall back.
+                //
+                // Now that this is a default, a shape whose experts or ffn width do
+                // not divide must still LOAD — refusing would turn a tuning default
+                // into a portability regression for a config that works today.
+                // moe_2d_dims validates before it writes, so the ShardDims still
+                // holds the whole-expert band and the fallback is simply to use it.
+                if (moe_2d_explicit) {
+                    rank_err[(size_t)r] = "2-D MoE: " + se.message;
+                    return false;
+                }
+                moe_2d_note[(size_t)r] = se.message;
+            }
+        }
 
         if (!kimi_k3_load_weights(g, cfg, opt, R.weights, 0, cfg.n_layers - 1)) {
             rank_err[(size_t)r] = "weight load failed";
@@ -303,10 +348,23 @@ bool kimi_k3_tp_init(const GGUF& g, const KimiK3Config& cfg, const K3PlanOptions
 
         // Buffered, not printed: eight ranks writing stderr concurrently interleaves
         // mid-line. Emitted in rank order after the join so the log reads as before.
-        char line[160];
-        std::snprintf(line, sizeof(line), "[k3-tp] rank %d: device %d, experts [%d,%d)\n",
-                      r, R.device, R.weights.shard.expert_band.offset,
-                      R.weights.shard.expert_band.end());
+        char line[220];
+        if (R.weights.shard.moe_2d) {
+            std::snprintf(line, sizeof(line),
+                          "[k3-tp] rank %d: device %d, experts [%d,%d), ffn [%d,%d) "
+                          "(2-D MoE %dx%d)\n",
+                          r, R.device, R.weights.shard.expert_band.offset,
+                          R.weights.shard.expert_band.end(),
+                          R.weights.shard.moe_ffn_band.offset,
+                          R.weights.shard.moe_ffn_band.end(),
+                          R.weights.shard.moe_expert_groups,
+                          R.weights.shard.moe_ffn_shards);
+        } else {
+            std::snprintf(line, sizeof(line),
+                          "[k3-tp] rank %d: device %d, experts [%d,%d)\n",
+                          r, R.device, R.weights.shard.expert_band.offset,
+                          R.weights.shard.expert_band.end());
+        }
         rank_log[(size_t)r] = line;
         return true;
     };
@@ -331,6 +389,11 @@ bool kimi_k3_tp_init(const GGUF& g, const KimiK3Config& cfg, const K3PlanOptions
     for (int r = 0; r < tp_size; ++r) {
         if (!rank_log[(size_t)r].empty()) std::fputs(rank_log[(size_t)r].c_str(), stderr);
     }
+    // Once per model, not once per rank: every rank derives the same answer from the
+    // same shape, so eight identical lines would only bury it.
+    if (!moe_2d_note[0].empty())
+        std::fprintf(stderr, "[k3-tp] 2-D MoE off (whole-expert sharding): %s\n",
+                     moe_2d_note[0].c_str());
     // Report EVERY failed rank, not just the first. With eight concurrent loads the
     // interesting case is "ranks 4-7 ran out of memory", and stopping at the first hides
     // whether one device is sick or the whole box is short.

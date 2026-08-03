@@ -98,6 +98,34 @@ struct ShardDims {
     int moe_ffn = 0;              // per-expert intermediate width, if ffn-sharded
     bool experts_sharded = false; // false => experts replicated, ffn sharded instead
 
+    // ---- 2-D MoE: expert groups x FFN band --------------------------------
+    //
+    // WHY A SECOND AXIS. Whole-expert sharding puts 896/tp_size experts on a rank,
+    // and the router picks top_k=16 GLOBAL ids per token. At tp=8 a rank owns an
+    // expected 2 of those 16, but the layer cannot finish until the BUSIEST rank
+    // does, and the expected busiest of 8 bins holding 16 balls is ~4.2. So the
+    // critical path is ~2.1x the average and 6 of 8 ranks idle at the barrier.
+    //
+    // Splitting the experts over FEWER, FATTER groups makes the imbalance smaller
+    // (2 bins of 16 balls: expected busiest ~9.57, i.e. 1.20x the mean) and pays
+    // for the lost parallelism on the FFN axis, which is perfectly balanced because
+    // it is a fixed width. Busiest-group work becomes 9.57 experts x (3072/fs) rows
+    // against 4.2 x 3072 — at eg=2, fs=4 that is 0.57x the critical-path work.
+    //
+    // This is legal for exactly the reason the SHARED expert is already banded this
+    // way (see kimi_k3.cpp): gate/up row-shard, situ is elementwise and preserves
+    // the band, down col-shards over the same band, so each rank ends up with a
+    // full-width PARTIAL that the existing expert all-reduce already sums. No new
+    // collective, no change to its width or count.
+    //
+    // eg * fs must equal tp_size. rank -> (group, shard) is group = rank / fs,
+    // shard = rank % fs, so the fs ranks of a group are adjacent — they read the
+    // same expert weights and are the ranks most likely to share a node.
+    bool moe_2d = false;
+    int  moe_expert_groups = 1;   // eg: how many ways the EXPERT axis splits
+    int  moe_ffn_shards    = 1;   // fs: how many ways each expert's FFN width splits
+    Band moe_ffn_band;            // this rank's band of the per-expert FFN width
+
     // Dense FFN (Qwythos / dense_ffn configs): always ffn-width sharded.
     int dense_ffn_total = 0;
     int dense_ffn = 0;
@@ -145,6 +173,36 @@ struct ModelShape {
 // keys at all on most ranks.
 ShardError shard_dims(const ModelShape& shape, const Config& cfg, int rank,
                       ShardDims* out);
+
+// Fill in the 2-D MoE fields of `d` (see ShardDims) for `rank`.
+//
+// `expert_groups` == 1 is the identity: it leaves moe_2d false and does not touch
+// expert_band, so whole-expert sharding is bit-for-bit the path it always was.
+// That is deliberate — the run-time switch must not have a second code path to
+// keep correct, only a different band.
+//
+// Every rejection is a message rather than a clamp. A shape that does not divide
+// cannot be rounded into one: an eg that does not divide n_experts would give
+// ranks different expert counts, and an fs that does not divide moe_ffn would
+// give them different FFN widths — either one makes the per-rank kernel geometry
+// and therefore the graph capture differ per rank, which is the failure this
+// header's even_band comment already refuses for tp_size.
+ShardError moe_2d_dims(int n_experts, int moe_ffn, int tp_size, int rank,
+                       int expert_groups, int block_elems, ShardDims* d);
+
+// The expert-group count to use when nobody asked for one.
+//
+// TWO GROUPS, NOT MORE, AND ONLY ONCE THERE ARE RANKS TO SPARE. The two costs move in
+// opposite directions: fewer groups balance the router's top_k better (the busiest of
+// eg bins holding top_k balls falls fast as eg shrinks), while more FFN shards make
+// each rank's slice narrower and the fixed per-rank work — the down combine's
+// latent-sized grid — a larger share of it. eg=2 is where those crossed when measured
+// at tp=8 on 8x H200: 34.76 ms/token against 36.01 at eg=4 and 38.31 whole-expert.
+//
+// Below tp_size 4 there is nothing to gain: eg=2 would leave fs=1, which is
+// whole-expert sharding with extra bookkeeping. Returning 1 there keeps the default
+// path identical to today's for small deployments rather than merely equivalent.
+int k3_default_moe_expert_groups(int tp_size);
 
 // ---------------------------------------------------------------------------
 // Weight slicing
