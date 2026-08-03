@@ -2416,6 +2416,81 @@ class CiWorkflowTest(unittest.TestCase):
         self.assertLess(main.index("resolve_mergeability("), main.index("if args.list:"),
                         "mergeability must be settled before anything reads it")
 
+    def test_the_first_bench_on_a_fresh_box_does_not_set_the_frontier(self):
+        """The bot measures main FIRST, so the run that pays to pull 554 GiB off disk into
+        page cache is the one that sets the frontier -- and an understated frontier makes
+        every PR in that round look better than it is. On this box: first bench loads in
+        40.27 s, the next four in 33.25-33.49 s.
+
+        Warms by READING THE WEIGHTS, not by running the bench: the cause is page cache, and
+        a throwaway bench run would spend 8 GPUs and risk the cudaMalloc race settle_gpus
+        exists for, to fix a disk problem.
+
+        Exercises the real function extracted from the harness."""
+        import tempfile, stat as _stat
+        ev = (ROOT / "bench/scripts/kimi_k3_eval.sh").read_text()
+        fn = ev[ev.index("warm_page_cache() {"):]
+        fn = fn[:fn.index("\n}\n") + 3]
+        self.assertIn("dd if=", fn, "warming no longer reads the weights")
+        self.assertNotIn("$BENCH", fn, "warming must not run the bench — that is 8 GPUs")
+
+        d = Path(tempfile.mkdtemp())
+        models = d / "models"
+        models.mkdir()
+        for i in (1, 2):
+            (models / f"m-0000{i}-of-00002.gguf").write_bytes(b"x" * 4096)
+        marker = d / "marker"
+
+        def run(extra_env=None, path_prefix=None, model=None):
+            script = d / "w.sh"
+            script.write_text(
+                "set -euo pipefail\n"
+                f'MODEL="{model or models / "m-00001-of-00002.gguf"}"\n'
+                + fn + "\nwarm_page_cache\necho SURVIVED\n")
+            env = dict(os.environ, KIMI_K3_WARM_MARKER=str(marker))
+            if path_prefix:
+                env["PATH"] = f"{path_prefix}:{env['PATH']}"
+            env.update(extra_env or {})
+            return subprocess.run(["bash", str(script)], capture_output=True, text=True,
+                                  env=env)
+
+        r = run()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("warming the page cache", r.stderr)
+        self.assertTrue(marker.exists(), "no marker — it would re-warm on every eval")
+
+        # Once per box, not per eval: the second call must be silent.
+        r = run()
+        self.assertNotIn("warming the page cache", r.stderr,
+                         "re-warmed with the marker present — that is 35 s per eval")
+
+        # Weights bigger than RAM: warming would evict what IS cached. Skip and say so.
+        marker.unlink()
+        stub = d / "stub"
+        stub.mkdir()
+        du = stub / "du"
+        du.write_text('#!/bin/bash\necho "999999999999\t/fake"\n')
+        du.chmod(du.stat().st_mode | _stat.S_IEXEC)
+        r = run(path_prefix=str(stub))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("exceed RAM", r.stderr)
+        self.assertNotIn("warming the page cache", r.stderr)
+        self.assertTrue(marker.exists(), "would re-probe every eval")
+
+        # A failed warm-up must never fail an eval — it optimises the measurement, it is
+        # not part of it.
+        marker.unlink()
+        r = run(model="/nonexistent/dir/m-00001-of-00002.gguf")
+        self.assertEqual(r.returncode, 0, f"an unreadable weights dir failed the eval\n{r.stderr}")
+        self.assertIn("SURVIVED", r.stdout)
+
+        # And an operator can turn it off outright.
+        marker.unlink()
+        r = run(extra_env={"KIMI_K3_NO_WARM": "1"})
+        self.assertEqual(r.returncode, 0)
+        self.assertNotIn("warming the page cache", r.stderr)
+        self.assertFalse(marker.exists(), "the kill switch still wrote a marker")
+
     def test_settle_gpus_cannot_kill_the_eval_it_exists_to_protect(self):
         """settle_gpus waits for the driver to reclaim ~1.1 TiB between the two timed runs,
         because a run that starts too early dies in cudaMalloc and costs the PR its whole
