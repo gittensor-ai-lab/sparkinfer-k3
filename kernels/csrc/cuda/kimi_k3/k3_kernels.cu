@@ -12,6 +12,8 @@
 #include "sparkinfer/kernels/iq2xs_tables.h"
 #include <climits>   // INT_MAX — the "no expert band" sentinel
 #include "sparkinfer/kernels/iq1s_tables.h"
+#include "k3_pdl.cuh"
+#include "sparkinfer/kernels/kimi_k3_fast.h"
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -59,6 +61,7 @@ __global__ void situ_kernel(float* __restrict__ out, const float* __restrict__ g
                             const float* __restrict__ up, int64_t n,
                             float beta, float inv_beta, float lb, float inv_lb,
                             int lb_active) {
+    k3_pdl_sync();
     const int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
     if (i >= n) return;
     const float g = gate[i];
@@ -114,6 +117,7 @@ __global__ void kda_decode_step_smem_kernel(float* __restrict__ out,
                                             const float* __restrict__ g,
                                             const float* __restrict__ beta,
                                             int head_dim) {
+    k3_pdl_sync();
     constexpr int IC = 32;                  // state columns staged per chunk
     const int SP = IC + 1;                  // padded row stride, kills bank conflicts
     const int h = blockIdx.x;
@@ -221,6 +225,7 @@ __global__ void kda_decode_step_vt_kernel(float* __restrict__ out,
                                           const float* __restrict__ g,
                                           const float* __restrict__ beta,
                                           int head_dim) {
+    k3_pdl_sync();
     constexpr int IC = 32;
     const int SP = IC + 1;
     const int h  = blockIdx.x;
@@ -311,6 +316,7 @@ __global__ void kda_decode_step_kernel(float* __restrict__ out, float* __restric
                                        const float* __restrict__ g,
                                        const float* __restrict__ beta,
                                        int head_dim) {
+    k3_pdl_sync();
     const int h = blockIdx.x;
     const int j = threadIdx.x;
     if (j >= head_dim) return;
@@ -399,6 +405,7 @@ __global__ void kda_gate_out_kernel(float* __restrict__ out, const float* __rest
                                     const float* __restrict__ norm_w,
                                     const float* __restrict__ g2,
                                     int head_dim, float eps) {
+    k3_pdl_sync();
     const int h = blockIdx.x;
     const float* oh = o + (size_t)h * head_dim;
     const float* gh = g2 + (size_t)h * head_dim;
@@ -461,6 +468,7 @@ __global__ void attn_res_score_kernel(float* __restrict__ scores,
                                       const float* __restrict__ cur,
                                       const float* __restrict__ score_w,
                                       int n_embd, int n_ckpt, float eps) {
+    k3_pdl_sync();
     __shared__ float shm[BLOCK / 32 + 1];
     // blockIdx.x in [0, n_ckpt]: the last block scores the current stream, which is
     // the only thing that made pass 1 look sequential.
@@ -484,6 +492,7 @@ __global__ void attn_res_apply_kernel(float* __restrict__ out,
                                       const float* __restrict__ cur,
                                       const float* __restrict__ scores,
                                       int n_embd, int n_ckpt) {
+    k3_pdl_sync();
     extern __shared__ float p[];              // n_ckpt + 1 softmax weights
 
     if (threadIdx.x == 0) {
@@ -515,6 +524,7 @@ __global__ void kda_conv_step_kernel(float* __restrict__ out, float* __restrict_
                                      const float* __restrict__ x,
                                      const float* __restrict__ w,
                                      int d_conv, int d_inner) {
+    k3_pdl_sync();
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= d_inner) return;
 
@@ -595,6 +605,7 @@ static_assert(sizeof(BlockQ8K) == 292, "bad block_q8_K layout");
 __global__ void dequant_iq2_xs_kernel(float* __restrict__ out,
                                       const BlockIQ2XS* __restrict__ blocks,
                                       int64_t n_groups) {
+    k3_pdl_sync();
     const int64_t g = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;  // 8-value group
     if (g >= n_groups) return;
 
@@ -630,6 +641,7 @@ __global__ void dequant_iq2_xs_kernel(float* __restrict__ out,
 __global__ void dequant_iq1_s_kernel(float* __restrict__ out,
                                      const BlockIQ1S* __restrict__ blocks,
                                      int64_t n_groups) {
+    k3_pdl_sync();
     const int64_t g = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
     if (g >= n_groups) return;
 
@@ -667,6 +679,7 @@ __global__ void moe_router_noaux_tc_kernel(float* __restrict__ out_w,
                                            const float* __restrict__ bias,
                                            int n_expert, int top_k,
                                            bool norm_w, float w_scale) {
+    k3_pdl_sync();
     const int tok = blockIdx.x;
     const float* lg = logits + (size_t)tok * n_expert;
     float* w   = out_w   + (size_t)tok * top_k;
@@ -906,6 +919,7 @@ __global__ void moe_gate_up_situ_kernel(float* __restrict__ scratch,
                                         float beta, float inv_beta,
                                         float lb, float inv_lb, int lb_active,
                                         int expert_begin, int n_local_experts) {
+    k3_pdl_sync();
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
     const int k = blockIdx.y;                                  // which selected expert
@@ -979,6 +993,7 @@ __global__ void moe_down_combine_kernel(float* __restrict__ out,
                                         const Blk* __restrict__ down_exps,
                                         int latent, int ffn, int top_k,
                                         int expert_begin, int n_local_experts) {
+    k3_pdl_sync();
     const int o = blockIdx.x;                 // output element in [0, latent)
     if (o >= latent) return;
     const int lane = threadIdx.x & 31;
@@ -1025,6 +1040,7 @@ __global__ void moe_gate_up_situ_q8k_kernel(float* __restrict__ scratch,
                                             float beta, float inv_beta,
                                             float lb, float inv_lb, int lb_active,
                                             int expert_begin, int n_local_experts) {
+    k3_pdl_sync();
     const int k = blockIdx.y;
     const int j = blockIdx.x;
     if (j >= ffn) return;
@@ -1056,6 +1072,7 @@ __global__ void moe_down_combine_q8k_kernel(float* __restrict__ out,
                                             const Blk* __restrict__ down_exps,
                                             int latent, int ffn, int top_k,
                                             int expert_begin, int n_local_experts) {
+    k3_pdl_sync();
     const int o = blockIdx.x;
     if (o >= latent) return;
     const int blocks_per_row = ffn / 256;
@@ -1080,6 +1097,7 @@ __global__ void moe_down_combine_q8k_kernel(float* __restrict__ out,
 __global__ void mla_gate_out_kernel(float* __restrict__ out,
                                     const float* __restrict__ attn_out,
                                     const float* __restrict__ gate_proj, int64_t n) {
+    k3_pdl_sync();
     const int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
     if (i >= n) return;
     out[i] = attn_out[i] * sigmoidf_(gate_proj[i]);
@@ -1094,6 +1112,7 @@ __global__ void kda_decay_gate_kernel(float* __restrict__ out,
                                       const float* __restrict__ g_raw,
                                       const float* __restrict__ A,
                                       int head_dim, float lower_bound) {
+    k3_pdl_sync();
     const int h = blockIdx.x;
     const int d = threadIdx.x;
     if (d >= head_dim) return;
@@ -1111,6 +1130,7 @@ template <int BLOCK>
 __global__ void l2_norm_heads_kernel(float* __restrict__ out,
                                      const float* __restrict__ x,
                                      int head_dim, float scale, float eps) {
+    k3_pdl_sync();
     const int h = blockIdx.x;
     const float* xh = x + (size_t)h * head_dim;
     float* oh = out + (size_t)h * head_dim;
@@ -1138,6 +1158,7 @@ __global__ void mla_absorb_q_kernel(float* __restrict__ out,
                                     const float* __restrict__ q_pe,
                                     const float* __restrict__ wk_b,
                                     int qk_nope, int kv_lora, int rope_dim) {
+    k3_pdl_sync();
     const int h = blockIdx.y;
     const int r = blockIdx.x;   // kv_lora index
     if (r >= kv_lora) return;
@@ -1525,6 +1546,7 @@ __global__ void mla_decode_attn_kernel(float* __restrict__ out,
                                        const float* __restrict__ wv_b,
                                        int key_length, int kv_lora, int v_dim,
                                        const int* __restrict__ d_pos, float scale) {
+    k3_pdl_sync();
     // LENGTH COMES FROM DEVICE MEMORY, NOT FROM A KERNEL ARGUMENT.
     //
     // A captured graph freezes its arguments. Passing position+1 by value meant every
@@ -1662,6 +1684,7 @@ __device__ __forceinline__ int get_int_b2(const int8_t* __restrict__ qs, int i32
 // deceptively close.
 __global__ void quantize_q8_0_kernel(BlockQ8_0* __restrict__ out,
                                      const float* __restrict__ x, int n_blocks) {
+    k3_pdl_sync();
     const int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= n_blocks) return;
     const float* xb = x + (size_t)b * 32;
@@ -1679,6 +1702,7 @@ __global__ void quantize_q8_0_kernel(BlockQ8_0* __restrict__ out,
 __global__ void quantize_q8_k_kernel(BlockQ8K* __restrict__ out,
                                      const float* __restrict__ x,
                                      int blocks_per_row, int n_rows) {
+    k3_pdl_sync();
     const int bi = blockIdx.x * blockDim.x + threadIdx.x;
     const int n_blocks = blocks_per_row * n_rows;
     if (bi >= n_blocks) return;
@@ -1741,6 +1765,7 @@ __global__ void mla_decode_attn_split_kernel(float* __restrict__ part_acc,
                                              int key_length, int kv_lora,
                                              const int* __restrict__ d_pos,
                                              float scale, int splits) {
+    k3_pdl_sync();
     // Device-read length; see mla_decode_attn_kernel. `splits` stays a launch-time
     // constant because it sizes the GRID, which a captured graph cannot change — the
     // driver re-captures instead when the plan moves (k3_mla_decode_plan).
@@ -1856,6 +1881,7 @@ __global__ void mla_decode_attn_hbatch_kernel(float* __restrict__ part_acc,
                                               int key_length, int kv_lora,
                                               const int* __restrict__ d_pos,
                                               float scale, int splits) {
+    k3_pdl_sync();
     // Device-read length; see mla_decode_attn_kernel.
     const int n_ctx = *d_pos + 1;   // d_pos is the ROW INDEX; the length is one more
     constexpr int NWARP = BLOCK / 32;
@@ -2029,6 +2055,7 @@ __global__ void mla_decode_combine_kernel(float* __restrict__ out,
                                           const float* __restrict__ part_ml,
                                           const float* __restrict__ wv_b,
                                           int kv_lora, int v_dim, int splits) {
+    k3_pdl_sync();
     constexpr int NWARP = BLOCK / 32;
     const int h    = blockIdx.x;
     const int lane = threadIdx.x & 31;
@@ -2108,6 +2135,7 @@ __global__ void mla_decode_merge_kernel(float* __restrict__ merged,
                                         const float* __restrict__ part_acc,
                                         const float* __restrict__ part_ml,
                                         int kv_lora, int splits) {
+    k3_pdl_sync();
     const int h  = blockIdx.x;
     const int rc = blockIdx.y;
     extern __shared__ float smem[];
@@ -2144,6 +2172,7 @@ __global__ void mla_decode_project_kernel(float* __restrict__ out,
                                           const float* __restrict__ merged,
                                           const float* __restrict__ wv_b,
                                           int kv_lora, int v_dim) {
+    k3_pdl_sync();
     constexpr int NWARP = BLOCK / 32;
     const int h    = blockIdx.x;
     const int vc   = blockIdx.y;
@@ -2186,21 +2215,22 @@ static void k3_mla_launch_combine(float* out, int dev, const float* wv_b, int n_
                                   int kv_lora, int v_dim, int splits, cudaStream_t stream) {
     if (k3_mla_wide_combine() && g_mla_merged[dev] != nullptr) {
         dim3 mg((unsigned)n_head, (unsigned)kMlaCombineRChunks);
-        mla_decode_merge_kernel<BLOCK><<<mg, BLOCK, ((size_t)splits + 1) * sizeof(float), stream>>>(
+        k3_pdl_launch(mg, BLOCK, ((size_t)splits + 1) * sizeof(float), stream, mla_decode_merge_kernel<BLOCK>, 
             g_mla_merged[dev], g_mla_part_acc[dev], g_mla_part_ml[dev], kv_lora, splits);
         dim3 pg((unsigned)n_head, (unsigned)kMlaCombineVChunks);
-        mla_decode_project_kernel<BLOCK><<<pg, BLOCK, (size_t)kv_lora * sizeof(float), stream>>>(
+        k3_pdl_launch(pg, BLOCK, (size_t)kv_lora * sizeof(float), stream, mla_decode_project_kernel<BLOCK>, 
             out, g_mla_merged[dev], wv_b, kv_lora, v_dim);
         return;
     }
     const size_t cshm = ((size_t)kv_lora + (size_t)splits + 1) * sizeof(float);
-    mla_decode_combine_kernel<BLOCK><<<(unsigned)n_head, BLOCK, cshm, stream>>>(
+    k3_pdl_launch((unsigned)n_head, BLOCK, cshm, stream, mla_decode_combine_kernel<BLOCK>, 
         out, g_mla_part_acc[dev], g_mla_part_ml[dev], wv_b, kv_lora, v_dim, splits);
 }
 
 template <int BLOCK>
 __global__ void proj_q8_0_kernel(float* __restrict__ y, const float* __restrict__ x,
                                  const BlockQ8_0* __restrict__ W, int blocks_per_row) {
+    k3_pdl_sync();
     const int n = blockIdx.x;
     const BlockQ8_0* row = W + (size_t)n * blocks_per_row;
     __shared__ float shm[BLOCK / 32 + 1];
@@ -2255,6 +2285,7 @@ __global__ void proj_q8_0_multirow_kernel(float* __restrict__ y,
                                           const float* __restrict__ x,
                                           const BlockQ8_0* __restrict__ W,
                                           int blocks_per_row, int n_rows) {
+    k3_pdl_sync();
     const int n0 = blockIdx.x * ROWS;
     __shared__ float shm[BLOCK / 32 + 1];
 
@@ -2326,6 +2357,7 @@ __global__ void proj_q8_0_fused4_kernel(float* __restrict__ y0, float* __restric
                                         const BlockQ8_0* __restrict__ W2,
                                         const BlockQ8_0* __restrict__ W3,
                                         int blocks_per_row, int n_rows) {
+    k3_pdl_sync();
     const int n0 = blockIdx.x * ROWS;
     __shared__ float shm[BLOCK / 32 + 1];
 
@@ -2390,6 +2422,7 @@ __global__ void proj_q8_0_q8_0_kernel(float* __restrict__ y,
                                       const BlockQ8_0* __restrict__ x,
                                       const BlockQ8_0* __restrict__ W,
                                       int blocks_per_row) {
+    k3_pdl_sync();
     const int n = blockIdx.x;
     const BlockQ8_0* row = W + (size_t)n * blocks_per_row;
     __shared__ float shm[BLOCK / 32 + 1];
@@ -2454,6 +2487,7 @@ __global__ void proj_q8_0_q8_0_multirow_kernel(float* __restrict__ y,
                                                const BlockQ8_0* __restrict__ x,
                                                const BlockQ8_0* __restrict__ W,
                                                int blocks_per_row, int n_rows) {
+    k3_pdl_sync();
     const int n0 = blockIdx.x * ROWS;
     __shared__ float shm[BLOCK / 32 + 1];
 
@@ -2523,6 +2557,7 @@ __global__ void proj_q8_0_q8_0_fused4_kernel(float* __restrict__ y0,
                                              const BlockQ8_0* __restrict__ W2,
                                              const BlockQ8_0* __restrict__ W3,
                                              int blocks_per_row, int n_rows) {
+    k3_pdl_sync();
     const int n0 = blockIdx.x * ROWS;
     __shared__ float shm[BLOCK / 32 + 1];
 
@@ -2576,6 +2611,7 @@ __global__ void proj_q8_0_q8_0_fused4_kernel(float* __restrict__ y0,
 __global__ void dequant_q8_0_kernel(float* __restrict__ out,
                                     const BlockQ8_0* __restrict__ blocks,
                                     int64_t n_blocks) {
+    k3_pdl_sync();
     const int64_t b = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
     if (b >= n_blocks) return;
     const float d = __half2float(__ushort_as_half(blocks[b].d));
@@ -2587,6 +2623,7 @@ __global__ void dequant_q8_0_kernel(float* __restrict__ out,
 __global__ void dequant_f32_passthrough_kernel(float* __restrict__ out,
                                                const float* __restrict__ src,
                                                int64_t n) {
+    k3_pdl_sync();
     const int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
     if (i < n) out[i] = src[i];
 }
@@ -2594,6 +2631,7 @@ __global__ void dequant_f32_passthrough_kernel(float* __restrict__ out,
 template <int BLOCK>
 __global__ void proj_f32_kernel(float* __restrict__ y, const float* __restrict__ x,
                                 const float* __restrict__ W, int K) {
+    k3_pdl_sync();
     const int n = blockIdx.x;
     const float* row = W + (size_t)n * K;
     __shared__ float shm[BLOCK / 32 + 1];
@@ -2607,11 +2645,13 @@ __global__ void proj_f32_kernel(float* __restrict__ y, const float* __restrict__
 
 __global__ void add_f32_kernel(float* __restrict__ out, const float* __restrict__ a,
                                const float* __restrict__ b, int64_t n) {
+    k3_pdl_sync();
     const int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
     if (i < n) out[i] = a[i] + b[i];
 }
 
 __global__ void sigmoid_inplace_f32_kernel(float* __restrict__ x, int64_t n) {
+    k3_pdl_sync();
     const int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
     if (i < n) x[i] = 1.0f / (1.0f + __expf(-x[i]));
 }
@@ -2629,6 +2669,7 @@ __global__ void mla_kv_store_kernel(float* __restrict__ cache,
                                     const float* __restrict__ kv_a_out,
                                     const int* __restrict__ d_pos,
                                     int kv_lora, int rope_dim, int key_length) {
+    k3_pdl_sync();
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= kv_lora + rope_dim) return;
     float* row = cache + (size_t)(*d_pos) * (size_t)key_length;
@@ -2643,6 +2684,7 @@ __global__ void bump_pos_kernel(int* __restrict__ p) { *p += 1; }
 template <int BLOCK>
 __global__ void rms_norm_kernel(float* __restrict__ out, const float* __restrict__ x,
                                 const float* __restrict__ w, int n, float eps) {
+    k3_pdl_sync();
     __shared__ float shm[BLOCK / 32 + 1];
     float acc = 0.0f;
     for (int d = threadIdx.x; d < n; d += BLOCK) acc += x[d] * x[d];
@@ -2661,7 +2703,7 @@ void situ_f32(float* out, const float* gate, const float* up, int64_t n,
     const int T = 256;
     const int64_t blocks = (n + T - 1) / T;
     const int lb_active = linear_beta > 0.0f ? 1 : 0;
-    situ_kernel<<<(unsigned)blocks, T, 0, stream>>>(
+    k3_pdl_launch((unsigned)blocks, T, 0, stream, situ_kernel, 
         out, gate, up, n, beta, 1.0f / beta, linear_beta,
         lb_active ? 1.0f / linear_beta : 1.0f, lb_active);
 }
@@ -2705,16 +2747,16 @@ void kda_decode_step_f32(float* out, float* state,
         const size_t shm_vt =
             ((size_t)3 * head_dim + (size_t)BV * (IC + 1)) * sizeof(float);
         const dim3 grid((unsigned)n_head, (unsigned)(head_dim / BV));
-        kda_decode_step_vt_kernel<BV><<<grid, BV, shm_vt, stream>>>(
+        k3_pdl_launch(grid, BV, shm_vt, stream, kda_decode_step_vt_kernel<BV>, 
             out, state, q, k, v, g, beta, head_dim);
         return;
     }
     if (head_dim == SMEM_BLOCK && head_dim % IC == 0) {
-        kda_decode_step_smem_kernel<SMEM_BLOCK><<<(unsigned)n_head, T, shm_staged, stream>>>(
+        k3_pdl_launch((unsigned)n_head, T, shm_staged, stream, kda_decode_step_smem_kernel<SMEM_BLOCK>, 
             out, state, q, k, v, g, beta, head_dim);
         return;
     }
-    kda_decode_step_kernel<128><<<(unsigned)n_head, T, shm, stream>>>(
+    k3_pdl_launch((unsigned)n_head, T, shm, stream, kda_decode_step_kernel<128>, 
         out, state, q, k, v, g, beta, head_dim);
 }
 
@@ -2722,7 +2764,7 @@ void kda_gate_out_f32(float* out, const float* o, const float* norm_w,
                       const float* g2, int head_dim, int n_head,
                       float eps, cudaStream_t stream) {
     if (head_dim <= 0 || n_head <= 0) return;
-    kda_gate_out_kernel<128><<<(unsigned)n_head, 128, 0, stream>>>(
+    k3_pdl_launch((unsigned)n_head, 128, 0, stream, kda_gate_out_kernel<128>, 
         out, o, norm_w, g2, head_dim, eps);
 }
 
@@ -2746,10 +2788,10 @@ void attn_res_mix_f32(float* out, const float* ckpts, const float* cur,
     const bool owned = (sc == nullptr);
     if (owned) cudaMallocAsync(&sc, (size_t)(n_ckpt + 1) * sizeof(float), stream);
 
-    attn_res_score_kernel<B><<<(unsigned)(n_ckpt + 1), B, 0, stream>>>(
+    k3_pdl_launch((unsigned)(n_ckpt + 1), B, 0, stream, attn_res_score_kernel<B>, 
         sc, ckpts, cur, score_w, n_embd, n_ckpt, eps);
-    attn_res_apply_kernel<B><<<(unsigned)((n_embd + B - 1) / B), B,
-                              (size_t)(n_ckpt + 1) * sizeof(float), stream>>>(
+    k3_pdl_launch((unsigned)((n_embd + B - 1) / B), B,
+                              (size_t)(n_ckpt + 1) * sizeof(float), stream, attn_res_apply_kernel<B>, 
         out, ckpts, cur, sc, n_embd, n_ckpt);
 
     if (owned) cudaFreeAsync(sc, stream);
@@ -2760,7 +2802,7 @@ void kda_conv_step_f32(float* out, float* state, const float* x, const float* w,
     if (d_conv < 2 || d_inner <= 0) return;
     const int T = 256;
     const int blocks = (d_inner + T - 1) / T;
-    kda_conv_step_kernel<<<(unsigned)blocks, T, 0, stream>>>(out, state, x, w, d_conv, d_inner);
+    k3_pdl_launch((unsigned)blocks, T, 0, stream, kda_conv_step_kernel, out, state, x, w, d_conv, d_inner);
 }
 
 // Upload the lattice/sign tables once. __device__ (NOT __constant__) is the right
@@ -2840,7 +2882,7 @@ void dequant_iq2_xs_f32(float* out, const void* src, int64_t n, cudaStream_t str
     const int64_t n_groups = n / 8;
     const int T = 256;
     const int64_t blocks = (n_groups + T - 1) / T;
-    dequant_iq2_xs_kernel<<<(unsigned)blocks, T, 0, stream>>>(
+    k3_pdl_launch((unsigned)blocks, T, 0, stream, dequant_iq2_xs_kernel, 
         out, (const BlockIQ2XS*)src, n_groups);
 }
 
@@ -2852,7 +2894,7 @@ void moe_router_noaux_tc_f32(float* out_w, int* out_ids, const float* logits,
     if (top_k > n_expert) return;
     const int T = 256;
     const size_t shm = (size_t)2 * n_expert * sizeof(float);
-    moe_router_noaux_tc_kernel<256><<<(unsigned)n_tokens, T, shm, stream>>>(
+    k3_pdl_launch((unsigned)n_tokens, T, shm, stream, moe_router_noaux_tc_kernel<256>, 
         out_w, out_ids, logits, bias, n_expert, top_k, norm_w, w_scale);
 }
 
@@ -2890,21 +2932,19 @@ static void moe_expert_ffn_launch(float* out, float* scratch,
     const float inv_lb = lb_active ? 1.0f / situ_linear_beta : 1.0f;
 
     if (xvec) {
-        moe_gate_up_situ_kernel<WARPS, true, Blk><<<g1, WARPS * 32, 0, stream>>>(
+        k3_pdl_launch(g1, WARPS * 32, 0, stream, moe_gate_up_situ_kernel<WARPS, true, Blk>, 
             scratch, x, ids, (const Blk*)gate_exps, (const Blk*)up_exps, latent, ffn,
             situ_beta, 1.0f / situ_beta, situ_linear_beta, inv_lb, lb_active,
             expert_begin, n_local);
-        moe_down_combine_kernel<WARPS, true, Blk>
-            <<<(unsigned)latent, WARPS * 32, dshm, stream>>>(
+        k3_pdl_launch((unsigned)latent, WARPS * 32, dshm, stream, moe_down_combine_kernel<WARPS, true, Blk>, 
                 out, scratch, ids, w, (const Blk*)down_exps, latent, ffn, top_k,
                 expert_begin, n_local);
     } else {
-        moe_gate_up_situ_kernel<WARPS, false, Blk><<<g1, WARPS * 32, 0, stream>>>(
+        k3_pdl_launch(g1, WARPS * 32, 0, stream, moe_gate_up_situ_kernel<WARPS, false, Blk>, 
             scratch, x, ids, (const Blk*)gate_exps, (const Blk*)up_exps, latent, ffn,
             situ_beta, 1.0f / situ_beta, situ_linear_beta, inv_lb, lb_active,
             expert_begin, n_local);
-        moe_down_combine_kernel<WARPS, false, Blk>
-            <<<(unsigned)latent, WARPS * 32, dshm, stream>>>(
+        k3_pdl_launch((unsigned)latent, WARPS * 32, dshm, stream, moe_down_combine_kernel<WARPS, false, Blk>, 
                 out, scratch, ids, w, (const Blk*)down_exps, latent, ffn, top_k,
                 expert_begin, n_local);
     }
@@ -2936,7 +2976,7 @@ void dequant_iq1_s_f32(float* out, const void* src, int64_t n, cudaStream_t stre
     const int64_t n_groups = n / 8;
     const int T = 256;
     const int64_t blocks = (n_groups + T - 1) / T;
-    dequant_iq1_s_kernel<<<(unsigned)blocks, T, 0, stream>>>(
+    k3_pdl_launch((unsigned)blocks, T, 0, stream, dequant_iq1_s_kernel, 
         out, (const BlockIQ1S*)src, n_groups);
 }
 
@@ -2973,7 +3013,7 @@ bool dequant_f32_by_type(float* out, const void* src, int64_t n, int ggml_type,
             if (n <= 0) return false;
             const int T = 256;
             const int64_t blocks = (n + T - 1) / T;
-            dequant_f32_passthrough_kernel<<<(unsigned)blocks, T, 0, stream>>>(
+            k3_pdl_launch((unsigned)blocks, T, 0, stream, dequant_f32_passthrough_kernel, 
                 out, (const float*)src, n);
             return true;
         }
@@ -2982,7 +3022,7 @@ bool dequant_f32_by_type(float* out, const void* src, int64_t n, int ggml_type,
             const int64_t n_blocks = n / 32;
             const int T = 256;
             const int64_t blocks = (n_blocks + T - 1) / T;
-            dequant_q8_0_kernel<<<(unsigned)blocks, T, 0, stream>>>(
+            k3_pdl_launch((unsigned)blocks, T, 0, stream, dequant_q8_0_kernel, 
                 out, (const BlockQ8_0*)src, n_blocks);
             return true;
         }
@@ -3008,7 +3048,7 @@ bool moe_expert_ffn_f32_by_type(float* out, float* scratch,
         BlockQ8K* qin = (BlockQ8K*)q8k_scratch;
         BlockQ8K* qacts = qin + latent / 256;
         const int T = 128;
-        quantize_q8_k_kernel<<<((latent / 256) + T - 1) / T, T, 0, stream>>>(
+        k3_pdl_launch(((latent / 256) + T - 1) / T, T, 0, stream, quantize_q8_k_kernel, 
             qin, x, latent / 256, 1);
         const int lb_active = situ_linear_beta > 0.0f ? 1 : 0;
         const int n_local = n_local_experts > 0 ? n_local_experts : INT_MAX;
@@ -3016,7 +3056,7 @@ bool moe_expert_ffn_f32_by_type(float* out, float* scratch,
         switch (ggml_type) {
             case 17:
                 ensure_iq2xs_tables();
-                moe_gate_up_situ_q8k_kernel<BlockIQ2XS><<<g1, 32, 0, stream>>>(
+                k3_pdl_launch(g1, 32, 0, stream, moe_gate_up_situ_q8k_kernel<BlockIQ2XS>, 
                     scratch, qin, ids, (const BlockIQ2XS*)gate_exps,
                     (const BlockIQ2XS*)up_exps, latent, ffn,
                     situ_beta, 1.0f / situ_beta, situ_linear_beta,
@@ -3025,7 +3065,7 @@ bool moe_expert_ffn_f32_by_type(float* out, float* scratch,
                 break;
             case 19:
                 ensure_iq1s_tables();
-                moe_gate_up_situ_q8k_kernel<BlockIQ1S><<<g1, 32, 0, stream>>>(
+                k3_pdl_launch(g1, 32, 0, stream, moe_gate_up_situ_q8k_kernel<BlockIQ1S>, 
                     scratch, qin, ids, (const BlockIQ1S*)gate_exps,
                     (const BlockIQ1S*)up_exps, latent, ffn,
                     situ_beta, 1.0f / situ_beta, situ_linear_beta,
@@ -3036,14 +3076,14 @@ bool moe_expert_ffn_f32_by_type(float* out, float* scratch,
                 return false;
         }
         const int act_blocks = top_k * (ffn / 256);
-        quantize_q8_k_kernel<<<(act_blocks + T - 1) / T, T, 0, stream>>>(
+        k3_pdl_launch((act_blocks + T - 1) / T, T, 0, stream, quantize_q8_k_kernel, 
             qacts, scratch, ffn / 256, top_k);
         if (ggml_type == 17) {
-            moe_down_combine_q8k_kernel<BlockIQ2XS><<<(unsigned)latent, 32, 0, stream>>>(
+            k3_pdl_launch((unsigned)latent, 32, 0, stream, moe_down_combine_q8k_kernel<BlockIQ2XS>, 
                 out, qacts, ids, w, (const BlockIQ2XS*)down_exps,
                 latent, ffn, top_k, expert_begin, n_local);
         } else {
-            moe_down_combine_q8k_kernel<BlockIQ1S><<<(unsigned)latent, 32, 0, stream>>>(
+            k3_pdl_launch((unsigned)latent, 32, 0, stream, moe_down_combine_q8k_kernel<BlockIQ1S>, 
                 out, qacts, ids, w, (const BlockIQ1S*)down_exps,
                 latent, ffn, top_k, expert_begin, n_local);
         }
@@ -3072,21 +3112,21 @@ void mla_gate_out_f32(float* out, const float* attn_out, const float* gate_proj,
     if (n <= 0) return;
     const int T = 256;
     const int64_t blocks = (n + T - 1) / T;
-    mla_gate_out_kernel<<<(unsigned)blocks, T, 0, stream>>>(out, attn_out, gate_proj, n);
+    k3_pdl_launch((unsigned)blocks, T, 0, stream, mla_gate_out_kernel, out, attn_out, gate_proj, n);
 }
 
 void kda_decay_gate_f32(float* out, const float* g_raw, const float* A,
                         int head_dim, int n_head, float lower_bound,
                         cudaStream_t stream) {
     if (head_dim <= 0 || n_head <= 0) return;
-    kda_decay_gate_kernel<<<(unsigned)n_head, head_dim, 0, stream>>>(
+    k3_pdl_launch((unsigned)n_head, head_dim, 0, stream, kda_decay_gate_kernel, 
         out, g_raw, A, head_dim, lower_bound);
 }
 
 void l2_norm_heads_f32(float* out, const float* x, int head_dim, int n_head,
                        float scale, float eps, cudaStream_t stream) {
     if (head_dim <= 0 || n_head <= 0) return;
-    l2_norm_heads_kernel<128><<<(unsigned)n_head, 128, 0, stream>>>(
+    k3_pdl_launch((unsigned)n_head, 128, 0, stream, l2_norm_heads_kernel<128>, 
         out, x, head_dim, scale, eps);
 }
 
@@ -3095,7 +3135,7 @@ void mla_absorb_q_f32(float* out, const float* q_nope, const float* q_pe,
                       int n_head, cudaStream_t stream) {
     if (n_head <= 0 || kv_lora <= 0 || qk_nope <= 0) return;
     dim3 grid((unsigned)kv_lora, (unsigned)n_head);
-    mla_absorb_q_kernel<128><<<grid, 128, 0, stream>>>(
+    k3_pdl_launch(grid, 128, 0, stream, mla_absorb_q_kernel<128>, 
         out, q_nope, q_pe, wk_b, qk_nope, kv_lora, rope_dim);
 }
 
@@ -3130,13 +3170,13 @@ void k3_mla_kv_store_f32(float* cache, const float* kv_cmpr_normed,
     if (!cache || !d_pos || kv_lora <= 0 || rope_dim <= 0 || key_length <= 0) return;
     const int n = kv_lora + rope_dim;
     const int T = 256;
-    mla_kv_store_kernel<<<(unsigned)((n + T - 1) / T), T, 0, stream>>>(
+    k3_pdl_launch((unsigned)((n + T - 1) / T), T, 0, stream, mla_kv_store_kernel, 
         cache, kv_cmpr_normed, kv_a_out, d_pos, kv_lora, rope_dim, key_length);
 }
 
 void k3_bump_pos(int* d_pos, cudaStream_t stream) {
     if (!d_pos) return;
-    bump_pos_kernel<<<1, 1, 0, stream>>>(d_pos);
+    k3_pdl_launch(1, 1, 0, stream, bump_pos_kernel, d_pos);
 }
 
 // TWO LENGTHS, AND THE SPLIT BETWEEN THEM IS THE WHOLE POINT.
@@ -3183,7 +3223,7 @@ void mla_decode_attn_f32(float* out, const float* q, const float* k_cache,
                ? std::min(k3_mla_max_splits(n_head), (n_ctx + kMlaSplitMinCtx - 1) / kMlaSplitMinCtx)
                : 1;
     if (splits <= 1) {
-        mla_decode_attn_kernel<BLOCK><<<(unsigned)n_head, BLOCK, shm, stream>>>(
+        k3_pdl_launch((unsigned)n_head, BLOCK, shm, stream, mla_decode_attn_kernel<BLOCK>, 
             out, q, k_cache, wv_b, key_length, kv_lora, v_dim, d_pos, scale);
         return;
     }
@@ -3226,29 +3266,29 @@ void mla_decode_attn_f32(float* out, const float* q, const float* k_cache,
         dim3 hgrid((unsigned)groups, (unsigned)splits);
         bool launched = true;
         switch (hpb * 8 + rslots) {
-            case 12 * 8 + 1: mla_decode_attn_hbatch_kernel<BLOCK, 12, 1><<<hgrid, BLOCK, hshm, stream>>>(
+            case 12 * 8 + 1: k3_pdl_launch(hgrid, BLOCK, hshm, stream, mla_decode_attn_hbatch_kernel<BLOCK, 12, 1>, 
                 g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, d_pos, scale, splits); break;
-            case 12 * 8 + 2: mla_decode_attn_hbatch_kernel<BLOCK, 12, 2><<<hgrid, BLOCK, hshm, stream>>>(
+            case 12 * 8 + 2: k3_pdl_launch(hgrid, BLOCK, hshm, stream, mla_decode_attn_hbatch_kernel<BLOCK, 12, 2>, 
                 g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, d_pos, scale, splits); break;
-            case 12 * 8 + 3: mla_decode_attn_hbatch_kernel<BLOCK, 12, 3><<<hgrid, BLOCK, hshm, stream>>>(
+            case 12 * 8 + 3: k3_pdl_launch(hgrid, BLOCK, hshm, stream, mla_decode_attn_hbatch_kernel<BLOCK, 12, 3>, 
                 g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, d_pos, scale, splits); break;
-            case 12 * 8 + 4: mla_decode_attn_hbatch_kernel<BLOCK, 12, 4><<<hgrid, BLOCK, hshm, stream>>>(
+            case 12 * 8 + 4: k3_pdl_launch(hgrid, BLOCK, hshm, stream, mla_decode_attn_hbatch_kernel<BLOCK, 12, 4>, 
                 g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, d_pos, scale, splits); break;
-            case 8 * 8 + 1: mla_decode_attn_hbatch_kernel<BLOCK, 8, 1><<<hgrid, BLOCK, hshm, stream>>>(
+            case 8 * 8 + 1: k3_pdl_launch(hgrid, BLOCK, hshm, stream, mla_decode_attn_hbatch_kernel<BLOCK, 8, 1>, 
                 g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, d_pos, scale, splits); break;
-            case 8 * 8 + 2: mla_decode_attn_hbatch_kernel<BLOCK, 8, 2><<<hgrid, BLOCK, hshm, stream>>>(
+            case 8 * 8 + 2: k3_pdl_launch(hgrid, BLOCK, hshm, stream, mla_decode_attn_hbatch_kernel<BLOCK, 8, 2>, 
                 g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, d_pos, scale, splits); break;
-            case 8 * 8 + 3: mla_decode_attn_hbatch_kernel<BLOCK, 8, 3><<<hgrid, BLOCK, hshm, stream>>>(
+            case 8 * 8 + 3: k3_pdl_launch(hgrid, BLOCK, hshm, stream, mla_decode_attn_hbatch_kernel<BLOCK, 8, 3>, 
                 g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, d_pos, scale, splits); break;
-            case 8 * 8 + 4: mla_decode_attn_hbatch_kernel<BLOCK, 8, 4><<<hgrid, BLOCK, hshm, stream>>>(
+            case 8 * 8 + 4: k3_pdl_launch(hgrid, BLOCK, hshm, stream, mla_decode_attn_hbatch_kernel<BLOCK, 8, 4>, 
                 g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, d_pos, scale, splits); break;
-            case 4 * 8 + 1: mla_decode_attn_hbatch_kernel<BLOCK, 4, 1><<<hgrid, BLOCK, hshm, stream>>>(
+            case 4 * 8 + 1: k3_pdl_launch(hgrid, BLOCK, hshm, stream, mla_decode_attn_hbatch_kernel<BLOCK, 4, 1>, 
                 g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, d_pos, scale, splits); break;
-            case 4 * 8 + 2: mla_decode_attn_hbatch_kernel<BLOCK, 4, 2><<<hgrid, BLOCK, hshm, stream>>>(
+            case 4 * 8 + 2: k3_pdl_launch(hgrid, BLOCK, hshm, stream, mla_decode_attn_hbatch_kernel<BLOCK, 4, 2>, 
                 g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, d_pos, scale, splits); break;
-            case 4 * 8 + 3: mla_decode_attn_hbatch_kernel<BLOCK, 4, 3><<<hgrid, BLOCK, hshm, stream>>>(
+            case 4 * 8 + 3: k3_pdl_launch(hgrid, BLOCK, hshm, stream, mla_decode_attn_hbatch_kernel<BLOCK, 4, 3>, 
                 g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, d_pos, scale, splits); break;
-            case 4 * 8 + 4: mla_decode_attn_hbatch_kernel<BLOCK, 4, 4><<<hgrid, BLOCK, hshm, stream>>>(
+            case 4 * 8 + 4: k3_pdl_launch(hgrid, BLOCK, hshm, stream, mla_decode_attn_hbatch_kernel<BLOCK, 4, 4>, 
                 g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, d_pos, scale, splits); break;
             default: launched = false; break;
         }
@@ -3261,7 +3301,7 @@ void mla_decode_attn_f32(float* out, const float* q, const float* k_cache,
     }
 
     dim3 grid((unsigned)n_head, (unsigned)splits);
-    mla_decode_attn_split_kernel<BLOCK><<<grid, BLOCK, shm, stream>>>(
+    k3_pdl_launch(grid, BLOCK, shm, stream, mla_decode_attn_split_kernel<BLOCK>, 
         g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora,
         d_pos, scale, splits);
     k3_mla_launch_combine<BLOCK>(out, dev, wv_b, n_head, kv_lora, v_dim, splits, stream);
@@ -3307,7 +3347,7 @@ bool k3_proj_f32(float* y, const float* x, const void* W, int wtype,
     constexpr int BLOCK = 128;
     switch (wtype) {
         case 0:   // F32, dense
-            proj_f32_kernel<BLOCK><<<(unsigned)N, BLOCK, 0, stream>>>(
+            k3_pdl_launch((unsigned)N, BLOCK, 0, stream, proj_f32_kernel<BLOCK>, 
                 y, x, (const float*)W, K);
             return true;
         case 8: {  // Q8_0
@@ -3356,62 +3396,60 @@ bool k3_proj_f32(float* y, const float* x, const void* W, int wtype,
                 const unsigned grid = (unsigned)((N + ROWS_W16 - 1) / ROWS_W16);
                 switch (TB) {
                     case 32:
-                        proj_q8_0_multirow_kernel<32, ROWS_W16><<<grid, 32, 0, stream>>>(
+                        k3_pdl_launch(grid, 32, 0, stream, proj_q8_0_multirow_kernel<32, ROWS_W16>, 
                             y, x, (const BlockQ8_0*)W, nb, N);
                         break;
                     case 64:
-                        proj_q8_0_multirow_kernel<64, ROWS_W16><<<grid, 64, 0, stream>>>(
+                        k3_pdl_launch(grid, 64, 0, stream, proj_q8_0_multirow_kernel<64, ROWS_W16>, 
                             y, x, (const BlockQ8_0*)W, nb, N);
                         break;
                     default:
-                        proj_q8_0_multirow_kernel<BLOCK, ROWS_W16>
-                            <<<grid, BLOCK, 0, stream>>>(y, x, (const BlockQ8_0*)W, nb, N);
+                        k3_pdl_launch(grid, BLOCK, 0, stream, proj_q8_0_multirow_kernel<BLOCK, ROWS_W16>, y, x, (const BlockQ8_0*)W, nb, N);
                         break;
                 }
             } else if (N >= ROWS_W8 * MIN_BLOCKS) {
                 const unsigned grid = (unsigned)((N + ROWS_W8 - 1) / ROWS_W8);
                 switch (TB) {
                     case 32:
-                        proj_q8_0_multirow_kernel<32, ROWS_W8><<<grid, 32, 0, stream>>>(
+                        k3_pdl_launch(grid, 32, 0, stream, proj_q8_0_multirow_kernel<32, ROWS_W8>, 
                             y, x, (const BlockQ8_0*)W, nb, N);
                         break;
                     case 64:
-                        proj_q8_0_multirow_kernel<64, ROWS_W8><<<grid, 64, 0, stream>>>(
+                        k3_pdl_launch(grid, 64, 0, stream, proj_q8_0_multirow_kernel<64, ROWS_W8>, 
                             y, x, (const BlockQ8_0*)W, nb, N);
                         break;
                     default:
-                        proj_q8_0_multirow_kernel<BLOCK, ROWS_W8>
-                            <<<grid, BLOCK, 0, stream>>>(y, x, (const BlockQ8_0*)W, nb, N);
+                        k3_pdl_launch(grid, BLOCK, 0, stream, proj_q8_0_multirow_kernel<BLOCK, ROWS_W8>, y, x, (const BlockQ8_0*)W, nb, N);
                         break;
                 }
             } else if (N >= ROWS * MIN_BLOCKS) {
                 const unsigned grid = (unsigned)((N + ROWS - 1) / ROWS);
                 switch (TB) {
                     case 32:
-                        proj_q8_0_multirow_kernel<32, ROWS><<<grid, 32, 0, stream>>>(
+                        k3_pdl_launch(grid, 32, 0, stream, proj_q8_0_multirow_kernel<32, ROWS>, 
                             y, x, (const BlockQ8_0*)W, nb, N);
                         break;
                     case 64:
-                        proj_q8_0_multirow_kernel<64, ROWS><<<grid, 64, 0, stream>>>(
+                        k3_pdl_launch(grid, 64, 0, stream, proj_q8_0_multirow_kernel<64, ROWS>, 
                             y, x, (const BlockQ8_0*)W, nb, N);
                         break;
                     default:
-                        proj_q8_0_multirow_kernel<BLOCK, ROWS><<<grid, BLOCK, 0, stream>>>(
+                        k3_pdl_launch(grid, BLOCK, 0, stream, proj_q8_0_multirow_kernel<BLOCK, ROWS>, 
                             y, x, (const BlockQ8_0*)W, nb, N);
                         break;
                 }
             } else {
                 switch (TB) {
                     case 32:
-                        proj_q8_0_kernel<32><<<(unsigned)N, 32, 0, stream>>>(
+                        k3_pdl_launch((unsigned)N, 32, 0, stream, proj_q8_0_kernel<32>, 
                             y, x, (const BlockQ8_0*)W, nb);
                         break;
                     case 64:
-                        proj_q8_0_kernel<64><<<(unsigned)N, 64, 0, stream>>>(
+                        k3_pdl_launch((unsigned)N, 64, 0, stream, proj_q8_0_kernel<64>, 
                             y, x, (const BlockQ8_0*)W, nb);
                         break;
                     default:
-                        proj_q8_0_kernel<BLOCK><<<(unsigned)N, BLOCK, 0, stream>>>(
+                        k3_pdl_launch((unsigned)N, BLOCK, 0, stream, proj_q8_0_kernel<BLOCK>, 
                             y, x, (const BlockQ8_0*)W, nb);
                         break;
                 }
@@ -3450,13 +3488,12 @@ bool k3_proj_ggml_f32_x4(float* y0, float* y1, float* y2, float* y3, const float
     // f32-weighted and never quantised at all. x is passed only so this can tell.
     constexpr int QT = 128;
     if (!x_pre_q8)
-        quantize_q8_0_kernel<<<(nb + QT - 1) / QT, QT, 0, stream>>>(
-            (BlockQ8_0*)q8_scratch, x, nb);
+        k3_quantize_q8_0(q8_scratch, x, nb, stream);
 
     const unsigned grid = (unsigned)((N + ROWS - 1) / ROWS);
     const BlockQ8_0* xq = (const BlockQ8_0*)q8_scratch;
 #define K3_QQ4_LAUNCH(BS)                                                        \
-    proj_q8_0_q8_0_fused4_kernel<BS, ROWS><<<grid, BS, 0, stream>>>(             \
+    k3_pdl_launch(grid, BS, 0, stream, proj_q8_0_q8_0_fused4_kernel<BS, ROWS>,              \
         y0, y1, y2, y3, xq, (const BlockQ8_0*)W0, (const BlockQ8_0*)W1,          \
         (const BlockQ8_0*)W2, (const BlockQ8_0*)W3, nb, N)
     switch (proj_block_for(nb)) {
@@ -3487,17 +3524,17 @@ bool k3_proj_f32_x4(float* y0, float* y1, float* y2, float* y3, const float* x,
     const unsigned grid = (unsigned)((N + ROWS - 1) / ROWS);
     switch (proj_block_for(nb)) {
         case 32:
-            proj_q8_0_fused4_kernel<32, ROWS><<<grid, 32, 0, stream>>>(
+            k3_pdl_launch(grid, 32, 0, stream, proj_q8_0_fused4_kernel<32, ROWS>, 
                 y0, y1, y2, y3, x, (const BlockQ8_0*)W0, (const BlockQ8_0*)W1,
                 (const BlockQ8_0*)W2, (const BlockQ8_0*)W3, nb, N);
             break;
         case 64:
-            proj_q8_0_fused4_kernel<64, ROWS><<<grid, 64, 0, stream>>>(
+            k3_pdl_launch(grid, 64, 0, stream, proj_q8_0_fused4_kernel<64, ROWS>, 
                 y0, y1, y2, y3, x, (const BlockQ8_0*)W0, (const BlockQ8_0*)W1,
                 (const BlockQ8_0*)W2, (const BlockQ8_0*)W3, nb, N);
             break;
         default:
-            proj_q8_0_fused4_kernel<128, ROWS><<<grid, 128, 0, stream>>>(
+            k3_pdl_launch(grid, 128, 0, stream, proj_q8_0_fused4_kernel<128, ROWS>, 
                 y0, y1, y2, y3, x, (const BlockQ8_0*)W0, (const BlockQ8_0*)W1,
                 (const BlockQ8_0*)W2, (const BlockQ8_0*)W3, nb, N);
             break;
@@ -3519,8 +3556,7 @@ bool k3_quantize_act_f32(void* q8_out, const float* x, int K, cudaStream_t strea
     if (!q8_out || !x || K <= 0 || K % 32 != 0) return false;
     const int nb = K / 32;
     constexpr int QT = 128;
-    quantize_q8_0_kernel<<<(nb + QT - 1) / QT, QT, 0, stream>>>(
-        (BlockQ8_0*)q8_out, x, nb);
+    k3_quantize_q8_0(q8_out, x, nb, stream);
     return true;
 }
 
@@ -3566,15 +3602,15 @@ bool k3_proj_q8act_f32(float* y, const void* q8_scratch, const void* W, int wtyp
         const unsigned grid = (unsigned)((N + (R) - 1) / (R));                        \
         switch (TB) {                                                                \
             case 32:                                                                 \
-                proj_q8_0_q8_0_multirow_kernel<32, R><<<grid, 32, 0, stream>>>(       \
+                k3_pdl_launch(grid, 32, 0, stream, proj_q8_0_q8_0_multirow_kernel<32, R>,        \
                     y, (const BlockQ8_0*)q8_scratch, (const BlockQ8_0*)W, nb, N);      \
                 break;                                                               \
             case 64:                                                                 \
-                proj_q8_0_q8_0_multirow_kernel<64, R><<<grid, 64, 0, stream>>>(       \
+                k3_pdl_launch(grid, 64, 0, stream, proj_q8_0_q8_0_multirow_kernel<64, R>,        \
                     y, (const BlockQ8_0*)q8_scratch, (const BlockQ8_0*)W, nb, N);      \
                 break;                                                               \
             default:                                                                 \
-                proj_q8_0_q8_0_multirow_kernel<BLOCK, R><<<grid, BLOCK, 0, stream>>>( \
+                k3_pdl_launch(grid, BLOCK, 0, stream, proj_q8_0_q8_0_multirow_kernel<BLOCK, R>,  \
                     y, (const BlockQ8_0*)q8_scratch, (const BlockQ8_0*)W, nb, N);      \
                 break;                                                               \
         }                                                                            \
@@ -3588,15 +3624,15 @@ bool k3_proj_q8act_f32(float* y, const void* q8_scratch, const void* W, int wtyp
         // also the one the numeric test pins bit-for-bit.
         switch (TB) {
             case 32:
-                proj_q8_0_q8_0_kernel<32><<<(unsigned)N, 32, 0, stream>>>(
+                k3_pdl_launch((unsigned)N, 32, 0, stream, proj_q8_0_q8_0_kernel<32>, 
                     y, (const BlockQ8_0*)q8_scratch, (const BlockQ8_0*)W, nb);
                 break;
             case 64:
-                proj_q8_0_q8_0_kernel<64><<<(unsigned)N, 64, 0, stream>>>(
+                k3_pdl_launch((unsigned)N, 64, 0, stream, proj_q8_0_q8_0_kernel<64>, 
                     y, (const BlockQ8_0*)q8_scratch, (const BlockQ8_0*)W, nb);
                 break;
             default:
-                proj_q8_0_q8_0_kernel<BLOCK><<<(unsigned)N, BLOCK, 0, stream>>>(
+                k3_pdl_launch((unsigned)N, BLOCK, 0, stream, proj_q8_0_q8_0_kernel<BLOCK>, 
                     y, (const BlockQ8_0*)q8_scratch, (const BlockQ8_0*)W, nb);
                 break;
         }
@@ -3631,7 +3667,7 @@ void rms_norm_f32(float* out, const float* x, const float* w, int n, float eps,
                   cudaStream_t stream) {
     if (n <= 0) return;
     constexpr int BLOCK = 128;
-    rms_norm_kernel<BLOCK><<<1, BLOCK, 0, stream>>>(out, x, w, n, eps);
+    k3_pdl_launch(1, BLOCK, 0, stream, rms_norm_kernel<BLOCK>, out, x, w, n, eps);
 }
 
 void k3_add_f32(float* out, const float* a, const float* b, int64_t n,
@@ -3639,14 +3675,14 @@ void k3_add_f32(float* out, const float* a, const float* b, int64_t n,
     if (n <= 0) return;
     const int T = 256;
     const int64_t blocks = (n + T - 1) / T;
-    add_f32_kernel<<<(unsigned)blocks, T, 0, stream>>>(out, a, b, n);
+    k3_pdl_launch((unsigned)blocks, T, 0, stream, add_f32_kernel, out, a, b, n);
 }
 
 void sigmoid_inplace_f32(float* x, int64_t n, cudaStream_t stream) {
     if (n <= 0) return;
     const int T = 256;
     const int64_t blocks = (n + T - 1) / T;
-    sigmoid_inplace_f32_kernel<<<(unsigned)blocks, T, 0, stream>>>(x, n);
+    k3_pdl_launch((unsigned)blocks, T, 0, stream, sigmoid_inplace_f32_kernel, x, n);
 }
 
 }  // namespace k3

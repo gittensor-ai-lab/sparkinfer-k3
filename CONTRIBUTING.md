@@ -101,7 +101,7 @@ per-subsystem budget**. **Two different denominators, and mixing them up is expe
   frontier**, or the label is `none` (inside measurement noise).
 - **Tier — % of the llama.cpp reference, NOT the frontier.** Past the gate the tier is
   `delta / llama_ref`, where `llama_ref` is pinned in `bench/scripts/reference.lock`
-  (**16.7026 tok/s** for `h200x8` / `UD-IQ1_S` **at the scored 128k context**):
+  (**18.4435 tok/s** for `h200x8` / `UD-IQ1_S` **at the scored 128k context**):
   `XS` <3.5%, `S` 3.5–6%, `M` 6–10%, `L` 10–18%, `XL` >18%. Any verified gain that clears
   the gate floors at `XS`.
 
@@ -117,27 +117,33 @@ same weights:
 
 | | ctx 64 | ctx 131,072 | lost |
 |---|--:|--:|--:|
-| llama.cpp | 18.20 | 16.70 | −8% |
-| sparkinfer | 10.34 | 1.00 | **−90%** |
+| llama.cpp | 18.32 | 18.44 | ~0% |
+| sparkinfer, as first measured | 10.34 | 1.00 | **−90%** |
 
-llama.cpp keeps a compressed MLA cache (`kv_lora` 512, f16); sparkinfer reduces over 576
-f32 per token in a kernel with one block per head. Scoring at 64 hid a **16.5×** gap behind
-a 1.8× one — and pointed the incentive at a context nobody runs.
+llama.cpp keeps a compressed MLA cache (`kv_lora` 512, f16) and holds its rate essentially
+flat with depth; sparkinfer reduced over 576 f32 per token in a kernel with one block per
+head. Scoring at 64 hid an **18×** gap behind a 1.8× one — and pointed the incentive at a
+context nobody runs.
 
-**So the headroom is in long-context attention.** With the frontier at **1.00 tok/s** and
-the basis at 16.7026, the bands work out as:
+**That headroom has largely been taken.** The frontier is now **29.97 tok/s** — past
+llama.cpp rather than behind it — so with the basis at 18.4435 the bands are absolute
+tok/s, and they no longer look brutal:
 
 | tier | gain over the frontier |
 |---|--:|
-| `XS` | +0.02 tok/s (the 2% significance gate) |
-| `S` | +0.60 (+60%) |
-| `M` | +1.01 (+101%) |
-| `L` | +1.68 (+168%) |
-| `XL` | +3.02 (+302%) |
+| `XS` | +0.60 tok/s (the 2% significance gate, which now binds first) |
+| `S` | +0.65 (+2.2%) |
+| `M` | +1.11 (+3.7%) |
+| `L` | +1.84 (+6.2%) |
+| `XL` | +3.32 (+11.1%) |
 
-Those look brutal as percentages and are not: sparkinfer at 128k sits at **6% of
-llama.cpp** and roughly **150× off the HBM bandwidth roofline**, so an `XL` is asking for
-work that is demonstrably on the table, not a miracle. Anchoring to llama.cpp is what stops
+Note the gate, not the tier, is what a small PR has to clear first: 2% of a 29.97 frontier
+is 0.60 tok/s, which is above the `S` and comparable to the `M` threshold. A real but small
+win now scores `none` — see #71, twice.
+
+sparkinfer at 128k now sits at **163% of llama.cpp**, and the remaining headroom is against
+the HBM bandwidth roofline rather than against llama.cpp — so an `XL` is still asking for
+work that is on the table, but the low-hanging fruit is gone. Anchoring to llama.cpp is what stops
 an immature frontier minting `XL`s from low-hanging fruit, and means the same tok/s of real
 work earns the same tier however fast the frontier already is. The verdict JSON reports both
 — `pct_over_frontier` is the honest measured speedup, `pct_of_llama` is the tier basis, and
