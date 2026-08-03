@@ -126,11 +126,27 @@ int main(int argc, char** argv) {
     int  max_ctx = 64;
     bool do_seek = false;
     std::vector<int> ids;
+    bool ids_given = false;
     for (int i = 2; i < argc; ++i) {
-        if (!std::strcmp(argv[i], "--ids") && i + 1 < argc) ids = parse_ids(argv[++i]);
+        if (!std::strcmp(argv[i], "--ids") && i + 1 < argc) {
+            ids = parse_ids(argv[++i]);
+            ids_given = true;
+        }
         else if (!std::strcmp(argv[i], "--logits") && i + 1 < argc) logits_path = argv[++i];
         else if (!std::strcmp(argv[i], "--ctx") && i + 1 < argc) max_ctx = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--seek")) do_seek = true;
+    }
+    // AN EMPTY --ids IS A FAILURE, NOT A BENCHMARK.
+    //
+    // parse_ids returns {} both for "the file could not be opened" and for "no ids in it",
+    // and the prompt path below is guarded by `!ids.empty()`. So without this, a typo'd
+    // @FILE prints one line and then falls through to the SYNTHETIC timing loop -- a
+    // different workload entirely -- and exits 0 with no .spkl written. An accuracy script
+    // that checks the exit status sees a pass. That is the failure mode this flag exists to
+    // remove, and it is worth being loud about precisely because the run still "works".
+    if (ids_given && ids.empty()) {
+        std::printf("--ids: no ids parsed (missing/empty file, or nothing numeric in it)\n");
+        return 1;
     }
 
     GGUF g; KimiK3Config cfg; KimiK3LayerCoverage cov;

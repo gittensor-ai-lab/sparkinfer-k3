@@ -536,7 +536,30 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
     // binary, same kernels, only the submission mechanism differs.
     static const bool want_graph = [] {
         const char* e = std::getenv("SPARKINFER_K3_GRAPH");
-        return !(e && e[0] == '0');
+        if (e && e[0] == '0') return false;
+        // PROFILING AND CAPTURE CANNOT BOTH BE ON.
+        //
+        // The phase profiler brackets each phase with cudaEventRecord and drains the
+        // previous pair with cudaEventSynchronize. A synchronise is illegal inside a
+        // stream capture, so with both enabled the capture aborts and every layer then
+        // reports "operation failed due to a previous error during capture" until the
+        // forward gives up at warm-up. That is not a profile with a caveat, it is no
+        // profile at all, and the error names the phase rather than the instrument.
+        //
+        // So profiling implies eager. Say so once, because the numbers that come back
+        // are then the EAGER mix: graphs are worth ~1.3 ms/token at 128k, and the
+        // profiler's own event syncs inflate the total further. The shares are usable,
+        // the absolute ms are not.
+        const char* pr = std::getenv("SPARKINFER_K3_PROFILE");
+        if (pr && pr[0] == '1') {
+            std::fprintf(stderr,
+                         "[k3-graph] SPARKINFER_K3_PROFILE=1 — running EAGER. Event "
+                         "timing cannot be captured into a graph; phase SHARES are "
+                         "valid, the absolute ms/token is inflated and is not the "
+                         "graph-mode number.\n");
+            return false;
+        }
+        return true;
     }();
     // `splits` sizes the grid and picks which MLA kernel runs; a graph can change
     // neither, so the plan is part of the graph's identity. Derived from the SAME

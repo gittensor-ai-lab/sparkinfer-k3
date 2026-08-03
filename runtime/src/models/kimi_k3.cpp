@@ -10,6 +10,7 @@
 #include <cstring>
 #include <algorithm>
 #include <cstdlib>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -365,6 +366,23 @@ bool upload_force_f32(const GGUF& g, const std::string& name, KimiK3Weights& w,
 struct K3Profiler {
     struct Slot { cudaEvent_t a = nullptr, b = nullptr; bool pending = false; double ms = 0; long n = 0; };
     std::unordered_map<std::string, Slot> slots;   // key: "tag@device"
+    // THE MAP IS TOUCHED BY EVERY RANK THREAD AT ONCE.
+    //
+    // This profiler is a process-global singleton and the TP driver issues the ranks
+    // CONCURRENTLY (see parallel_issue), so eight threads reach start()/stop() for the
+    // same tag at the same time. `slots[key]` INSERTS, and a concurrent insert rehashes
+    // the table under the other threads' feet — the references they are holding, and the
+    // cudaEvent handles inside them, become garbage.
+    //
+    // It survived only because the tag set is tiny and stops growing after layer 1, so
+    // the racing window is one layer wide. Adding a fifth tag widened it enough to hand
+    // back a destroyed event: "LAUNCH FAILED at layer 2, phase FfnFinish: invalid
+    // resource handle". A profiler that corrupts the run it is measuring is worse than
+    // no profiler, and the failure blames the phase rather than the instrument.
+    //
+    // The lock costs nothing when profiling is off — every entry point returns on `on`
+    // before reaching it — and the profiled path is already event-synchronised.
+    std::mutex mu;
     bool on = false;
     K3Profiler() { const char* e = std::getenv("SPARKINFER_K3_PROFILE"); on = e && e[0] == '1'; }
 
@@ -375,6 +393,7 @@ struct K3Profiler {
     }
     void start(const std::string& tag, cudaStream_t st) {
         if (!on) return;
+        std::lock_guard<std::mutex> g(mu);
         auto& sl = slots[key_for(tag)];
         if (!sl.a) { cudaEventCreate(&sl.a); cudaEventCreate(&sl.b); }
         if (sl.pending) {   // drain the previous pair for this tag+device first
@@ -387,11 +406,13 @@ struct K3Profiler {
     }
     void stop(const std::string& tag, cudaStream_t st) {
         if (!on) return;
+        std::lock_guard<std::mutex> g(mu);
         auto it = slots.find(key_for(tag));
         if (it != slots.end() && it->second.b) cudaEventRecord(it->second.b, st);
     }
     void report() {
         if (!on) return;
+        std::lock_guard<std::mutex> g(mu);
         // Aggregate per TAG across devices. Every rank runs the same phases, so the
         // per-tag sum is total GPU time in that phase across the node, and the shares
         // are what the optimisation decision needs.
