@@ -939,6 +939,11 @@ __global__ void moe_gate_up_situ_kernel(float* __restrict__ scratch,
     const Blk* u_row = up_exps   + (size_t)(e * ffn + j) * blocks_per_row;
 
     float gacc = 0.0f, uacc = 0.0f;
+    // blocks_per_row arrives as a runtime argument, so nvcc cannot unroll this and each
+    // iteration's divergent iq1s_grid_c gather sits alone on a dependent chain. Unrolling
+    // puts four independent gathers and four weight loads in flight. Accumulation order
+    // is unchanged, so this is bit-identical.
+#pragma unroll 4
     for (int b = 0; b < blocks_per_row; ++b) {
         const float* xb = x + b * 256;
         gacc += block_dot<XVEC>(g_row[b], xb, lane, 32);
@@ -1539,10 +1544,21 @@ static inline int k3_sm_count(int dev) {
     return cache[dev] > 0 ? cache[dev] : 0;
 }
 
-template <int BLOCK>
+// The latent KV cache element type is a template parameter on all three decode
+// kernels, deduced from the k_cache argument so no launch site names it. f32 is
+// the historical layout; __half is the one that matters: the cache is the single
+// largest byte item a decode token moves (24 MLA layers x ctx x 576 floats,
+// replicated on every rank — 13.7 GB/token/rank at 128k), and llama.cpp's own
+// default type_k is F16, so the f32 cache paid 2x the reference's KV traffic to
+// be MORE precise than the thing the output is scored against. Conversion is
+// in-register on load; arithmetic stays f32 throughout.
+static __device__ __forceinline__ float kv_ld(const float* p) { return *p; }
+static __device__ __forceinline__ float kv_ld(const __half* p) { return __half2float(*p); }
+
+template <int BLOCK, typename KV>
 __global__ void mla_decode_attn_kernel(float* __restrict__ out,
                                        const float* __restrict__ q,
-                                       const float* __restrict__ k_cache,
+                                       const KV* __restrict__ k_cache,
                                        const float* __restrict__ wv_b,
                                        int key_length, int kv_lora, int v_dim,
                                        const int* __restrict__ d_pos, float scale) {
@@ -1583,9 +1599,9 @@ __global__ void mla_decode_attn_kernel(float* __restrict__ out,
 
         // --- score the tile: one warp per token, lanes stride over d ---
         for (int t = warp; t < tn; t += NWARP) {
-            const float* kt = k_cache + (size_t)(t0 + t) * key_length;
+            const KV* kt = k_cache + (size_t)(t0 + t) * key_length;
             float s = 0.0f;
-            for (int d = lane; d < key_length; d += 32) s += s_q[d] * kt[d];
+            for (int d = lane; d < key_length; d += 32) s += s_q[d] * kv_ld(kt + d);
 #pragma unroll
             for (int off = 16; off > 0; off >>= 1)
                 s += __shfl_down_sync(0xffffffff, s, off);
@@ -1618,7 +1634,7 @@ __global__ void mla_decode_attn_kernel(float* __restrict__ out,
         for (int r = threadIdx.x; r < kv_lora; r += BLOCK) {
             float a = s_acc[r] * corr;
             for (int t = 0; t < tn; ++t)
-                a += s_p[t] * k_cache[(size_t)(t0 + t) * key_length + r];
+                a += s_p[t] * kv_ld(k_cache + (size_t)(t0 + t) * key_length + r);
             s_acc[r] = a;
         }
         __syncthreads();
@@ -1757,11 +1773,11 @@ __global__ void quantize_q8_k_kernel(BlockQ8K* __restrict__ out,
 // NOT bit-identical to the single-block version: summing per-slice partials reassociates
 // the same terms. The parity gate is top-1 >= 0.90 / KL <= 0.20 and the reference here is
 // float64, so this is checked on tolerance, like the online-softmax rewrite it builds on.
-template <int BLOCK>
+template <int BLOCK, typename KV>
 __global__ void mla_decode_attn_split_kernel(float* __restrict__ part_acc,
                                              float* __restrict__ part_ml,
                                              const float* __restrict__ q,
-                                             const float* __restrict__ k_cache,
+                                             const KV* __restrict__ k_cache,
                                              int key_length, int kv_lora,
                                              const int* __restrict__ d_pos,
                                              float scale, int splits) {
@@ -1799,9 +1815,9 @@ __global__ void mla_decode_attn_split_kernel(float* __restrict__ part_acc,
         const int tn = min(kMlaCtxTile, t_end - t0);
 
         for (int t = warp; t < tn; t += NWARP) {
-            const float* kt = k_cache + (size_t)(t0 + t) * key_length;
+            const KV* kt = k_cache + (size_t)(t0 + t) * key_length;
             float sdot = 0.0f;
-            for (int d = lane; d < key_length; d += 32) sdot += s_q[d] * kt[d];
+            for (int d = lane; d < key_length; d += 32) sdot += s_q[d] * kv_ld(kt + d);
 #pragma unroll
             for (int off = 16; off > 0; off >>= 1)
                 sdot += __shfl_down_sync(0xffffffff, sdot, off);
@@ -1829,7 +1845,7 @@ __global__ void mla_decode_attn_split_kernel(float* __restrict__ part_acc,
         for (int r = threadIdx.x; r < kv_lora; r += BLOCK) {
             float a = s_acc[r] * corr;
             for (int t = 0; t < tn; ++t)
-                a += s_p[t] * k_cache[(size_t)(t0 + t) * key_length + r];
+                a += s_p[t] * kv_ld(k_cache + (size_t)(t0 + t) * key_length + r);
             s_acc[r] = a;
         }
         __syncthreads();
@@ -1873,11 +1889,11 @@ __global__ void mla_decode_attn_split_kernel(float* __restrict__ part_acc,
 // tile still runs in increasing t. cpu_reference_test models THIS schedule against a
 // float64 two-pass reference; kimi_k3_numeric_test pins it on the device at a context
 // long enough to take this path.
-template <int BLOCK, int HPB, int RSLOTS, int TPW = kMlaTokensPerWarp>
+template <int BLOCK, int HPB, int RSLOTS, typename KV, int TPW = kMlaTokensPerWarp>
 __global__ void mla_decode_attn_hbatch_kernel(float* __restrict__ part_acc,
                                               float* __restrict__ part_ml,
                                               const float* __restrict__ q,
-                                              const float* __restrict__ k_cache,
+                                              const KV* __restrict__ k_cache,
                                               int key_length, int kv_lora,
                                               const int* __restrict__ d_pos,
                                               float scale, int splits) {
@@ -1901,8 +1917,12 @@ __global__ void mla_decode_attn_hbatch_kernel(float* __restrict__ part_acc,
     float* s_l = s_m + HPB;                                   // HPB  running exp-sum
     float* s_c = s_l + HPB;                                   // HPB  this tile's rescale
 
+    // (h0 + i/key_length)*key_length + (i%key_length) is identically h0*key_length + i,
+    // so the 32-bit div AND mod per element were computing the identity — 27 iterations
+    // of both, per thread, per block, on a 256-block grid, every MLA layer. Same
+    // addresses, same values, now a contiguous copy.
     for (int i = threadIdx.x; i < HPB * key_length; i += BLOCK)
-        s_q[i] = q[(size_t)(h0 + i / key_length) * key_length + (i % key_length)];
+        s_q[i] = q[(size_t)h0 * key_length + i];
     if (threadIdx.x < HPB) { s_m[threadIdx.x] = -1e30f; s_l[threadIdx.x] = 0.0f; }
 
     // Latent accumulators: RSLOTS r-values x HPB heads, in registers.
@@ -1932,7 +1952,7 @@ __global__ void mla_decode_attn_hbatch_kernel(float* __restrict__ part_acc,
             // The tail duplicates the last row rather than branching: the extra lanes
             // compute a score that is never stored, and every load stays in bounds.
             const int tc = min(TPW, tn - tb);
-            const float* kt[TPW];
+            const KV* kt[TPW];
 #pragma unroll
             for (int tt = 0; tt < TPW; ++tt)
                 kt[tt] = k_cache + (size_t)(t0 + tb + min(tt, tc - 1)) * key_length;
@@ -1941,7 +1961,7 @@ __global__ void mla_decode_attn_hbatch_kernel(float* __restrict__ part_acc,
             for (int d = lane; d < key_length; d += 32) {
                 float kv[TPW];
 #pragma unroll
-                for (int tt = 0; tt < TPW; ++tt) kv[tt] = kt[tt][d];
+                for (int tt = 0; tt < TPW; ++tt) kv[tt] = kv_ld(kt[tt] + d);
 #pragma unroll
                 for (int hh = 0; hh < HPB; ++hh) {
                     const float qv = s_q[hh * key_length + d];
@@ -2013,7 +2033,7 @@ __global__ void mla_decode_attn_hbatch_kernel(float* __restrict__ part_acc,
 
 #pragma unroll 4
         for (int t = 0; t < tn; ++t) {
-            const float* kt = k_cache + (size_t)(t0 + t) * key_length;
+            const KV* kt = k_cache + (size_t)(t0 + t) * key_length;
             float p[HPB];
 #pragma unroll
             for (int hh = 0; hh < HPB; ++hh) p[hh] = s_p[hh * kMlaCtxTile + t];
@@ -2021,7 +2041,7 @@ __global__ void mla_decode_attn_hbatch_kernel(float* __restrict__ part_acc,
             for (int u = 0; u < RSLOTS; ++u) {
                 const int r = threadIdx.x + u * BLOCK;
                 if (r < kv_lora) {
-                    const float kv = kt[r];
+                    const float kv = kv_ld(kt + r);
 #pragma unroll
                     for (int hh = 0; hh < HPB; ++hh) acc[u][hh] += p[hh] * kv;
                 }
@@ -2916,11 +2936,18 @@ static void moe_expert_ffn_launch(float* out, float* scratch,
     // the band test must never reject. INT_MAX makes it a no-op rather than a branch.
     const int n_local = n_local_experts > 0 ? n_local_experts : INT_MAX;
 
-    // Holds the "foreign slots read as zero" invariant the gate/up kernel used to
-    // maintain per-CTA. Only a banded rank can leave a slot untouched; at tp_size 1
-    // every slot is written, so memsetting there would be pure added work.
-    if (n_local_experts > 0 || expert_begin != 0)
-        cudaMemsetAsync(scratch, 0, (size_t)top_k * ffn * sizeof(float), stream);
+    // The "foreign slots read as zero" invariant is now established ONCE, when the
+    // scratch is allocated (kimi_k3.cpp), not on every layer.
+    //
+    // It holds just as strongly there, and the reason is that the set of foreign slots
+    // never changes: a rank's expert band is fixed for the run, and moe_gate_up writes
+    // only its OWN slots. A slot foreign to this rank is therefore written by nobody,
+    // ever — so a single zeroing at allocation leaves it zero for the whole run, which
+    // is exactly what re-zeroing it 92 times a token was buying. (Owned slots are fully
+    // overwritten before they are read, so clearing them was never load-bearing either.)
+    //
+    // That removes 92 launches and ~18 MB of writes per token per rank from the critical
+    // path while keeping the guarantee moe_down_combine's band re-test relies on.
 
     // float4 activation reads need 16-byte alignment. Both pointers are cudaMalloc
     // bases in every K3 caller and the per-block offsets are multiples of 1024 bytes,
@@ -3195,10 +3222,15 @@ void k3_bump_pos(int* d_pos, cudaStream_t stream) {
 // They must agree. k3_mla_decode_plan() is the single derivation both the driver's
 // invalidation check and this launcher call — a probe that can drift from what actually
 // launches fails by launching the wrong grid, which is worse than not having one.
-void mla_decode_attn_f32(float* out, const float* q, const float* k_cache,
-                         const float* wv_b, int key_length, int kv_lora,
-                         int v_dim, int n_head, int n_ctx, const int* d_pos,
-                         float scale, cudaStream_t stream) {
+//
+// One launcher for both cache layouts: KV is deduced by every kernel from the
+// k_cache argument, so this dispatch is written once and the f32/f16 entry
+// points at the bottom are one-line wrappers.
+template <typename KV>
+static void mla_decode_attn_launch(float* out, const float* q, const KV* k_cache,
+                                   const float* wv_b, int key_length, int kv_lora,
+                                   int v_dim, int n_head, int n_ctx, const int* d_pos,
+                                   float scale, cudaStream_t stream) {
     if (n_head <= 0 || n_ctx <= 0 || key_length <= 0 || kv_lora <= 0 || v_dim <= 0) return;
     if (!d_pos) return;
     constexpr int BLOCK = 256;
@@ -3223,7 +3255,7 @@ void mla_decode_attn_f32(float* out, const float* q, const float* k_cache,
                ? std::min(k3_mla_max_splits(n_head), (n_ctx + kMlaSplitMinCtx - 1) / kMlaSplitMinCtx)
                : 1;
     if (splits <= 1) {
-        k3_pdl_launch((unsigned)n_head, BLOCK, shm, stream, mla_decode_attn_kernel<BLOCK>, 
+        k3_pdl_launch((unsigned)n_head, BLOCK, shm, stream, mla_decode_attn_kernel<BLOCK, KV>, 
             out, q, k_cache, wv_b, key_length, kv_lora, v_dim, d_pos, scale);
         return;
     }
@@ -3266,29 +3298,29 @@ void mla_decode_attn_f32(float* out, const float* q, const float* k_cache,
         dim3 hgrid((unsigned)groups, (unsigned)splits);
         bool launched = true;
         switch (hpb * 8 + rslots) {
-            case 12 * 8 + 1: k3_pdl_launch(hgrid, BLOCK, hshm, stream, mla_decode_attn_hbatch_kernel<BLOCK, 12, 1>, 
+            case 12 * 8 + 1: k3_pdl_launch(hgrid, BLOCK, hshm, stream, mla_decode_attn_hbatch_kernel<BLOCK, 12, 1, KV>, 
                 g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, d_pos, scale, splits); break;
-            case 12 * 8 + 2: k3_pdl_launch(hgrid, BLOCK, hshm, stream, mla_decode_attn_hbatch_kernel<BLOCK, 12, 2>, 
+            case 12 * 8 + 2: k3_pdl_launch(hgrid, BLOCK, hshm, stream, mla_decode_attn_hbatch_kernel<BLOCK, 12, 2, KV>, 
                 g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, d_pos, scale, splits); break;
-            case 12 * 8 + 3: k3_pdl_launch(hgrid, BLOCK, hshm, stream, mla_decode_attn_hbatch_kernel<BLOCK, 12, 3>, 
+            case 12 * 8 + 3: k3_pdl_launch(hgrid, BLOCK, hshm, stream, mla_decode_attn_hbatch_kernel<BLOCK, 12, 3, KV>, 
                 g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, d_pos, scale, splits); break;
-            case 12 * 8 + 4: k3_pdl_launch(hgrid, BLOCK, hshm, stream, mla_decode_attn_hbatch_kernel<BLOCK, 12, 4>, 
+            case 12 * 8 + 4: k3_pdl_launch(hgrid, BLOCK, hshm, stream, mla_decode_attn_hbatch_kernel<BLOCK, 12, 4, KV>, 
                 g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, d_pos, scale, splits); break;
-            case 8 * 8 + 1: k3_pdl_launch(hgrid, BLOCK, hshm, stream, mla_decode_attn_hbatch_kernel<BLOCK, 8, 1>, 
+            case 8 * 8 + 1: k3_pdl_launch(hgrid, BLOCK, hshm, stream, mla_decode_attn_hbatch_kernel<BLOCK, 8, 1, KV>, 
                 g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, d_pos, scale, splits); break;
-            case 8 * 8 + 2: k3_pdl_launch(hgrid, BLOCK, hshm, stream, mla_decode_attn_hbatch_kernel<BLOCK, 8, 2>, 
+            case 8 * 8 + 2: k3_pdl_launch(hgrid, BLOCK, hshm, stream, mla_decode_attn_hbatch_kernel<BLOCK, 8, 2, KV>, 
                 g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, d_pos, scale, splits); break;
-            case 8 * 8 + 3: k3_pdl_launch(hgrid, BLOCK, hshm, stream, mla_decode_attn_hbatch_kernel<BLOCK, 8, 3>, 
+            case 8 * 8 + 3: k3_pdl_launch(hgrid, BLOCK, hshm, stream, mla_decode_attn_hbatch_kernel<BLOCK, 8, 3, KV>, 
                 g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, d_pos, scale, splits); break;
-            case 8 * 8 + 4: k3_pdl_launch(hgrid, BLOCK, hshm, stream, mla_decode_attn_hbatch_kernel<BLOCK, 8, 4>, 
+            case 8 * 8 + 4: k3_pdl_launch(hgrid, BLOCK, hshm, stream, mla_decode_attn_hbatch_kernel<BLOCK, 8, 4, KV>, 
                 g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, d_pos, scale, splits); break;
-            case 4 * 8 + 1: k3_pdl_launch(hgrid, BLOCK, hshm, stream, mla_decode_attn_hbatch_kernel<BLOCK, 4, 1>, 
+            case 4 * 8 + 1: k3_pdl_launch(hgrid, BLOCK, hshm, stream, mla_decode_attn_hbatch_kernel<BLOCK, 4, 1, KV>, 
                 g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, d_pos, scale, splits); break;
-            case 4 * 8 + 2: k3_pdl_launch(hgrid, BLOCK, hshm, stream, mla_decode_attn_hbatch_kernel<BLOCK, 4, 2>, 
+            case 4 * 8 + 2: k3_pdl_launch(hgrid, BLOCK, hshm, stream, mla_decode_attn_hbatch_kernel<BLOCK, 4, 2, KV>, 
                 g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, d_pos, scale, splits); break;
-            case 4 * 8 + 3: k3_pdl_launch(hgrid, BLOCK, hshm, stream, mla_decode_attn_hbatch_kernel<BLOCK, 4, 3>, 
+            case 4 * 8 + 3: k3_pdl_launch(hgrid, BLOCK, hshm, stream, mla_decode_attn_hbatch_kernel<BLOCK, 4, 3, KV>, 
                 g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, d_pos, scale, splits); break;
-            case 4 * 8 + 4: k3_pdl_launch(hgrid, BLOCK, hshm, stream, mla_decode_attn_hbatch_kernel<BLOCK, 4, 4>, 
+            case 4 * 8 + 4: k3_pdl_launch(hgrid, BLOCK, hshm, stream, mla_decode_attn_hbatch_kernel<BLOCK, 4, 4, KV>, 
                 g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, d_pos, scale, splits); break;
             default: launched = false; break;
         }
@@ -3301,10 +3333,52 @@ void mla_decode_attn_f32(float* out, const float* q, const float* k_cache,
     }
 
     dim3 grid((unsigned)n_head, (unsigned)splits);
-    k3_pdl_launch(grid, BLOCK, shm, stream, mla_decode_attn_split_kernel<BLOCK>, 
+    k3_pdl_launch(grid, BLOCK, shm, stream, mla_decode_attn_split_kernel<BLOCK, KV>, 
         g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora,
         d_pos, scale, splits);
     k3_mla_launch_combine<BLOCK>(out, dev, wv_b, n_head, kv_lora, v_dim, splits, stream);
+}
+
+void mla_decode_attn_f32(float* out, const float* q, const float* k_cache,
+                         const float* wv_b, int key_length, int kv_lora,
+                         int v_dim, int n_head, int n_ctx, const int* d_pos,
+                         float scale, cudaStream_t stream) {
+    mla_decode_attn_launch<float>(out, q, k_cache, wv_b, key_length, kv_lora,
+                                  v_dim, n_head, n_ctx, d_pos, scale, stream);
+}
+
+void mla_decode_attn_kvf16(float* out, const float* q, const void* k_cache,
+                           const float* wv_b, int key_length, int kv_lora,
+                           int v_dim, int n_head, int n_ctx, const int* d_pos,
+                           float scale, cudaStream_t stream) {
+    mla_decode_attn_launch<__half>(out, q, (const __half*)k_cache, wv_b,
+                                   key_length, kv_lora, v_dim, n_head, n_ctx,
+                                   d_pos, scale, stream);
+}
+
+// F16 twin of mla_kv_store_kernel: same device-held row index, same concat
+// layout, narrowing with round-to-nearest as ggml does for its own F16 type_k.
+// The f32 path cannot simply be reused because a copy cannot narrow.
+__global__ void mla_kv_store_f16_kernel(__half* __restrict__ cache,
+                                        const float* __restrict__ cmpr,
+                                        const float* __restrict__ kv_a_out,
+                                        const int* __restrict__ d_pos,
+                                        int kv_lora, int rope_dim, int key_length) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= kv_lora + rope_dim) return;
+    __half* row = cache + (size_t)(*d_pos) * key_length;
+    row[i] = __float2half_rn(i < kv_lora ? cmpr[i] : kv_a_out[i]);
+}
+
+void k3_mla_kv_store_f16(void* cache, const float* kv_cmpr_normed,
+                         const float* kv_a_out, const int* d_pos,
+                         int kv_lora, int rope_dim, int key_length,
+                         cudaStream_t stream) {
+    if (!cache || !d_pos || kv_lora <= 0 || rope_dim <= 0 || key_length <= 0) return;
+    const int n = kv_lora + rope_dim;
+    const int T = 256;
+    mla_kv_store_f16_kernel<<<(unsigned)((n + T - 1) / T), T, 0, stream>>>(
+        (__half*)cache, kv_cmpr_normed, kv_a_out, d_pos, kv_lora, rope_dim, key_length);
 }
 
 // Threads that would run ZERO iterations of the block loop are not free.
