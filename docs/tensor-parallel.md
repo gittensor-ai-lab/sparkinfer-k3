@@ -23,7 +23,8 @@ sharded. Read the status table, then the limit at the bottom.
 | ✅ **Forward integration** | `kimi_k3_tp.cpp` — phase-split forward, one collective per MoE layer |
 | ✅ **Sharded weight loading** | `upload_sliced()` consumes `plan_tensor_residency()`'s StridedCopy |
 | ✅ **End to end** | 93 layers on 8x H200, text in text out, matches the pipeline to 1.85e-09 |
-| ❌ **`ShardPolicy::Full`** | attention is REPLICATED. Declared, not enabled — see the limit below |
+| ❌ **`ShardPolicy::Full` (lm_head)** | vocab RowShard still unsupported — Full today is Attn + dense FFN only |
+| ✅ **Dense FFN under Full** | leading dense gate/up/down banded; one extra all-reduce/token |
 
 ### Two corrections this table used to hide
 
@@ -220,14 +221,22 @@ benchmark measure one card.
 Steps 1-3 of the old list are done: the collective is validated on hardware, the loader
 shards, and the forward issues the reduce. What is left:
 
-1. **`ShardPolicy::Full` — shard attention.** This is the whole ballgame now. See below.
+1. **`ShardPolicy::Full` — dense FFN done; lm_head vocab shard still open.** Attention
+   bands and the leading dense FFN are sharded under Full (default with
+   `SPARKINFER_K3_SHARD_DENSE` on). Vocab RowShard for lm_head is still refused by the
+   loader allowlist — the forward indexes full vocab on rank 0.
 2. **Batched prefill.** There is none; prompt ingestion is one forward per prompt token.
 3. **CUDA-graph capture across ranks.** ~30 unfused launches per layer x 93 layers, and
    the profile is launch/occupancy-bound at 13x off roofline. An 8-stream capture with
    collectives inside is where the host-event vs in-kernel-barrier distinction starts to
    matter, and where `peer-oneshot` would finally earn its keep.
+<<<<<<< HEAD
 4. ~~**f32 fast collectives.**~~ **Done.** peer-oneshot and multimem both reduce f32;
    `SPARKINFER_TP_BACKEND=multimem` no longer downgrades to NCCL for K3's residual stream.
+=======
+4. **f32 fast collectives.** peer-oneshot carries an f32 path; multimem is still bf16-only
+   on this branch (see the multimem-f32 PR).
+>>>>>>> cd676f8 (feat(k3): ShardPolicy::Full — band the leading dense FFN)
 
 ## The limit of ExpertsOnly, and why it is now the whole story
 

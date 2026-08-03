@@ -145,13 +145,16 @@ bool upload_sliced(const GGUF& g, const std::string& name, KimiK3Weights& w,
     }
 
     // --- tp_size > 1 ---
-    // Under ExpertsOnly, only the three routed-expert stacks are banded. Everything
-    // else takes the replicate path above, at full width, so the forward's cfg-derived
-    // shapes stay correct on every rank. Matching on the tensor SUFFIX rather than on
-    // the rule is deliberate: attn_k_b/attn_v_b also carry Rule::ExpertShard (they
-    // band the head axis), and banding those without teaching the MLA kernels their
-    // per-rank head count would silently drop 7/8 of the attention heads.
-    if (w.policy != KimiK3Weights::ShardPolicy::Full) {
+    // Allowlist, ALWAYS — including under ShardPolicy::Full. Full used to skip this
+    // gate and honour every weight_plan rule, which would RowShard lm_head while
+    // the forward still indexes full vocab on rank 0. Full now means "Attn + dense
+    // FFN on the allowlist", not "the plan is law".
+    //
+    // Matching on the tensor SUFFIX rather than on the rule is deliberate:
+    // attn_k_b/attn_v_b also carry Rule::ExpertShard (they band the head axis), and
+    // banding those without teaching the MLA kernels their per-rank head count
+    // would silently drop 7/8 of the attention heads.
+    {
         auto ends_with = [&](const char* suf) {
             const std::size_t n = std::strlen(suf);
             return name.size() >= n && name.compare(name.size() - n, n, suf) == 0;
@@ -207,7 +210,18 @@ bool upload_sliced(const GGUF& g, const std::string& name, KimiK3Weights& w,
                                          ends_with("ffn_up_shexp.weight")   ||
                                          ends_with("ffn_down_shexp.weight");
 
-        if (!routed_expert_stack && !shared_expert_stack &&
+        // Full: leading dense FFN, same Row/Col pattern as the shared expert.
+        // Only the three dense projections — never lm_head / token_embd.
+        const bool dense_ffn_stack =
+            KimiK3Weights::shards_dense(w.policy) &&
+            (ends_with("ffn_gate.weight") || ends_with("ffn_up.weight") ||
+             ends_with("ffn_down.weight")) &&
+            !ends_with("ffn_gate_exps.weight") && !ends_with("ffn_up_exps.weight") &&
+            !ends_with("ffn_down_exps.weight") && !ends_with("ffn_gate_shexp.weight") &&
+            !ends_with("ffn_up_shexp.weight") && !ends_with("ffn_down_shexp.weight") &&
+            !ends_with("ffn_gate_inp.weight");
+
+        if (!routed_expert_stack && !shared_expert_stack && !dense_ffn_stack &&
             !kda_sharded && !mla_sharded) {
             void* d = nullptr;
             if (cudaMalloc(&d, (size_t)t->n_bytes) != cudaSuccess) {
@@ -2242,14 +2256,38 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
 
         k3_profiler().start(layer < cfg.leading_dense ? "ffn_dense" : "ffn_moe", stream);
         if (layer < cfg.leading_dense) {
-            if (!proj_h(s.dense_gate, normed2_src, L.ffn_gate, cfg.dense_ffn, H)) return false;
-            if (!proj_h(s.dense_up, normed2_src, L.ffn_up, cfg.dense_ffn, H)) return false;
-            if (fwd.debug) fwd.debug("dbg_dense_gate", layer, s.dense_gate, cfg.dense_ffn);
-            if (fwd.debug) fwd.debug("dbg_dense_up", layer, s.dense_up, cfg.dense_ffn);
-            k3k::situ_f32(s.dense_situ, s.dense_gate, s.dense_up, cfg.dense_ffn,
+            // Same Row/Col banding as the shared expert (weight_plan: gate/up
+            // RowShard, down ColShard). Widths from rank_ne — never cfg.dense_ffn /
+            // tp_size — because block_aligned_band can hand a remainder to the low
+            // ranks. Under ExpertsAndAttn the tensors are full width and rank_ne
+            // equals cfg.dense_ffn, so this is the same code path with the same
+            // values it always had. Activation is normed2_src (tile-prep may have
+            // already written it; hoist_act above is skipped when ffn_prepared).
+            if (!L.ffn_gate.ok() || !L.ffn_up.ok() || !L.ffn_down.ok()) return false;
+            const int dense_band = (int)L.ffn_gate.rank_ne[1];
+            if (dense_band <= 0 || (int)L.ffn_down.rank_ne[0] != dense_band)
+                return false;
+            const int tp_size = fwd.w->shard.tp_size;
+            if (tp_size > 1 && KimiK3Weights::shards_dense(fwd.w->policy) &&
+                dense_band * tp_size != cfg.dense_ffn) {
+                std::fprintf(stderr,
+                             "[k3] layer %d: dense FFN not banded — rank width %d x "
+                             "tp_size %d != %d. The reduce would sum %d copies of a "
+                             "complete dense FFN output.\n",
+                             layer, dense_band, tp_size, cfg.dense_ffn, tp_size);
+                return false;
+            }
+            if (!proj_h(s.dense_gate, normed2_src, L.ffn_gate, dense_band, H)) return false;
+            if (!proj_h(s.dense_up, normed2_src, L.ffn_up, dense_band, H)) return false;
+            if (fwd.debug) fwd.debug("dbg_dense_gate", layer, s.dense_gate, dense_band);
+            if (fwd.debug) fwd.debug("dbg_dense_up", layer, s.dense_up, dense_band);
+            k3k::situ_f32(s.dense_situ, s.dense_gate, s.dense_up, dense_band,
                          cfg.situ_beta, cfg.situ_linear_beta, stream);
-            if (fwd.debug) fwd.debug("dbg_dense_situ", layer, s.dense_situ, cfg.dense_ffn);
-            if (!proj(s.ffn_out, s.dense_situ, L.ffn_down, H, cfg.dense_ffn)) return false;
+            if (fwd.debug) fwd.debug("dbg_dense_situ", layer, s.dense_situ, dense_band);
+            // ColShard over the band → full-width PARTIAL in ffn_out. The TP driver
+            // reduces it when shards_dense; under ExpertsAndAttn dense_band ==
+            // cfg.dense_ffn so the result is already complete and must NOT be reduced.
+            if (!proj(s.ffn_out, s.dense_situ, L.ffn_down, H, dense_band)) return false;
         } else {
             // --- FORK: routed_down and the whole shared expert ----------------
             //

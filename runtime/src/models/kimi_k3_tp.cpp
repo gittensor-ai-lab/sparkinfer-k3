@@ -283,13 +283,22 @@ bool kimi_k3_tp_init(const GGUF& g, const KimiK3Config& cfg, const K3PlanOptions
             const char* e = std::getenv("SPARKINFER_K3_SHARD_MLA");
             return !(e && e[0] == '0');          // ON unless explicitly disabled
         }();
+        // Leading dense FFN under ShardPolicy::Full. ON by default with the attn
+        // bands: the eval harness never sets env knobs, so an opt-in here would
+        // score as a no-op. SPARKINFER_K3_SHARD_DENSE=0 restores ExpertsAndAttn.
+        static const bool shard_dense = [] {
+            const char* e = std::getenv("SPARKINFER_K3_SHARD_DENSE");
+            return !(e && e[0] == '0');
+        }();
         const bool k = shard_kda && tp_size > 1;
         const bool m = shard_mla && tp_size > 1;
+        const bool d = shard_dense && tp_size > 1;
         R.weights.policy =
-            (k && m) ? KimiK3Weights::ShardPolicy::ExpertsAndAttn :
-            k        ? KimiK3Weights::ShardPolicy::ExpertsAndKda  :
-            m        ? KimiK3Weights::ShardPolicy::ExpertsAndMla  :
-                       KimiK3Weights::ShardPolicy::ExpertsOnly;
+            (k && m && d) ? KimiK3Weights::ShardPolicy::Full :
+            (k && m)      ? KimiK3Weights::ShardPolicy::ExpertsAndAttn :
+            k             ? KimiK3Weights::ShardPolicy::ExpertsAndKda  :
+            m             ? KimiK3Weights::ShardPolicy::ExpertsAndMla  :
+                            KimiK3Weights::ShardPolicy::ExpertsOnly;
         R.weights.shard.tp_size = tp_size;
         R.weights.shard.rank = r;
         R.weights.shard.hidden = cfg.hidden;
@@ -300,6 +309,9 @@ bool kimi_k3_tp_init(const GGUF& g, const KimiK3Config& cfg, const K3PlanOptions
             ? tp::even_band(cfg.n_experts, tp_size, r)
             : tp::Band{0, cfg.n_experts};
         R.weights.shard.moe_ffn_total = cfg.moe_ffn;
+        R.weights.shard.dense_ffn_total = cfg.dense_ffn;
+        R.weights.shard.dense_ffn = (d && cfg.dense_ffn > 0)
+            ? cfg.dense_ffn / tp_size : cfg.dense_ffn;
 
         // 2-D MoE: SPARKINFER_K3_MOE_2D = number of EXPERT GROUPS. Read once per rank
         // here so the weights, the state and the kernels all derive their geometry
@@ -437,6 +449,10 @@ bool kimi_k3_tp_init(const GGUF& g, const KimiK3Config& cfg, const K3PlanOptions
     if (!moe_2d_note[0].empty())
         std::fprintf(stderr, "[k3-tp] 2-D MoE off (whole-expert sharding): %s\n",
                      moe_2d_note[0].c_str());
+    if (tp_size > 1 && KimiK3Weights::shards_dense(out.ranks[0].weights.policy))
+        std::fprintf(stderr, "[k3-tp] ShardPolicy::Full — leading dense FFN banded "
+                             "(%d-wide / %d ranks, +1 collective/token)\n",
+                     cfg.dense_ffn, tp_size);
     // Report EVERY failed rank, not just the first. With eight concurrent loads the
     // interesting case is "ranks 4-7 ran out of memory", and stopping at the first hides
     // whether one device is sick or the whole box is short.
@@ -928,10 +944,13 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
         }
 
         // --- the collective -------------------------------------------------
-        // MoE layers only. The leading dense layer's FFN is replicated under this
-        // policy, so it holds a complete result already and reducing it would
-        // multiply it by tp_size.
-        if (is_moe && tp_size > 1) {
+        // MoE layers: expert (+ shared-expert) partial at expert_latent+hidden.
+        // Leading dense under Full: ffn_down's full-width partial at hidden.
+        // Under ExpertsAndAttn the dense FFN is replicated, so it already holds a
+        // complete result and reducing it would multiply by tp_size.
+        const bool dense_reduce = tp_size > 1 && !is_moe &&
+            KimiK3Weights::shards_dense(p.ranks[0].weights.policy);
+        if ((is_moe || dense_reduce) && tp_size > 1) {
             int count = 0;
             for (int r = 0; r < tp_size; ++r) {
                 int n = 0;
@@ -970,11 +989,13 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
                 }
             } else {
                 const IClock::time_point tc = ip.on ? IClock::now() : IClock::time_point{};
-                // Zero-copy: the partials are ALREADY in reduce_in() — the swap
-                // above aimed them there — so this launches the reduce with no
-                // staging copies. The gather above still ran: it is what validates
-                // the width every rank agrees on.
-                const bool okc = p.zero_copy
+                // Zero-copy owned path is wired for the MoE fused buffer only
+                // (kimi_k3_swap_partial_buffer(FfnPartial) retargets moe_fused).
+                // Dense writes ffn_out — stage through the group call rather than
+                // reducing empty peer buffers. One D2D of 28 KiB on one layer/token.
+                // When MoE zero-copy is on, use the slot-addressed 1-bar path from #107.
+                const bool use_zc = p.zero_copy && is_moe;
+                const bool okc = use_zc
                     ? p.coll->allreduce_f32_owned_slot((size_t)count, p.streams, slot_moe)
                     : p.coll->allreduce_f32_group(p.reduce_bufs, (size_t)count,
                                                   p.streams);
@@ -988,8 +1009,9 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
             ++coll_k;
             // Phase 3's routed_norm reads (and normalises in place) the reduced
             // sum where the collective wrote it. In-place writes to reduce_out are
-            // rank-private: peers only ever read inputs.
-            if (p.zero_copy) {
+            // rank-private: peers only ever read inputs. Dense has no phase-3 MoE
+            // consumer of a swapped buffer — FfnFinish reads ffn_out in place.
+            if (p.zero_copy && is_moe) {
                 for (std::size_t r = 0; r < p.ranks.size(); ++r)
                     kimi_k3_swap_partial_buffer(p.ranks[r].fwd, K3LayerPhase::FfnPartial,
                                                 p.zc_out[r]);
