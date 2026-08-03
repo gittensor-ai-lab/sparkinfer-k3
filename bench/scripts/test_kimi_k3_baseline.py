@@ -2069,6 +2069,53 @@ class CiWorkflowTest(unittest.TestCase):
         ok, _ = bot.eligibility(pr(crlf))
         self.assertTrue(ok, "CRLF line endings broke the section scan")
 
+    def test_the_copycat_judge_resolves_to_the_provider_whose_key_exists(self):
+        """The 70-80% band is the only tier containment cannot decide, so it must actually
+        reach a model.
+
+        Two ways the wiring silently disabled it, both from passing repo variables straight
+        through as env:
+
+          COPYCAT_LLM_PROVIDER defaulted to 'openai' when the variable was unset. _llm_provider
+          returns any explicit value without checking a key exists, so it selected a provider
+          with no key and never reached the autodetect that would have found YUNWEI_API_KEY.
+
+          COPYCAT_LLM_MODEL was hardcoded to gpt-4o-mini, overriding the yunwei provider default
+          (deepseek-v4-pro) that the gateway actually serves. And passing an unset variable
+          through sets the variable to "" -- os.environ.get(k, default) returns "" for a key
+          that EXISTS, so the model became the empty string rather than the default."""
+        import importlib
+        sys.path.insert(0, str(ROOT / "eval"))
+        try:
+            saved = {k: os.environ.get(k) for k in
+                     ("OPENAI_API_KEY", "CURSOR_API_KEY", "DEEPSEEK_API_KEY", "YUNWEI_API_KEY",
+                      "COPYCAT_LLM_PROVIDER", "COPYCAT_LLM_MODEL")}
+            for k in saved:
+                os.environ.pop(k, None)
+            os.environ["YUNWEI_API_KEY"] = "sk-test"
+            os.environ["COPYCAT_LLM_PROVIDER"] = ""    # unset repo variable
+            os.environ["COPYCAT_LLM_MODEL"] = ""       # unset repo variable
+            import copycat_guard as g
+            importlib.reload(g)
+            provider = g._llm_provider()
+            self.assertEqual(provider, "yunwei",
+                             "autodetect skipped the provider whose key is present")
+            self.assertTrue(g._llm_api_key(provider), "resolved a provider with no key")
+            self.assertEqual(g._llm_model(provider), "deepseek-v4-pro",
+                             "an empty COPYCAT_LLM_MODEL became the model name")
+        finally:
+            for k, v in saved.items():
+                os.environ.pop(k, None)
+                if v is not None:
+                    os.environ[k] = v
+            sys.path.remove(str(ROOT / "eval"))
+
+        wf = (ROOT / ".github/workflows/copycat-guard.yml").read_text()
+        self.assertNotIn("|| 'openai'", wf,
+                         "the workflow forces a provider again, defeating key autodetect")
+        self.assertNotIn("COPYCAT_LLM_MODEL: gpt-4o-mini", wf,
+                         "the model is hardcoded again, overriding the provider default")
+
     def test_no_workflow_has_a_duplicate_key(self):
         """A duplicate YAML key is a STARTUP FAILURE: GitHub refuses the file, creates zero
         jobs, and the check goes red with nothing to click into.
