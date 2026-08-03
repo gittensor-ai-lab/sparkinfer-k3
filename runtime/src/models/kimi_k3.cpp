@@ -1,6 +1,7 @@
 #include "sparkinfer/models/kimi_k3.h"
 
 #include "sparkinfer/kernels/kimi_k3.h"
+#include "sparkinfer/kernels/kimi_k3_fast.h"
 #include "sparkinfer/models/kimi_k3_gguf_manifest.h"
 #include "sparkinfer/tp/weight_residency.h"   // plan_tensor_residency for the sharded loader
 
@@ -1059,9 +1060,16 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
 
     auto proj = [&](float* y, const float* x, const KimiK3Tensor& W, int N, int K) {
         if (!W.ok()) return false;
-        if (ggml_qact_proj)
+        if (ggml_qact_proj) {
+            // The one-barrier multi-row kernel is bit-identical and declines every
+            // shape it does not improve, so this is a launch-geometry choice and not
+            // a numerical one.
+            if (k3k::k3_proj_q8_multirow_1bar(y, x, W.data, W.type, N, K,
+                                              s.proj_q8, stream))
+                return true;
             return k3k::k3_proj_ggml_f32(y, x, W.data, W.type, N, K,
                                          s.proj_q8, stream);
+        }
         return k3k::k3_proj_f32(y, x, W.data, W.type, N, K, stream);
     };
 
@@ -1187,12 +1195,19 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             const bool qkvg_pre = (hoisted_src == s.normed);
             const bool fused_qkvg = fusable &&
                 (ggml_qact_proj
-                     ? k3k::k3_proj_ggml_f32_x4(s.qkv_q, s.qkv_k, s.qkv_v, s.g_proj_out,
+                     ? (k3k::k3_proj_q8_fused4_1bar(s.qkv_q, s.qkv_k, s.qkv_v,
+                                                    s.g_proj_out, s.normed,
+                                                    L.attn_q.data, L.attn_k.data,
+                                                    L.attn_v.data, L.ssm_g.data,
+                                                    L.attn_q.type, qkv, H,
+                                                    qkvg_pre ? s.act_q8 : s.proj_q8,
+                                                    stream, qkvg_pre) ||
+                        k3k::k3_proj_ggml_f32_x4(s.qkv_q, s.qkv_k, s.qkv_v, s.g_proj_out,
                                                 s.normed, L.attn_q.data, L.attn_k.data,
                                                 L.attn_v.data, L.ssm_g.data,
                                                 L.attn_q.type, qkv, H,
                                                 qkvg_pre ? s.act_q8 : s.proj_q8,
-                                                stream, qkvg_pre)
+                                                stream, qkvg_pre))
                      : k3k::k3_proj_f32_x4(s.qkv_q, s.qkv_k, s.qkv_v, s.g_proj_out,
                                            s.normed, L.attn_q.data, L.attn_k.data,
                                            L.attn_v.data, L.ssm_g.data,
@@ -1227,30 +1242,107 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             if (!proj_h(s.f_a_out, s.normed, L.ssm_f_a, head_dim, H)) return false;
             if (!proj(s.g_raw, s.f_a_out, L.ssm_f_b, qkv, head_dim)) return false;
             if (!L.ssm_dt_bias.ok()) return false;
-            k3k::k3_add_f32(s.g_raw, s.g_raw, w_dt, qkv, stream);
-
             if (!L.ssm_a.ok()) return false;
-            k3k::kda_decay_gate_f32(s.decay_g, s.g_raw, w_a,
-                                    head_dim, n_head, cfg.kda_gate_lower_bound, stream);
+            // The gate reads g_raw anyway, so it adds the bias on the way in — one
+            // launch instead of two, bit-identical. Declining runs both as main does.
+            if (!k3k::k3_kda_decay_gate_dt(s.decay_g, s.g_raw, w_dt, w_a, head_dim,
+                                           n_head, cfg.kda_gate_lower_bound, stream)) {
+                k3k::k3_add_f32(s.g_raw, s.g_raw, w_dt, qkv, stream);
+                k3k::kda_decay_gate_f32(s.decay_g, s.g_raw, w_a,
+                                        head_dim, n_head, cfg.kda_gate_lower_bound,
+                                        stream);
+            }
 
             // ssm_beta is [n_heads, hidden] and stays REPLICATED: its suffix is shared
             // with Qwen's GDN, so one weight_plan entry governs both models. Project
             // all cfg.n_q_heads rows and read this rank's band -- 96 rows of a
             // 7168-wide Q8_0 matrix is 0.7 MB against 468 MB of projections, so the
             // duplicated work is not worth a rule that would change another model.
-            if (!proj_h(s.beta_out, s.normed, L.ssm_beta, cfg.n_q_heads, H)) return false;
+            // ssm_beta IS PROJECTED AT FULL WIDTH ON EVERY RANK AND READ AT A BAND.
+            //
+            // The tensor is [n_q_heads, hidden] and stays Replicate in weight_plan for
+            // a good reason — its suffix is shared with Qwen's GDN, so a rule here
+            // would silently change another model — but the justification recorded
+            // beside that rule is about VRAM residency ("0.7 MB against 468 MB of
+            // projections"), and residency is not what this costs. The GEMV runs all
+            // 96 rows on all 8 ranks and the decode step then reads 12 of them, so
+            // 87.5% of a 96 x 7168 f32 read is discarded: 2.297 MiB per layer, 158 MiB
+            // per token per rank, in a projection nobody re-checked after #63 banded
+            // the heads.
+            //
+            // The fix is a pointer, not a rule. Rows are contiguous, so this rank's
+            // band starts at row hd_off and the launch narrows to n_head rows written
+            // at s.beta_out + hd_off — the exact slice the decode step already reads.
+            // Bit-identical: row hd_off+i computed off a shifted base is the same dot
+            // product over the same K in the same order. The weight stays Replicate,
+            // so no other model's plan moves.
+            //
+            // SPARKINFER_K3_BETA_BAND=0 restores the full-width projection.
+            static const bool beta_band = [] {
+                const char* e = std::getenv("SPARKINFER_K3_BETA_BAND");
+                return !(e && e[0] == '0');
+            }();
+            const int beta_rows = (beta_band && hd_off + n_head <= cfg.n_q_heads)
+                                ? n_head : cfg.n_q_heads;
+            const int beta_off  = (beta_rows == cfg.n_q_heads) ? 0 : hd_off;
+            {
+                if (!L.ssm_beta.ok()) return false;
+                // Row stride in BYTES, because a banded base has to skip whole rows of
+                // whatever the weight is stored as. Only the two types this path can
+                // actually meet are handled; anything else keeps the full projection
+                // rather than guessing a stride.
+                long row_bytes = 0;
+                if (L.ssm_beta.type == 0)      row_bytes = (long)H * (long)sizeof(float);
+                else if (L.ssm_beta.type == 8) row_bytes = (long)(H / 32) * 34;
+                const int  n_rows = row_bytes > 0 ? beta_rows : cfg.n_q_heads;
+                const int  r_off  = row_bytes > 0 ? beta_off  : 0;
+                const void* wbase = (const char*)L.ssm_beta.data + (size_t)r_off * row_bytes;
+                // Mirrors proj_h: take #94's hoisted activation when it holds THIS x
+                // and the weight is Q8_0, else the ordinary path. ssm_beta is f32 today
+                // so this resolves to k3_proj_f32, but writing it this way means the
+                // band does not silently opt out of the hoist if the weight ever moves.
+                const bool okb =
+                    (hoisted_src == s.normed && L.ssm_beta.type == 8)
+                        ? k3k::k3_proj_q8act_f32(s.beta_out + r_off, s.act_q8, wbase,
+                                                 L.ssm_beta.type, n_rows, H, stream)
+                        : (ggml_qact_proj
+                               ? k3k::k3_proj_ggml_f32(s.beta_out + r_off, s.normed,
+                                                       wbase, L.ssm_beta.type, n_rows, H,
+                                                       s.proj_q8, stream)
+                               : k3k::k3_proj_f32(s.beta_out + r_off, s.normed, wbase,
+                                                  L.ssm_beta.type, n_rows, H, stream));
+                if (!okb) return false;
+            }
             // beta is the delta-rule update rate: llama.cpp's build_kda_layer applies
             // a sigmoid to the projection before the scan consumes it. Omitting this
             // left beta unbounded (rms ~1.7 vs the correct ~0.75) and scaled the whole
             // KDA output — the layer-0 divergence vs llama that this restores.
-            k3k::sigmoid_inplace_f32(s.beta_out, cfg.n_q_heads, stream);
+            // The decode step below applies the sigmoid itself when the fused path
+            // takes the work, so this launch exists only for the fallback.
+            const bool beta_sig_fused = k3k::k3_kda_fuse_enabled();
+            if (!beta_sig_fused)
+                // Only the rows the projection above actually wrote — the rest of the
+                // scratch is stale and never read.
+                k3k::sigmoid_inplace_f32(s.beta_out + beta_off, beta_rows, stream);
 
             if (fwd.debug) fwd.debug("dbg_decay_g", layer, s.decay_g, qkv);
             if (fwd.debug) fwd.debug("dbg_beta", layer, s.beta_out, cfg.n_q_heads);
-            k3k::kda_decode_step_f32(s.delta_out, st.delta_state[kda_ord],
-                                     s.conv_q, s.conv_k, s.conv_v, s.decay_g,
-                                     s.beta_out + hd_off,
-                                     head_dim, n_head, stream);
+            // The warp-per-column step declines at any shape or alignment it is not
+            // written for, and the tiled kernel below is then exactly what main runs.
+            // Both read the same f32 state, so a decline is a slower path and never a
+            // different answer.
+            if (!k3k::k3_kda_decode_step_ip(s.delta_out, st.delta_state[kda_ord],
+                                            s.conv_q, s.conv_k, s.conv_v, s.decay_g,
+                                            s.beta_out + hd_off,
+                                            head_dim, n_head, beta_sig_fused, stream)) {
+                // The fused step declined, so beta is still raw if the fold was on.
+                if (beta_sig_fused)
+                    k3k::sigmoid_inplace_f32(s.beta_out + beta_off, beta_rows, stream);
+                k3k::kda_decode_step_f32(s.delta_out, st.delta_state[kda_ord],
+                                         s.conv_q, s.conv_k, s.conv_v, s.decay_g,
+                                         s.beta_out + hd_off,
+                                         head_dim, n_head, stream);
+            }
             if (fwd.debug) fwd.debug("dbg_delta_out", layer, s.delta_out, qkv);
 
             // Already computed above when the q/k/v/g fusion took the fast path.
@@ -1280,18 +1372,11 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
                     return false;
             }
 
-            // De-interleave [qh, key_length_mla] into q_nope [qh, qk_nope] and
-            // q_pe [qh, rope_dim] — each head's 192 values are qk_nope(128) then
-            // rope_dim(64) concatenated, so this is a strided 2-D copy, not a plain split.
-            cudaMemcpy2DAsync(s.q_nope, (size_t)qk_nope * sizeof(float),
-                              s.q_proj_out, (size_t)cfg.key_length_mla * sizeof(float),
-                              (size_t)qk_nope * sizeof(float), qh,
-                              cudaMemcpyDeviceToDevice, stream);
-            cudaMemcpy2DAsync(s.q_pe, (size_t)cfg.rope_dim * sizeof(float),
-                              (const char*)s.q_proj_out + (size_t)qk_nope * sizeof(float),
-                              (size_t)cfg.key_length_mla * sizeof(float),
-                              (size_t)cfg.rope_dim * sizeof(float), qh,
-                              cudaMemcpyDeviceToDevice, stream);
+            // The de-interleave into q_nope / q_pe is done by INDEXING inside the
+            // absorb kernel when it takes the work. It only happens here — as the two
+            // strided D2D copies main issues — when that kernel declines, which is
+            // decided below and recorded so the call site stays a single decision.
+            bool absorb_strided = false;
 
             if (!proj_h(s.kv_a_out, s.normed, L.attn_kv_a_mqa, cfg.key_length, H)) return false;
             if (!L.attn_kv_a_norm.ok()) return false;
@@ -1312,13 +1397,30 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
                                      cfg.rope_dim, cfg.key_length, stream);
 
             if (!L.attn_k_b.ok() || !L.attn_v_b.ok()) return false;
-            k3k::mla_absorb_q_f32(s.absorbed_q, s.q_nope, s.q_pe,
-                                  (const float*)L.attn_k_b.data, qk_nope, cfg.kv_lora_rank,
-                                  cfg.rope_dim, qh, stream);
+            absorb_strided = k3k::k3_mla_absorb_q_strided(
+                s.absorbed_q, s.q_proj_out, (const float*)L.attn_k_b.data, qk_nope,
+                cfg.kv_lora_rank, cfg.rope_dim, cfg.key_length_mla, qh, stream);
+            if (!absorb_strided) {
+                cudaMemcpy2DAsync(s.q_nope, (size_t)qk_nope * sizeof(float),
+                                  s.q_proj_out,
+                                  (size_t)cfg.key_length_mla * sizeof(float),
+                                  (size_t)qk_nope * sizeof(float), qh,
+                                  cudaMemcpyDeviceToDevice, stream);
+                cudaMemcpy2DAsync(s.q_pe, (size_t)cfg.rope_dim * sizeof(float),
+                                  (const char*)s.q_proj_out +
+                                      (size_t)qk_nope * sizeof(float),
+                                  (size_t)cfg.key_length_mla * sizeof(float),
+                                  (size_t)cfg.rope_dim * sizeof(float), qh,
+                                  cudaMemcpyDeviceToDevice, stream);
+                k3k::mla_absorb_q_f32(s.absorbed_q, s.q_nope, s.q_pe,
+                                      (const float*)L.attn_k_b.data, qk_nope,
+                                      cfg.kv_lora_rank, cfg.rope_dim, qh, stream);
+            }
             if (fwd.debug) fwd.debug("mla_absorb_q", layer, s.absorbed_q, qh * cfg.key_length);
 
             const float mla_scale = 1.0f / std::sqrt((float)cfg.key_length_mla);
-            k3k::mla_decode_attn_f32(s.mla_attn_out, s.absorbed_q, st.mla_kv_cache[mla_ord],
+            k3k::mla_decode_attn_f32(s.mla_attn_out, s.absorbed_q,
+                                     st.mla_kv_cache[mla_ord],
                                      (const float*)L.attn_v_b.data, cfg.key_length,
                                      cfg.kv_lora_rank, cfg.value_length_mla, qh,
                                      // host length: picks the launch plan only.
