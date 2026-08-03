@@ -939,6 +939,11 @@ __global__ void moe_gate_up_situ_kernel(float* __restrict__ scratch,
     const Blk* u_row = up_exps   + (size_t)(e * ffn + j) * blocks_per_row;
 
     float gacc = 0.0f, uacc = 0.0f;
+    // blocks_per_row arrives as a runtime argument, so nvcc cannot unroll this and each
+    // iteration's divergent iq1s_grid_c gather sits alone on a dependent chain. Unrolling
+    // puts four independent gathers and four weight loads in flight. Accumulation order
+    // is unchanged, so this is bit-identical.
+#pragma unroll 4
     for (int b = 0; b < blocks_per_row; ++b) {
         const float* xb = x + b * 256;
         gacc += block_dot<XVEC>(g_row[b], xb, lane, 32);
@@ -1912,8 +1917,12 @@ __global__ void mla_decode_attn_hbatch_kernel(float* __restrict__ part_acc,
     float* s_l = s_m + HPB;                                   // HPB  running exp-sum
     float* s_c = s_l + HPB;                                   // HPB  this tile's rescale
 
+    // (h0 + i/key_length)*key_length + (i%key_length) is identically h0*key_length + i,
+    // so the 32-bit div AND mod per element were computing the identity — 27 iterations
+    // of both, per thread, per block, on a 256-block grid, every MLA layer. Same
+    // addresses, same values, now a contiguous copy.
     for (int i = threadIdx.x; i < HPB * key_length; i += BLOCK)
-        s_q[i] = q[(size_t)(h0 + i / key_length) * key_length + (i % key_length)];
+        s_q[i] = q[(size_t)h0 * key_length + i];
     if (threadIdx.x < HPB) { s_m[threadIdx.x] = -1e30f; s_l[threadIdx.x] = 0.0f; }
 
     // Latent accumulators: RSLOTS r-values x HPB heads, in registers.
