@@ -1580,10 +1580,16 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
                 return false;
             if (fwd.debug) fwd.debug("dbg_router_logits", layer, s.router_logits, cfg.n_experts);
             if (!L.exp_probs_b.ok()) return false;
-            k3k::moe_router_noaux_tc_f32(s.router_w, s.router_ids, s.router_logits,
+            // Shared-memory selection first; it declines to the original below on any
+            // shape it does not handle, and is bit-identical where it does.
+            if (!k3k::k3_moe_router_fast(s.router_w, s.router_ids, s.router_logits,
                                          (const float*)L.exp_probs_b.data, cfg.n_experts,
                                          cfg.top_k, /*n_tokens=*/1, /*norm_w=*/true,
-                                         /*w_scale=*/1.0f, stream);
+                                         /*w_scale=*/1.0f, stream))
+                k3k::moe_router_noaux_tc_f32(s.router_w, s.router_ids, s.router_logits,
+                                             (const float*)L.exp_probs_b.data, cfg.n_experts,
+                                             cfg.top_k, /*n_tokens=*/1, /*norm_w=*/true,
+                                             /*w_scale=*/1.0f, stream);
             if (fwd.debug) fwd.debug("dbg_router_w", layer, s.router_w, cfg.top_k);
 
             // routed_down feeds the dispatch UNNORMALISED — routed_norm (if present)
@@ -1682,6 +1688,9 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
     // here is Replicate and reads the ALREADY-REDUCED value — routed_norm is an
     // rms_norm, so the sum cannot be deferred past it. ----
     if (do_ffn_f) {
+        // Set when the shared expert is present, i.e. when the layer's tail is the
+        // adjacent PAIR of adds that k3_add3_f32 fuses.
+        bool fused_tail = false;
         if (layer >= cfg.leading_dense) {
             // Post-collective: every rank must now hold the SAME complete expert sum,
             // equal to what tp=1 computed. If this tag differs, the dispatch or the
@@ -1706,14 +1715,27 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             // ffn_routed_up lifted the latent, shexp_out was already hidden-wide.
             if (L.has_shared_experts) {
                 if (fwd.debug) fwd.debug("dbg_shexp", layer, s.shexp_out, H);
-                k3k::k3_add_f32(s.ffn_out, s.ffn_out, s.shexp_out, H, stream);
+                // The shared-expert fold is issued BELOW, fused with the residual add
+                // that consumes it — see k3_add3.cu. `fused_tail` records that decision
+                // so the fallback path stays a single straight-line pair.
+                fused_tail = true;
             }
         }
         k3_profiler().stop(layer < cfg.leading_dense ? "ffn_dense" : "ffn_moe", stream);
-        if (fwd.debug) fwd.debug("ffn_out", layer, s.ffn_out, H);
 
-        // FFN residual is ALWAYS an add, never a replace.
-        k3k::k3_add_f32(hidden_out, hidden_out, s.ffn_out, H, stream);
+        // FFN residual is ALWAYS an add, never a replace. When the shared expert is
+        // present its fold and this add are adjacent and share an operand, so they go
+        // out as one launch; k3_add3_f32 declines to the original pair.
+        if (fused_tail &&
+            k3k::k3_add3_f32(hidden_out, s.ffn_out, s.ffn_out, s.shexp_out,
+                             hidden_out, H, stream)) {
+            if (fwd.debug) fwd.debug("ffn_out", layer, s.ffn_out, H);
+        } else {
+            if (fused_tail)
+                k3k::k3_add_f32(s.ffn_out, s.ffn_out, s.shexp_out, H, stream);
+            if (fwd.debug) fwd.debug("ffn_out", layer, s.ffn_out, H);
+            k3k::k3_add_f32(hidden_out, hidden_out, s.ffn_out, H, stream);
+        }
         if (fwd.debug) fwd.debug("l_out", layer, hidden_out, H);
     }
     return k3_check_launch(layer, phase);

@@ -4,6 +4,7 @@
 #include "sparkinfer/tp/peer_oneshot_allreduce.h"
 #include "tp_allreduce.cuh"
 #include "tp_error.hpp"
+#include "tp_pdl.cuh"
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -14,11 +15,14 @@ namespace sparkinfer::tp {
 using tpar::Signal;
 using tpar::RankSignals;
 using tpar::kMaxBlocks;
+using tpar::kSlotCount;
 using tpar::array_t;
 using tpar::packed_reduce_bf16;
 using tpar::packed_reduce_f32;
 using tpar::barrier_at_start;
 using tpar::barrier_at_end;
+using tpar::tp_pdl_sync;
+using tpar::tp_pdl_launch;
 
 // __global__ kernels live in a named namespace (matching the codebase's other
 // kernel TUs), not an anonymous one.
@@ -59,22 +63,50 @@ struct PeerInputsF32 {
     const float* p[N];
 };
 
-template <int N>
+// kEndBar=true is main's kernel, unchanged. kEndBar=false is the single-barrier
+// form: the caller has rotated `peers` onto one of kSlotCount input slots and
+// passes the same rotation index as `arr`, so the exit rendezvous is no longer
+// what keeps a fast rank off a slow peer's input. See k3_coll_1bar.h for the
+// whole argument and for the host-side check the rotation depends on. Both are
+// instantiated; SPARKINFER_K3_COLL_1BAR=0 picks the two-barrier one at launch.
+template <int N, bool kEndBar>
 __global__ void __launch_bounds__(512, 1)
     peer_oneshot_allreduce_f32_kernel(PeerInputsF32<N> peers, RankSignals<N> sg,
                                       Signal* self_sg, int rank,
-                                      float* __restrict__ out, int n_vec) {
+                                      float* __restrict__ out, int n_vec, int arr) {
     using P = array_t<float, 4>;
     const P* ptrs[N];
 #pragma unroll
     for (int r = 0; r < N; r++) ptrs[r] = reinterpret_cast<const P*>(peers.p[r]);
 
-    barrier_at_start<N>(sg, self_sg, rank);
+    // ABOVE barrier_at_start, and that placement is the whole safety argument: this
+    // grid may be spinning up while the kernel that fills in_buf is still retiring,
+    // and the flag published below tells eight peers "my input is written". A no-op
+    // unless the launch was programmatic. See tp_pdl.cuh.
+    tp_pdl_sync();
+
+    barrier_at_start<N>(sg, self_sg, rank, kEndBar ? 0 : arr);
     for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < n_vec;
          idx += gridDim.x * blockDim.x) {
         reinterpret_cast<P*>(out)[idx] = packed_reduce_f32<N>(ptrs, idx);
     }
-    barrier_at_end<N, true>(sg, self_sg, rank);
+    // NO EARLY cudaTriggerProgrammaticLaunchCompletion() HERE, AND THAT STAYS TRUE
+    // UNDER THE PING-PONG. It is tempting: out[] is final for this rank the moment
+    // the loop ends, and tp_allreduce.cuh says barrier_at_end<true>'s "only job is to
+    // keep a fast rank from clobbering the shared input before a slow rank finishes
+    // reading it" — so the successor, which only reads out[], appears free to go.
+    //
+    // It is not, and the rotation does not make it so. Programmatic edges are
+    // PAIRWISE: releasing the successor lets IT release ITS successor, so a triggered
+    // chain runs arbitrarily far ahead — past the kSlotCount collectives that are the
+    // entire reuse distance the ping-pong provides. The rotation buys a bounded amount
+    // of run-ahead; an early trigger removes the bound. The failure is a slow peer
+    // summing a buffer a fast rank has already rewritten: wrong numbers on some
+    // tokens, no crash, and an accuracy gate that catches it only probabilistically.
+    //
+    // So this keeps the SUCCESSOR half of PDL (above) and leaves the predecessor half
+    // alone, exactly as it did with two barriers.
+    if constexpr (kEndBar) barrier_at_end<N, true>(sg, self_sg, rank);
 }
 
 // Same reduce, NO in-kernel barrier — used only by the host-event baseline path
@@ -147,6 +179,12 @@ int grid_for(int n_vec, int block) {
 
 }  // namespace detail
 
+// The host header names the slot count so collective.cpp can branch on it at
+// compile time; tp_allreduce.cuh names it so the device side can size Signal.
+// They are the same number and this is where that is enforced.
+static_assert(PeerOneShotAllreduce::kInputSlots == kSlotCount,
+              "host and device slot counts must agree");
+
 struct PeerOneShotAllreduce::Impl {
     std::vector<int> devices;
     std::size_t count = 0;
@@ -179,20 +217,43 @@ void launch_in_kernel(PeerOneShotAllreduce::Impl* s, int n_vec,
 
 template <int N>
 void launch_in_kernel_f32(PeerOneShotAllreduce::Impl* s, int n_vec,
-                          const std::vector<void*>& streams) {
+                          const std::vector<void*>& streams, int slot) {
+    // slot < 0 means "the caller is not rotating": one buffer, exit barrier kept,
+    // byte-for-byte main's launch. Anything else selects an input slot AND the
+    // matching counter array — one index drives both, which is what makes
+    // "consecutive collectives never share a buffer or an array" a single fact
+    // rather than two that can drift apart.
+    const bool one_bar = slot >= 0;
+    const int  s_idx   = one_bar ? slot : 0;
     PeerInputsF32<N> peers{};
     RankSignals<N> sg{};
     for (int r = 0; r < N; r++) {
-        peers.p[r] = reinterpret_cast<const float*>(s->in_buf[r]);
+        peers.p[r] = reinterpret_cast<const float*>(s->in_buf[r]) +
+                     (size_t)s_idx * s->count;
         sg.sg[r] = s->sig[r];
     }
     const int block = 512;
     const int grid = grid_for(n_vec, block);
     for (int r = 0; r < N; r++) {
         SPARKINFER_TP_CUDA_CHECK(cudaSetDevice(s->devices[r]));
-        peer_oneshot_allreduce_f32_kernel<N><<<grid, block, 0,
-            reinterpret_cast<cudaStream_t>(streams[r])>>>(
-            peers, sg, s->sig[r], r, reinterpret_cast<float*>(s->out_buf[r]), n_vec);
+        // The f32 entry point only — it exists because K3 keeps its residual stream
+        // f32, so it is the one every K3 reduce takes and no other model's. The bf16
+        // kernel above is Qwen's and is deliberately left on the plain launch: this
+        // factor is measured at 128k on K3 and has no business changing the
+        // submission mechanism of a path it was never run against.
+        if (one_bar) {
+            tp_pdl_launch(dim3((unsigned)grid), dim3((unsigned)block), 0,
+                          reinterpret_cast<cudaStream_t>(streams[r]),
+                          peer_oneshot_allreduce_f32_kernel<N, false>,
+                          peers, sg, s->sig[r], r,
+                          reinterpret_cast<float*>(s->out_buf[r]), n_vec, s_idx);
+        } else {
+            tp_pdl_launch(dim3((unsigned)grid), dim3((unsigned)block), 0,
+                          reinterpret_cast<cudaStream_t>(streams[r]),
+                          peer_oneshot_allreduce_f32_kernel<N, true>,
+                          peers, sg, s->sig[r], r,
+                          reinterpret_cast<float*>(s->out_buf[r]), n_vec, 0);
+        }
         SPARKINFER_TP_CUDA_CHECK(cudaGetLastError());
     }
 }
@@ -274,6 +335,13 @@ PeerOneShotAllreduce::PeerOneShotAllreduce(const std::vector<int>& devices,
     // Sized for f32, the wider of the two element types this class now
     // reduces; bf16 uses the front half. One allocation serves both.
     const std::size_t bytes = count * sizeof(float);
+    // The INPUT is allocated kSlotCount times over so the single-barrier kernel
+    // can rotate through the slots (k3_coll_1bar.h). At K3's max_count of 10752
+    // floats that is 43 KB -> 129 KB per rank; the output and the two-shot
+    // scratch are untouched, because only the input is the contended buffer.
+    // Allocated unconditionally so the env toggle stays a pure launch-time
+    // choice on one binary rather than something the constructor has to know.
+    const std::size_t in_bytes = bytes * (std::size_t)kSlotCount;
     for (int r = 0; r < N; r++) {
         if (cudaSetDevice(devices[r]) != cudaSuccess) return;
         // Enable peer access from devices[r] to every other rank.
@@ -287,7 +355,7 @@ PeerOneShotAllreduce::PeerOneShotAllreduce(const std::vector<int>& devices,
             }
             (void)cudaGetLastError();  // clear sticky AlreadyEnabled
         }
-        if (cudaMalloc(&impl_->in_buf[r], bytes) != cudaSuccess) return;
+        if (cudaMalloc(&impl_->in_buf[r], in_bytes) != cudaSuccess) return;
         if (cudaMalloc(&impl_->out_buf[r], bytes) != cudaSuccess) return;
         if (cudaMalloc(&impl_->tmp_buf[r], bytes) != cudaSuccess) return;
         if (cudaMalloc(&impl_->sig[r], sizeof(Signal)) != cudaSuccess) return;
@@ -316,9 +384,14 @@ PeerOneShotAllreduce::~PeerOneShotAllreduce() noexcept {
 }
 
 void* PeerOneShotAllreduce::rank_buffer(int rank) const noexcept {
-    if (!ok_ || rank < 0 || rank >= (int)impl_->in_buf.size()) return nullptr;
-    return impl_->in_buf[rank];
+    return rank_buffer(rank, 0);
 }
+void* PeerOneShotAllreduce::rank_buffer(int rank, int slot) const noexcept {
+    if (!ok_ || rank < 0 || rank >= (int)impl_->in_buf.size()) return nullptr;
+    if (slot < 0 || slot >= kSlotCount) return nullptr;
+    return reinterpret_cast<float*>(impl_->in_buf[rank]) + (size_t)slot * impl_->count;
+}
+int PeerOneShotAllreduce::slots() noexcept { return kSlotCount; }
 void* PeerOneShotAllreduce::rank_result(int rank) const noexcept {
     if (!ok_ || rank < 0 || rank >= (int)impl_->out_buf.size()) return nullptr;
     return impl_->out_buf[rank];
@@ -339,13 +412,20 @@ void PeerOneShotAllreduce::allreduce_bf16(std::size_t count,
 
 void PeerOneShotAllreduce::allreduce_f32(std::size_t count,
                                          const std::vector<void*>& streams) {
+    allreduce_f32(count, streams, -1);
+}
+
+void PeerOneShotAllreduce::allreduce_f32(std::size_t count,
+                                         const std::vector<void*>& streams,
+                                         int slot) {
     if (!ok_) return;
     const int N = static_cast<int>(impl_->devices.size());
     const int n_vec = static_cast<int>(count / 4);   // 128-bit packs of 4 floats
+    if (slot >= kSlotCount) slot = -1;               // never guess: fall back safe
     switch (N) {
-        case 2: detail::launch_in_kernel_f32<2>(impl_, n_vec, streams); break;
-        case 4: detail::launch_in_kernel_f32<4>(impl_, n_vec, streams); break;
-        case 8: detail::launch_in_kernel_f32<8>(impl_, n_vec, streams); break;
+        case 2: detail::launch_in_kernel_f32<2>(impl_, n_vec, streams, slot); break;
+        case 4: detail::launch_in_kernel_f32<4>(impl_, n_vec, streams, slot); break;
+        case 8: detail::launch_in_kernel_f32<8>(impl_, n_vec, streams, slot); break;
         default: break;
     }
 }

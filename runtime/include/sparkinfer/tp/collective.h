@@ -159,6 +159,28 @@ public:
         (void)count; (void)streams; return false;
     }
 
+    // ---- rotating input slots ------------------------------------------------
+    // How many independently-writable input regions this backend offers. ONE by
+    // default, which is the shape every backend has always had: a single peer-
+    // visible input per rank whose reuse across the token's collectives is made
+    // safe by the reduce kernel's own exit barrier.
+    //
+    // A backend that returns more is offering to drop that exit barrier in
+    // exchange for the caller rotating the slot, so the write that precedes
+    // collective k+slots() is separated from collective k's reads by every entry
+    // barrier in between. The caller opts in by using the two calls below; a
+    // caller that ignores them gets exactly the old behaviour, which is why these
+    // are defaulted rather than pure.
+    virtual int reduce_slots() const { return 1; }
+    virtual void* reduce_in_slot(int rank, int slot) const {
+        (void)slot; return reduce_in(rank);
+    }
+    virtual bool allreduce_f32_owned_slot(std::size_t count,
+                                          const std::vector<cudaStream_t>& streams,
+                                          int slot) {
+        (void)slot; return allreduce_f32_owned(count, streams);
+    }
+
     // Largest `count` the owned buffers can hold. 0 when !owns_buffers().
     virtual std::size_t max_count() const { return 0; }
 

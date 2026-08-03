@@ -55,6 +55,7 @@
 // SPARKINFER_K3_PROJ_1BAR=0 declines both, and every projection goes back through
 // k3_proj_ggml_f32 / k3_proj_ggml_f32_x4 exactly as main runs them.
 
+#include "sparkinfer/kernels/k3_proj_rowbudget.h"
 #include "sparkinfer/kernels/kimi_k3_fast.h"
 #include "k3_pdl.cuh"
 
@@ -332,13 +333,19 @@ bool k3_proj_q8_multirow_1bar(float* y, const float* x, const void* W, int wtype
 
     const int nb = K / 32;
     const int TB = block_for(nb);
-    const int rows = (N >= MIN_N_W16) ? 16 : (N >= MIN_N_W8) ? 8 : 4;
+    // The N-only tier, kept as the input to the warp budget rather than replaced
+    // outright: the budget may only ever LOWER it (widen the grid), never raise it.
+    // See sparkinfer/kernels/k3_proj_rowbudget.h — TB is decided from K above and
+    // stays exactly as it was, which is what keeps every accumulation order intact.
+    const int legacy_rows = (N >= MIN_N_W16) ? 16 : (N >= MIN_N_W8) ? 8 : 4;
+    const int rows = k3_proj_rows_for_budget(N, TB, legacy_rows);
 
     // Validate the geometry BEFORE quantising. Declining after a launch would leave
     // the caller's fallback re-quantising into the same scratch — the same bytes, so
     // harmless, but a decline should cost nothing at all.
     const bool shape_ok = (TB == 32 || TB == 64 || TB == 128) &&
-                          (rows == 4 || rows == 8 || rows == 16);
+                          (rows == 1 || rows == 2 || rows == 4 ||
+                           rows == 8 || rows == 16);
     if (!shape_ok) return false;
 
     constexpr int QT = 128;
@@ -353,12 +360,18 @@ bool k3_proj_q8_multirow_1bar(float* y, const float* x, const void* W, int wtype
         case 32 * 100 + 16: K3_1BAR_LAUNCH(32, 16); break;
         case 32 * 100 +  8: K3_1BAR_LAUNCH(32,  8); break;
         case 32 * 100 +  4: K3_1BAR_LAUNCH(32,  4); break;
+        case 32 * 100 +  2: K3_1BAR_LAUNCH(32,  2); break;
+        case 32 * 100 +  1: K3_1BAR_LAUNCH(32,  1); break;
         case 64 * 100 + 16: K3_1BAR_LAUNCH(64, 16); break;
         case 64 * 100 +  8: K3_1BAR_LAUNCH(64,  8); break;
         case 64 * 100 +  4: K3_1BAR_LAUNCH(64,  4); break;
+        case 64 * 100 +  2: K3_1BAR_LAUNCH(64,  2); break;
+        case 64 * 100 +  1: K3_1BAR_LAUNCH(64,  1); break;
         case 128 * 100 + 16: K3_1BAR_LAUNCH(128, 16); break;
         case 128 * 100 +  8: K3_1BAR_LAUNCH(128,  8); break;
         case 128 * 100 +  4: K3_1BAR_LAUNCH(128,  4); break;
+        case 128 * 100 +  2: K3_1BAR_LAUNCH(128,  2); break;
+        case 128 * 100 +  1: K3_1BAR_LAUNCH(128,  1); break;
         default: return false;
     }
 #undef K3_1BAR_LAUNCH

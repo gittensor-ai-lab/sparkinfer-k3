@@ -7,6 +7,7 @@
 // `tp_allreduce_check` on a real node before any forward path trusts it.
 
 #include "sparkinfer/tp/collective.h"
+#include "sparkinfer/tp/k3_coll_1bar.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -250,6 +251,40 @@ public:
     }
     void* reduce_out(int rank) const override {
         return (rank >= 0 && rank < n_) ? impl_->rank_result(rank) : nullptr;
+    }
+
+    // Rotating input slots — offered only by a backend that declares them AND
+    // only while the toggle is on. Falling back to 1 slot is not a degraded mode:
+    // it is main, with the kernel's exit barrier doing the same job.
+    int reduce_slots() const override {
+        if constexpr (Impl::kInputSlots > 1)
+            return k3_coll_1bar_enabled() ? Impl::kInputSlots : 1;
+        else
+            return 1;
+    }
+    void* reduce_in_slot(int rank, int slot) const override {
+        if constexpr (Impl::kInputSlots > 1) {
+            if (rank < 0 || rank >= n_) return nullptr;
+            return impl_->rank_buffer(rank, slot);
+        } else {
+            (void)slot;
+            return reduce_in(rank);
+        }
+    }
+    bool allreduce_f32_owned_slot(std::size_t count,
+                                  const std::vector<cudaStream_t>& streams,
+                                  int slot) override {
+        if constexpr (Impl::kSupportsF32 && Impl::kInputSlots > 1) {
+            if (static_cast<int>(streams.size()) != n_) return false;
+            if (count == 0) return true;
+            if (count > max_count_) return false;
+            std::vector<void*> raw(streams.size());
+            for (std::size_t i = 0; i < streams.size(); ++i) raw[i] = (void*)streams[i];
+            impl_->allreduce_f32(count, raw, slot);
+            return true;
+        } else {
+            return allreduce_f32_owned(count, streams);
+        }
     }
 
     // Mode A is not available: reducing a caller-owned pointer would require

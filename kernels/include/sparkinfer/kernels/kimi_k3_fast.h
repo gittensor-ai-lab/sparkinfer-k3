@@ -98,6 +98,39 @@ bool k3_proj_q8_fused4_1bar(float* y0, float* y1, float* y2, float* y3, const fl
                             int wtype, int N, int K, void* q8_scratch,
                             cudaStream_t stream, bool x_pre_q8 = false);
 
+// ---------------------------------------------------------------------------
+// Factor — MoE router, selection kept in shared memory
+// ---------------------------------------------------------------------------
+// moe_router_noaux_tc_kernel publishes each of its 16 winners straight to the caller's
+// GLOBAL buffers and then re-reads all 16 back from a single thread to normalise them —
+// sixteen dependent global loads at the end of a kernel that runs 92 times per token per
+// rank and measures 17.8 us. This keeps the winners in shared and writes once, and folds
+// the per-warp candidates with a warp reduce instead of a serial walk by thread 0.
+//
+// Bit-identical, including the tie-break: the comparison is a total order on
+// (value desc, index asc), so the fold order cannot change the winner.
+//
+// Declines — returns false, caller runs the original — on SPARKINFER_K3_ROUTER_FAST=0,
+// a top_k above 32, or a shared request past the 48 KiB budget.
+bool k3_moe_router_fast(float* out_w, int* out_ids, const float* logits,
+                        const float* bias, int n_expert, int top_k, int n_tokens,
+                        bool norm_w, float w_scale, cudaStream_t stream);
+
+
+// ---------------------------------------------------------------------------
+// Factor — the FFN tail's two residual adds, in one launch
+// ---------------------------------------------------------------------------
+// Every MoE layer ends with `ffn_out += shexp_out` immediately followed by
+// `hidden_out += ffn_out`, with no kernel between them: 184 launches per token per rank
+// for two 28 KiB elementwise adds, each of which costs 2.95 us regardless of content.
+// This does both in one launch and is bit-identical — same two operations, same order,
+// same f32 intermediate. out_ab is still written because the debug hook between the two
+// original calls reads it.
+//
+// Declines on SPARKINFER_K3_ADD3=0.
+bool k3_add3_f32(float* out, float* out_ab, const float* a, const float* b,
+                 const float* c, int64_t n, cudaStream_t stream);
+
 }  // namespace k3
 }  // namespace kernels
 }  // namespace sparkinfer

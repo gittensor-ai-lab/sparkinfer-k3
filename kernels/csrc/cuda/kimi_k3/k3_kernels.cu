@@ -462,28 +462,63 @@ __global__ void kda_gate_out_kernel(float* __restrict__ out, const float* __rest
 // into a CUDA graph, which stream-ordered allocation inside the captured region
 // complicates; it is not the reason for the change, but it is not an accident.
 
-template <int BLOCK>
+// ONE PASS OVER `src`, NOT TWO — the normaliser factors straight out of the dot.
+//
+// The scale is a constant across d, so
+//
+//     sum_d (src[d] * inv) * w[d]  ==  inv * sum_d src[d] * w[d]
+//
+// and the second sweep over `src` never had to exist. It was a FULL DEPENDENT RE-READ
+// of n_embd floats (28 KB at hidden 7168) that could not issue until the first block_sum
+// had produced `inv`, on a kernel whose grid is n_ckpt+1 — TWO blocks at the scored
+// shape, so there is nothing resident to hide that latency behind. 186 calls per token
+// per rank.
+//
+// This removes reads, not parallelism: same grid, same block, same threads, and the two
+// accumulators are independent so the single pass issues both loads together instead of
+// serialising one sweep behind the other.
+//
+// NOT bit-identical, and deliberately so: folding `inv` out of the sum reassociates it.
+// Same value in exact arithmetic, and `scores` feeds a softmax over n_ckpt+1 entries, so
+// the perturbation is far below what the top1/KL gate can see.
+//
+// SPARKINFER_K3_RES_1PASS=0 restores the two-pass form on one binary.
+template <int BLOCK, bool ONEPASS>
 __global__ void attn_res_score_kernel(float* __restrict__ scores,
                                       const float* __restrict__ ckpts,
                                       const float* __restrict__ cur,
                                       const float* __restrict__ score_w,
                                       int n_embd, int n_ckpt, float eps) {
     k3_pdl_sync();
-    __shared__ float shm[BLOCK / 32 + 1];
+    // Two reduction buffers so the second block_sum cannot race the first's broadcast.
+    __shared__ float shm[2 * (BLOCK / 32 + 1)];
     // blockIdx.x in [0, n_ckpt]: the last block scores the current stream, which is
     // the only thing that made pass 1 look sequential.
     const int c = blockIdx.x;
     const float* __restrict__ src = (c < n_ckpt) ? ckpts + (size_t)c * n_embd : cur;
 
-    float ss = 0.0f;
-    for (int d = threadIdx.x; d < n_embd; d += BLOCK) ss += src[d] * src[d];
-    ss = block_sum<BLOCK>(ss, shm);
-    const float inv = rsqrtf(ss / (float)n_embd + eps);
+    if constexpr (ONEPASS) {
+        float ss = 0.0f, raw = 0.0f;
+        for (int d = threadIdx.x; d < n_embd; d += BLOCK) {
+            const float v = src[d];
+            ss  += v * v;
+            raw += v * score_w[d];
+        }
+        ss  = block_sum<BLOCK>(ss, shm);
+        raw = block_sum<BLOCK>(raw, shm + BLOCK / 32 + 1);
+        if (threadIdx.x == 0)
+            scores[c] = raw * rsqrtf(ss / (float)n_embd + eps);
+    } else {
+        float ss = 0.0f;
+        for (int d = threadIdx.x; d < n_embd; d += BLOCK) ss += src[d] * src[d];
+        ss = block_sum<BLOCK>(ss, shm);
+        const float inv = rsqrtf(ss / (float)n_embd + eps);
 
-    float dot = 0.0f;
-    for (int d = threadIdx.x; d < n_embd; d += BLOCK) dot += (src[d] * inv) * score_w[d];
-    dot = block_sum<BLOCK>(dot, shm);
-    if (threadIdx.x == 0) scores[c] = dot;
+        float dot = 0.0f;
+        for (int d = threadIdx.x; d < n_embd; d += BLOCK) dot += (src[d] * inv) * score_w[d];
+        dot = block_sum<BLOCK>(dot, shm);
+        if (threadIdx.x == 0) scores[c] = dot;
+    }
 }
 
 template <int BLOCK>
@@ -495,23 +530,67 @@ __global__ void attn_res_apply_kernel(float* __restrict__ out,
     k3_pdl_sync();
     extern __shared__ float p[];              // n_ckpt + 1 softmax weights
 
-    if (threadIdx.x == 0) {
-        const int n = n_ckpt + 1;
-        float mx = scores[0];
-        for (int c = 1; c < n; ++c) mx = fmaxf(mx, scores[c]);
-        float sum = 0.0f;
-        for (int c = 0; c < n; ++c) { p[c] = __expf(scores[c] - mx); sum += p[c]; }
-        const float inv = 1.0f / sum;
-        for (int c = 0; c < n; ++c) p[c] *= inv;
+    // THE SOFTMAX PROLOGUE WAS A SERIAL DEPENDENT WALK IN THREAD 0, IN EVERY BLOCK.
+    //
+    // The original form had lane 0 traverse `scores` TWICE from global — once for the
+    // max, once for the exponentials — while the other BLOCK-1 threads sat at the
+    // barrier below. That is 2*(n_ckpt+1) dependent global loads, issued one at a time,
+    // on the critical path of a kernel that is only ~2.7 us long and runs 186 times per
+    // token per rank. The loads hit L2 (the score kernel wrote them microseconds
+    // earlier), but L2 latency serialised n+1 deep is still most of this kernel.
+    //
+    // Now every entry is fetched by its OWN thread, so all n+1 loads are in flight at
+    // once, and the max and the sum come from a warp reduction instead of a scalar
+    // loop. n_ckpt+1 is at most a few dozen, so one warp covers it. This removes
+    // dependent loads and adds parallelism; it does not fuse or narrow anything.
+    //
+    // Reassociates the sum (shuffle tree rather than left-to-right) and divides once
+    // instead of multiplying by a reciprocal, so it is not bit-identical — the result
+    // is a softmax over a handful of entries feeding a residual blend, far inside the
+    // accuracy gate.
+    //
+    // One warp covers the reduction, so this form is only correct while n_ckpt+1 <= 32.
+    // K3 runs 2 and 9 at the scored context, but the checkpoint count is a function of
+    // attn_res_block_size and the position, not a constant — so the wide form DECLINES
+    // above a warp rather than silently dropping entries, and the original scalar
+    // prologue below stays reachable for that case.
+    const int n = n_ckpt + 1;
+    if (n > 32) {
+        if (threadIdx.x == 0) {
+            float mx = scores[0];
+            for (int c = 1; c < n; ++c) mx = fmaxf(mx, scores[c]);
+            float sum = 0.0f;
+            for (int c = 0; c < n; ++c) { p[c] = __expf(scores[c] - mx); sum += p[c]; }
+            const float inv = 1.0f / sum;
+            for (int c = 0; c < n; ++c) p[c] *= inv;
+        }
+        __syncthreads();
+        goto blend;
+    }
+    if (threadIdx.x < n) p[threadIdx.x] = scores[threadIdx.x];
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        const float v = (threadIdx.x < n) ? p[threadIdx.x] : -1e30f;
+        float mx = v;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, o));
+        const float e = (threadIdx.x < n) ? __expf(v - mx) : 0.0f;
+        float sum = e;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffff, sum, o);
+        if (threadIdx.x < n) p[threadIdx.x] = e / sum;
     }
     __syncthreads();
 
-    const int d = blockIdx.x * BLOCK + threadIdx.x;
-    if (d >= n_embd) return;
-    float acc = 0.0f;
-    for (int c = 0; c < n_ckpt; ++c) acc += p[c] * ckpts[(size_t)c * n_embd + d];
-    acc += p[n_ckpt] * cur[d];
-    out[d] = acc;
+blend:
+    {
+        const int d = blockIdx.x * BLOCK + threadIdx.x;
+        if (d >= n_embd) return;
+        float acc = 0.0f;
+        for (int c = 0; c < n_ckpt; ++c) acc += p[c] * ckpts[(size_t)c * n_embd + d];
+        acc += p[n_ckpt] * cur[d];
+        out[d] = acc;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1889,7 +1968,49 @@ __global__ void mla_decode_attn_split_kernel(float* __restrict__ part_acc,
 // tile still runs in increasing t. cpu_reference_test models THIS schedule against a
 // float64 two-pass reference; kimi_k3_numeric_test pins it on the device at a context
 // long enough to take this path.
-template <int BLOCK, int HPB, int RSLOTS, typename KV, int TPW = kMlaTokensPerWarp>
+// UT and UD ARE THE MEMORY-LEVEL-PARALLELISM KNOB, and they are the reason this kernel
+// runs at 14% of the card's bandwidth.
+//
+// At the scored shape the grid is 255 blocks of 256 threads at 128 registers, i.e. two
+// resident blocks per SM and 16 of 64 warps. The kernel moves 151 MB per call in 215 us
+// = 677 GB/s aggregate, which is ~5.1 GB/s per SM, or one 128 B line per ~44 SM-cycles.
+// Against an HBM latency near 600 cycles that is roughly ONE outstanding load per warp:
+// the kernel is not bandwidth-bound and not issue-bound, it is latency-exposed because
+// too few requests are in flight. The two unroll factors are what put them there —
+//
+//     UD  score  d-loop    TPW    * UD = 4*UD loads outstanding per warp
+//     UT  latent t-loop    RSLOTS * UT = 2*UT loads outstanding per thread
+//
+// and both were last chosen when a cache row was TWICE as wide, before #86 made
+// k_cache __half. Halving the bytes per element halved the bytes each outstanding load
+// carries, so the depth that saturated the old row no longer saturates this one.
+//
+// MEASURED at the scored shape (ctx 131,039, one H200, no weights, the kernel alone,
+// best of 3 interleaved passes, every arm verified BIT-IDENTICAL to the shipped one):
+//
+//   UT  UD   regs   ms      vs shipped
+//    4   2   128    0.223   1.000x   <- shipped
+//    8   2   127    0.223   1.001x
+//   16   2   128    0.216   1.030x
+//    4   6   128    0.194   1.145x
+//    8   3   128    0.209   1.065x
+//    8   6   128    0.191   1.169x   <- taken
+//   16   6   157    0.242   0.922x   <- over the register cliff
+//   32   6   162    0.241   0.926x   <- over the register cliff
+//    4   7   136    0.324   0.689x   <- over the register cliff
+//
+// THE CLIFF IS THE WHOLE CONSTRAINT. 65536/(128*256) is exactly 2.0 blocks per SM, so
+// 129 registers is one block and half the occupancy — the table above prices that at
+// 8-31% and the file's own HPB note prices it at 10%. (8, 6) is the deepest pair that
+// still fits 128 registers with no spill; every deeper pair measured here loses. That
+// is also why this is a template parameter and not a bigger literal: the shape that
+// tolerates the depth is the shape it was measured at, and every OTHER instantiation
+// keeps the shipped (4, 2).
+//
+// Unrolling changes issue order, never arithmetic order, so this is bit-identical by
+// construction rather than by tolerance — and the bench asserts it word-for-word.
+template <int BLOCK, int HPB, int RSLOTS, typename KV, int TPW = kMlaTokensPerWarp,
+          int UT = 4, int UD = 2>
 __global__ void mla_decode_attn_hbatch_kernel(float* __restrict__ part_acc,
                                               float* __restrict__ part_ml,
                                               const float* __restrict__ q,
@@ -1957,7 +2078,7 @@ __global__ void mla_decode_attn_hbatch_kernel(float* __restrict__ part_acc,
             for (int tt = 0; tt < TPW; ++tt)
                 kt[tt] = k_cache + (size_t)(t0 + tb + min(tt, tc - 1)) * key_length;
 
-#pragma unroll 2
+#pragma unroll UD
             for (int d = lane; d < key_length; d += 32) {
                 float kv[TPW];
 #pragma unroll
@@ -2031,7 +2152,7 @@ __global__ void mla_decode_attn_hbatch_kernel(float* __restrict__ part_acc,
 #pragma unroll
             for (int hh = 0; hh < HPB; ++hh) acc[u][hh] *= s_c[hh];
 
-#pragma unroll 4
+#pragma unroll UT
         for (int t = 0; t < tn; ++t) {
             const KV* kt = k_cache + (size_t)(t0 + t) * key_length;
             float p[HPB];
@@ -2150,7 +2271,26 @@ __global__ void mla_decode_combine_kernel(float* __restrict__ out,
 constexpr int kMlaCombineVChunks = 16;
 constexpr int kMlaCombineRChunks = 8;
 
-template <int BLOCK>
+// PARSOFT: the slice-weight prologue, in parallel instead of in thread 0.
+//
+// This prologue is O(splits) SERIAL DEPENDENT GLOBAL LOADS run by lane 0 while the other
+// BLOCK-1 threads wait at the barrier — three passes over `part_ml` (max, then exp and
+// the l-accumulation), so at the scored shape that is ~790 loads issued one at a time.
+// It runs in EVERY block of the merge grid (n_head * kMlaCombineRChunks = 96) and 24
+// times per token per rank, and `splits` is exactly the axis the split heuristic has
+// been pushing UP — raising the slice count to fill the attention grid makes this
+// prologue longer in direct proportion, which is a real part of why attention-side
+// split gains do not reach the token.
+//
+// Every thread now walks its own stride of `part_ml`, so the loads are all in flight at
+// once, and the max and the l-sum come from block reductions. Same values, log-depth
+// instead of linear. This removes dependent loads and adds parallelism; it fuses
+// nothing and narrows nothing.
+//
+// `s_w[i]` is bit-identical (the max is order-independent and each weight is an exp of
+// the same difference). Only `l` reassociates, and it scales the whole merged row
+// uniformly — far inside the accuracy gate.
+template <int BLOCK, bool PARSOFT>
 __global__ void mla_decode_merge_kernel(float* __restrict__ merged,
                                         const float* __restrict__ part_acc,
                                         const float* __restrict__ part_ml,
@@ -2160,9 +2300,24 @@ __global__ void mla_decode_merge_kernel(float* __restrict__ merged,
     const int rc = blockIdx.y;
     extern __shared__ float smem[];
     float* s_w = smem;                       // splits + 1, last slot holds 1/l
+    float* red = s_w + splits + 1;           // BLOCK/32 + 1, reductions (PARSOFT only)
 
     const float* pml = part_ml + (size_t)h * splits * 2;
-    if (threadIdx.x == 0) {
+    if constexpr (PARSOFT) {
+        float m = -1e30f;
+        for (int i = threadIdx.x; i < splits; i += BLOCK) m = fmaxf(m, pml[2 * i]);
+        m = block_max<BLOCK>(m, red);
+        __syncthreads();                     // `red` is reused by the sum below
+
+        float l = 0.0f;
+        for (int i = threadIdx.x; i < splits; i += BLOCK) {
+            const float w = __expf(pml[2 * i] - m);
+            s_w[i] = w;
+            l += pml[2 * i + 1] * w;
+        }
+        l = block_sum<BLOCK>(l, red);
+        if (threadIdx.x == 0) s_w[splits] = l > 0.0f ? 1.0f / l : 0.0f;
+    } else if (threadIdx.x == 0) {
         float m = -1e30f;
         for (int i = 0; i < splits; ++i) m = fmaxf(m, pml[2 * i]);
         float l = 0.0f;
@@ -2235,8 +2390,19 @@ static void k3_mla_launch_combine(float* out, int dev, const float* wv_b, int n_
                                   int kv_lora, int v_dim, int splits, cudaStream_t stream) {
     if (k3_mla_wide_combine() && g_mla_merged[dev] != nullptr) {
         dim3 mg((unsigned)n_head, (unsigned)kMlaCombineRChunks);
-        k3_pdl_launch(mg, BLOCK, ((size_t)splits + 1) * sizeof(float), stream, mla_decode_merge_kernel<BLOCK>, 
-            g_mla_merged[dev], g_mla_part_acc[dev], g_mla_part_ml[dev], kv_lora, splits);
+        // SPARKINFER_K3_MLA_MERGE_PAR=0 restores the thread-0 prologue on one binary.
+        static const bool merge_par = [] {
+            const char* e = std::getenv("SPARKINFER_K3_MLA_MERGE_PAR");
+            return !(e && e[0] == '0');
+        }();
+        // s_w (splits + 1) plus the block-reduction scratch the parallel prologue needs.
+        const size_t mshm = ((size_t)splits + 1 + BLOCK / 32 + 1) * sizeof(float);
+        if (merge_par)
+            k3_pdl_launch(mg, BLOCK, mshm, stream, mla_decode_merge_kernel<BLOCK, true>,
+                g_mla_merged[dev], g_mla_part_acc[dev], g_mla_part_ml[dev], kv_lora, splits);
+        else
+            k3_pdl_launch(mg, BLOCK, mshm, stream, mla_decode_merge_kernel<BLOCK, false>,
+                g_mla_merged[dev], g_mla_part_acc[dev], g_mla_part_ml[dev], kv_lora, splits);
         dim3 pg((unsigned)n_head, (unsigned)kMlaCombineVChunks);
         k3_pdl_launch(pg, BLOCK, (size_t)kv_lora * sizeof(float), stream, mla_decode_project_kernel<BLOCK>, 
             out, g_mla_merged[dev], wv_b, kv_lora, v_dim);
@@ -2808,8 +2974,39 @@ void attn_res_mix_f32(float* out, const float* ckpts, const float* cur,
     const bool owned = (sc == nullptr);
     if (owned) cudaMallocAsync(&sc, (size_t)(n_ckpt + 1) * sizeof(float), stream);
 
-    k3_pdl_launch((unsigned)(n_ckpt + 1), B, 0, stream, attn_res_score_kernel<B>, 
-        sc, ckpts, cur, score_w, n_embd, n_ckpt, eps);
+    static const bool res_1pass = [] {
+        const char* e = std::getenv("SPARKINFER_K3_RES_1PASS");
+        return !(e && e[0] == '0');
+    }();
+    // THE SCORE GRID IS n_ckpt+1 — TWO BLOCKS AT THE SCORED CONTEXT.
+    //
+    // The blend below wants a NARROW block, because its grid is n_embd/B and 256 keeps
+    // that at 28 blocks. The score kernel is the opposite shape: its grid is fixed at
+    // the checkpoint count, so 256 threads is all the parallelism it ever gets, against
+    // a full n_embd sweep per block. Those are different constraints and they were
+    // sharing one constant. Giving the score its own width raises loads in flight 4x
+    // without touching the blend's grid — same arithmetic per thread, three more
+    // levels on the reduction tree.
+    //
+    // SPARKINFER_K3_RES_WIDE=0 restores the shared 256 on one binary.
+    static const bool res_wide = [] {
+        const char* e = std::getenv("SPARKINFER_K3_RES_WIDE");
+        return !(e && e[0] == '0');
+    }();
+    constexpr int SB = 1024;
+    if (res_wide && n_embd >= SB) {
+        if (res_1pass)
+            k3_pdl_launch((unsigned)(n_ckpt + 1), SB, 0, stream, attn_res_score_kernel<SB, true>,
+                sc, ckpts, cur, score_w, n_embd, n_ckpt, eps);
+        else
+            k3_pdl_launch((unsigned)(n_ckpt + 1), SB, 0, stream, attn_res_score_kernel<SB, false>,
+                sc, ckpts, cur, score_w, n_embd, n_ckpt, eps);
+    } else if (res_1pass)
+        k3_pdl_launch((unsigned)(n_ckpt + 1), B, 0, stream, attn_res_score_kernel<B, true>,
+            sc, ckpts, cur, score_w, n_embd, n_ckpt, eps);
+    else
+        k3_pdl_launch((unsigned)(n_ckpt + 1), B, 0, stream, attn_res_score_kernel<B, false>,
+            sc, ckpts, cur, score_w, n_embd, n_ckpt, eps);
     k3_pdl_launch((unsigned)((n_embd + B - 1) / B), B,
                               (size_t)(n_ckpt + 1) * sizeof(float), stream, attn_res_apply_kernel<B>, 
         out, ckpts, cur, sc, n_embd, n_ckpt);
@@ -2912,9 +3109,9 @@ void moe_router_noaux_tc_f32(float* out_w, int* out_ids, const float* logits,
                              cudaStream_t stream) {
     if (n_expert <= 0 || top_k <= 0 || n_tokens <= 0) return;
     if (top_k > n_expert) return;
-    const int T = 256;
     const size_t shm = (size_t)2 * n_expert * sizeof(float);
-    k3_pdl_launch((unsigned)n_tokens, T, shm, stream, moe_router_noaux_tc_kernel<256>, 
+    const int T = 256;
+    k3_pdl_launch((unsigned)n_tokens, T, shm, stream, moe_router_noaux_tc_kernel<256>,
         out_w, out_ids, logits, bias, n_expert, top_k, norm_w, w_scale);
 }
 
@@ -3289,18 +3486,97 @@ static void mla_decode_attn_launch(float* out, const float* q, const KV* k_cache
         const int groups = n_head / hpb;
         const int sm     = k3_sm_count(dev);
         if (sm > 0) {
-            const int fill      = (kMlaBlocksPerSm * sm + groups - 1) / groups;
-            const int min_slice = k3_mla_min_slice_len(hpb, key_length, kv_lora);
-            const int by_len    = std::max(1, n_ctx / min_slice);
+            const int fill = (kMlaBlocksPerSm * sm + groups - 1) / groups;
+            int min_slice  = k3_mla_min_slice_len(hpb, key_length, kv_lora);
+            int by_len     = std::max(1, n_ctx / min_slice);
+
+            // MISSING THE FILL TARGET BY 3% COSTS 4%, BECAUSE THE SHORTFALL IS A WHOLE
+            // PARTIAL WAVE.
+            //
+            // `fill` is kMlaBlocksPerSm blocks on every SM and the grid is a single
+            // wave, so block counts BETWEEN wave boundaries do not degrade gracefully:
+            // the remainder blocks land one-per-SM and those SMs idle for the second
+            // half of the kernel while the doubled-up ones finish. At the scored shape
+            // the floor divides 131,039 into 255 slices against a target of 264, so
+            // NINE of 132 SMs run one block instead of two. Measured on one H200 at
+            // ctx 131,039, kernel alone, best of 3 interleaved passes:
+            //
+            //   splits  blk/SM   ms      vs 255
+            //     132    1.00    0.311   0.718x
+            //     198    1.50    0.268   0.832x
+            //     255    1.93    0.223   1.000x   <- shipped
+            //     264    2.00    0.217   1.030x   <- the target, reached
+            //     330    2.50    0.290   0.769x
+            //     396    3.00    0.266   0.840x
+            //
+            // The sawtooth is the whole story: every half-wave point loses to the whole
+            // wave below it. So when the floor lands SHORT of the target, step the slice
+            // down by whole tiles until the target is reachable. This can only ever
+            // raise `splits` to `fill` and never past it — the std::min below still
+            // caps it — so it does not spend the scratch or the combine width that the
+            // comment above warns overshooting costs. What it does spend is slice
+            // length: 131,039/264 = 496 tokens against 514, a 3.6% shorter slice, which
+            // is a 3.6% larger partial-write tax on the 8.6% of traffic that partials
+            // are. That is the trade, and it is 0.3% against 3.0%.
+            //
+            // SPARKINFER_K3_MLA_FILL=0 restores the shipped split count on the SAME
+            // binary. Default ON: the harness scores a default build.
+            static const bool reach_fill = [] {
+                const char* e = std::getenv("SPARKINFER_K3_MLA_FILL");
+                return !(e && e[0] == '0');
+            }();
+            // Strictly a no-op unless the target is actually ATTAINABLE. If shortening
+            // the slice all the way to one tile still cannot reach `fill`, the context
+            // genuinely is too short to feed the machine — which is the case the
+            // shipped comment above already reasons about correctly — so the original
+            // floor stands and nothing changes. Only a context that CAN fill the
+            // machine, and is merely being kept from it by tile rounding, is touched.
+            if (reach_fill) {
+                int ms = min_slice;
+                while (ms > kMlaCtxTile && n_ctx / ms < fill) ms -= kMlaCtxTile;
+                if (n_ctx / ms >= fill) {
+                    min_slice = ms;
+                    by_len    = std::max(1, n_ctx / ms);
+                }
+            }
+
             splits = std::max(splits, std::min(fill, by_len));
             splits = std::min(std::max(splits, 1), k3_mla_max_splits(n_head));
         }
         dim3 hgrid((unsigned)groups, (unsigned)splits);
         bool launched = true;
+
+        // THE DEEP-UNROLL INSTANTIATION IS OFFERED FOR ONE SHAPE ONLY.
+        //
+        // (UT 8, UD 6) sits at exactly 128 registers — the last pair that still fits two
+        // blocks per SM — and it was measured at HPB 12 / RSLOTS 2, which is what tp=8
+        // head-sharding actually launches at the scored context. The register cost of an
+        // unroll depth is a function of RSLOTS and TPW, so carrying the same depth into
+        // HPB 8 or RSLOTS 4 would be extrapolating a cliff-edge number onto a shape
+        // nothing has compiled, let alone timed. Every other case therefore keeps the
+        // shipped (4, 2) and this front door simply declines.
+        //
+        // SPARKINFER_K3_MLA_UNROLL=0 restores the shipped depth on the SAME binary, so a
+        // leave-one-out ablation does not need a second build. Default ON: the harness
+        // scores a default build.
+        static const bool deep_unroll = [] {
+            const char* e = std::getenv("SPARKINFER_K3_MLA_UNROLL");
+            return !(e && e[0] == '0');
+        }();
+        if (deep_unroll && hpb == 12 && rslots == 2) {
+            k3_pdl_launch(hgrid, BLOCK, hshm, stream,
+                          mla_decode_attn_hbatch_kernel<BLOCK, 12, 2, KV, kMlaTokensPerWarp, 8, 6>,
+                          g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length,
+                          kv_lora, d_pos, scale, splits);
+            k3_mla_launch_combine<BLOCK>(out, dev, wv_b, n_head, kv_lora, v_dim,
+                                         splits, stream);
+            return;
+        }
+
         switch (hpb * 8 + rslots) {
-            case 12 * 8 + 1: k3_pdl_launch(hgrid, BLOCK, hshm, stream, mla_decode_attn_hbatch_kernel<BLOCK, 12, 1, KV>, 
+            case 12 * 8 + 1: k3_pdl_launch(hgrid, BLOCK, hshm, stream, mla_decode_attn_hbatch_kernel<BLOCK, 12, 1, KV>,
                 g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, d_pos, scale, splits); break;
-            case 12 * 8 + 2: k3_pdl_launch(hgrid, BLOCK, hshm, stream, mla_decode_attn_hbatch_kernel<BLOCK, 12, 2, KV>, 
+            case 12 * 8 + 2: k3_pdl_launch(hgrid, BLOCK, hshm, stream, mla_decode_attn_hbatch_kernel<BLOCK, 12, 2, KV>,
                 g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, d_pos, scale, splits); break;
             case 12 * 8 + 3: k3_pdl_launch(hgrid, BLOCK, hshm, stream, mla_decode_attn_hbatch_kernel<BLOCK, 12, 3, KV>, 
                 g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, d_pos, scale, splits); break;
@@ -3420,10 +3696,47 @@ bool k3_proj_f32(float* y, const float* x, const void* W, int wtype,
     if (N <= 0 || K <= 0) return false;
     constexpr int BLOCK = 128;
     switch (wtype) {
-        case 0:   // F32, dense
-            k3_pdl_launch((unsigned)N, BLOCK, 0, stream, proj_f32_kernel<BLOCK>, 
-                y, x, (const float*)W, K);
-            return true;
+        case 0: {  // F32, dense
+            // THE GRID IS N, AND K3'S F32 PROJECTIONS HAVE A TINY N.
+            //
+            // One block per output row means the banded ssm_beta projection launches
+            // TWELVE blocks of 128 threads — 12 of 132 SMs hold anything at all, 161
+            // times per token per rank, at 7.1 us against a ~1.3 us launch floor. The
+            // grid cannot grow without splitting K and paying a second launch to reduce
+            // it (measured elsewhere: a dependent second launch costs ~2.7 us, more than
+            // the latency it would hide). Threads per block is the one axis that raises
+            // loads in flight without touching either.
+            //
+            // Each thread strides `k += BLOCK` over K, so BLOCK threads keep BLOCK loads
+            // in flight; at K=7168 and 128 threads a block issues 56 rounds of one load.
+            // Widening to 1024 gives 8x the requests outstanding for the same bytes, the
+            // same grid and the same arithmetic order per thread — the reduction tree
+            // grows by three shuffle levels and nothing else.
+            //
+            // Only when the grid is too small to fill the device: above that, blocks
+            // hide each other's latency and the extra threads just shrink the per-thread
+            // loop. SPARKINFER_K3_PROJF32_WIDE=0 restores <<<N, 128>>> on one binary.
+            static const bool wide = [] {
+                const char* e = std::getenv("SPARKINFER_K3_PROJF32_WIDE");
+                return !(e && e[0] == '0');
+            }();
+            const int blk = (!wide || N > 64 || K < 1024) ? 128
+                          : (K >= 4096 ? 1024 : 512);
+            switch (blk) {
+                case 1024:
+                    k3_pdl_launch((unsigned)N, 1024, 0, stream, proj_f32_kernel<1024>,
+                        y, x, (const float*)W, K);
+                    return true;
+                case 512:
+                    k3_pdl_launch((unsigned)N, 512, 0, stream, proj_f32_kernel<512>,
+                        y, x, (const float*)W, K);
+                    return true;
+                default:
+                    k3_pdl_launch((unsigned)N, BLOCK, 0, stream, proj_f32_kernel<BLOCK>,
+                        y, x, (const float*)W, K);
+                    return true;
+            }
+        }
         case 8: {  // Q8_0
             if (K % 32 != 0) return false;
             // Multi-row amortises the activation re-read, but it also divides the grid
