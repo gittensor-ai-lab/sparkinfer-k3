@@ -4,6 +4,7 @@
 
 #include "sparkinfer/kernels/kimi_k3.h"
 #include "sparkinfer/models/k3_head_band.h"
+#include "sparkinfer/models/k3_moe_band.h"
 #include "sparkinfer/tp/k3_coll_1bar.h"
 #include "sparkinfer/tp/shard.h"
 
@@ -505,6 +506,8 @@ bool kimi_k3_tp_init(const GGUF& g, const KimiK3Config& cfg, const K3PlanOptions
     // does not clear the check, rather than rotating anyway on a geometry the
     // proof does not cover.
     if (out.zero_copy && tp_size > 1) {
+        const bool moe_band_on = k3_moe_band_active(cfg.n_experts, cfg.expert_latent,
+                                                    cfg.hidden, tp_size);
         int per_token = 0;
         for (int L = 0; L < cfg.n_layers; ++L) {
             const bool kda = cfg.is_kda_layer(L);
@@ -513,6 +516,13 @@ bool kimi_k3_tp_init(const GGUF& g, const KimiK3Config& cfg, const K3PlanOptions
                 (!kda && KimiK3Weights::shards_mla(out.ranks[0].weights.policy));
             if (ar) ++per_token;
             if (L >= cfg.leading_dense) ++per_token;
+            // The MoE dense band adds TWO exchanges per MoE layer — the route payload
+            // and routed_up (k3_moe_band.h). Counted here, from the same predicate the
+            // forward splits on, because this number is what decides whether the
+            // rotation is sound: 185 -> 369, and 368 % 3 = 2 clears it as 184 % 3 = 1
+            // does with the band off. Adding only one of the two would give 277, and
+            // 276 % 3 = 0 would decline the rotation for the whole run.
+            if (L >= cfg.leading_dense && moe_band_on) per_token += 2;
         }
         const int slots = out.coll->reduce_slots();
         if (slots > 1 && tp::k3_coll_1bar_ok(per_token, slots)) {
@@ -545,6 +555,41 @@ bool kimi_k3_tp_init(const GGUF& g, const KimiK3Config& cfg, const K3PlanOptions
     return true;
 }
 
+// One MoE-dense-band exchange: collect every rank's payload for `phase`, all-reduce
+// it, and repoint the phase at the result. Each rank wrote only its ROW BAND into a
+// zeroed buffer, so the sum IS the concatenation — see k3_moe_band.h. Factored out
+// because the two sites differ only in phase, slot and width, and the width is the
+// one thing neither site may guess: kimi_k3_partial_buffer reports it.
+static bool k3_band_exchange(KimiK3TP& p, int layer, K3LayerPhase phase, int slot,
+                             const char* name, IssueProfile& ip) {
+    const int tp_size = (int)p.ranks.size();
+    int count = 0;
+    for (int r = 0; r < tp_size; ++r) {
+        int n = 0;
+        float* buf = kimi_k3_partial_buffer(p.ranks[(size_t)r].fwd, layer, phase, &n);
+        if (!buf || n <= 0) return false;
+        if (r == 0) count = n;
+        else if (n != count) return false;   // ranks must agree on the width
+        p.reduce_bufs[(size_t)r] = buf;
+    }
+    const IClock::time_point tk = ip.on ? IClock::now() : IClock::time_point{};
+    const bool okk = p.zero_copy
+        ? p.coll->allreduce_f32_owned_slot((size_t)count, p.streams, slot)
+        : p.coll->allreduce_f32_group(p.reduce_bufs, (size_t)count, p.streams);
+    if (ip.on) ip.t_coll += secs_since(tk);
+    if (!okk) {
+        std::fprintf(stderr, "[k3-tp] %s exchange failed at layer %d\n", name, layer);
+        return false;
+    }
+    // Only the zero-copy path moved the payload: the staged group reduce summed the
+    // ranks' own buffers in place, so there is nothing to repoint and repointing
+    // anyway would aim the next phase at a reduce_out() that was never written.
+    if (p.zero_copy)
+        for (std::size_t r = 0; r < p.ranks.size(); ++r)
+            kimi_k3_swap_partial_buffer(p.ranks[r].fwd, phase, p.zc_out[r]);
+    return true;
+}
+
 bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
     if (p.ranks.empty() || !p.coll) return false;
     const KimiK3Config& cfg = p.cfg;
@@ -553,6 +598,16 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
 
     IssueProfile& ip = issue_profile();
     const IClock::time_point t_tok0 = ip.on ? IClock::now() : IClock::time_point{};
+    // EXACTLY the predicate the forward allocated and split on (k3_moe_band.h), with
+    // nothing added — not even zero_copy. The forward decides at scratch-allocation
+    // time, before the collective's mode is known, so a driver that ANDed in one more
+    // condition could skip the two exchanges on a run where the forward had already
+    // split its phases: FfnPartial would then never reach the router or routed_down at
+    // all, and the layer would run on the previous layer's latent. The staged path
+    // handles the band perfectly well (k3_band_exchange), so there is nothing to gain
+    // by narrowing it here.
+    const bool moe_band_on =
+        k3_moe_band_active(cfg.n_experts, cfg.expert_latent, H, tp_size);
 
     // Parallel submission. Off at tp_size 1 (nothing to parallelise, and the
     // single-rank path must stay identical) and off under SPARKINFER_K3_SERIAL_ISSUE=1,
@@ -746,20 +801,39 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
         // and the attention reduce, when it exists, is the one immediately before.
         // n_slots == 1 gives slot -1 everywhere, which is main's kernel over
         // main's single buffer.
-        const int k_attn = coll_k;
-        const int k_moe  = coll_k + (attn_reduce ? 1 : 0);
-        const int slot_attn = n_slots > 1 ? (k_attn % n_slots) : -1;
-        const int slot_moe  = n_slots > 1 ? (k_moe  % n_slots) : -1;
+        // THE MoE DENSE BAND adds two more, and the running index has to step over
+        // them in ISSUE ORDER — attention, route, MoE, routed_up — or two collectives
+        // in the same layer would rotate onto one slot and the entry barrier would no
+        // longer separate a write from the previous read of that buffer.
+        const bool band_layer = moe_band_on && is_moe;
+        const int k_attn  = coll_k;
+        const int k_route = k_attn  + (attn_reduce ? 1 : 0);
+        const int k_moe   = k_route + (band_layer ? 1 : 0);
+        const int k_up    = k_moe   + 1;
+        const int slot_attn  = n_slots > 1 ? (k_attn  % n_slots) : -1;
+        const int slot_route = n_slots > 1 ? (k_route % n_slots) : -1;
+        const int slot_moe   = n_slots > 1 ? (k_moe   % n_slots) : -1;
+        const int slot_up    = n_slots > 1 ? (k_up    % n_slots) : -1;
         float* const* in_attn = slot_attn >= 0
             ? p.zc_in_slot[(size_t)slot_attn].data() : p.zc_in.data();
+        float* const* in_route = slot_route >= 0
+            ? p.zc_in_slot[(size_t)slot_route].data() : p.zc_in.data();
         float* const* in_moe = slot_moe >= 0
             ? p.zc_in_slot[(size_t)slot_moe].data() : p.zc_in.data();
+        float* const* in_up = slot_up >= 0
+            ? p.zc_in_slot[(size_t)slot_up].data() : p.zc_in.data();
 
         if (p.zero_copy && tp_size > 1 && (is_moe || zc_attn)) {
             for (std::size_t r = 0; r < p.ranks.size(); ++r) {
                 if (is_moe)
                     kimi_k3_swap_partial_buffer(p.ranks[r].fwd, K3LayerPhase::FfnPartial,
                                                 in_moe[r]);
+                if (band_layer) {
+                    kimi_k3_swap_partial_buffer(p.ranks[r].fwd, K3LayerPhase::FfnRoute,
+                                                in_route[r]);
+                    kimi_k3_swap_partial_buffer(p.ranks[r].fwd, K3LayerPhase::FfnUp,
+                                                in_up[r]);
+                }
                 // The attention partial rides the SAME owned pair. The reuse is
                 // safe for the same reason 185 sequential collectives already
                 // share it: the attn value is written to zc_in, reduced into
@@ -773,13 +847,20 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
             }
         }
 
+        // The phase that follows the attention. Under the band a MoE layer's FFN opens
+        // with FfnRoute (ffn_norm, then the router and routed_down bands) and the rest
+        // of FfnPartial waits for the route exchange; otherwise FfnPartial is the whole
+        // front and this is exactly what main issued.
+        const K3LayerPhase ffn_front =
+            band_layer ? K3LayerPhase::FfnRoute : K3LayerPhase::FfnPartial;
+
         const IClock::time_point t_p12 = ip.on ? IClock::now() : IClock::time_point{};
         if (!issue_all([&](int r) {
                 KimiK3TPRank& R = p.ranks[(size_t)r];
                 if (!kimi_k3_forward_layer_phase(R.fwd, layer, K3LayerPhase::Attn,
                                                  R.x, R.x_next)) return false;
-                if (attn_reduce) return true;  // FfnPartial waits for the reduce
-                return kimi_k3_forward_layer_phase(R.fwd, layer, K3LayerPhase::FfnPartial,
+                if (attn_reduce) return true;  // the FFN front waits for the reduce
+                return kimi_k3_forward_layer_phase(R.fwd, layer, ffn_front,
                                                    R.x, R.x_next);
             })) return false;
         // Closed HERE so t_issue never spans the reduce below; the second issue
@@ -833,12 +914,35 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
             const IClock::time_point t_fp = ip.on ? IClock::now() : IClock::time_point{};
             if (!issue_all([&](int r) {
                     KimiK3TPRank& R = p.ranks[(size_t)r];
+                    return kimi_k3_forward_layer_phase(R.fwd, layer, ffn_front,
+                                                       R.x, R.x_next);
+                })) return false;
+            if (ip.on) {
+                ip.t_issue += secs_since(t_fp);
+                ip.n_phase_calls += tp_size;
+                if (!parallel_issue) ip.n_setdev += tp_size;
+            }
+        }
+
+        // --- the ROUTE exchange (MoE dense band only) -----------------------
+        // Meets the router's logits and routed_down's latent, each written as this
+        // rank's row band into a zeroed payload, so this all-reduce IS the
+        // concatenation. Everything behind it — the top-k, the expert dispatch, the
+        // shared expert — needs the whole of both.
+        if (band_layer) {
+            if (!k3_band_exchange(p, layer, K3LayerPhase::FfnRoute, slot_route,
+                                  "route", ip)) return false;
+            ++p.n_collectives;
+            ++coll_k;
+            const IClock::time_point t_fp2 = ip.on ? IClock::now() : IClock::time_point{};
+            if (!issue_all([&](int r) {
+                    KimiK3TPRank& R = p.ranks[(size_t)r];
                     return kimi_k3_forward_layer_phase(R.fwd, layer,
                                                        K3LayerPhase::FfnPartial,
                                                        R.x, R.x_next);
                 })) return false;
             if (ip.on) {
-                ip.t_issue += secs_since(t_fp);
+                ip.t_issue += secs_since(t_fp2);
                 ip.n_phase_calls += tp_size;
                 if (!parallel_issue) ip.n_setdev += tp_size;
             }
@@ -911,6 +1015,30 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
                     kimi_k3_swap_partial_buffer(p.ranks[r].fwd, K3LayerPhase::FfnPartial,
                                                 p.zc_out[r]);
             }
+        }
+
+        // --- routed_up, then its exchange (MoE dense band only) --------------
+        // Split out of phase 3 because routed_up is the layer's last big read and the
+        // only thing between the MoE reduce and the residual add: 27.3 MB of Q8_0 that
+        // every rank was reading in full to compute the same 7168 floats. The shared
+        // expert is folded into the band inside this phase, in front of the exchange —
+        // reduce_out() is one buffer per rank, so this reduce overwrites it.
+        if (band_layer) {
+            const IClock::time_point t_up = ip.on ? IClock::now() : IClock::time_point{};
+            if (!issue_all([&](int r) {
+                    KimiK3TPRank& R = p.ranks[(size_t)r];
+                    return kimi_k3_forward_layer_phase(R.fwd, layer, K3LayerPhase::FfnUp,
+                                                       R.x, R.x_next);
+                })) return false;
+            if (ip.on) {
+                ip.t_issue += secs_since(t_up);
+                ip.n_phase_calls += tp_size;
+                if (!parallel_issue) ip.n_setdev += tp_size;
+            }
+            if (!k3_band_exchange(p, layer, K3LayerPhase::FfnUp, slot_up,
+                                  "routed_up", ip)) return false;
+            ++p.n_collectives;
+            ++coll_k;
         }
 
         // --- phase 3 on every rank ------------------------------------------

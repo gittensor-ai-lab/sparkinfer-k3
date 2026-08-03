@@ -2,6 +2,8 @@
 // vLLM comm trick 2/6 (#74). See header + tp_allreduce.cuh.
 
 #include "sparkinfer/tp/peer_oneshot_allreduce.h"
+// Payload-aware CTA width for the f32 entry point — see sparkinfer/tp/k3_coll_ctas.h.
+#include "sparkinfer/tp/k3_coll_ctas.h"
 #include "tp_allreduce.cuh"
 #include "tp_error.hpp"
 #include "tp_pdl.cuh"
@@ -232,7 +234,9 @@ void launch_in_kernel_f32(PeerOneShotAllreduce::Impl* s, int n_vec,
                      (size_t)s_idx * s->count;
         sg.sg[r] = s->sig[r];
     }
-    const int block = 512;
+    // A decode token is 1792 vectors, which at 512 threads is FOUR CTAs. The work is
+    // fixed at one vector per thread, so more SMs can only come from a smaller CTA.
+    const int block = k3_coll_block_for(n_vec, kMaxBlocks);
     const int grid = grid_for(n_vec, block);
     for (int r = 0; r < N; r++) {
         SPARKINFER_TP_CUDA_CHECK(cudaSetDevice(s->devices[r]));

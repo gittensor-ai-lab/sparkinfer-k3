@@ -3,6 +3,7 @@
 #include "sparkinfer/kernels/kimi_k3.h"
 #include "sparkinfer/kernels/kimi_k3_fast.h"
 #include "sparkinfer/models/kimi_k3_gguf_manifest.h"
+#include "sparkinfer/models/k3_moe_band.h"
 #include "sparkinfer/tp/weight_residency.h"   // plan_tensor_residency for the sharded loader
 
 #include <cmath>
@@ -826,6 +827,18 @@ struct KimiK3Forward::Scratch {
     float* gate_proj_out = nullptr;   // [qh*value_length_mla]
 
     // FFN / MoE
+    // Is the MoE dense band live for this rank, and does the router take part? Both
+    // are decided ONCE in kimi_k3_forward_alloc_scratch, because they choose the
+    // buffer LAYOUT: with the router banded, its logits and routed_down's latent are
+    // one fused payload met by one collective; without it, they are two ordinary
+    // allocations and only routed_down's is reduced. The forward and the driver read
+    // these rather than re-deriving the decision, so the phase split, the payload
+    // width and the pointer arithmetic cannot disagree. See k3_moe_band.h.
+    bool moe_band = false;
+    bool moe_band_router = false;
+    // [n_experts + expert_latent], owned, only when moe_band_router. router_logits
+    // and routed_down_out are then views into it.
+    float* route_fused = nullptr;
     float* router_logits = nullptr;   // [n_experts]
     float* router_w = nullptr;        // [top_k]
     int*   router_ids = nullptr;      // [top_k]
@@ -850,6 +863,15 @@ struct KimiK3Forward::Scratch {
     // failure the cached quantise-once attempt shipped as top1 0.0.
     void* act_q8 = nullptr;
     void* moe_q8 = nullptr;            // optional llama CPU-compat block_q8_K scratch
+    // Which activation act_q8 currently holds, or null. PERSISTED ACROSS PHASE CALLS
+    // on purpose: with the MoE dense band on, ffn_norm and its hoist happen in
+    // FfnRoute while the shared expert's two projections read the same activation in
+    // FfnPartial, and a marker local to one call would make them re-quantise an
+    // identical 7168-float vector twice per MoE layer. The window this widens is
+    // still safe for the reason #86 gives — act_q8 is rank-private scratch that no
+    // collective touches, and every write to a hoistable buffer is followed
+    // immediately by its hoist_act, so the marker cannot name stale bytes.
+    const float* hoisted_src = nullptr;
 
     // ---- DAG LANES -------------------------------------------------------
     //
@@ -958,10 +980,36 @@ bool kimi_k3_forward_alloc_scratch(const KimiK3Config& cfg, KimiK3Forward& fwd) 
     ok &= alloc_f(s.mla_attn_out, (size_t)qh * cfg.value_length_mla);
     ok &= alloc_f(s.gate_proj_out, (size_t)qh * cfg.value_length_mla);
 
-    ok &= alloc_f(s.router_logits, cfg.n_experts);
+    // ONE ALLOCATION, TWO TENSORS, FOR THE SAME REASON moe_fused IS ONE BELOW.
+    //
+    // With the MoE dense band on, the router and routed_down each produce this
+    // rank's row band of a vector every rank needs whole, at the same point in the
+    // layer and out of the same activation. Placing them adjacently lets the driver
+    // meet both with ONE collective at n_experts + expert_latent instead of two —
+    // which is what makes the router band cost nothing beyond its memset, and what
+    // keeps the collective count at 369 rather than 277 (k3_moe_band.h on why that
+    // number decides whether the single-barrier rotation stays sound).
+    //
+    // router_logits MUST come first: kimi_k3_swap_partial_buffer rebuilds both views
+    // from the base, and the expert dispatch reads the latent suffix in place.
+    // The band needs hidden divisible too — routed_up is banded over it in FfnUp —
+    // so a geometry that could not split all three declines as a whole rather than
+    // banding two tensors and leaving the third to a phase the driver still issues.
+    s.moe_band = fwd.w && k3_moe_band_active(cfg.n_experts, cfg.expert_latent, H,
+                                             fwd.w->shard.tp_size);
+    s.moe_band_router = s.moe_band && k3_moe_band_router_enabled();
+    if (s.moe_band_router) {
+        ok &= alloc_f(s.route_fused, (size_t)cfg.n_experts + (size_t)cfg.expert_latent);
+        if (ok) {
+            s.router_logits   = s.route_fused;
+            s.routed_down_out = s.route_fused + cfg.n_experts;
+        }
+    } else {
+        ok &= alloc_f(s.router_logits, cfg.n_experts);
+        ok &= alloc_f(s.routed_down_out, cfg.expert_latent);
+    }
     ok &= alloc_f(s.router_w, cfg.top_k);
     ok &= alloc_i(s.router_ids, cfg.top_k);
-    ok &= alloc_f(s.routed_down_out, cfg.expert_latent);
     // THE SCRATCH IS THE RANK'S FFN WIDTH, NOT THE MODEL'S. Under 2-D MoE this rank
     // evaluates only its band of each expert's intermediate, so top_k * band is all
     // that is ever written — and sizing it from cfg would leave 3/4 of the buffer
@@ -1084,6 +1132,28 @@ float* kimi_k3_partial_buffer(KimiK3Forward& fwd, int layer, K3LayerPhase phase,
         if (count) *count = cfg.expert_latent + cfg.hidden;
         return s.moe_fused;
     }
+    // The two band phases (k3_moe_band.h). Each rank wrote its ROW BAND into a
+    // zeroed payload, so what the collective sums is a concatenation rather than a
+    // sum of overlapping contributions — see the header on why that is exact.
+    if (phase == K3LayerPhase::FfnRoute) {
+        if (!s.moe_band || layer < cfg.leading_dense) { if (count) *count = 0; return nullptr; }
+        // FUSED when the router is banded too: its logits AND routed_down's latent,
+        // adjacent by construction (kimi_k3_forward_alloc_scratch), met by ONE
+        // collective. With SPARKINFER_K3_MOE_BAND_ROUTER=0 the router is full-width
+        // on every rank and must NOT be reduced — eight identical copies summed is
+        // eight times the logits — so the payload is routed_down's latent alone.
+        if (s.moe_band_router) {
+            if (count) *count = cfg.n_experts + cfg.expert_latent;
+            return s.route_fused;
+        }
+        if (count) *count = cfg.expert_latent;
+        return s.routed_down_out;
+    }
+    if (phase == K3LayerPhase::FfnUp) {
+        if (!s.moe_band || layer < cfg.leading_dense) { if (count) *count = 0; return nullptr; }
+        if (count) *count = cfg.hidden;
+        return s.ffn_out;
+    }
     if (count) *count = 0;
     return nullptr;
 }
@@ -1103,6 +1173,23 @@ float* kimi_k3_swap_partial_buffer(KimiK3Forward& fwd, K3LayerPhase phase,
         s.moe_fused = buf;
         s.moe_out   = buf;
         s.shexp_out = buf + fwd.cfg->expert_latent;
+    } else if (phase == K3LayerPhase::FfnRoute) {
+        // Same rule as the fused MoE payload above: the base moves and BOTH views
+        // move with it. Repointing route_fused alone would leave routed_down writing
+        // the old allocation while the collective reduced the new one. With the
+        // router unbanded there is only one view, and its logits stay where they are.
+        if (s.moe_band_router) {
+            old = s.route_fused;
+            s.route_fused     = buf;
+            s.router_logits   = buf;
+            s.routed_down_out = buf + fwd.cfg->n_experts;
+        } else {
+            old = s.routed_down_out;
+            s.routed_down_out = buf;
+        }
+    } else if (phase == K3LayerPhase::FfnUp) {
+        old = s.ffn_out;
+        s.ffn_out = buf;
     }
     return old;
 }
@@ -1143,7 +1230,9 @@ static bool k3_check_launch(int layer, K3LayerPhase phase) {
     if (e == cudaSuccess) return true;
     const char* pn = phase == K3LayerPhase::All        ? "All"
                    : phase == K3LayerPhase::Attn       ? "Attn"
-                   : phase == K3LayerPhase::FfnPartial ? "FfnPartial" : "FfnFinish";
+                   : phase == K3LayerPhase::FfnPartial ? "FfnPartial"
+                   : phase == K3LayerPhase::FfnRoute   ? "FfnRoute"
+                   : phase == K3LayerPhase::FfnUp      ? "FfnUp" : "FfnFinish";
     std::fprintf(stderr,
                  "[k3] LAUNCH FAILED at layer %d, phase %s: %s\n"
                  "     A kernel did not launch. Its output buffer still holds the "
@@ -1163,8 +1252,32 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
     cudaStream_t stream = fwd.stream;
     const float eps = cfg.rms_eps;
 
+    // THE MoE DENSE BAND (k3_moe_band.h) SPLITS TWO PHASES, AND ONLY ON MoE LAYERS.
+    //
+    // `band_split` is derived from the allocation's own decision — s.moe_band is set
+    // once, at scratch time, by the same predicate that chose the buffer layout — so
+    // the forward and the layout cannot disagree about whether the split is
+    // happening. With it false, FfnRoute and FfnUp are never issued by the driver,
+    // do_ffn_r folds back into FfnPartial and do_ffn_u back into FfnFinish, and every
+    // line below runs in the order and the phase it always did.
+    // Named apart from the `tp_size` the shared-expert check declares in its own
+    // scope below, so neither shadows the other.
+    const int band_rank = fwd.w ? fwd.w->shard.rank : 0;
+    const int band_tp   = fwd.w ? fwd.w->shard.tp_size : 1;
+    const bool band_split = s.moe_band && layer >= cfg.leading_dense;
+
     const bool do_attn   = (phase == K3LayerPhase::All || phase == K3LayerPhase::Attn);
+    // Front of the FFN: ffn_res_mix, ffn_norm, the hoist, and (MoE) the router and
+    // routed_down projections.
+    const bool do_ffn_r  = (phase == K3LayerPhase::All ||
+                            phase == (band_split ? K3LayerPhase::FfnRoute
+                                                 : K3LayerPhase::FfnPartial));
+    // Rest of FfnPartial: top-k, the expert dispatch, the shared expert.
     const bool do_ffn_p  = (phase == K3LayerPhase::All || phase == K3LayerPhase::FfnPartial);
+    // Front of FfnFinish: routed_norm and routed_up.
+    const bool do_ffn_u  = (phase == K3LayerPhase::All ||
+                            phase == (band_split ? K3LayerPhase::FfnUp
+                                                 : K3LayerPhase::FfnFinish));
     const bool do_ffn_f  = (phase == K3LayerPhase::All || phase == K3LayerPhase::FfnFinish);
 
     const int H = cfg.hidden;
@@ -1297,7 +1410,13 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
         const char* e = std::getenv("SPARKINFER_K3_QACT_HOIST");
         return !(e && e[0] == '0');
     }();
-    const float* hoisted_src = nullptr;      // which activation s.act_q8 currently holds
+    // Which activation s.act_q8 currently holds. LIVES IN SCRATCH, not on the stack:
+    // under the MoE dense band ffn_norm and its hoist run in FfnRoute while the shared
+    // expert's two projections read the same activation back in FfnPartial, and a
+    // marker local to one call would make them re-quantise an identical 7168-float
+    // vector on all 92 MoE layers. See the field's comment on why the wider window is
+    // still safe.
+    const float*& hoisted_src = s.hoisted_src;
     auto hoist_act = [&](const float* x, int K) {
         hoisted_src = nullptr;
         if (!want_hoist || !ggml_qact_proj || !s.act_q8) return;
@@ -1343,6 +1462,48 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
     };
     auto proj_h = [&](float* y, const float* x, const KimiK3Tensor& W, int N, int K) {
         return proj_h_on(main_lane, y, x, W, N, K);
+    };
+
+    // A REPLICATED projection over this rank's ROW BAND — k3_moe_band.h. `rows_total`
+    // is the full N; the band is rows [off, off + rows) of it, and because a GGUF
+    // tensor's rows are contiguous the weight is reached by a byte offset and nothing
+    // else. Same kernel, same K, same per-row accumulation order, smaller N.
+    //
+    // WHEN `banded` IS FALSE this is the ordinary full-width projection. WHEN IT IS
+    // TRUE AND THE BAND WILL NOT RESOLVE, IT FAILS — it does not quietly fall back.
+    //
+    // That asymmetry is the whole safety property. The caller has already zeroed a
+    // payload that a collective is about to SUM across eight ranks, so a rank that
+    // answered a banded request with a full-width result would contribute a complete
+    // vector where seven zeros were expected, and the reduce would return eight times
+    // the right answer: fluent, wrong, and invisible to every timing benchmark. Same
+    // failure the shared-expert width check below exists to prevent, so it gets the
+    // same treatment — a geometry this cannot split is a bug, not a fallback.
+    auto proj_band_on = [&](Lane ln, float* y, const float* x, const KimiK3Tensor& W,
+                            int rows_total, int K, bool banded) {
+        if (!W.ok()) return false;
+        if (!banded) return proj_h_on(ln, y, x, W, rows_total, K);
+        K3MoeBand b;
+        if (!k3_moe_band(rows_total, (size_t)W.n_bytes, band_tp, band_rank, &b)) {
+            std::fprintf(stderr,
+                         "[k3] layer %d: MoE dense band requested but unresolvable — "
+                         "%d rows over tp_size %d, %ld bytes. The exchange would sum %d "
+                         "complete copies instead of concatenating eight bands.\n",
+                         layer, rows_total, band_tp, W.n_bytes, band_tp);
+            return false;
+        }
+        KimiK3Tensor Wb = W;
+        Wb.data    = (const void*)((const char*)W.data + b.byte_off);
+        Wb.n_bytes = (long)((size_t)W.n_bytes / (size_t)band_tp);
+        Wb.rank_ne[1] = b.rows;
+        return proj_h_on(ln, y + b.offset, x, Wb, b.rows, K);
+    };
+    // Band on the main stream. The band decides WHICH ROWS this rank computes;
+    // the lane decides WHICH QUEUE runs them. They are orthogonal, so the two
+    // compose by passing a lane rather than by choosing between them.
+    auto proj_band = [&](float* y, const float* x, const KimiK3Tensor& W,
+                         int rows_total, int K, bool banded) {
+        return proj_band_on(main_lane, y, x, W, rows_total, K, banded);
     };
 
     // ---- phase 1: attention. Ends holding a FULL-WIDTH PARTIAL SUM,
@@ -1775,7 +1936,7 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
     }
 
     // ---- phase 2: attention residual, FFN norm, and the FFN's PARTIAL. ----
-    if (do_ffn_p) {
+    if (do_ffn_r) {
         // --- combine: replace on a checkpoint layer, add otherwise. Uses hidden_in
         // (the RAW pre-mix value), not s.mixed — the reference's residual add is
         // against the unmixed prefix_sum, only the norm/attention input was mixed. ---
@@ -1832,45 +1993,126 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             // leaves the capture unjoined, and "EndCapture failed" is a much worse
             // report than "this weight is missing". Declining to fork is always safe —
             // the checks below still run and still return false, just on a linear stream.
-            const bool moe_fork = dag && dag_moe &&
-                L.ffn_routed_down.ok() && L.ffn_gate_inp.ok() && L.exp_probs_b.ok() &&
-                L.ffn_gate_exps.ok() && L.ffn_up_exps.ok() && L.ffn_down_exps.ok() &&
-                (!L.has_shared_experts ||
-                 (L.ffn_gate_shexp.ok() && L.ffn_up_shexp.ok() && L.ffn_down_shexp.ok()));
-            if (moe_fork) dag_fork(2);
-            const Lane l_rd  = moe_fork ? lane_of(0) : main_lane;   // routed_down
-            const Lane l_shx = moe_fork ? lane_of(1) : main_lane;   // shared expert
+            // ONE LANE HERE, NOT TWO, AND THE SHARED EXPERT FORKS IN ITS OWN PHASE.
+            //
+            // Under the MoE dense band this block is a SEPARATE CALL from the dispatch
+            // below — the driver runs FfnRoute, issues the route exchange, then runs
+            // FfnPartial — so a lane forked here cannot be joined there. K3LaneScope
+            // would close it at this call's return anyway, which is correct but makes a
+            // cross-phase fork pointless. Each phase therefore forks and joins itself.
+            const bool rd_fork = dag && dag_moe &&
+                L.ffn_routed_down.ok() && L.ffn_gate_inp.ok();
+            // The band zeroes its payload BEFORE the fork, so every lane inherits the
+            // cleared buffer through dag_fork's event rather than racing it.
+            if (band_split) {
+                // EVERY ELEMENT THIS RANK DOES NOT OWN MUST BE AN EXACT ZERO. The
+                // collective sums the eight ranks, so the payload is a concatenation
+                // only while the other seven contributions to each element are 0.0f.
+                // Cleared per layer rather than once: the payload IS the collective's
+                // rotating input slot, which the previous layer's reduce wrote a result
+                // into.
+                float* const payload = s.moe_band_router ? s.route_fused : s.routed_down_out;
+                const size_t payload_n = s.moe_band_router
+                                       ? (size_t)cfg.n_experts + (size_t)cfg.expert_latent
+                                       : (size_t)cfg.expert_latent;
+                cudaMemsetAsync(payload, 0, payload_n * sizeof(float), stream);
+            }
+            if (rd_fork) dag_fork(1);
+            const Lane l_rd = rd_fork ? lane_of(0) : main_lane;     // routed_down
 
-            if (!proj_h(s.router_logits, s.normed2, L.ffn_gate_inp, cfg.n_experts, H))
+            if (!proj_band(s.router_logits, s.normed2, L.ffn_gate_inp, cfg.n_experts, H,
+                           band_split && s.moe_band_router))
                 return false;
-            if (fwd.debug) fwd.debug("dbg_router_logits", layer, s.router_logits, cfg.n_experts);
-            if (!L.exp_probs_b.ok()) return false;
-            // Shared-memory selection first; it declines to the original below on any
-            // shape it does not handle, and is bit-identical where it does.
-            if (!k3k::k3_moe_router_fast(s.router_w, s.router_ids, s.router_logits,
-                                         (const float*)L.exp_probs_b.data, cfg.n_experts,
-                                         cfg.top_k, /*n_tokens=*/1, /*norm_w=*/true,
-                                         /*w_scale=*/1.0f, stream))
-                k3k::moe_router_noaux_tc_f32(s.router_w, s.router_ids, s.router_logits,
-                                             (const float*)L.exp_probs_b.data, cfg.n_experts,
-                                             cfg.top_k, /*n_tokens=*/1, /*norm_w=*/true,
-                                             /*w_scale=*/1.0f, stream);
-            if (fwd.debug) fwd.debug("dbg_router_w", layer, s.router_w, cfg.top_k);
-
             // routed_down feeds the dispatch UNNORMALISED — routed_norm (if present)
             // normalises the dispatch's OUTPUT, not this. See build_latent_moe in the
             // reference: build_moe_ffn runs first, then "if (layer.ffn_routed_norm)
             // moe_out = build_norm(moe_out, ...)", and only after that does
             // ffn_routed_up run. Getting this backwards (norm between routed_down and
             // the dispatch) was an earlier version's bug, same class as the ssm_norm fix.
-            if (!proj_h_on(l_rd, s.routed_down_out, s.normed2, L.ffn_routed_down,
-                           cfg.expert_latent, H))
+            if (!proj_band_on(l_rd, s.routed_down_out, s.normed2, L.ffn_routed_down,
+                              cfg.expert_latent, H, band_split))
                 return false;
+            // JOIN before the phase returns: under the band the route exchange reads
+            // this band immediately, and it is enqueued on the main stream.
+            if (rd_fork) dag_join(0);
+        }
+    }
 
-            if (!L.ffn_gate_exps.ok() || !L.ffn_up_exps.ok() || !L.ffn_down_exps.ok())
+    // ---- phase 2b: everything downstream of the ROUTE exchange. Under the band the
+    // driver has met the router's logits and routed_down's latent by the time this
+    // runs; without it this is the same straight line, in the same call. ----
+    if (do_ffn_p && layer >= cfg.leading_dense) {
+        if (fwd.debug) fwd.debug("dbg_router_logits", layer, s.router_logits, cfg.n_experts);
+        if (!L.exp_probs_b.ok()) return false;
+        // Shared-memory selection first; it declines to the original below on any
+        // shape it does not handle, and is bit-identical where it does.
+        if (!k3k::k3_moe_router_fast(s.router_w, s.router_ids, s.router_logits,
+                                     (const float*)L.exp_probs_b.data, cfg.n_experts,
+                                     cfg.top_k, /*n_tokens=*/1, /*norm_w=*/true,
+                                     /*w_scale=*/1.0f, stream))
+            k3k::moe_router_noaux_tc_f32(s.router_w, s.router_ids, s.router_logits,
+                                         (const float*)L.exp_probs_b.data, cfg.n_experts,
+                                         cfg.top_k, /*n_tokens=*/1, /*norm_w=*/true,
+                                         /*w_scale=*/1.0f, stream);
+        if (fwd.debug) fwd.debug("dbg_router_w", layer, s.router_w, cfg.top_k);
+
+        if (!L.ffn_gate_exps.ok() || !L.ffn_up_exps.ok() || !L.ffn_down_exps.ok())
+            return false;
+        // THE EXPERT BAND. The router above ran on the replicated ffn_gate_inp,
+        // so every rank picked the SAME top_k global ids; this rank evaluates only
+        // the ones whose weights it holds, leaving a partial sum in s.moe_out that
+        // the driver reduces at expert_latent before phase 3. At tp_size 1 the
+        // band covers every expert and the call is unchanged.
+        const int expert_begin  = fwd.w->shard.expert_band.offset;
+        const int n_local_exp   = fwd.w->shard.tp_size > 1
+                                    ? fwd.w->shard.expert_band.extent : 0;
+        // UNDER 2-D MoE THE BAND ABOVE IS WIDER AND THIS WIDTH IS NARROWER, and
+        // the kernels need no other change: they already index the packed weights
+        // as (e * ffn + j) and (e * latent + o) with `ffn` as the stride, so
+        // handing them the rank's 768-row band addresses the rank's own buffer
+        // exactly as 3072 addressed the whole one. The expert-band test is
+        // likewise unchanged — the group is still a CONTIGUOUS id range, just a
+        // longer one. What changes is only which bytes the loader packed.
+        const int moe_ffn_rank = k3_moe_ffn_local(fwd, cfg);
+        const bool moe_ok = k3k::moe_expert_ffn_f32_by_type(
+            s.moe_out, s.moe_scratch, s.routed_down_out, s.router_ids, s.router_w,
+            L.ffn_gate_exps.data, L.ffn_up_exps.data, L.ffn_down_exps.data,
+            cfg.expert_latent, moe_ffn_rank, cfg.top_k, cfg.situ_beta,
+            cfg.situ_linear_beta, L.ffn_gate_exps.type, stream,
+            expert_begin, n_local_exp, ggml_qact_moe ? s.moe_q8 : nullptr);
+        if (!moe_ok) return false;
+        // This rank's PARTIAL expert sum: it legitimately differs per rank and
+        // from the tp=1 value. dbg_moe_reduced below is the one that must match.
+        if (fwd.debug) fwd.debug("dbg_moe_partial", layer, s.moe_out, cfg.expert_latent);
+
+        // THE SHARED EXPERT, IN THIS PHASE ON PURPOSE.
+        //
+        // It reads `normed2` and nothing downstream of the collective, so it can
+        // run here — and running here is what lets its partial ride the expert
+        // reduce instead of needing one of its own (weight_plan.cpp). gate/up are
+        // RowShard so this rank owns a band of the ffn width; situ is elementwise
+        // and preserves the band; down is ColShard over the same band, so what
+        // lands in shexp_out is a full-width PARTIAL, exactly like moe_out.
+        //
+        // Widths come from rank_ne, never from cfg: block_aligned_band hands a
+        // remainder to the low ranks, so a rank that derived n_ff_shexp/tp_size
+        // would be wrong on precisely the ranks that differ.
+        if (L.has_shared_experts) {
+            if (!L.ffn_gate_shexp.ok() || !L.ffn_up_shexp.ok() ||
+                !L.ffn_down_shexp.ok()) return false;
+            const int shexp_band = (int)L.ffn_gate_shexp.rank_ne[1];
+            if (shexp_band <= 0 || (int)L.ffn_down_shexp.rank_ne[0] != shexp_band)
                 return false;
-            // JOIN routed_down: the dispatch reads it as its activation.
-            if (moe_fork) dag_join(0);
+            // The shared expert reads only normed2, and it writes
+            // shexp_out = moe_fused[expert_latent, +H) while the dispatch below writes
+            // moe_out = moe_fused[0, expert_latent) — disjoint ranges of one allocation,
+            // which is why a single collective already reduces both.
+            const bool shx_fork = dag && dag_moe && L.has_shared_experts &&
+                L.exp_probs_b.ok() && L.ffn_gate_exps.ok() && L.ffn_up_exps.ok() &&
+                L.ffn_down_exps.ok() && L.ffn_gate_shexp.ok() &&
+                L.ffn_up_shexp.ok() && L.ffn_down_shexp.ok();
+            if (shx_fork) dag_fork(1);
+            const Lane l_shx = shx_fork ? lane_of(0) : main_lane;
             // THE EXPERT BAND. The router above ran on the replicated ffn_gate_inp,
             // so every rank picked the SAME top_k global ids; this rank evaluates only
             // the ones whose weights it holds, leaving a partial sum in s.moe_out that
@@ -1958,40 +2200,72 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             // here, inside the phase, or the reduce races the lane that fills it.
             // It is also what keeps the capture joined: an outstanding lane at
             // cudaStreamEndCapture fails the capture outright.
-            if (moe_fork) dag_join(1);
+            if (shx_fork) dag_join(0);
         }
     }
 
     // ---- phase 3: everything downstream of the FFN collective. Every weight
     // here is Replicate and reads the ALREADY-REDUCED value — routed_norm is an
     // rms_norm, so the sum cannot be deferred past it. ----
+    if (do_ffn_u && layer >= cfg.leading_dense) {
+        // Post-collective: every rank must now hold the SAME complete expert sum,
+        // equal to what tp=1 computed. If this tag differs, the dispatch or the
+        // reduce is wrong; if it matches and ffn_out still differs, the fault is
+        // downstream in routed_norm / routed_up / shexp.
+        if (fwd.debug) fwd.debug("dbg_moe_reduced", layer, s.moe_out, cfg.expert_latent);
+        if (L.has_routed_norm) {
+            if (!L.ffn_routed_norm.ok()) return false;
+            k3k::rms_norm_f32(s.moe_out, s.moe_out,
+                              (const float*)L.ffn_routed_norm.data, cfg.expert_latent,
+                              eps, stream);
+        }
+
+        if (fwd.debug) fwd.debug("dbg_moe_normed", layer, s.moe_out, cfg.expert_latent);
+        // ROUTED_UP, BANDED — the same shape as the LM head and the reason this factor
+        // exists. It is the last read of the layer and it is fully exposed: the MoE
+        // reduce has just ended, the residual add that consumes it is one launch away,
+        // and 27.3 MB of Q8_0 is read identically on all eight ranks to produce eight
+        // identical copies. Zeroing first, for the reason the route payload does.
+        if (band_split)
+            cudaMemsetAsync(s.ffn_out, 0, (size_t)H * sizeof(float), stream);
+        if (!proj_band(s.ffn_out, s.moe_out, L.ffn_routed_up, H, cfg.expert_latent,
+                       band_split))
+            return false;
+
+        // THE SHARED-EXPERT FOLD MOVES IN FRONT OF THE EXCHANGE, AND IT HAS TO.
+        //
+        // reduce_out() is ONE buffer per rank, shared by every collective, and
+        // shexp_out is a view into it — so the routed_up exchange overwrites the
+        // reduced shared-expert output that the residual add would otherwise still
+        // need. Folding here reads it while it is still live, and the fold is exactly
+        // as valid banded as whole: rank r adds shexp_out's OWN band to the rows it
+        // just projected, so summing the ranks yields routed_up + shexp complete.
+        // Bit-identical — the same two floats added in the same order, then seven
+        // exact zeros. It also costs nothing: the add3 below loses its shexp operand
+        // and becomes the plain residual add, so the launch count is unchanged.
+        if (band_split && L.has_shared_experts) {
+            K3MoeBand b;
+            if (!k3_moe_band(H, (size_t)H * sizeof(float), band_tp, band_rank, &b))
+                return false;
+            k3k::k3_add_f32(s.ffn_out + b.offset, s.ffn_out + b.offset,
+                            s.shexp_out + b.offset, b.rows, stream);
+        }
+    }
+
     if (do_ffn_f) {
         // Set when the shared expert is present, i.e. when the layer's tail is the
         // adjacent PAIR of adds that k3_add3_f32 fuses.
         bool fused_tail = false;
         if (layer >= cfg.leading_dense) {
-            // Post-collective: every rank must now hold the SAME complete expert sum,
-            // equal to what tp=1 computed. If this tag differs, the dispatch or the
-            // reduce is wrong; if it matches and ffn_out still differs, the fault is
-            // downstream in routed_norm / routed_up / shexp.
-            if (fwd.debug) fwd.debug("dbg_moe_reduced", layer, s.moe_out, cfg.expert_latent);
-            if (L.has_routed_norm) {
-                if (!L.ffn_routed_norm.ok()) return false;
-                k3k::rms_norm_f32(s.moe_out, s.moe_out,
-                                  (const float*)L.ffn_routed_norm.data, cfg.expert_latent,
-                                  eps, stream);
-            }
-
-            if (fwd.debug) fwd.debug("dbg_moe_normed", layer, s.moe_out, cfg.expert_latent);
-            if (!proj(s.ffn_out, s.moe_out, L.ffn_routed_up, H, cfg.expert_latent))
-                return false;
             if (fwd.debug) fwd.debug("dbg_routed_up", layer, s.ffn_out, H);
-
             // The shared expert was computed in phase FfnPartial and its partial has
             // been reduced along with the expert accumulator, so what is left here is
             // the add. Both contributions are at hidden width by this point:
             // ffn_routed_up lifted the latent, shexp_out was already hidden-wide.
-            if (L.has_shared_experts) {
+            // Under the band the fold already happened, in front of the routed_up
+            // exchange and on this rank's band — see FfnUp above. What arrives here is
+            // routed_up + shexp complete, so the tail is the plain residual add.
+            if (L.has_shared_experts && !band_split) {
                 if (fwd.debug) fwd.debug("dbg_shexp", layer, s.shexp_out, H);
                 // The shared-expert fold is issued BELOW, fused with the residual add
                 // that consumes it — see k3_add3.cu. `fused_tail` records that decision

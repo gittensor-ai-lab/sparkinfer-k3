@@ -369,6 +369,7 @@ struct KimiK3Forward {
     KimiK3RuntimeState* state = nullptr;
     K3PlanOptions opt;
     cudaStream_t stream = nullptr;   // null = the default stream
+
     KimiK3DebugFn debug;             // may be empty
 
     // Scratch buffers, sized once and reused every call. Allocated by
@@ -427,7 +428,26 @@ bool kimi_k3_forward_layer(KimiK3Forward& fwd, int layer, const float* hidden_in
 // `All` runs all three back to back and is what kimi_k3_forward_layer calls, so the
 // tp_size 1 path is unchanged. Running All must be bit-identical to running the
 // three phases in sequence — asserted by kimi_k3_tp_phase_check.
-enum class K3LayerPhase { All = 0, Attn = 1, FfnPartial = 2, FfnFinish = 3 };
+//
+// TWO MORE PHASES EXIST ONLY WHEN THE MoE DENSE BAND IS ON (k3_moe_band.h). They
+// are splits of the two above, at the points where a banded projection has to meet
+// its pieces; with the band off the driver never issues them and FfnPartial /
+// FfnFinish cover the same work they always did.
+//
+//   FfnRoute    the front of FfnPartial: ffn_norm, the hoisted quantise, and the
+//               router + routed_down projections — each over this rank's ROW BAND,
+//               into a zeroed payload. Both read ffn_norm's output and neither
+//               reads the other, so one exchange serves both.
+//                 -> reduce at n_experts + expert_latent
+//   FfnUp       the front of FfnFinish: routed_norm and the routed_up projection
+//               over this rank's row band, into a zeroed payload.
+//                 -> reduce at hidden
+//
+// MoE LAYERS ONLY. The leading dense layer has no router and no routed_up, so it
+// keeps the three-phase shape whatever the toggle says.
+enum class K3LayerPhase {
+    All = 0, Attn = 1, FfnPartial = 2, FfnFinish = 3, FfnRoute = 4, FfnUp = 5
+};
 
 bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase phase,
                                 const float* hidden_in, float* hidden_out);

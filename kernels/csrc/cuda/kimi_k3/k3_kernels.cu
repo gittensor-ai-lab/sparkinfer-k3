@@ -14,6 +14,7 @@
 #include "sparkinfer/kernels/iq1s_tables.h"
 #include "k3_pdl.cuh"
 #include "sparkinfer/kernels/kimi_k3_fast.h"
+#include "sparkinfer/kernels/k3_mla_pvec.h"
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -2083,8 +2084,13 @@ __global__ void mla_decode_attn_split_kernel(float* __restrict__ part_acc,
 //
 // Unrolling changes issue order, never arithmetic order, so this is bit-identical by
 // construction rather than by tolerance — and the bench asserts it word-for-word.
+// PVEC selects the LAYOUT OF s_p, and nothing else. See k3_mla_pvec.h for why the
+// t-major layout is worth a template parameter: the latent phase reads all HPB
+// probabilities for ONE token before it touches the cache, and head-major spacing
+// forces that to be HPB separate scalar LDS where t-major makes it HPB/4 broadcast
+// LDS.128. Same values, same order, bit-identical.
 template <int BLOCK, int HPB, int RSLOTS, typename KV, int TPW = kMlaTokensPerWarp,
-          int UT = 4, int UD = 2>
+          int UT = 4, int UD = 2, bool PVEC = false>
 __global__ void mla_decode_attn_hbatch_kernel(float* __restrict__ part_acc,
                                               float* __restrict__ part_ml,
                                               const float* __restrict__ q,
@@ -2111,6 +2117,14 @@ __global__ void mla_decode_attn_hbatch_kernel(float* __restrict__ part_acc,
     float* s_m = s_p + (size_t)HPB * kMlaCtxTile;             // HPB  running max
     float* s_l = s_m + HPB;                                   // HPB  running exp-sum
     float* s_c = s_l + HPB;                                   // HPB  this tile's rescale
+
+    // Where head hh's probability for tile-token t lives. Head-major (main) spaces the
+    // HPB values of one token kMlaCtxTile floats apart; t-major packs them adjacent.
+    // The allocation is the same HPB * kMlaCtxTile floats either way, so hshm and every
+    // occupancy fact about this kernel are untouched.
+    auto p_at = [&](int hh, int t) -> int {
+        return PVEC ? (t * HPB + hh) : (hh * kMlaCtxTile + t);
+    };
 
     // (h0 + i/key_length)*key_length + (i%key_length) is identically h0*key_length + i,
     // so the 32-bit div AND mod per element were computing the identity — 27 iterations
@@ -2172,7 +2186,7 @@ __global__ void mla_decode_attn_hbatch_kernel(float* __restrict__ part_acc,
 #pragma unroll
                     for (int off = 16; off > 0; off >>= 1)
                         v += __shfl_down_sync(0xffffffff, v, off);
-                    if (lane == 0 && tt < tc) s_p[hh * kMlaCtxTile + tb + tt] = v * scale;
+                    if (lane == 0 && tt < tc) s_p[p_at(hh, tb + tt)] = v * scale;
                 }
         }
         __syncthreads();
@@ -2182,14 +2196,20 @@ __global__ void mla_decode_attn_hbatch_kernel(float* __restrict__ part_acc,
         // that owns hh is the only thing that touches them. Read both before the
         // __syncwarp so no lane can observe this tile's write in place of the running
         // value it is supposed to fold into.
+        // Under PVEC this warp's stride through the tile is HPB instead of 1, which is a
+        // 4-way bank conflict at HPB 12 — deliberately paid here rather than in phase 3.
+        // This phase touches each probability three times across 12 heads shared over
+        // NWARP warps; phase 3 touches every one of them BLOCK times over RSLOTS slots,
+        // so the two sides of the trade differ by more than an order of magnitude.
         for (int hh = warp; hh < HPB; hh += NWARP) {
-            float* pr = s_p + hh * kMlaCtxTile;
+            float* pr   = s_p + (PVEC ? hh : hh * kMlaCtxTile);
+            const int ps = PVEC ? HPB : 1;
             const float m_prev = s_m[hh];
             const float l_prev = s_l[hh];
             __syncwarp();
 
             float tm = -1e30f;
-            for (int t = lane; t < tn; t += 32) tm = fmaxf(tm, pr[t]);
+            for (int t = lane; t < tn; t += 32) tm = fmaxf(tm, pr[t * ps]);
 #pragma unroll
             for (int off = 16; off > 0; off >>= 1)
                 tm = fmaxf(tm, __shfl_down_sync(0xffffffff, tm, off));
@@ -2202,8 +2222,8 @@ __global__ void mla_decode_attn_hbatch_kernel(float* __restrict__ part_acc,
 
             float ls = 0.0f;
             for (int t = lane; t < tn; t += 32) {
-                const float e = __expf(pr[t] - m_new);
-                pr[t] = e;
+                const float e = __expf(pr[t * ps] - m_new);
+                pr[t * ps] = e;
                 ls += e;
             }
 #pragma unroll
@@ -2229,9 +2249,30 @@ __global__ void mla_decode_attn_hbatch_kernel(float* __restrict__ part_acc,
 #pragma unroll UT
         for (int t = 0; t < tn; ++t) {
             const KV* kt = k_cache + (size_t)(t0 + t) * key_length;
+            // EVERY LANE READS THE SAME HPB PROBABILITIES. Head-major spacing makes that
+            // HPB scalar LDS broadcasts against RSLOTS*HPB fused multiply-adds — at K3's
+            // HPB 12 / RSLOTS 2 that is 12 loads per 24 FMAs, so a third of this loop's
+            // issue slots move no data the arithmetic could not already reach. t-major
+            // makes the same HPB values adjacent and 16-byte aligned (s_p starts at
+            // HPB*key_length floats and t*HPB*4 B is a multiple of 16 for every HPB this
+            // kernel instantiates, all of which are multiples of 4), so they arrive in
+            // HPB/4 broadcast LDS.128 instead: 3 loads per 24 FMAs.
+            //
+            // Identical values in identical order, so acc accumulates the same sum term
+            // for term — bit-identical by construction, not by tolerance.
             float p[HPB];
+            if constexpr (PVEC) {
+                const float4* pv = (const float4*)(s_p + (size_t)t * HPB);
 #pragma unroll
-            for (int hh = 0; hh < HPB; ++hh) p[hh] = s_p[hh * kMlaCtxTile + t];
+                for (int j = 0; j < HPB / 4; ++j) {
+                    const float4 v = pv[j];
+                    p[4 * j + 0] = v.x; p[4 * j + 1] = v.y;
+                    p[4 * j + 2] = v.z; p[4 * j + 3] = v.w;
+                }
+            } else {
+#pragma unroll
+                for (int hh = 0; hh < HPB; ++hh) p[hh] = s_p[hh * kMlaCtxTile + t];
+            }
 #pragma unroll
             for (int u = 0; u < RSLOTS; ++u) {
                 const int r = threadIdx.x + u * BLOCK;
@@ -3664,10 +3705,26 @@ static void mla_decode_attn_launch(float* out, const float* q, const KV* k_cache
             return !(e && e[0] == '0');
         }();
         if (deep_unroll && hpb == 12 && rslots == 2) {
-            k3_pdl_launch(hgrid, BLOCK, hshm, stream,
-                          mla_decode_attn_hbatch_kernel<BLOCK, 12, 2, KV, kMlaTokensPerWarp, 8, 6>,
-                          g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length,
-                          kv_lora, d_pos, scale, splits);
+            // t-major s_p, so the latent phase reads one token's twelve probabilities as
+            // three broadcast LDS.128 instead of twelve scalar loads. Layout only — same
+            // shared bytes, same registers, same grid. See k3_mla_pvec.h.
+            //
+            // The float4 read is at s_p + t*HPB, and s_p itself starts HPB*key_length
+            // floats into the tile. Both offsets must be 16-byte aligned or the load is
+            // an unspecified-address fault rather than a wrong number, so the shape that
+            // is actually instantiated asserts it here rather than trusting the header.
+            static_assert(12 % 4 == 0, "HPB must be a multiple of 4 for the float4 read");
+            if (k3_mla_pvec_on() && (12 * key_length * sizeof(float)) % 16u == 0) {
+                k3_pdl_launch(hgrid, BLOCK, hshm, stream,
+                              mla_decode_attn_hbatch_kernel<BLOCK, 12, 2, KV, kMlaTokensPerWarp, 8, 6, true>,
+                              g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length,
+                              kv_lora, d_pos, scale, splits);
+            } else {
+                k3_pdl_launch(hgrid, BLOCK, hshm, stream,
+                              mla_decode_attn_hbatch_kernel<BLOCK, 12, 2, KV, kMlaTokensPerWarp, 8, 6>,
+                              g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length,
+                              kv_lora, d_pos, scale, splits);
+            }
             k3_mla_launch_combine<BLOCK>(out, dev, wv_b, n_head, kv_lora, v_dim,
                                          splits, stream);
             return;

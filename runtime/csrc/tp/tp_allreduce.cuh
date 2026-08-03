@@ -37,7 +37,19 @@ using FlagType = uint32_t;
 
 // vLLM uses 36 blocks for the all-reduce: "too many SMs cause contention on the
 // NVLink bus." We cap Signal storage to that and clamp the launch likewise.
-constexpr int kMaxBlocks = 36;
+//
+// RAISED TO 64 FOR THE DECODE-SIZED PAYLOAD. vLLM's cap is about a BATCH of hidden
+// states saturating NVLink from too many SMs at once. K3 at decode reduces one token —
+// 229 KB of peer reads for the widest of its four collectives — which is three orders
+// of magnitude short of contending for anything, and the shape that actually binds
+// there is the opposite one: at 512 threads a 1792-vector payload is four CTAs on a
+// 132-SM GPU (see sparkinfer/tp/k3_coll_ctas.h).
+//
+// The cap still exists, and it is still what bounds these arrays: the barrier indexes
+// start/end/mid by blockIdx.x, so a grid above kMaxBlocks writes past them and
+// corrupts a peer's barrier state — a hang or a silent wrong sum, not a launch
+// failure. Raising it costs 3 * 64 * 8 * 4 + 64 * 4 = 6.4 KB per rank, once.
+constexpr int kMaxBlocks = 64;
 
 // Per-rank synchronization buffer, peer-accessible from every rank. Two counter
 // sets (start/end) are needed because a peer block can reach the second sync
