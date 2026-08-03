@@ -1150,8 +1150,32 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
     // takes the ordinary path.
     auto proj_h = [&](float* y, const float* x, const KimiK3Tensor& W, int N, int K) {
         if (!W.ok()) return false;
-        if (hoisted_src == x && W.type == 8)
+        if (hoisted_src == x && W.type == 8) {
+            // THE HOIST WAS SHORT-CIRCUITING THE ONE-BARRIER EPILOGUE.
+            //
+            // #90 added k3_proj_q8_multirow_1bar to replace the per-row block_sum --
+            // two __syncthreads each -- with a single fold, and its own comment names
+            // ffn_routed_down (N 3584, K 7168, ROWS 8, 2 main-loop iterations) as a
+            // target shape. But this lambda returned k3_proj_q8act_f32 before the 1bar
+            // path could ever be reached, so routed_down kept paying 16 serialised
+            // block-wide barriers on all 92 MoE layers -- at 448 CTAs over 132 SMs
+            // there is nothing resident to hide them behind. attn_q_a and attn_gate
+            // (N 1536, ROWS 4, 8 barriers) lost it on all 24 MLA layers for the same
+            // reason. The two optimisations were mutually exclusive and the hoist won
+            // silently.
+            //
+            // x_pre_q8 is what reconciles them, and it already existed with no caller:
+            // k3_quantize_act_f32 is a thin wrapper over the SAME k3_quantize_q8_0 the
+            // 1bar path would call itself, so s.act_q8 already holds byte-identical
+            // Q8_0 and the kernel simply skips re-quantising. BIT-IDENTICAL, and it
+            // does not write the scratch, so later proj_h calls on the same hoisted
+            // activation are unaffected. k3_proj_q8_fused4_1bar at the KDA group is
+            // the precedent -- it has passed qkvg_pre this way since #94.
+            if (k3k::k3_proj_q8_multirow_1bar(y, x, W.data, W.type, N, K,
+                                              s.act_q8, stream, /*x_pre_q8=*/true))
+                return true;
             return k3k::k3_proj_q8act_f32(y, s.act_q8, W.data, W.type, N, K, stream);
+        }
         return proj(y, x, W, N, K);
     };
 
