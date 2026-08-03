@@ -1508,7 +1508,7 @@ class CiWorkflowTest(unittest.TestCase):
         return f.name
 
     def _run_guard(self, ns_lo, ns_hi, n_lo, n_hi, self_tps, self_ms,
-                   tol="1.5", work_tol="2.0", llama_ref="16.70",
+                   tol="1.5", work_tol="2.0", llama_ref="18.44",
                    max_over_llama="3.0", jitter_s="2.0"):
         return subprocess.run(
             [sys.executable, self._speed_guard(), str(int(ns_lo)), str(int(ns_hi)),
@@ -1568,7 +1568,7 @@ class CiWorkflowTest(unittest.TestCase):
         band where a fabricated claim is both timing-free and scorable, which is the original
         hole in a narrower window."""
         MARGIN = self._margin_default()               # read from the harness, not restated
-        JITTER, WORK_TOL, LLAMA, MULT = 2.0, 2.0, 16.70, 3.0
+        JITTER, WORK_TOL, LLAMA, MULT = 2.0, 2.0, 18.44, 3.0
         crossover = MARGIN / (JITTER * WORK_TOL)      # tok/s: timing stops being evidence
         ceiling = LLAMA * MULT                        # 50.1 tok/s: plausibility takes over
         self.assertLessEqual(
@@ -1702,7 +1702,7 @@ class CiWorkflowTest(unittest.TestCase):
                 "set -euo pipefail\n"
                 f"NS_LO={int(ns_lo)}\nNS_HI={int(ns_hi)}\n"
                 "TOKENS_LO=8\nTOKENS_HI=136\n"
-                f"SELF_TPS={self_tps}\nSELF_MS={self_ms}\nLLAMA_REF=16.70\n"
+                f"SELF_TPS={self_tps}\nSELF_MS={self_ms}\nLLAMA_REF=18.44\n"
                 + fragment
                 + "\necho SCORED_TPS=$TPS\n")
             f = tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False)

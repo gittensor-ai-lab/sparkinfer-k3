@@ -142,9 +142,10 @@ QUANT="$(printf '%s' "${PRIMARY_QUANT:-UD-IQ1_S}" | sed 's/^UD-//' | tr -cd 'A-Z
 # so the recorded context, the slot name and the measured context were three different
 # things, and 128k, the configuration this repo actually targets, was never scored at all.
 #
-# 128k is where the two engines diverge. Measured on 8x H200 / UD-IQ1_S: llama.cpp gives up
-# 8% from depth 0 to 131,072 (18.20 -> 16.70 tok/s) while sparkinfer gives up 90%
-# (10.34 -> 1.01). Scoring at 64 hid that entirely.
+# 128k is where the two engines diverged. Measured on 8x H200 / UD-IQ1_S: llama.cpp holds
+# its rate essentially flat from depth 0 to 131,072 (18.32 -> 18.44 tok/s, 3 reps) while
+# sparkinfer gave up 90% (10.34 -> 1.01). Scoring at 64 hid that entirely. The -8% falloff
+# once recorded for llama.cpp here was a single-rep artefact from a different box.
 SCORED_CTX="${KIMI_K3_SCORED_CTX:-131072}"
 CTX_SUFFIX="${KIMI_K3_CTX_SUFFIX:-128K}"
 lookup() {  # $1 = LLAMA | SPARKINFER
