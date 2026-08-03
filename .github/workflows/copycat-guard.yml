@@ -20,7 +20,7 @@ name: copycat-guard
 on:
   pull_request_target:
     # ready_for_review so a PR opened as a draft is still scanned once it is real.
-    types: [opened, ready_for_review]
+    types: [opened, reopened, ready_for_review, synchronize]
 
 permissions:
   contents: write          # push policy files
@@ -56,19 +56,16 @@ jobs:
           fi
 
       - uses: actions/checkout@v4
-        if: steps.key.outputs.have_key == 'true'
         with:
           ref: main
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Run copycat guard
-        if: steps.key.outputs.have_key == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           YUNWEI_API_KEY: ${{ secrets.YUNWEI_API_KEY }}
-          COPYCAT_LLM_PROVIDER: ${{ vars.COPYCAT_LLM_PROVIDER }}
-          COPYCAT_LLM_PROVIDER: openai
+          COPYCAT_LLM_PROVIDER: ${{ vars.COPYCAT_LLM_PROVIDER || 'openai' }}
           COPYCAT_LLM_MODEL: gpt-4o-mini
           PR_NUM: ${{ github.event.pull_request.number }}
         run: |

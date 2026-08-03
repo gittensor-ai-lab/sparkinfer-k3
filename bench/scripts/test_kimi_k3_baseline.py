@@ -2069,6 +2069,59 @@ class CiWorkflowTest(unittest.TestCase):
         ok, _ = bot.eligibility(pr(crlf))
         self.assertTrue(ok, "CRLF line endings broke the section scan")
 
+    def test_no_workflow_has_a_duplicate_key(self):
+        """A duplicate YAML key is a STARTUP FAILURE: GitHub refuses the file, creates zero
+        jobs, and the check goes red with nothing to click into.
+
+        copycat-guard.yml had `COPYCAT_LLM_PROVIDER` twice in one env block and had therefore
+        NEVER run -- 100 of 100 recorded runs failed, every one before any job existed. It hid
+        because the file also has a documented reason to be red (no OPENAI_API_KEY), so a
+        permanently failing check looked like the known condition.
+
+        Python's yaml.safe_load accepts duplicates silently (last wins), so a plain parse test
+        would not have caught it. This one looks for the duplicate specifically."""
+        import yaml as _y
+        found = []
+
+        def collect(path):
+            def check(loader, node, deep=False):
+                seen = set()
+                for k, _v in node.value:
+                    key = loader.construct_object(k, deep=deep)
+                    if key in seen:
+                        found.append(f"{path}:{k.start_mark.line + 1} duplicate key {key!r}")
+                    seen.add(key)
+                return _y.SafeLoader.construct_mapping(loader, node, deep)
+            return check
+
+        wfs = sorted((ROOT / ".github/workflows").glob("*.yml"))
+        self.assertTrue(wfs, "no workflows found — wrong path?")
+        for wf in wfs:
+            loader = type("L", (_y.SafeLoader,), {})
+            loader.add_constructor(_y.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+                                   collect(wf.name))
+            with wf.open() as fh:
+                _y.load(fh, loader)
+        self.assertEqual(found, [], "duplicate keys make GitHub reject the whole workflow:\n"
+                                    + "\n".join(found))
+
+    def test_copycat_containment_does_not_depend_on_an_llm_key(self):
+        """Layers 1, 2 and 4 are containment — deterministic, no model involved. Only the
+        50-70% judge band uses one, and copycat_policy.py gates that itself via LLM_ENABLED /
+        COPYCAT_LLM_ENABLED.
+
+        Both the checkout and the guard step used to carry
+        `if: steps.key.outputs.have_key == 'true'`, so with no key the blocking tiers never
+        ran at all -- while the workflow's own notice said "containment tiers still run".
+        The step that would have printed that notice was in the job that never started."""
+        wf = (ROOT / ".github/workflows/copycat-guard.yml").read_text()
+        body = wf[wf.index("    steps:"):]
+        self.assertNotIn("if: steps.key.outputs.have_key == 'true'", body,
+                         "containment is gated on an optional LLM key again")
+        # ...and a PR that opens clean then pushes copied code must still be scanned.
+        self.assertIn("synchronize", wf,
+                      "only the moment of opening is scanned — push-after-open evades it")
+
     def test_every_eval_builds_from_scratch_with_a_pinned_compiler(self):
         """build/ is gitignored, so `git clean -qfd` leaves it (that needs -x) and every PR
         was compiled on top of the previous PR's objects, round after round.
