@@ -47,3 +47,24 @@ add_executable(kimi_k3_rms_norm_test kimi_k3_rms_norm_test.cu)
 target_link_libraries(kimi_k3_rms_norm_test PRIVATE si_k3)
 target_include_directories(kimi_k3_rms_norm_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
 add_test(NAME kimi_k3_rms_norm_test COMMAND kimi_k3_rms_norm_test)
+
+# K3 decode fast paths — ONE TEST BINARY PER OPTIMISATION, mirroring one source file
+# per optimisation (kernels/csrc/cuda/kimi_k3/k3_*.cu). A factor that has to be dropped
+# after a re-measurement takes its own test with it and leaves the others building.
+#
+# The _cpu_ ones check the SCHEDULES against float64 with no device, which is the only
+# coverage that runs on a fork's PR: the five ci.yml checks stay pending until a
+# maintainer approves the workflow. The _gpu_ ones run the same paths at K3's REAL dims
+# — the shape every fast path is gated on, and the one kimi_k3_numeric_test's shrunk
+# dims (kv_lora 64, key_length 80) never reach. They exit 0 with no device.
+add_executable(k3_kda_step_cpu_test k3_kda_step_cpu_test.cpp)
+set_target_properties(k3_kda_step_cpu_test PROPERTIES CXX_STANDARD 17)
+add_test(NAME k3_kda_step_cpu_test COMMAND k3_kda_step_cpu_test)
+
+foreach(k3t k3_kda_step_gpu_test k3_mla_absorb_gpu_test
+            k3_proj_1bar_gpu_test)
+    add_executable(${k3t} ${k3t}.cu)
+    target_link_libraries(${k3t} PRIVATE si_k3)
+    target_include_directories(${k3t} PRIVATE ${PROJECT_SOURCE_DIR}/include)
+    add_test(NAME ${k3t} COMMAND ${k3t})
+endforeach()
