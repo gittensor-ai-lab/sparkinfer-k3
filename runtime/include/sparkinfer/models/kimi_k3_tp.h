@@ -160,7 +160,12 @@ struct KimiK3TP {
     std::unique_ptr<tp::Collective> coll;
     std::vector<cudaStream_t> streams;   // cached in rank order for the group call
     std::vector<void*> reduce_bufs;      // scratch, refilled per collective
-    long n_collectives = 0;              // counted, so a run can assert it saw 92/token
+    // Counted so a run can assert how many it saw. The expected number is NOT a constant:
+    // it follows the shard policy, and under today's default (both attention bands sharded)
+    // it is 185/token at 93 layers, not the 92 that ExpertsOnly issues. Ask
+    // kimi_k3_expected_collectives() rather than writing the arithmetic out again — that
+    // second copy is exactly what went stale in issue #75.
+    long n_collectives = 0;
 
     // Graph state. `captured_plan` is the MLA `splits` the graph was recorded against;
     // when the live plan differs the graph is thrown away and re-recorded, because
