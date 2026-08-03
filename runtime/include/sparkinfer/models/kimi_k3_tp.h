@@ -128,6 +128,29 @@ struct KimiK3TPRank {
     float* x = nullptr;              // [hidden]
     float* x_next = nullptr;         // [hidden]
     float* logits = nullptr;         // [vocab], rank 0 only
+
+    // THE CANONICAL ASSIGNMENT OF THE x/x_next PAIR, AND WHY IT HAS TO EXIST.
+    //
+    // Phase 3 swaps x and x_next once per layer. 93 layers is an ODD number, and rank 0
+    // swaps once more in the attention-residual head, so the pair comes out of a token
+    // exchanged relative to how it went in — the assignment ALTERNATES between tokens.
+    //
+    // Eagerly that is harmless: every launch reads the live pointer. A captured graph
+    // bakes addresses, so a graph recorded on one parity would, on the next token, read
+    // the buffer it should be writing and write the one it should be reading. Fluent,
+    // wrong, and invisible to any timing benchmark.
+    //
+    // Resetting to these at the start of every token makes each token begin identically.
+    // The contents need no preservation: the hidden state does not carry across tokens
+    // (the embed overwrites x; only the KV cache and the KDA recurrent state persist).
+    float* x_canon = nullptr;
+    float* x_next_canon = nullptr;
+
+    // Per-rank capture. One graph per rank, because each rank owns its own stream and
+    // its own device; they rendezvous inside the collective at replay time exactly as
+    // they do eagerly.
+    cudaGraph_t     graph = nullptr;
+    cudaGraphExec_t exec  = nullptr;
 };
 
 struct KimiK3TP {
@@ -138,6 +161,16 @@ struct KimiK3TP {
     std::vector<cudaStream_t> streams;   // cached in rank order for the group call
     std::vector<void*> reduce_bufs;      // scratch, refilled per collective
     long n_collectives = 0;              // counted, so a run can assert it saw 92/token
+
+    // Graph state. `captured_plan` is the MLA `splits` the graph was recorded against;
+    // when the live plan differs the graph is thrown away and re-recorded, because
+    // `splits` sizes the grid and picks the kernel and a graph can change neither.
+    // Both come from k3_mla_decode_plan() so the check cannot drift from the launcher.
+    bool graph_disabled = false;  // set once capture has failed; never retried
+    bool graph_ready   = false;
+    int  captured_plan = 0;
+    long n_replays     = 0;
+    long n_captures    = 0;
 
     // One submission thread per rank. Empty until the first decode step, and
     // bypassed entirely at tp_size 1 — a single rank has nothing to parallelise

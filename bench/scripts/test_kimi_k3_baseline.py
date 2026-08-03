@@ -2069,6 +2069,106 @@ class CiWorkflowTest(unittest.TestCase):
         ok, _ = bot.eligibility(pr(crlf))
         self.assertTrue(ok, "CRLF line endings broke the section scan")
 
+    def test_the_copycat_judge_resolves_to_the_provider_whose_key_exists(self):
+        """The 70-80% band is the only tier containment cannot decide, so it must actually
+        reach a model.
+
+        Two ways the wiring silently disabled it, both from passing repo variables straight
+        through as env:
+
+          COPYCAT_LLM_PROVIDER defaulted to 'openai' when the variable was unset. _llm_provider
+          returns any explicit value without checking a key exists, so it selected a provider
+          with no key and never reached the autodetect that would have found YUNWEI_API_KEY.
+
+          COPYCAT_LLM_MODEL was hardcoded to gpt-4o-mini, overriding the yunwei provider default
+          (deepseek-v4-pro) that the gateway actually serves. And passing an unset variable
+          through sets the variable to "" -- os.environ.get(k, default) returns "" for a key
+          that EXISTS, so the model became the empty string rather than the default."""
+        import importlib
+        sys.path.insert(0, str(ROOT / "eval"))
+        try:
+            saved = {k: os.environ.get(k) for k in
+                     ("OPENAI_API_KEY", "CURSOR_API_KEY", "DEEPSEEK_API_KEY", "YUNWEI_API_KEY",
+                      "COPYCAT_LLM_PROVIDER", "COPYCAT_LLM_MODEL")}
+            for k in saved:
+                os.environ.pop(k, None)
+            os.environ["YUNWEI_API_KEY"] = "sk-test"
+            os.environ["COPYCAT_LLM_PROVIDER"] = ""    # unset repo variable
+            os.environ["COPYCAT_LLM_MODEL"] = ""       # unset repo variable
+            import copycat_guard as g
+            importlib.reload(g)
+            provider = g._llm_provider()
+            self.assertEqual(provider, "yunwei",
+                             "autodetect skipped the provider whose key is present")
+            self.assertTrue(g._llm_api_key(provider), "resolved a provider with no key")
+            self.assertEqual(g._llm_model(provider), "deepseek-v4-pro",
+                             "an empty COPYCAT_LLM_MODEL became the model name")
+        finally:
+            for k, v in saved.items():
+                os.environ.pop(k, None)
+                if v is not None:
+                    os.environ[k] = v
+            sys.path.remove(str(ROOT / "eval"))
+
+        wf = (ROOT / ".github/workflows/copycat-guard.yml").read_text()
+        self.assertNotIn("|| 'openai'", wf,
+                         "the workflow forces a provider again, defeating key autodetect")
+        self.assertNotIn("COPYCAT_LLM_MODEL: gpt-4o-mini", wf,
+                         "the model is hardcoded again, overriding the provider default")
+
+    def test_no_workflow_has_a_duplicate_key(self):
+        """A duplicate YAML key is a STARTUP FAILURE: GitHub refuses the file, creates zero
+        jobs, and the check goes red with nothing to click into.
+
+        copycat-guard.yml had `COPYCAT_LLM_PROVIDER` twice in one env block and had therefore
+        NEVER run -- 100 of 100 recorded runs failed, every one before any job existed. It hid
+        because the file also has a documented reason to be red (no OPENAI_API_KEY), so a
+        permanently failing check looked like the known condition.
+
+        Python's yaml.safe_load accepts duplicates silently (last wins), so a plain parse test
+        would not have caught it. This one looks for the duplicate specifically."""
+        import yaml as _y
+        found = []
+
+        def collect(path):
+            def check(loader, node, deep=False):
+                seen = set()
+                for k, _v in node.value:
+                    key = loader.construct_object(k, deep=deep)
+                    if key in seen:
+                        found.append(f"{path}:{k.start_mark.line + 1} duplicate key {key!r}")
+                    seen.add(key)
+                return _y.SafeLoader.construct_mapping(loader, node, deep)
+            return check
+
+        wfs = sorted((ROOT / ".github/workflows").glob("*.yml"))
+        self.assertTrue(wfs, "no workflows found — wrong path?")
+        for wf in wfs:
+            loader = type("L", (_y.SafeLoader,), {})
+            loader.add_constructor(_y.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+                                   collect(wf.name))
+            with wf.open() as fh:
+                _y.load(fh, loader)
+        self.assertEqual(found, [], "duplicate keys make GitHub reject the whole workflow:\n"
+                                    + "\n".join(found))
+
+    def test_copycat_containment_does_not_depend_on_an_llm_key(self):
+        """Layers 1, 2 and 4 are containment — deterministic, no model involved. Only the
+        50-70% judge band uses one, and copycat_policy.py gates that itself via LLM_ENABLED /
+        COPYCAT_LLM_ENABLED.
+
+        Both the checkout and the guard step used to carry
+        `if: steps.key.outputs.have_key == 'true'`, so with no key the blocking tiers never
+        ran at all -- while the workflow's own notice said "containment tiers still run".
+        The step that would have printed that notice was in the job that never started."""
+        wf = (ROOT / ".github/workflows/copycat-guard.yml").read_text()
+        body = wf[wf.index("    steps:"):]
+        self.assertNotIn("if: steps.key.outputs.have_key == 'true'", body,
+                         "containment is gated on an optional LLM key again")
+        # ...and a PR that opens clean then pushes copied code must still be scanned.
+        self.assertIn("synchronize", wf,
+                      "only the moment of opening is scanned — push-after-open evades it")
+
     def test_every_eval_builds_from_scratch_with_a_pinned_compiler(self):
         """build/ is gitignored, so `git clean -qfd` leaves it (that needs -x) and every PR
         was compiled on top of the previous PR's objects, round after round.
@@ -2100,6 +2200,69 @@ class CiWorkflowTest(unittest.TestCase):
                          "configure output is discarded again — a failed configure would be "
                          "invisible and cmake --build would proceed on whatever cache exists")
         self.assertIn("configure FAILED", cfg, "a failed configure no longer aborts")
+
+    def test_conflicted_prs_are_labelled_and_the_label_clears_itself(self):
+        """The conflict skip was correct but invisible: it printed a line in a log only the
+        operator reads, so #55, #87 and #90 each sat out a full round with nothing on the PR
+        saying why. The label is the contributor-facing half of a decision the round was
+        already making.
+
+        Self-clearing, like needs-rebase — mergeability is re-resolved every round before
+        this runs, so a rebased PR loses the label without anyone asking."""
+        bot = self._bot()
+        calls = []
+        orig_gh = bot.gh
+
+        class R:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        def fake_gh(args, timeout=120):
+            calls.append(args)
+            return R()
+
+        try:
+            bot.gh = fake_gh
+            prs = [
+                {"number": 90, "mergeable": "CONFLICTING", "labels": []},              # add
+                {"number": 55, "mergeable": "CONFLICTING",
+                 "labels": [{"name": bot.CONFLICT_LABEL}]},                            # already
+                {"number": 86, "mergeable": "MERGEABLE",
+                 "labels": [{"name": bot.CONFLICT_LABEL}]},                            # clear
+                {"number": 71, "mergeable": "MERGEABLE", "labels": []},                # nothing
+                {"number": 96, "mergeable": "UNKNOWN", "labels": []},                  # nothing
+            ]
+            bot.sync_conflict_labels("r", prs, dry_run=False)
+        finally:
+            bot.gh = orig_gh
+
+        posts = [c for c in calls if "-X" in c and "POST" in c and "labels" in " ".join(c)]
+        dels = [c for c in calls if "-X" in c and "DELETE" in c]
+        self.assertEqual(len(posts), 1, f"expected exactly one add, got {posts}")
+        self.assertIn("issues/90/labels", " ".join(posts[0]), "labelled the wrong PR")
+        self.assertEqual(len(dels), 1, f"expected exactly one clear, got {dels}")
+        self.assertIn("issues/86/labels", " ".join(dels[0]),
+                      "the label does not clear once a PR is mergeable again")
+        # UNKNOWN must not be labelled — it is the normal answer while GitHub recomputes.
+        self.assertNotIn("issues/96", " ".join(" ".join(c) for c in calls),
+                         "labelled a PR whose mergeability GitHub had not computed")
+        # NOT `gh pr edit --add-label`: it hits deprecated projectCards and exits 1.
+        self.assertFalse([c for c in calls if c[:2] == ["pr", "edit"]],
+                         "used the projectCards path that silently fails")
+
+    def test_the_conflict_label_never_blocks_a_merge(self):
+        """GitHub already refuses to merge a conflicted branch, so putting this in
+        NEVER_MERGE_LABELS adds nothing — and a stale one would block a PR that is now
+        perfectly mergeable. The state is the authority; the label only reports it."""
+        bot = self._bot()
+        self.assertNotIn(bot.CONFLICT_LABEL, bot.NEVER_MERGE_LABELS)
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        head = src[src.index("resolve_mergeability(args.repo, prs)"):src.index("if args.rebase_sweep")]
+        self.assertIn("sync_conflict_labels(", head,
+                      "conflicted PRs are skipped silently again")
+        self.assertLess(head.index("resolve_mergeability("), head.index("sync_conflict_labels("),
+                        "labelled before mergeability was settled — would label on UNKNOWN")
 
     def test_the_round_serves_the_oldest_pr_first(self):
         """`gh pr list` returns newest-first, so a round served the most recent submission

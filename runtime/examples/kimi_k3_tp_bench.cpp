@@ -166,7 +166,16 @@ int main(int argc, char** argv) {
             std::printf("--seek: ctx %d too small for %d tokens\n", max_ctx, n_tokens);
             return 1;
         }
-        for (auto& r : p.ranks) r.state.position = target;
+        for (auto& r : p.ranks) {
+            // BOTH copies. Setting only r.state.position leaves the device at 0 while the
+            // host plans for 131040 — the kernels then attend over a single position and
+            // the benchmark measures a token that is not doing the work it claims to.
+            cudaSetDevice(r.device);
+            if (!kimi_k3_set_position(r.state, target)) {
+                std::printf("seek: failed to set device position on rank %d\n", r.rank);
+                return 1;
+            }
+        }
         std::printf("seek: position -> %d (ctx alloc %d)\n", target, max_ctx);
     }
 

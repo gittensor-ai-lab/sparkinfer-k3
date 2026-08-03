@@ -417,10 +417,39 @@ void mla_absorb_q_f32(float* out, const float* q_nope, const float* q_pe,
 // k_cache: [key_length, n_ctx]      token-major rows; MQA (one K shared by heads)
 // wv_b:    [kv_lora, v_dim, n_head]  kv_lora fastest
 // out:     [v_dim, n_head]
+// n_ctx is the HOST's context length (position + 1) and is used ONLY to derive the launch
+// plan — grid size and which kernel — which a captured graph cannot change. d_pos is the
+// DEVICE's ROW INDEX; the kernels derive their length from it as *d_pos + 1, so a replayed
+// graph attends over the live position rather than the one frozen at capture. Both must
+// describe the same token: n_ctx == (host position) + 1 and *d_pos == (host position).
 void mla_decode_attn_f32(float* out, const float* q, const float* k_cache,
                          const float* wv_b, int key_length, int kv_lora,
-                         int v_dim, int n_head, int n_ctx, float scale,
+                         int v_dim, int n_head, int n_ctx, const int* d_pos,
+                         float scale, cudaStream_t stream);
+
+// The single derivation of `splits`, shared by the launcher above and the driver's
+// graph-invalidation check so the two can never disagree about the live plan.
+int k3_mla_decode_plan(int n_head, int kv_lora, int n_ctx);
+
+// Allocate the MLA split scratch up front. An allocation inside a stream capture fails
+// the CAPTURE, not the allocation, so this must be called before the first capture.
+bool k3_mla_prewarm_split_scratch(int n_head, int kv_lora);
+
+// Upload the IQ2_XS / IQ1_S lattice tables for the CURRENT device up front. They are
+// otherwise uploaded lazily on first use with a synchronous cudaMemcpyToSymbol, which is
+// illegal inside a stream capture — and under IQ1_S that first use falls on the first MoE
+// layer, so it invalidates a capture that had recorded the dense layer cleanly.
+void k3_prewarm_quant_tables();
+
+// Store this token's MLA K-cache row at a device-held position. Replaces a host-computed
+// row address that a captured graph would freeze at the capture-time position.
+void k3_mla_kv_store_f32(float* cache, const float* kv_cmpr_normed,
+                         const float* kv_a_out, const int* d_pos,
+                         int kv_lora, int rope_dim, int key_length,
                          cudaStream_t stream);
+
+// Advance the device's position, inside the captured region.
+void k3_bump_pos(int* d_pos, cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
 // 14. Generic projection (GEMV), f32 activation in, f32 out

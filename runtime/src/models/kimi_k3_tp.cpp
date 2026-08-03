@@ -290,6 +290,11 @@ bool kimi_k3_tp_init(const GGUF& g, const KimiK3Config& cfg, const K3PlanOptions
             rank_err[(size_t)r] = "cudaMalloc x/x_next failed";
             return false;
         }
+        // Remembered so every token can START from the same assignment. The 93 per-layer
+        // swaps are odd, so without this the pair alternates and a captured graph's baked
+        // addresses would be right on one token and inverted on the next.
+        R.x_canon      = R.x;
+        R.x_next_canon = R.x_next;
         if (r == 0 &&
             cudaMalloc(&R.logits, (size_t)cfg.vocab * sizeof(float)) != cudaSuccess) {
             rank_err[(size_t)r] = "cudaMalloc logits failed";
@@ -456,6 +461,38 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
     // token 1, because max_ckpt is exactly one token's worth of checkpoints.
     for (auto& R : p.ranks) R.state.n_ckpt = 0;
 
+    // Start every token from the SAME x/x_next assignment. See KimiK3TPRank::x_canon:
+    // the 93 per-layer swaps are odd, so the pair alternates between tokens, and a
+    // captured graph bakes the addresses it saw. Free eagerly (two pointer writes),
+    // and it is what lets one recorded graph serve every token.
+    for (auto& R : p.ranks) {
+        if (R.x_canon) { R.x = R.x_canon; R.x_next = R.x_next_canon; }
+    }
+
+    // GRAPH CAPTURE. Off with SPARKINFER_K3_GRAPH=0, which is the A/B control: same
+    // binary, same kernels, only the submission mechanism differs.
+    static const bool want_graph = [] {
+        const char* e = std::getenv("SPARKINFER_K3_GRAPH");
+        return !(e && e[0] == '0');
+    }();
+    // `splits` sizes the grid and picks which MLA kernel runs; a graph can change
+    // neither, so the plan is part of the graph's identity. Derived from the SAME
+    // function the launcher uses so the two cannot disagree about the live plan.
+    const int live_plan = k3k::k3_mla_decode_plan(cfg.n_q_heads, cfg.kv_lora_rank,
+                                                  p.ranks[0].state.position + 1);
+    const bool graph_on = want_graph && !p.graph_disabled && tp_size > 1 && parallel_issue;
+    if (graph_on && p.graph_ready && p.captured_plan != live_plan) {
+        // The plan moved (a kMlaSplitMinCtx boundary). Throw the graph away rather than
+        // replay a grid that no longer fits the context.
+        for (auto& R : p.ranks) {
+            if (R.exec)  { cudaSetDevice(R.device); cudaGraphExecDestroy(R.exec);  R.exec  = nullptr; }
+            if (R.graph) { cudaGraphDestroy(R.graph); R.graph = nullptr; }
+        }
+        p.graph_ready = false;
+    }
+    const bool replaying = graph_on && p.graph_ready;
+    const bool capturing = graph_on && !p.graph_ready;
+
     {
         const IClock::time_point t0 = ip.on ? IClock::now() : IClock::time_point{};
         if (!issue_all([&](int r) {
@@ -468,6 +505,64 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
         }
     }
 
+    // Capture starts AFTER the embed. The embed is the only per-token input and it is one
+    // kernel out of ~4,376 — leaving it eager keeps the token id out of the graph entirely
+    // instead of having to make it device-resident, and costs nothing measurable.
+    if (capturing) {
+        for (auto& R : p.ranks) {
+            if (cudaSetDevice(R.device) != cudaSuccess) return false;
+            // RELAXED, not ThreadLocal. This driver enqueues each rank's compute from a
+            // PINNED POOL WORKER while the collective is enqueued from the main thread,
+            // so the work for one capturing stream legitimately arrives from two threads.
+            // ThreadLocal ties the capture to the thread that began it and invalidates it
+            // when the other one enqueues — which is the "previous error during capture"
+            // this hit at the first all-reduce. Relaxed is the mode that matches a
+            // multi-threaded submitter; the pre-warmed split scratch (k3_mla_prewarm_...)
+            // is what removes the allocation Relaxed would otherwise stop policing.
+            if (cudaStreamBeginCapture(R.stream, cudaStreamCaptureModeRelaxed)
+                != cudaSuccess) {
+                std::fprintf(stderr, "[k3-graph] BeginCapture failed on rank %d — "
+                                     "eager for the rest of the run\n", R.rank);
+                for (auto& Q : p.ranks) {
+                    cudaGraph_t g = nullptr;
+                    cudaSetDevice(Q.device);
+                    cudaStreamEndCapture(Q.stream, &g);   // unwind any that did begin
+                    if (g) cudaGraphDestroy(g);
+                }
+                cudaGetLastError();
+                p.graph_disabled = true;
+                return kimi_k3_tp_forward_token(p, token_id, out_logits);
+            }
+        }
+    }
+
+    // WHERE DID THE CAPTURE DIE? cudaGetLastError only ever reports the CASCADE
+    // ("previous error during capture") from wherever the next launch happens to be, which
+    // pointed at layer 1's FfnPartial and sent me hunting through the MoE dispatch for a
+    // fault that was somewhere else entirely. This asks the stream directly, so the first
+    // report is the actual site.
+    auto cap_ok = [&](const char* where, int layer) -> bool {
+        if (!capturing) return true;
+        for (auto& R : p.ranks) {
+            cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+            if (cudaSetDevice(R.device) != cudaSuccess) return false;
+            const cudaError_t e = cudaStreamGetCaptureInfo(R.stream, &cs, nullptr);
+            if (e != cudaSuccess || cs != cudaStreamCaptureStatusActive) {
+                std::fprintf(stderr,
+                    "[k3-graph] CAPTURE LOST at %s (layer %d, rank %d): status=%d err=%s\n",
+                    where, layer, R.rank, (int)cs, cudaGetErrorString(e));
+                return false;
+            }
+        }
+        return true;
+    };
+    if (!cap_ok("after-embed", -1)) return false;
+
+    // When replaying, none of this is issued: the recorded graph already contains every
+    // launch. The loop is skipped wholesale rather than guarded per-call, because a
+    // partially-skipped token would leave the host-side pointer swaps out of step with
+    // what the graph does.
+    if (!replaying)
     for (int layer = 0; layer < cfg.n_layers; ++layer) {
         const bool is_moe = layer >= cfg.leading_dense;
 
@@ -658,6 +753,7 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
     if (cudaSetDevice(R0.device) != cudaSuccess) return false;
     const KimiK3Weights& w = R0.weights;
 
+    if (!replaying) {
     if (cfg.attn_res_block_size > 0) {
         if (!w.has_output_res_score || !w.output_res_score.ok()) return false;
         k3k::attn_res_mix_f32(R0.x_next, R0.state.res_bank, R0.x,
@@ -672,6 +768,91 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
     if (!k3k::k3_proj_f32(R0.logits, R0.x_next, w.output.data, w.output.type,
                           cfg.vocab, H, R0.stream))
         return false;
+
+    // THE DEVICE POSITION ADVANCES INSIDE THE GRAPH. This is the single line that makes a
+    // replay a different token rather than the same one again: the KV store indexes with
+    // *d_pos and the attention lengths its loop with *d_pos + 1, so without a bump in the
+    // recorded region every replayed token would overwrite one KV row and attend over a
+    // frozen context. The host mirror is advanced separately, at the end of the call.
+    //
+    // Each rank's device must be CURRENT for its own launch: this runs inside the head,
+    // where rank 0's device was made current, and enqueueing onto another rank's stream
+    // from the wrong device is an "invalid resource handle" — which is what it was.
+    for (auto& R : p.ranks) {
+        if (!R.state.d_pos) continue;
+        if (cudaSetDevice(R.device) != cudaSuccess) return false;
+        k3k::k3_bump_pos(R.state.d_pos, R.stream);
+    }
+    if (cudaSetDevice(R0.device) != cudaSuccess) return false;   // restore for the head's sync
+    }  // if (!replaying)
+
+    // Close the capture and instantiate. Nothing has EXECUTED yet on a capture token —
+    // capture records — so the launch below is what runs this token's work, on the
+    // capture pass and on every replay alike.
+    if (capturing) {
+        bool ok_cap = true;
+        for (auto& R : p.ranks) {
+            if (cudaSetDevice(R.device) != cudaSuccess) { ok_cap = false; break; }
+            if (cudaStreamEndCapture(R.stream, &R.graph) != cudaSuccess ||
+                R.graph == nullptr) { ok_cap = false; break; }
+            if (cudaGraphInstantiate(&R.exec, R.graph, nullptr, nullptr, 0)
+                != cudaSuccess) { ok_cap = false; break; }
+        }
+        if (!ok_cap) {
+            // A FAILED CAPTURE MUST COST SPEED, NEVER CORRECTNESS.
+            //
+            // This used to `return false`, which failed the token and took the whole run
+            // down — so a binary built with the default (graph on) would not decode at all
+            // on a box where capture is unavailable. Backwards: capture is an optimisation,
+            // and the model runs perfectly well without it. Disable it for the rest of the
+            // process and let this token be re-issued eagerly by the caller.
+            std::fprintf(stderr, "[k3-graph] capture failed — eager for the rest of the run\n");
+            for (auto& R : p.ranks) {
+                cudaSetDevice(R.device);
+                if (R.exec)  { cudaGraphExecDestroy(R.exec);  R.exec  = nullptr; }
+                if (R.graph) { cudaGraphDestroy(R.graph);     R.graph = nullptr; }
+            }
+            cudaGetLastError();          // clear the sticky capture error
+            p.graph_disabled = true;     // never attempt capture again
+            p.graph_ready    = false;
+            return kimi_k3_tp_forward_token(p, token_id, out_logits);   // eager retry
+        }
+        p.graph_ready   = true;
+        p.captured_plan = live_plan;
+        ++p.n_captures;
+        size_t nnodes = 0;
+        cudaGraphGetNodes(p.ranks[0].graph, nullptr, &nnodes);
+        std::fprintf(stderr, "[k3-graph] captured decode step: %zu nodes/rank, "
+                             "%ld collectives/token, mla splits=%d, from position %d\n",
+                     nnodes, p.n_collectives, live_plan, p.ranks[0].state.position);
+    }
+
+    if (graph_on) {
+        // LAUNCH THE EIGHT GRAPHS CONCURRENTLY, NOT IN RANK ORDER.
+        //
+        // This is the point of the whole change and it is easy to get wrong by writing the
+        // obvious loop. Measured on #86's capture-ON build, per-rank mean lateness at the
+        // collective rises MONOTONICALLY with rank — 19.5 us at rank 0 to 34.4 us at rank 7,
+        // which was last to arrive at 40% of the 185 barriers. Routing skew is
+        // data-dependent and would scatter; a clean 0..7 gradient is submission order.
+        //
+        // Capture was supposed to kill that and does not, because a host loop still issues
+        // cudaGraphLaunch eight times in rank order: rank 7's token starts after seven
+        // launches have gone ahead of it, every token, by construction. The barrier then
+        // charges everyone for it — 81.5% of collective time is ranks waiting, 4.80 ms of
+        // 5.89 ms per rank per token.
+        //
+        // The issue pool already owns one thread per rank with its device pinned at thread
+        // start, so dispatching the launch through it costs nothing and removes the ordering.
+        if (!issue_all([&](int r) {
+                return cudaGraphLaunch(p.ranks[(size_t)r].exec,
+                                       p.ranks[(size_t)r].stream) == cudaSuccess;
+            })) {
+            std::fprintf(stderr, "[k3-graph] graph launch failed\n");
+            return false;
+        }
+        ++p.n_replays;
+    }
 
     const IClock::time_point t_s0 = ip.on ? IClock::now() : IClock::time_point{};
     if (cudaStreamSynchronize(R0.stream) != cudaSuccess) return false;
@@ -699,6 +880,14 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
 
     // Advance every rank's position together. They run the same attention, so a rank
     // whose position drifted would index a different KV row for the same token.
+    //
+    // BOTH copies advance, and the device one advances ON THE STREAM. The host mirror
+    // picks the launch plan (a graph cannot resize its own grid); the device value is what
+    // the KV store indexes with and the attention lengths its loop with. Bumping the
+    // device side from inside the stream is what makes a REPLAY advance — a host-only
+    // increment would leave every replayed token writing the capture-time row.
+    // Host mirror only. The DEVICE side was bumped inside the captured region above —
+    // doing it again here would double-advance and skip every other KV row.
     for (auto& R : p.ranks) ++R.state.position;
     return true;
 }
