@@ -1,7 +1,7 @@
 // What does tensor parallelism actually buy on Kimi K3 decode?
 //
 //   kimi_k3_tp_bench <first-shard.gguf> [tp_size] [n_layers] [n_tokens] [--ctx N] [--seek]
-//                    [--ids a,b,c] [--logits FILE]
+//                    [--ids a,b,c | --ids @FILE] [--logits FILE]
 //
 // --ids feeds an exact prompt (ids, not text) instead of the synthetic sequence, and
 // --logits dumps the final step's logits in .spkl. Together they are what compares a
@@ -65,11 +65,30 @@ bool write_spkl(const char* path, const std::vector<float>& logits, int n_vocab)
 
 std::vector<int> parse_ids(const char* s) {
     std::vector<int> out;
+    // @FILE, because a 128k-token context CANNOT be passed inline. Linux caps a single argv
+    // element at MAX_ARG_STRLEN (32 pages = 131072 bytes) independently of ARG_MAX, so
+    // 131,072 ids -- ~592 KB as text -- fails with "Argument list too long" even though the
+    // 2 MB total limit is nowhere near. Without this there is no way to feed the scored
+    // context as REAL tokens, and correctness at 128k stays untestable: --seek leaves the
+    // cache zeroed, which is faithful for timing and meaningless for logits.
+    std::string buf;
+    if (s && s[0] == '@') {
+        std::FILE* f = std::fopen(s + 1, "rb");
+        if (!f) { std::printf("--ids: cannot open %s\n", s + 1); return out; }
+        char chunk[65536];
+        size_t n;
+        while ((n = std::fread(chunk, 1, sizeof chunk, f)) > 0) buf.append(chunk, n);
+        std::fclose(f);
+        s = buf.c_str();
+    }
     const char* p = s;
     while (*p) {
+        // Separator-agnostic: commas, newlines and spaces all work, so a file written by
+        // `tr` or one id per line both parse.
+        while (*p && (*p == ',' || *p == '\n' || *p == '\r' || *p == ' ' || *p == '\t')) ++p;
+        if (!*p) break;
         out.push_back(std::atoi(p));
-        while (*p && *p != ',') ++p;
-        if (*p == ',') ++p;
+        while (*p && *p != ',' && *p != '\n' && *p != '\r' && *p != ' ' && *p != '\t') ++p;
     }
     return out;
 }
