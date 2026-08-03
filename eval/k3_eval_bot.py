@@ -976,8 +976,64 @@ def publish_receipt(repo_log, num, res, box_out, dry_run):
             print(f"#{num}: could not publish {name}: {q.stderr.strip()[:160]}",
                   file=sys.stderr)
             return False
+    index_run(repo_log, rid, res, json.loads(body), num, dry_run)
     print(f">> #{num}: published runs/{rid} to {repo_log}")
     return True
+
+
+def index_run(repo_log, rid, res, receipt, num, dry_run):
+    """Append the run to ledger.jsonl and index.json.
+
+    THE INDEX IS THE PAGE. The log's README calls index.json "newest-first summary, for the
+    page" and ledger.jsonl "append-only, one line per run" -- but only kimi_k3_attest.py ever
+    wrote them, and that is the BOX-side publisher, which cannot run: the box has no git
+    write credentials, deliberately, because a machine being judged should not be able to
+    rewrite the ledger judging it. When publishing moved here the index maintenance was left
+    behind, so 24 of 25 runs never reached either file and both had been frozen since
+    2026-07-31 on a single 3.55 BASELINE row.
+
+    Same schema as the sealer, so the two paths cannot disagree about what a row looks like.
+    Non-fatal on failure: the run directory is the record of truth and is already published;
+    a missing index row is a display bug, and losing the receipt over one would be worse.
+    """
+    att = receipt.get("attestation", {}) if isinstance(receipt, dict) else {}
+    entry = {
+        "run_id": rid,
+        "timestamp_utc": att.get("timestamp_utc", ""),
+        "label": res.get("label"),
+        "tps": res.get("tps"),
+        "top1": res.get("top1"),
+        "kl": res.get("kl"),
+        "commit": att.get("code", {}).get("commit", "") or res.get("commit", ""),
+        "attestation_type": receipt.get("attestation_type", "") if isinstance(receipt, dict) else "",
+        "pr": num,
+    }
+    if dry_run:
+        print(f"--- dry-run: would index {rid} ({entry['label']} tps={entry['tps']})")
+        return True
+    ok = True
+    for path, mutate in (("ledger.jsonl", lambda cur: cur + json.dumps(entry, sort_keys=True) + "\n"),
+                         ("index.json", lambda cur: json.dumps(
+                             [entry] + (json.loads(cur) if cur.strip() else []), indent=2))):
+        r = gh(["api", f"repos/{repo_log}/contents/{path}"])
+        sha, cur = "", ""
+        if r.returncode == 0:
+            try:
+                meta = json.loads(r.stdout or "{}")
+                sha = meta.get("sha", "")
+                cur = base64.b64decode(meta.get("content", "")).decode()
+            except (ValueError, KeyError):
+                pass
+        args = ["api", "-X", "PUT", f"repos/{repo_log}/contents/{path}",
+                "-f", f"message=index {rid}: {entry['label']} tps={entry['tps']} (PR #{num})",
+                "-f", "content=" + base64.b64encode(mutate(cur).encode()).decode()]
+        if sha:
+            args += ["-f", f"sha={sha}"]
+        if gh(args).returncode != 0:
+            print(f"!! #{num}: could not update {path} — the run is published but the page "
+                  "will not show it", file=sys.stderr)
+            ok = False
+    return ok
 
 
 # Which merge states each path may proceed through.
