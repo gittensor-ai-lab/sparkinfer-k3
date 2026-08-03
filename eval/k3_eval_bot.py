@@ -371,12 +371,42 @@ def _box_build(sha, what):
         "git checkout -q origin/main -- bench/scripts",
         "rm -rf bench/refdata",
         "export PATH=/usr/local/cuda/bin:$PATH",
+        # EVERY BUILD IS FROM SCRATCH.
+        #
+        # build/ is gitignored, so `git clean -qfd` leaves it (that needs -x) and every PR
+        # was compiled on top of the previous PR's objects, round after round, across a dozen
+        # checkouts. On 2026-08-03 that path produced numbers no fresh build can reproduce:
+        # #81 measured 14.54 in a round and 22.17 on six clean builds, and main measured
+        # 14.14 through the same build directory against 21.25 clean. The regression that
+        # reading caused was real -- #81 was reverted in #84 on the strength of it.
+        #
+        # A single incremental step is not obviously at fault: main->#81 in isolation
+        # reproduces 22.18. What the bot does is not a single step, it is a dozen, and the
+        # difference is not worth reasoning about when the cure is this cheap. A clean build
+        # is ~20 s here, about 2 minutes across a full round, against a ~40 minute round --
+        # far less than one wrong measurement costs.
+        "rm -rf build",
+        # PIN THE COMPILER. /usr/local/cuda is a symlink the box owner can move, and it DID
+        # move today: the note in memory recorded 12.8, the link now resolves to 13.0. Both
+        # measure the same here (21.24 vs 21.25), so this did not cause the above -- but a
+        # loop that pays on measurements should not let a symlink choose its compiler, and
+        # the version belongs in the log so the next discrepancy is diagnosable rather than
+        # archaeological.
+        'NVCC="$(command -v nvcc)"',
+        '[ -x "$NVCC" ] || { echo "no nvcc on PATH" >&2; exit 1; }',
+        'echo ">> toolchain: $($NVCC --version | tail -1)"',
         # -DSPARKINFER_TP=ON is not optional here. Without it the runtime has no NCCL
         # collective, and kimi_k3_tp_bench refuses to run sharded rather than silently
         # producing a wrong number -- correct behaviour, but it means a build configured
         # without this flag fails at eval time with no hint that configure was the cause.
-        "cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=90 "
-        "-DSPARKINFER_TP=ON >/dev/null",
+        #
+        # Configure output is NO LONGER discarded. It used to go to /dev/null, so a failed
+        # configure was invisible and `cmake --build` walked on against whatever cache
+        # happened to exist -- which is how a stale build directory can decide a payout
+        # without anything in the log admitting it.
+        'cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=90 '
+        '-DSPARKINFER_TP=ON -DCMAKE_CUDA_COMPILER="$NVCC" '
+        '|| { echo "cmake configure FAILED" >&2; exit 1; }',
         f"cmake --build build -j{BUILD_JOBS} --target kimi_k3_tp_bench >/dev/null",
     ])
     r = sh(f"{steps} && echo K3_BUILD_OK", timeout=5400)
