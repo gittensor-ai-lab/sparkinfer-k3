@@ -2879,6 +2879,45 @@ __global__ void rms_norm_kernel(float* __restrict__ out, const float* __restrict
     for (int d = threadIdx.x; d < n; d += BLOCK) out[d] = x[d] * inv * w[d];
 }
 
+// Same norm, one float4 per thread-step instead of one float.
+//
+// This kernel is a single block by construction: the mean has to be complete before
+// any output element is scaled, and one block is the only place a grid-wide barrier
+// is free. That is not the part that costs — the part that costs is that a block of
+// 128 scalar threads keeps ~2 KB of loads in flight, and covering HBM latency on this
+// part needs an order of magnitude more than that. Threads and load width are the two
+// knobs that raise bytes-in-flight without touching the barrier, so both move.
+//
+// n4 is the float4 count; n stays the element count because it is the divisor of the
+// mean and must not silently become n/4.
+template <int BLOCK>
+__global__ void rms_norm_vec4_kernel(float* __restrict__ out, const float* __restrict__ x,
+                                     const float* __restrict__ w, int n4, int n, float eps) {
+    k3_pdl_sync();
+    __shared__ float shm[BLOCK / 32 + 1];
+    const float4* __restrict__ x4 = (const float4*)x;
+    const float4* __restrict__ w4 = (const float4*)w;
+    float4* __restrict__ o4 = (float4*)out;
+
+    float acc = 0.0f;
+    for (int d = threadIdx.x; d < n4; d += BLOCK) {
+        const float4 v = x4[d];
+        acc += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+    }
+    const float ss = block_sum<BLOCK>(acc, shm);
+    const float inv = rsqrtf(ss / (float)n + eps);
+    for (int d = threadIdx.x; d < n4; d += BLOCK) {
+        const float4 v = x4[d];
+        const float4 g = w4[d];
+        float4 r;
+        r.x = v.x * inv * g.x;
+        r.y = v.y * inv * g.y;
+        r.z = v.z * inv * g.z;
+        r.w = v.w * inv * g.w;
+        o4[d] = r;
+    }
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -4050,11 +4089,75 @@ size_t k3_moe_q8_k_bytes(int latent, int ffn, int top_k) {
            sizeof(BlockQ8K);
 }
 
+// Threads for the single-block norm, sized to the width rather than fixed at 128.
+// Capped at 1024 because that is the hardware block limit, floored at 128 so the
+// narrow norms keep the shape they already had instead of shrinking.
+static inline int rms_norm_block_for(int units) {
+    if (units >= 1024) return 1024;
+    if (units >= 512)  return 512;
+    if (units >= 256)  return 256;
+    return 128;
+}
+
+static inline bool rms_norm_aligned16(const void* p) {
+    return ((uintptr_t)p & 15u) == 0;
+}
+
 void rms_norm_f32(float* out, const float* x, const float* w, int n, float eps,
                   cudaStream_t stream) {
     if (n <= 0) return;
-    constexpr int BLOCK = 128;
-    k3_pdl_launch(1, BLOCK, 0, stream, rms_norm_kernel<BLOCK>, out, x, w, n, eps);
+
+    // K3 runs this hundreds of times per token per rank — attn_norm and ffn_norm at
+    // hidden 7168, routed_norm at latent 3584, and the MLA q/kv lora norms — and every
+    // one of them was a single block of 128 threads. The block count has to stay 1 (see
+    // the kernel), so the only way to raise bytes-in-flight is more threads, wider
+    // loads, or both. Launches go through k3_pdl_launch so this stays on the PDL path
+    // the rest of the decode chain uses (#90).
+    //
+    // The vector path needs n divisible by 4 AND all three pointers 16B-aligned. Both
+    // are checked rather than assumed: these pointers are offsets into scratch arenas
+    // and into mmap'd GGUF tensor data, not fresh cudaMalloc returns, so alignment is
+    // a property of where a tensor landed and not something the type system carries.
+    // A misaligned float4 load is an unspecified-address fault, so the check is the
+    // difference between a kernel and a crash — and the scalar path below is exact,
+    // not a degraded mode.
+    if (n % 4 == 0 && rms_norm_aligned16(out) && rms_norm_aligned16(x) &&
+        rms_norm_aligned16(w)) {
+        const int n4 = n / 4;
+        switch (rms_norm_block_for(n4)) {
+            case 1024:
+                k3_pdl_launch(1, 1024, 0, stream, rms_norm_vec4_kernel<1024>,
+                              out, x, w, n4, n, eps);
+                return;
+            case 512:
+                k3_pdl_launch(1, 512, 0, stream, rms_norm_vec4_kernel<512>,
+                              out, x, w, n4, n, eps);
+                return;
+            case 256:
+                k3_pdl_launch(1, 256, 0, stream, rms_norm_vec4_kernel<256>,
+                              out, x, w, n4, n, eps);
+                return;
+            default:
+                k3_pdl_launch(1, 128, 0, stream, rms_norm_vec4_kernel<128>,
+                              out, x, w, n4, n, eps);
+                return;
+        }
+    }
+
+    switch (rms_norm_block_for(n)) {
+        case 1024:
+            k3_pdl_launch(1, 1024, 0, stream, rms_norm_kernel<1024>, out, x, w, n, eps);
+            return;
+        case 512:
+            k3_pdl_launch(1, 512, 0, stream, rms_norm_kernel<512>, out, x, w, n, eps);
+            return;
+        case 256:
+            k3_pdl_launch(1, 256, 0, stream, rms_norm_kernel<256>, out, x, w, n, eps);
+            return;
+        default:
+            k3_pdl_launch(1, 128, 0, stream, rms_norm_kernel<128>, out, x, w, n, eps);
+            return;
+    }
 }
 
 void k3_add_f32(float* out, const float* a, const float* b, int64_t n,
