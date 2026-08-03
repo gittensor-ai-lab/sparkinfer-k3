@@ -89,15 +89,30 @@ class ForkPinTest(unittest.TestCase):
                 var = f"KIMI_K3_{node}_LLAMA_{suffix}"
                 self.assertEqual(bash(f'echo "${var}"'), "0", var)
 
-    def test_lock_prefix_matches_node(self):
-        for node, want in (("h200x8", "KIMI_K3_H200X8_LLAMA_"),
-                           ("b200x8", "KIMI_K3_B200X8_LLAMA_"),
-                           ("b300x4", "KIMI_K3_B300X4_LLAMA_")):
+    def test_lock_prefix_matches_node_and_quant(self):
+        """The prefix carries BOTH, because a slot names the measurement completely.
+
+        This used to expect the unqualified KIMI_K3_<NODE>_LLAMA_, which is what the script
+        emitted -- and those slots are the all-zero ones the harness does not read. The
+        harness reads KIMI_K3_<NODE>_<QUANT>_LLAMA_128K, so a baseline run landed its number
+        where nothing would ever score from it. See
+        test_the_baseline_writes_the_slot_the_harness_reads, which pins the two derivations
+        to each other."""
+        for node, want in (("h200x8", "KIMI_K3_H200X8_IQ1S_LLAMA_"),
+                           ("b200x8", "KIMI_K3_B200X8_IQ1S_LLAMA_"),
+                           ("b300x4", "KIMI_K3_B300X4_IQ1S_LLAMA_")):
             out = subprocess.run(
                 ["bash", str(SCRIPTS / "kimi_k3_baseline.sh"), "--node", node, "--dry-run"],
                 capture_output=True, text=True, cwd=ROOT)
             self.assertEqual(out.returncode, 0, out.stderr[-2000:])
             self.assertIn(want, out.stdout, node)
+        # ...and the quant half tracks PRIMARY_QUANT rather than being hardcoded.
+        out = subprocess.run(
+            ["bash", str(SCRIPTS / "kimi_k3_baseline.sh"), "--node", "h200x8", "--dry-run"],
+            capture_output=True, text=True, cwd=ROOT,
+            env={**os.environ, "PRIMARY_QUANT": "UD-Q2_K_XL"})
+        self.assertIn("KIMI_K3_H200X8_Q2KXL_LLAMA_", out.stdout,
+                      "the quant tag is hardcoded, so a Q2_K_XL run would overwrite IQ1_S")
 
 
 class ShardPathTest(unittest.TestCase):
@@ -2200,6 +2215,47 @@ class CiWorkflowTest(unittest.TestCase):
                          "configure output is discarded again — a failed configure would be "
                          "invisible and cmake --build would proceed on whatever cache exists")
         self.assertIn("configure FAILED", cfg, "a failed configure no longer aborts")
+
+    def test_the_baseline_writes_the_slot_the_harness_reads(self):
+        """A reference measured into a slot nothing scores from is wasted GPU time.
+
+        _kimi_k3.sh states the convention: "The reference.lock slots keep the quant in their
+        NAME for exactly this reason (KIMI_K3_H200X8_IQ1S_LLAMA_128), so a number measured
+        under this default can never be read as a Q2_K_XL result."
+
+        kimi_k3_baseline.sh did not implement it. It emitted KIMI_K3_H200X8_LLAMA_* whatever
+        PRIMARY_QUANT said, while kimi_k3_eval.sh reads KIMI_K3_H200X8_IQ1S_LLAMA_128K -- and
+        the unqualified slots it wrote instead are the all-zero ones whose emptiness once made
+        label.py return BASELINE for every run.
+
+        Runs BOTH derivations as shell, the real ones lifted from each file, so agreement is
+        demonstrated rather than asserted."""
+        base = (ROOT / "bench/scripts/kimi_k3_baseline.sh").read_text()
+        ev = (ROOT / "bench/scripts/kimi_k3_eval.sh").read_text()
+
+        writer = next(l for l in base.splitlines() if l.startswith("LOCK_PREFIX="))
+        reader_pfx = next(l for l in ev.splitlines() if l.startswith("PFX="))
+        reader_q = next(l for l in ev.splitlines() if l.startswith("QUANT="))
+
+        for node, quant in (("h200x8", "UD-IQ1_S"), ("h200x8", "UD-Q2_K_XL"),
+                            ("b200x8", "UD-IQ1_S")):
+            w = subprocess.run(
+                ["bash", "-c", f'NODE={node}; PRIMARY_QUANT={quant}; {writer}; printf "%s" "$LOCK_PREFIX"'],
+                capture_output=True, text=True).stdout
+            r = subprocess.run(
+                ["bash", "-c", f'NODE={node}; PRIMARY_QUANT={quant}; {reader_pfx}; {reader_q}; '
+                               f'printf "%s_%s" "$PFX" "$QUANT"'],
+                capture_output=True, text=True).stdout
+            self.assertEqual(w, r,
+                             f"{node}/{quant}: baseline writes {w!r} but the harness reads {r!r}")
+
+        # And the IQ1_S case must be the slot that actually exists in the shipped lock.
+        lock = (ROOT / "bench/scripts/reference.lock").read_text()
+        w = subprocess.run(
+            ["bash", "-c", f'NODE=h200x8; PRIMARY_QUANT=UD-IQ1_S; {writer}; printf "%s" "$LOCK_PREFIX"'],
+            capture_output=True, text=True).stdout
+        self.assertIn(f"{w}_LLAMA_128K", lock,
+                      f"{w}_LLAMA_128K is not a slot in reference.lock")
 
     def test_conflicted_prs_are_labelled_and_the_label_clears_itself(self):
         """The conflict skip was correct but invisible: it printed a line in a log only the
