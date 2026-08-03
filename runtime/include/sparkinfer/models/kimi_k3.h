@@ -149,10 +149,12 @@ struct KimiK3Weights {
     //                divides the FLOPs but not the cache read. It buys a fraction
     //                and pays a full collective.
     //
-    //   Full         Also row/col-shard the MLA and dense-FFN projections, per
-    //                weight_plan. NOT YET SUPPORTED by the forward — the loader
-    //                would shard weights the executor still indexes at full width,
-    //                which reads past the end of the slice.
+    //   Full         ExpertsAndAttn PLUS the leading dense FFN (gate/up RowShard,
+    //                down ColShard). Costs one extra all-reduce per token on the
+    //                leading dense layer. lm_head / token_embd stay REPLICATED —
+    //                weight_plan would RowShard them, but the forward still indexes
+    //                full vocab on rank 0, so Full is NOT "honor every weight_plan
+    //                rule"; it is Attn + dense FFN via the loader allowlist.
     //
     // Kept explicit rather than inferred from tp_size so that turning one on is a
     // deliberate act with a matching forward, not a silent consequence of tp>1.
@@ -193,10 +195,17 @@ struct KimiK3Weights {
     // each `== ExpertsAndKda` would have been six chances to miss one, and a
     // missed site shards weights the forward still indexes at full width.
     static bool shards_kda(ShardPolicy p) {
-        return p == ShardPolicy::ExpertsAndKda || p == ShardPolicy::ExpertsAndAttn;
+        return p == ShardPolicy::ExpertsAndKda || p == ShardPolicy::ExpertsAndAttn
+            || p == ShardPolicy::Full;
     }
     static bool shards_mla(ShardPolicy p) {
-        return p == ShardPolicy::ExpertsAndMla || p == ShardPolicy::ExpertsAndAttn;
+        return p == ShardPolicy::ExpertsAndMla || p == ShardPolicy::ExpertsAndAttn
+            || p == ShardPolicy::Full;
+    }
+    // Leading dense FFN (gate/up/down). Full only — ExpertsAndAttn leaves it
+    // replicated so the dense path stays the single-GPU code with full width.
+    static bool shards_dense(ShardPolicy p) {
+        return p == ShardPolicy::Full;
     }
 
     // WHICH SLICE OF EACH TENSOR THIS RANK HOLDS. Set BEFORE calling the loader;

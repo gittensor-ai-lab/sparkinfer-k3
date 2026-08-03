@@ -520,6 +520,12 @@ static void test_kda_collective_accounting() {
     CHECK_EQ(k3_reduce_count_per_token(0, 0, true), 0);
     CHECK_EQ(k3_reduce_count_per_token(-1, -1, true), 0);
 
+    // Full: +1 for the leading dense FFN reduce (at hidden), on top of attn+MoE.
+    CHECK_EQ(k3_reduce_count_per_token(69, 24, 92, true, true, 1), 186);
+    CHECK_EQ(k3_reduce_count_per_token(69, 24, 92, true, true, 0), 185);
+    CHECK_EQ(k3_reduce_count_per_token(69, 24, 92, true, true, 1) -
+             k3_reduce_count_per_token(69, 24, 92, true, true, 0), 1);
+
     // The payload is full hidden width — a col-shard yields a partial sum over the
     // WHOLE output, which is what makes it an all-reduce and not an all-gather.
     ShardDims sd;

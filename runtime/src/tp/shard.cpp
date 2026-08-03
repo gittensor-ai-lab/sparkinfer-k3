@@ -440,15 +440,17 @@ ShardError mla_shard_dims(const MlaShape& shape, const Config& cfg, int rank,
 }
 
 int k3_reduce_count_per_token(int n_kda_layers, int n_moe_layers, bool kda_sharded) {
-    return k3_reduce_count_per_token(n_kda_layers, 0, n_moe_layers, kda_sharded, false);
+    return k3_reduce_count_per_token(n_kda_layers, 0, n_moe_layers, kda_sharded, false, 0);
 }
 
 int k3_reduce_count_per_token(int n_kda_layers, int n_mla_layers, int n_moe_layers,
-                              bool kda_sharded, bool mla_sharded) {
+                              bool kda_sharded, bool mla_sharded,
+                              int n_dense_ffn_layers) {
     const int kda = (kda_sharded && n_kda_layers > 0) ? n_kda_layers : 0;
     const int mla = (mla_sharded && n_mla_layers > 0) ? n_mla_layers : 0;
     const int moe = n_moe_layers > 0 ? n_moe_layers : 0;
-    return kda + mla + moe;
+    const int dense = n_dense_ffn_layers > 0 ? n_dense_ffn_layers : 0;
+    return kda + mla + moe + dense;
 }
 
 }  // namespace tp
