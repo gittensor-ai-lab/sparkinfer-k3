@@ -1195,8 +1195,8 @@ class CiWorkflowTest(unittest.TestCase):
             self._bot().mark_merge_first(
                 "r", [(20, {"tps": 8.17}), (25, {"tps": 9.55})], True)
         out = buf.getvalue()
-        self.assertIn("--add-label merge-first on #25", out)
-        self.assertIn("--remove-label merge-first on #20", out)
+        self.assertIn("would add merge-first on #25", out)
+        self.assertIn("would remove merge-first on #20", out)
 
     def test_admin_merge_is_reachable_only_through_the_guards(self):
         """The bot may now bypass branch protection, by explicit operator choice. What must
@@ -2441,13 +2441,19 @@ class CiWorkflowTest(unittest.TestCase):
                          "a bit-identical PR (#77, #81) must be silent")
         verdict, ratio, note = bot.kl_ratchet(self.PR74_KL, m)
         self.assertEqual(verdict, "warn", "#74's 1.53x regression was reported as clean again")
+        # and crossing the bar is still a hard block
+        self.assertEqual(bot.kl_ratchet(0.06, m)[0], "reject")
         self.assertAlmostEqual(ratio, 1.528, places=2)
         self.assertIn("1.53x", note)
         self.assertIn("main", note)
 
         # The bars themselves would have said nothing about any of these.
+        # POLICY 2026-08-04: parity under label.py's 0.05 bar is not a regression, so the
+        # >=2x cases WARN rather than block -- main is 0.0039, so even 5x is 0.019, well
+        # inside what the bar accepts. The ratchet still SEES the drift, which is the
+        # property this test is really about; it no longer blocks on it alone.
         for mult, want in ((1.2499, "ok"), (1.25, "warn"), (1.9999, "warn"),
-                           (2.0, "reject"), (5.0, "reject")):
+                           (2.0, "warn"), (5.0, "warn")):
             self.assertEqual(bot.kl_ratchet(m * mult, m)[0], want,
                              f"{mult}x main classified wrong")
             self.assertLess(m * mult, 0.05 if mult < 12 else 1e9,
@@ -2527,7 +2533,9 @@ class CiWorkflowTest(unittest.TestCase):
         main = {f"ctx{d}": {"kl": 0.004} for d in (4, 128, 32768)}
         pr = {"ctx4": {"kl": 0.004}, "ctx128": {"kl": 0.004}, "ctx32768": {"kl": 0.010}}
         verdict, ratio, note = bot.kl_ratchet(pr, main)
-        self.assertEqual(verdict, "reject", "a 2.5x regression at 32k was not rejected")
+        # 0.010 is under the 0.05 bar, so this warns rather than blocks; the point of the
+        # test is that the WORST depth decides and is named, not that it blocks.
+        self.assertEqual(verdict, "warn", "a 2.5x regression at 32k went unreported")
         self.assertAlmostEqual(ratio, 2.5, places=6)
         self.assertIn("ctx32768", note, "the note does not say WHICH depth failed")
         # The mean ratio here is 1.5x -- a warn, not a reject. With the full nine deep
@@ -2535,6 +2543,85 @@ class CiWorkflowTest(unittest.TestCase):
         mean_ratio = sum(pr[k]["kl"] / main[k]["kl"] for k in pr) / len(pr)
         self.assertLess(mean_ratio, bot.KL_RATCHET_REJECT,
                         "this case no longer distinguishes worst-case from mean")
+
+    # measured on h200x8 / UD-IQ1_S, main @ cee15a2 — the round that raised this question
+    MAIN_DEPTHS = {"ctx4": 0.006694998, "ctx128": 0.000038610, "ctx256": 0.000002824,
+                   "ctx512": 0.000025096, "ctx1024": 0.000064222, "ctx2048": 0.000419637,
+                   "ctx4096": 0.000001542}
+
+    @staticmethod
+    def _d(m):
+        return {k: {"kl": v} for k, v in m.items()}
+
+    def test_a_ratio_on_a_number_far_under_the_bar_is_not_a_regression(self):
+        """#104 was blocked for 3.85x at ctx512 — an absolute KLD of 0.000097, which is
+        0.19% of label.py's KL_BAR of 0.05 — while being BETTER than main at ctx4, the depth
+        that carries real weight.
+
+        The sweep grades down to ctx4096 where main sits at 1.5e-06, five orders of magnitude
+        under the bar. There a reduction-order change moves the RATIO by multiples and the
+        absolute divergence by nothing actionable. The ratchet exists to stop parity drifting
+        toward the bar, not to police arithmetic already 500x beneath it."""
+        bot = self._bot()
+        pr104 = {"ctx4": 0.004538860, "ctx128": 0.000046209, "ctx256": 0.000002271,
+                 "ctx512": 0.000096551, "ctx1024": 0.000018631, "ctx2048": 0.000119183,
+                 "ctx4096": 0.000002993}
+        v, _, note = bot.kl_ratchet(self._d(pr104), self._d(self.MAIN_DEPTHS))
+        self.assertEqual(v, "ok", "blocked on a ratio 500x under the acceptance bar")
+        # the immaterial depths are still REPORTED, marked, so nothing is hidden
+        self.assertIn("ctx512=3.85x*", note)
+
+    def test_a_material_regression_is_still_rejected(self):
+        """#115 is the contrast and must stay blocked: ctx2048 at 0.0019 is 3.9% of the bar,
+        and its ctx4 parity degraded 60% (0.0067 -> 0.0107, 21% of the bar). That is exactly
+        the cumulative drift toward the bar the ratchet was built to catch."""
+        bot = self._bot()
+        pr115 = {"ctx4": 0.010727574, "ctx128": 0.000022304, "ctx256": 0.000009617,
+                 "ctx512": 0.000065321, "ctx1024": 0.000067953, "ctx2048": 0.001943870,
+                 "ctx4096": 0.000000325}
+        v, r, note = bot.kl_ratchet(self._d(pr115), self._d(self.MAIN_DEPTHS))
+        # POLICY: parity still under label.py's 0.05 bar is not a regression, however the
+        # ratio reads. 0.0019 at ctx2048 is 3.9% of the bar, so this WARNS and is reported
+        # -- visible in the round log and the PR comment -- but does not block a merge.
+        self.assertEqual(v, "warn")
+        self.assertAlmostEqual(r, 4.632, places=2)
+        self.assertIn("ctx2048", note)
+        self.assertIn("under the", note)
+
+    def test_the_floor_is_not_tuned_to_two_cases(self):
+        """Every floor from 1e-4 to 1e-3 clears #104 and keeps #115, so the default sits
+        mid-plateau rather than on a knife edge."""
+        bot = self._bot()
+        pr104 = {"ctx4": 0.004538860, "ctx128": 0.000046209, "ctx256": 0.000002271,
+                 "ctx512": 0.000096551, "ctx1024": 0.000018631, "ctx2048": 0.000119183,
+                 "ctx4096": 0.000002993}
+        pr115 = {"ctx4": 0.010727574, "ctx128": 0.000022304, "ctx256": 0.000009617,
+                 "ctx512": 0.000065321, "ctx1024": 0.000067953, "ctx2048": 0.001943870,
+                 "ctx4096": 0.000000325}
+        orig = bot.KL_RATCHET_FLOOR
+        try:
+            for f in (1e-4, 2.5e-4, 5e-4, 1e-3):
+                bot.KL_RATCHET_FLOOR = f
+                self.assertEqual(bot.kl_ratchet(self._d(pr104), self._d(self.MAIN_DEPTHS))[0],
+                                 "ok", f"floor {f:g} blocks #104")
+                self.assertEqual(bot.kl_ratchet(self._d(pr115), self._d(self.MAIN_DEPTHS))[0],
+                                 "warn", f"floor {f:g} silences #115 entirely")
+        finally:
+            bot.KL_RATCHET_FLOOR = orig
+        self.assertGreaterEqual(orig, 1e-4)
+        self.assertLessEqual(orig, 1e-3)
+
+    def test_the_floor_never_exempts_the_depth_that_carries_weight(self):
+        """main's ctx4 is 0.0067 — 13% of the bar — so it is always material and the ratchet
+        stays fully live exactly where cumulative drift would show."""
+        bot = self._bot()
+        self.assertGreater(self.MAIN_DEPTHS["ctx4"], bot.KL_RATCHET_FLOOR)
+        worse = dict(self.MAIN_DEPTHS)
+        worse["ctx4"] = self.MAIN_DEPTHS["ctx4"] * 2.5      # 0.0167 — still under the bar
+        self.assertEqual(bot.kl_ratchet(self._d(worse), self._d(self.MAIN_DEPTHS))[0], "warn")
+        over = dict(self.MAIN_DEPTHS)
+        over["ctx4"] = 0.06                                  # at/over the 0.05 bar
+        self.assertEqual(bot.kl_ratchet(self._d(over), self._d(self.MAIN_DEPTHS))[0], "reject")
 
     def test_a_depth_the_pr_did_not_measure_is_called_out(self):
         """Comparing only the depths both sides happen to share would let a narrowed
@@ -2706,6 +2793,54 @@ class CiWorkflowTest(unittest.TestCase):
         verdict = "main measured 0 tok/s — refusing to score a round against it"
         self.assertFalse(bot.is_transient(RuntimeError(verdict)),
                          "a real verdict became retryable — the guard is now advisory")
+
+    def test_the_regression_label_uses_the_endpoint_that_works(self):
+        """`gh pr edit --add-label` queries projectCards, which GitHub deprecated, so it
+        exits 1 even where the repo has no projects. merge-first and merge-conflict were
+        both moved to the issues REST endpoint for exactly that reason; the
+        accuracy-regression call was missed.
+
+        Observed live on #104 and #115: both measured a parity regression, both printed the
+        warning, and both finished the round carrying only their eval:* tier. unsafe_tier
+        still excluded them from THAT round's merge decision, but the label is the durable
+        enforcement -- it is what NEVER_MERGE_LABELS reads, so without it a later round or a
+        human sees a clean PR."""
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        self.assertNotIn('"--add-label"', src,
+                         "a label is still applied via the deprecated projectCards path")
+        bot = self._bot()
+        # every label the merge path depends on must go through the REST endpoint
+        for lbl in ("merge-first", bot.KL_REGRESSION_LABEL, bot.CONFLICT_LABEL):
+            self.assertIn(f'labels[]={lbl}', src.replace('{KL_REGRESSION_LABEL}',
+                                                         bot.KL_REGRESSION_LABEL)
+                                               .replace('{CONFLICT_LABEL}',
+                                                        bot.CONFLICT_LABEL),
+                          f"{lbl} is not applied via issues/N/labels")
+        self.assertIn(bot.KL_REGRESSION_LABEL, bot.NEVER_MERGE_LABELS)
+
+    def test_the_wall_clock_margin_dominates_load_jitter(self):
+        """The differential is a BOUND carrying load variance, not a reading. At 512 marginal
+        tokens and a ~40 tok/s frontier the signal was ~12.8 s against jitter measured at up
+        to 17 s -- larger than the thing being measured -- and one round produced all three
+        mutually exclusive failures of this check on code that never changed: #104 too fast
+        (WORK_TOL), #109 too slow (SPEED_TOL), #113 negative delta.
+
+        The tolerances are deliberately NOT the fix: raising SPEED_TOL buys the same pass
+        rate by letting a binary claim 2x its measured speed, which is the fabrication this
+        guard refuses."""
+        ev = (ROOT / "bench/scripts/kimi_k3_eval.sh").read_text()
+        import re
+        m = re.search(r'MARGIN_TOKENS="\$\{KIMI_K3_MARGIN_TOKENS:-(\d+)\}"', ev)
+        self.assertIsNotNone(m, "MARGIN_TOKENS is no longer env-tunable with a default")
+        margin = int(m.group(1))
+        WORST_JITTER_S, FRONTIER = 17.0, 45.0
+        self.assertGreaterEqual(margin / FRONTIER, 2 * WORST_JITTER_S,
+                                f"{margin} tokens is {margin/FRONTIER:.1f}s of signal against "
+                                f"{WORST_JITTER_S}s of measured jitter — the bound carries no "
+                                f"information")
+        # and the tolerances must not have been loosened to compensate
+        self.assertIn("KIMI_K3_SPEED_TOL:-1.5", ev, "the fabrication tolerance was widened")
+        self.assertIn("KIMI_K3_WORK_TOL:-2.0", ev)
 
     def test_the_answer_key_capture_is_reproducible(self):
         """The corpus is committed with its hash and the capture is one documented command,
@@ -3590,3 +3725,41 @@ class CiWorkflowTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class RatchetBlocksOnlyAtTheBarTest(unittest.TestCase):
+    """Parity under label.py's KL_BAR is not a regression, whatever the ratio says.
+
+    The ratchet still measures and reports every depth and still warns, because a ratio is
+    the only signal that sees drift at all. It no longer applies the blocking label below the
+    bar. What that gives up is deliberate and recorded: the absolute bar cannot see
+    cumulative drift -- #74 merged at 1.53x main, which moved the baseline permanently, and
+    about five such merges fit under 0.05 before the bar notices."""
+
+    MAIN = {"ctx4": 0.006694998, "ctx2048": 0.000419637}
+
+    def _bot(self):
+        import importlib.util
+        s = importlib.util.spec_from_file_location("b", str(ROOT / "eval/k3_eval_bot.py"))
+        m = importlib.util.module_from_spec(s); s.loader.exec_module(m); return m
+
+    @staticmethod
+    def _d(m):
+        return {k: {"kl": v} for k, v in m.items()}
+
+    def test_a_big_ratio_under_the_bar_warns_but_never_blocks(self):
+        bot = self._bot()
+        for mult in (2.0, 5.0, 7.0):                     # 0.0134, 0.0335, 0.0469 — all < 0.05
+            pr = dict(self.MAIN); pr["ctx4"] = self.MAIN["ctx4"] * mult
+            v, _, _ = bot.kl_ratchet(self._d(pr), self._d(self.MAIN))
+            self.assertEqual(v, "warn", f"{mult}x main is under the bar and must not block")
+
+    def test_crossing_the_bar_still_blocks(self):
+        bot = self._bot()
+        pr = dict(self.MAIN); pr["ctx4"] = 0.051
+        self.assertEqual(bot.kl_ratchet(self._d(pr), self._d(self.MAIN))[0], "reject")
+
+    def test_the_block_threshold_is_the_acceptance_bar(self):
+        bot = self._bot()
+        self.assertEqual(bot.KL_RATCHET_BLOCK_AT, 0.05,
+                         "the ratchet must block at label.py's KL_BAR, not a separate number")

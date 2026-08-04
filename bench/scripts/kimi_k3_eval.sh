@@ -235,7 +235,28 @@ TOKENS_LO="$TOKENS"
 # against 7.0 s of observed jitter. It costs ~20 s more wall clock per bench pair, which is
 # nothing against a ~40 minute round, and it re-widens as ms/token falls -- so this number
 # owes a review the next time the frontier doubles. Env-tunable for that reason.
-MARGIN_TOKENS="${KIMI_K3_MARGIN_TOKENS:-512}"
+#
+# THAT REVIEW CAME DUE, AND 512 HAD STOPPED MEASURING ANYTHING.
+#
+# The frontier roughly doubled (~18-22 -> 40-45 tok/s), so 512 marginal tokens shrank to
+# ~12.8 s of signal while the load jitter it has to dominate stayed put. On 2026-08-04 that
+# jitter was measured at up to 17 s -- LARGER than the signal -- and one round produced all
+# three of the mutually exclusive ways this check can fail, on three PRs whose code never
+# changed:
+#
+#   #104  differential 65.38 tok/s (too fast)   -> WORK_TOL: "did not do the extra work"
+#   #109  differential 16.96 tok/s (too slow)   -> SPEED_TOL: "faster than elapsed allows"
+#   #113  differential NEGATIVE (-4.04 s)       -> "non-positive time delta"
+#
+# #109 is the clearest: its self-report moved 40.05 -> 39.96 between two rounds (0.2%) while
+# its differential moved 25.42 -> 16.96 (50%). The self-report is the measurement; the
+# differential is a bound carrying load variance, and at 512 the variance had swallowed it.
+#
+# 2048 restores ~51 s of signal, about 3x the worst observed jitter. It costs ~38 s per bench
+# pair at the current frontier. The TOLERANCES ARE UNCHANGED: raising SPEED_TOL instead would
+# have bought the same pass rate by letting a binary claim 2x its measured speed, which is
+# the fabrication this guard exists to refuse.
+MARGIN_TOKENS="${KIMI_K3_MARGIN_TOKENS:-2048}"
 TOKENS_HI="$(( TOKENS_LO + MARGIN_TOKENS ))"
 
 # POLARIS_API_KEY signs the attestation ledger, and `. .polaris_env` put it in the
