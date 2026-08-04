@@ -16,10 +16,10 @@ sharded. Read the status table, then the limit at the bottom.
 | ✅ **Backend selection** | `runtime/src/tp/backend_select.cpp` — CUDA-free, **44 checks passing** |
 | ✅ **Tensor→rule mapping** | `runtime/src/tp/weight_plan.cpp` — CUDA-free, **230 checks passing** |
 | ✅ **NCCL collective** | bf16 **and f32** — **validated exact on 8× H200, every rank** |
-| ✅ **Fast collectives** | peer-oneshot + multimem — **validated on 8× H200 (bf16 only)** |
+| ✅ **Fast collectives** | peer-oneshot + multimem — peer validated on 8× H200 (bf16 and f32); multimem now has both dtypes |
 | ✅ **Validation tool** | `tp_allreduce_check` — **run; numbers in `bench/results/`** |
 | ✅ **Reduce points** | corrected: the MoE collective is at `expert_latent`, not hidden — see below |
-| ⚠️ **f32 fast collectives** | peer-oneshot/multimem are bf16-only; K3 f32 falls back to NCCL |
+| ✅ **f32 fast collectives** | peer-oneshot and multimem both reduce f32; K3 no longer falls back to NCCL for either |
 | ✅ **Forward integration** | `kimi_k3_tp.cpp` — phase-split forward, one collective per MoE layer |
 | ✅ **Sharded weight loading** | `upload_sliced()` consumes `plan_tensor_residency()`'s StridedCopy |
 | ✅ **End to end** | 93 layers on 8x H200, text in text out, matches the pipeline to 1.85e-09 |
@@ -226,9 +226,8 @@ shards, and the forward issues the reduce. What is left:
    the profile is launch/occupancy-bound at 13x off roofline. An 8-stream capture with
    collectives inside is where the host-event vs in-kernel-barrier distinction starts to
    matter, and where `peer-oneshot` would finally earn its keep.
-4. **f32 fast collectives.** peer-oneshot and multimem are bf16-only, so K3 falls back to
-   NCCL. peer-oneshot was 3.3x faster than NCCL in bf16, so an f32 variant is worth roughly
-   3.5 ms/token — real, but far behind item 1.
+4. ~~**f32 fast collectives.**~~ **Done.** peer-oneshot and multimem both reduce f32;
+   `SPARKINFER_TP_BACKEND=multimem` no longer downgrades to NCCL for K3's residual stream.
 
 ## The limit of ExpertsOnly, and why it is now the whole story
 

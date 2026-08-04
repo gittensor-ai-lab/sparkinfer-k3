@@ -127,9 +127,9 @@ public:
 
     // False when this backend has no f32 reduce. Checked at SETUP, not per call:
     // a forward that needs f32 must refuse a backend that cannot do it rather than
-    // discover it 186 collectives into a token. peer-oneshot reports true — its
-    // f32 kernel mirrors the bf16 one at 4 elements per 128-bit transaction;
-    // multimem still reports false (no f32 kernel written).
+    // discover it 186 collectives into a token. peer-oneshot and multimem both
+    // report true — each has an f32 kernel that mirrors its bf16 one at 4 elements
+    // per 128-bit transaction.
     virtual bool supports_f32() const { return false; }
 
     // Mode B. False for NCCL and the no-op; true for the peer/multimem backends.
