@@ -656,9 +656,21 @@ def measure_accuracy(what):
                                          if "setlocale" not in l)[-400:]
                         if tail:
                             why.append(f"{log}: …{tail}")
+                # DO NOT SAY "refusing to score" HERE.
+                #
+                # That exact phrase is VERDICT_MARKERS[0], and is_transient() treats a
+                # verdict marker ANYWHERE in the message as decisive -- so wording it that
+                # way told with_box_retry that a busy node was a permanent scoring verdict
+                # and killed the round on the first attempt. An incomplete suite is the
+                # box failing, not the harness reaching a conclusion about this PR: the
+                # right response is to retry, and TRANSIENT_RE already matches the
+                # `cudaMalloc failed` / `init failed at tp=` the probe log carries.
+                #
+                # The REFUSAL is unchanged -- 7 of 8 probes is still not parity and is
+                # still never scored. Only the classification of WHY it happened changes.
                 raise RuntimeError(
-                    f"{what}: probe {name} produced no logits — refusing to score a "
-                    f"partial parity suite. Came back: "
+                    f"{what}: incomplete parity suite — probe {name} produced no logits. "
+                    f"Came back: "
                     f"{sorted(f for f in os.listdir(workdir) if f.endswith('.spkl'))}"
                     + ("\n" + "\n".join(why) if why else "")
                     + (f"\nssh stderr: {(r.stderr or '').strip()[:200]}" if r.stderr else ""))

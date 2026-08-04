@@ -2587,7 +2587,7 @@ class CiWorkflowTest(unittest.TestCase):
         """Nine of ten probes returning is not a pass at 90%. It is an unmeasured depth."""
         src = (ROOT / "eval/k3_eval_bot.py").read_text()
         acc = src[src.index("def measure_accuracy("):src.index("def _hello_ids_csv(")]
-        self.assertIn("partial parity suite", acc)
+        self.assertIn("incomplete parity suite", acc)
         self.assertIn("raise RuntimeError", acc)
         # worst-case aggregation, not mean
         self.assertIn("min(d[\"top1\"]", acc)
@@ -2657,9 +2657,9 @@ class CiWorkflowTest(unittest.TestCase):
                          "a probe's stderr is thrown away, so a dead probe cannot say why")
         self.assertIn("hello.log", acc)
         self.assertIn("deep.log", acc)
-        # …and the failure path must quote them
-        self.assertIn("hello.log", src[src.index("produced no logits") - 1200:
-                                       src.index("produced no logits") + 900])
+        # …and the failure path must actually read them back
+        self.assertIn('os.path.join(workdir, log)', acc,
+                      "the failure path never opens the probe logs it captured")
         # the wait happens before the first big allocation
         self.assertIn("nvidia-smi", acc, "measure_accuracy never checks whether the node is free")
         self.assertLess(acc.index("nvidia-smi"), acc.index("--logits"),
@@ -2667,6 +2667,45 @@ class CiWorkflowTest(unittest.TestCase):
         bot = self._bot()
         self.assertGreater(bot.PARITY_SETTLE_TRIES * bot.PARITY_SETTLE_SLEEP, 300,
                            "the wait is too short to outlast a neighbour's run")
+
+    def test_a_busy_node_is_retried_not_treated_as_a_verdict(self):
+        """The round that died on 2026-08-04 should have retried and probably succeeded.
+
+        is_transient() treats a VERDICT_MARKER anywhere in the message as decisive, and the
+        incomplete-suite error said "refusing to score a partial parity suite" -- so
+        `cudaMalloc failed`, which TRANSIENT_RE explicitly lists as retryable, was
+        classified as a permanent verdict about the PR and with_box_retry gave up on the
+        first attempt.
+
+        The refusal is not the bug and does not change: 7 of 8 probes is not parity and is
+        never scored. What changes is that a BUSY BOX is the box failing, not the harness
+        reaching a conclusion, so it gets the retry it always should have had."""
+        bot = self._bot()
+
+        # The phrasing that poisoned the classifier must be gone from the RAISED MESSAGE.
+        # Scoped to the raise expression, not the whole function: is_transient() only ever
+        # sees str(exc), so a comment explaining the trap is not itself the trap.
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        start = src.index('f"{what}: incomplete parity suite')
+        raised = src[start:start + 600]
+        for marker in bot.VERDICT_MARKERS:
+            self.assertNotIn(marker, raised,
+                             f"the incomplete-suite message says {marker!r}, which "
+                             f"is_transient() reads as a permanent verdict")
+
+        # a real incomplete-suite message, carrying the probe log the box actually emits
+        busy = ("main: incomplete parity suite — probe ctx4 produced no logits. "
+                "Came back: ['longctx.ctx128.spkl']\n"
+                "hello.log: …[k3] cudaMalloc failed for blk.92.ffn_gate_exps.weight "
+                "rank slice (240844800 bytes)\n[k3-tp] rank 0: weight load failed\n"
+                "init failed at tp=8, 93 layers")
+        self.assertTrue(bot.is_transient(RuntimeError(busy)),
+                        "a node that was merely busy is still not retried")
+
+        # …while a genuine scoring refusal must still never be retried
+        verdict = "main measured 0 tok/s — refusing to score a round against it"
+        self.assertFalse(bot.is_transient(RuntimeError(verdict)),
+                         "a real verdict became retryable — the guard is now advisory")
 
     def test_the_answer_key_capture_is_reproducible(self):
         """The corpus is committed with its hash and the capture is one documented command,
