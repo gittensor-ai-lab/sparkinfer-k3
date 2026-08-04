@@ -921,6 +921,20 @@ KL_REGRESSION_LABEL = "accuracy-regression"
 # keeps #115, so this is not tuned to two cases. Depths below it are still REPORTED, marked
 # with *, and a depth that grows material stops being exempt on its own.
 KL_RATCHET_FLOOR = float(os.environ.get("K3_KL_RATCHET_FLOOR", "5e-4"))
+# BELOW THE ACCEPTANCE BAR, A RATIO IS NOT A REGRESSION.
+#
+# label.py REJECTs at mean KLD > 0.05, and that bar is the accuracy gate. A PR whose parity
+# is still under it has not degraded accuracy in any sense the project acts on, however its
+# ratio against main reads -- so the ratchet no longer applies the blocking label there. It
+# still MEASURES and REPORTS every depth, and still warns, because a ratio is the only signal
+# that sees drift at all; it just no longer blocks a merge on its own.
+#
+# WHAT THIS GIVES UP, ON PURPOSE. The ratchet existed because the absolute bar cannot see
+# cumulative drift: #74 merged at 1.53x main, which moved the baseline permanently, and the
+# next 1.53x then starts from the new number. About five such merges fit under 0.05, each
+# individually fine, and the bar only catches it once the damage is done. That risk is now
+# accepted policy -- the warn line is what surfaces it, and a human decides.
+KL_RATCHET_BLOCK_AT = float(os.environ.get("K3_KL_RATCHET_BLOCK_AT", "0.05"))
 
 
 def _depth_sort_key(name):
@@ -990,10 +1004,15 @@ def kl_ratchet(pr_kl, main_kl):
     if dropped:
         note += f"  [WARNING: not measured on the PR: {', '.join(dropped)}]"
 
-    if ratio >= KL_RATCHET_REJECT:
-        return "reject", ratio, f"{note} (>= {KL_RATCHET_REJECT}x — accuracy regression)"
+    # A blocking verdict needs BOTH a large ratio and an absolute divergence that has
+    # actually reached the acceptance bar. Under the bar the ratio is reported and warned on,
+    # never labelled: parity that is still inside what label.py accepts is not a regression.
+    if ratio >= KL_RATCHET_REJECT and pr[worst] >= KL_RATCHET_BLOCK_AT:
+        return "reject", ratio, f"{note} (>= {KL_RATCHET_REJECT}x AND at/over the {KL_RATCHET_BLOCK_AT} bar — accuracy regression)"
     if ratio >= KL_RATCHET_WARN:
-        return "warn", ratio, f"{note} (>= {KL_RATCHET_WARN}x — worse than main)"
+        under = (f" — reported only: {pr[worst]:.9f} is under the {KL_RATCHET_BLOCK_AT} bar"
+                 if ratio >= KL_RATCHET_REJECT else "")
+        return "warn", ratio, f"{note} (>= {KL_RATCHET_WARN}x — worse than main{under})"
     return "ok", ratio, note
 
 

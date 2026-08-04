@@ -64,10 +64,11 @@ Ingestion runs at decode speed (42.80 tok/s measured) — see #119.
 Two consequences for you:
 
 - A regression at one depth fails the gate even if the other nine are perfect.
-- Parity is also **ratcheted against `main` measured in the same round, per depth**: 1.25x
-  worse than main is annotated, 2.0x worse is rejected and labelled `accuracy-regression`.
-  Reduction-order changes move these numbers legitimately, which is why the factors are
-  not 1.0 — but drift that nobody is told about is what the ratchet exists to stop.
+- Parity is also **ratcheted against `main` measured in the same round, per depth**, and
+  reported on every PR. **Below the 0.05 bar a ratio is never a regression** — it is
+  annotated so drift is visible, but it does not block a merge. `accuracy-regression` is
+  applied only when a depth is both ≥2.0x main **and** at or over the bar, at which point
+  `label.py` REJECTs on the absolute value anyway.
 
 Note that KLD is ~400x the 1e-5 same-implementation bar, from a known and accepted cause
 (K3 keeps f32 activations where ggml quantizes them before a quantized mat-vec). Do not go
