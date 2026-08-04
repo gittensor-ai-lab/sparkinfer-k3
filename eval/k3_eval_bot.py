@@ -905,6 +905,22 @@ def measure_frontier(repo):
 KL_RATCHET_WARN = float(os.environ.get("K3_KL_RATCHET_WARN", "1.25"))
 KL_RATCHET_REJECT = float(os.environ.get("K3_KL_RATCHET_REJECT", "2.0"))
 KL_REGRESSION_LABEL = "accuracy-regression"
+# MATERIALITY FLOOR: a ratio is only a regression if the number it moved is big enough to
+# matter. The depth sweep grades parity from ctx4 down to ctx4096, where main sits at
+# 1.5e-06 -- five orders of magnitude below label.py's KL_BAR of 0.05. At those magnitudes a
+# reduction-order change moves the ratio by multiples while moving the ABSOLUTE divergence by
+# nothing anyone can act on, and the ratchet exists to stop parity drifting toward the bar,
+# not to police arithmetic that is already 500x under it.
+#
+# #104 is the case: its only >=2x depth was ctx512 at 0.000097 -- 0.19% of the bar -- while it
+# was BETTER than main at ctx4, the depth that carries real weight. It was blocked anyway.
+# #115 is the contrast and must stay blocked: ctx2048 at 0.0019 is 3.9% of the bar and its
+# ctx4 parity degraded 60% (0.0067 -> 0.0107, 21% of the bar).
+#
+# 5e-4 is 1% of KL_BAR and sits mid-plateau: every floor from 1e-4 to 1e-3 clears #104 and
+# keeps #115, so this is not tuned to two cases. Depths below it are still REPORTED, marked
+# with *, and a depth that grows material stops being exempt on its own.
+KL_RATCHET_FLOOR = float(os.environ.get("K3_KL_RATCHET_FLOOR", "5e-4"))
 
 
 def _depth_sort_key(name):
@@ -954,12 +970,19 @@ def kl_ratchet(pr_kl, main_kl):
 
     ratios = {k: pr[k] / mn[k] for k in shared}
     order = sorted(shared, key=_depth_sort_key)
-    worst = max(shared, key=lambda k: ratios[k])
+    # Only depths whose absolute divergence is material can produce a verdict. The rest are
+    # reported with a trailing * so the full picture is still visible in the round log.
+    graded = [k for k in shared if pr[k] >= KL_RATCHET_FLOOR]
+    detail = " ".join(f"{k}={ratios[k]:.2f}x" + ("" if k in graded else "*") for k in order)
+    if not graded:
+        top = max(shared, key=lambda k: ratios[k])
+        return "ok", ratios[top], (
+            f"parity vs main: every depth below the {KL_RATCHET_FLOOR:g} materiality floor "
+            f"(worst {ratios[top]:.2f}x at {top}, {pr[top]:.9f}) [{detail}]")
+    worst = max(graded, key=lambda k: ratios[k])
     ratio = ratios[worst]
-
-    detail = " ".join(f"{k}={ratios[k]:.2f}x" for k in order)
     note = (f"KLD {pr[worst]:.9f} vs main {mn[worst]:.9f} — {ratio:.2f}x at {worst} "
-            f"(worst of {len(shared)} depths) [{detail}]")
+            f"(worst of {len(graded)} material depths of {len(shared)}) [{detail}]")
     # A depth main measured but the PR did not is lost coverage, not a pass. measure_accuracy
     # already hard-fails on a partial suite; this catches the case where the two sides were
     # measured with different K3_PARITY_DEPTHS, which would otherwise silently narrow the gate.

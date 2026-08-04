@@ -2536,6 +2536,78 @@ class CiWorkflowTest(unittest.TestCase):
         self.assertLess(mean_ratio, bot.KL_RATCHET_REJECT,
                         "this case no longer distinguishes worst-case from mean")
 
+    # measured on h200x8 / UD-IQ1_S, main @ cee15a2 — the round that raised this question
+    MAIN_DEPTHS = {"ctx4": 0.006694998, "ctx128": 0.000038610, "ctx256": 0.000002824,
+                   "ctx512": 0.000025096, "ctx1024": 0.000064222, "ctx2048": 0.000419637,
+                   "ctx4096": 0.000001542}
+
+    @staticmethod
+    def _d(m):
+        return {k: {"kl": v} for k, v in m.items()}
+
+    def test_a_ratio_on_a_number_far_under_the_bar_is_not_a_regression(self):
+        """#104 was blocked for 3.85x at ctx512 — an absolute KLD of 0.000097, which is
+        0.19% of label.py's KL_BAR of 0.05 — while being BETTER than main at ctx4, the depth
+        that carries real weight.
+
+        The sweep grades down to ctx4096 where main sits at 1.5e-06, five orders of magnitude
+        under the bar. There a reduction-order change moves the RATIO by multiples and the
+        absolute divergence by nothing actionable. The ratchet exists to stop parity drifting
+        toward the bar, not to police arithmetic already 500x beneath it."""
+        bot = self._bot()
+        pr104 = {"ctx4": 0.004538860, "ctx128": 0.000046209, "ctx256": 0.000002271,
+                 "ctx512": 0.000096551, "ctx1024": 0.000018631, "ctx2048": 0.000119183,
+                 "ctx4096": 0.000002993}
+        v, _, note = bot.kl_ratchet(self._d(pr104), self._d(self.MAIN_DEPTHS))
+        self.assertEqual(v, "ok", "blocked on a ratio 500x under the acceptance bar")
+        # the immaterial depths are still REPORTED, marked, so nothing is hidden
+        self.assertIn("ctx512=3.85x*", note)
+
+    def test_a_material_regression_is_still_rejected(self):
+        """#115 is the contrast and must stay blocked: ctx2048 at 0.0019 is 3.9% of the bar,
+        and its ctx4 parity degraded 60% (0.0067 -> 0.0107, 21% of the bar). That is exactly
+        the cumulative drift toward the bar the ratchet was built to catch."""
+        bot = self._bot()
+        pr115 = {"ctx4": 0.010727574, "ctx128": 0.000022304, "ctx256": 0.000009617,
+                 "ctx512": 0.000065321, "ctx1024": 0.000067953, "ctx2048": 0.001943870,
+                 "ctx4096": 0.000000325}
+        v, r, note = bot.kl_ratchet(self._d(pr115), self._d(self.MAIN_DEPTHS))
+        self.assertEqual(v, "reject")
+        self.assertAlmostEqual(r, 4.632, places=2)
+        self.assertIn("ctx2048", note)
+
+    def test_the_floor_is_not_tuned_to_two_cases(self):
+        """Every floor from 1e-4 to 1e-3 clears #104 and keeps #115, so the default sits
+        mid-plateau rather than on a knife edge."""
+        bot = self._bot()
+        pr104 = {"ctx4": 0.004538860, "ctx128": 0.000046209, "ctx256": 0.000002271,
+                 "ctx512": 0.000096551, "ctx1024": 0.000018631, "ctx2048": 0.000119183,
+                 "ctx4096": 0.000002993}
+        pr115 = {"ctx4": 0.010727574, "ctx128": 0.000022304, "ctx256": 0.000009617,
+                 "ctx512": 0.000065321, "ctx1024": 0.000067953, "ctx2048": 0.001943870,
+                 "ctx4096": 0.000000325}
+        orig = bot.KL_RATCHET_FLOOR
+        try:
+            for f in (1e-4, 2.5e-4, 5e-4, 1e-3):
+                bot.KL_RATCHET_FLOOR = f
+                self.assertEqual(bot.kl_ratchet(self._d(pr104), self._d(self.MAIN_DEPTHS))[0],
+                                 "ok", f"floor {f:g} blocks #104")
+                self.assertEqual(bot.kl_ratchet(self._d(pr115), self._d(self.MAIN_DEPTHS))[0],
+                                 "reject", f"floor {f:g} lets #115 through")
+        finally:
+            bot.KL_RATCHET_FLOOR = orig
+        self.assertGreaterEqual(orig, 1e-4)
+        self.assertLessEqual(orig, 1e-3)
+
+    def test_the_floor_never_exempts_the_depth_that_carries_weight(self):
+        """main's ctx4 is 0.0067 — 13% of the bar — so it is always material and the ratchet
+        stays fully live exactly where cumulative drift would show."""
+        bot = self._bot()
+        self.assertGreater(self.MAIN_DEPTHS["ctx4"], bot.KL_RATCHET_FLOOR)
+        worse = dict(self.MAIN_DEPTHS)
+        worse["ctx4"] = self.MAIN_DEPTHS["ctx4"] * 2.5
+        self.assertEqual(bot.kl_ratchet(self._d(worse), self._d(self.MAIN_DEPTHS))[0], "reject")
+
     def test_a_depth_the_pr_did_not_measure_is_called_out(self):
         """Comparing only the depths both sides happen to share would let a narrowed
         K3_PARITY_DEPTHS on one side silently shrink the gate to whatever overlaps."""
