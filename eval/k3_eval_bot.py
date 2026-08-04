@@ -538,6 +538,11 @@ PARITY_CORPUS = os.environ.get("K3_PARITY_CORPUS", "longctx")
 # The deep pass is minutes of decode, not seconds, and it runs behind the same ssh call
 # as the 4-token probe. 3600 was sized for the latter alone.
 PARITY_TIMEOUT = int(os.environ.get("K3_PARITY_TIMEOUT", "10800"))
+# Wait for a busy node before loading 553 GiB onto it. A GPU under this many MiB counts as
+# free -- a few hundred MiB of driver/context is normal and never clears.
+PARITY_SETTLE_MIB = int(os.environ.get("K3_PARITY_SETTLE_MIB", "2048"))
+PARITY_SETTLE_TRIES = int(os.environ.get("K3_PARITY_SETTLE_TRIES", "60"))
+PARITY_SETTLE_SLEEP = int(os.environ.get("K3_PARITY_SETTLE_SLEEP", "20"))
 
 
 def measure_accuracy(what):
@@ -574,10 +579,32 @@ def measure_accuracy(what):
     binary = f"{BOX_REPO_DIR}/build/runtime/kimi_k3_tp_bench"
     steps = [f"cd {BOX_REPO_DIR}", f"mkdir -p {outdir}"]
 
+    # WAIT FOR THE NODE. This is a RENTED box and it is not always ours: on 2026-08-04 a
+    # round walked into another tenant's benchmark sweep, both jobs tried to allocate ~70
+    # GiB/GPU, and both died on cudaMalloc. The harness gained settle_gpus() for its own
+    # run, but that is in _box_eval -- by which point THIS function has already tried to
+    # load 553 GiB. Wait here, where the first allocation actually happens.
+    #
+    # Advisory, not fatal: if the box never clears we still try, because refusing to score
+    # because a neighbour is busy is its own failure mode. The point is to not collide with
+    # something that is about to finish.
+    steps.append(
+        f'for i in $(seq 1 {PARITY_SETTLE_TRIES}); do '
+        f'busy=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null '
+        f"| awk -v lim={PARITY_SETTLE_MIB} '$1 > lim' | wc -l || true); "
+        f'[ "${{busy:-0}}" = "0" ] && break; '
+        f'echo "waiting for $busy busy GPU(s) …" >&2; sleep {PARITY_SETTLE_SLEEP}; done')
+
     # The 4-token probe: fed inline exactly as it always was, so its number stays
     # comparable with every round this gate has ever reported.
+    #
+    # STDERR GOES TO A FILE, NOT /dev/null. It used to be discarded, and when the probe
+    # died of cudaMalloc the only thing the round could say was "probe ctx4 produced no
+    # logits" -- which reads as a bug in the parity suite and sent the investigation to
+    # entirely the wrong place. The log is small and rides back in the same tar.
     steps.append(f"env -u POLARIS_API_KEY {binary} {gguf} {ndev} 93 1 "
-                 f"--ids {_hello_ids_csv()} --logits {outdir}/hello.spkl >/dev/null 2>&1")
+                 f"--ids {_hello_ids_csv()} --logits {outdir}/hello.spkl "
+                 f"> {outdir}/hello.log 2>&1")
 
     # The deep suite: ONE pass over the longest prefix, dumping at each checkpoint. The
     # ids are read from the box's own origin/main checkout -- 32768 ids is ~200 KB, far
@@ -592,7 +619,7 @@ def measure_accuracy(what):
                      f"--ids @{deep_ids} "
                      f"--checkpoints {','.join(str(d) for d in PARITY_DEPTHS)} "
                      f"--logits-prefix {outdir}/{PARITY_CORPUS} "
-                     f"--ctx {max(PARITY_DEPTHS) + 16} >/dev/null 2>&1")
+                     f"--ctx {max(PARITY_DEPTHS) + 16} > {outdir}/deep.log 2>&1")
 
     # tar+base64 back over the same ssh channel: no scp, no second auth, and the transfer
     # is part of the command whose exit status we already check.
@@ -616,11 +643,25 @@ def measure_accuracy(what):
         for name, ref_spkl, remote_name in probes:
             ours = os.path.join(workdir, remote_name)
             if not os.path.isfile(ours) or os.path.getsize(ours) == 0:
+                # Quote the PROBE'S OWN log, not just ssh's stderr. The probe writes to
+                # <outdir>/{hello,deep}.log and it rides back in the same tar, so the
+                # actual reason -- most often `cudaMalloc failed`, i.e. the node was busy
+                # -- is right here instead of being inferred from an absent file.
+                why = []
+                for log in ("hello.log", "deep.log"):
+                    p = os.path.join(workdir, log)
+                    if os.path.isfile(p):
+                        tail = open(p, errors="replace").read().strip()
+                        tail = "\n".join(l for l in tail.splitlines()
+                                         if "setlocale" not in l)[-400:]
+                        if tail:
+                            why.append(f"{log}: …{tail}")
                 raise RuntimeError(
                     f"{what}: probe {name} produced no logits — refusing to score a "
                     f"partial parity suite. Came back: "
                     f"{sorted(f for f in os.listdir(workdir) if f.endswith('.spkl'))}"
-                    + (f"; box stderr: {(r.stderr or '').strip()[:300]}" if r.stderr else ""))
+                    + ("\n" + "\n".join(why) if why else "")
+                    + (f"\nssh stderr: {(r.stderr or '').strip()[:200]}" if r.stderr else ""))
             depths[name] = _compare_logits_here(ref_spkl, ours, what, name)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)

@@ -2635,6 +2635,39 @@ class CiWorkflowTest(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 bot._extract_probes(tf, _tmp.mkdtemp())
 
+    def test_a_busy_node_is_waited_for_and_a_dead_probe_explains_itself(self):
+        """2026-08-04: a round walked into another tenant's benchmark on the rented box.
+        Both jobs tried to allocate ~70 GiB/GPU and both died on cudaMalloc.
+
+        Two separate failures, two separate fixes:
+
+        The bot did not WAIT. The harness has settle_gpus(), but that runs in _box_eval --
+        by which point measure_accuracy has already tried to load 553 GiB. The wait has to
+        be where the first allocation happens.
+
+        The bot could not SAY WHY. Both probes were run with `>/dev/null 2>&1`, so an
+        out-of-memory death surfaced as "probe ctx4 produced no logits — refusing to score
+        a partial parity suite", which reads as a bug in the parity suite and sends the
+        investigation to entirely the wrong place. One line of `cudaMalloc failed` was
+        thrown away."""
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        acc = src[src.index("def measure_accuracy("):src.index("def _extract_probes(")]
+        # the probes must not discard their own diagnostics
+        self.assertNotIn(">/dev/null 2>&1", acc,
+                         "a probe's stderr is thrown away, so a dead probe cannot say why")
+        self.assertIn("hello.log", acc)
+        self.assertIn("deep.log", acc)
+        # …and the failure path must quote them
+        self.assertIn("hello.log", src[src.index("produced no logits") - 1200:
+                                       src.index("produced no logits") + 900])
+        # the wait happens before the first big allocation
+        self.assertIn("nvidia-smi", acc, "measure_accuracy never checks whether the node is free")
+        self.assertLess(acc.index("nvidia-smi"), acc.index("--logits"),
+                        "the settle must come BEFORE the first probe, not after")
+        bot = self._bot()
+        self.assertGreater(bot.PARITY_SETTLE_TRIES * bot.PARITY_SETTLE_SLEEP, 300,
+                           "the wait is too short to outlast a neighbour's run")
+
     def test_the_answer_key_capture_is_reproducible(self):
         """The corpus is committed with its hash and the capture is one documented command,
         so a reference nobody can regenerate never becomes the thing everything is scored
