@@ -2468,8 +2468,8 @@ class CiWorkflowTest(unittest.TestCase):
             self.assertIn("unavailable", note, f"{label} did not say why")
 
     # ---- the gate was ONE 4-token probe, n=1 --------------------------------------------
-    DEEP_DEPTHS = (128, 256, 512, 1024, 2048, 4096, 8192)
-    OPT_IN_DEPTHS = (16384, 32768)      # captured and committed, off by default on cost
+    DEEP_DEPTHS = (128, 256, 512, 1024, 2048, 4096)
+    OPT_IN_DEPTHS = (8192, 16384, 32768)   # captured and committed, off by default on cost
 
     def test_parity_is_probed_at_many_depths_not_one_point(self):
         """The gate graded a single next-token distribution after a 4-token prompt.
@@ -2483,14 +2483,14 @@ class CiWorkflowTest(unittest.TestCase):
         self.assertEqual(tuple(bot.PARITY_DEPTHS), self.DEEP_DEPTHS)
         probes = bot._parity_probes()
         self.assertEqual(len(probes), 1 + len(self.DEEP_DEPTHS),
-                         "the default suite is not ctx4 + seven depths")
+                         "the default suite is not ctx4 + six depths")
         self.assertEqual(probes[0][0], "ctx4",
                          "the historical 4-token probe must be kept, so the number this "
                          "gate has always reported stays comparable")
 
     def test_the_deeper_depths_are_captured_even_though_they_are_off_by_default(self):
-        """8192 is the default because the deep pass costs max(depth)/decode_tok_s per
-        measured build -- 233 s to 8192 against 809 s to 32768, at a flat ~42 tok/s. The
+        """4096 is the default because the deep pass costs max(depth)/decode_tok_s per
+        measured build -- 136 s to 4096 against 812 s to 32768, at a flat ~42 tok/s. The
         deeper references are still committed so K3_PARITY_DEPTHS can turn them on without
         a fresh 554 GB capture; dropping the files would make that a lie."""
         refdata = ROOT / "bench" / "refdata"
