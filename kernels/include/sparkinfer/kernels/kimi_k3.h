@@ -263,7 +263,8 @@ void moe_router_noaux_tc_f32(float* out_w, int* out_ids, const float* logits,
 //
 // IQ1_S MoE (default): lattice reads go through a 4 KB offset-packed table
 // (SPARKINFER_K3_IQ1S_PACK=0 restores the uint64 gather). Gate/down specialize
-// the scored K3 block counts and software-pipeline the next weight load.
+// the scored K3 block counts, software-pipeline the next weight load, and fuse
+// gate+up against one register-staged activation (no CTA barrier).
 //
 // Weights are ggml IQ2_XS (type 17), rows of `latent` values = latent/256 blocks.
 // Expert e's gate/up row j starts at block (e*ffn + j) * (latent/256).

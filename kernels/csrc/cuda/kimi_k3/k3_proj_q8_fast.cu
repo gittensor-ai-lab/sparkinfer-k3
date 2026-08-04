@@ -390,8 +390,15 @@ bool k3_proj_q8_fused4_1bar(float* y0, float* y1, float* y2, float* y3, const fl
     if (N <= 0 || K <= 0 || wtype != 8 || K % 32 != 0) return false;
     if (!y0 || !y1 || !y2 || !y3 || !W0 || !W1 || !W2 || !W3 || !q8_scratch) return false;
 
-    constexpr int ROWS = 4;      // k3_proj_ggml_f32_x4's, so the two arms differ only
-    if (N < ROWS) return false;  // in the epilogue
+    // ROWS=2 fills ~3072 warps at N=1536 (was 1536 at ROWS=4). Activation is
+    // re-read once more but stays L2-resident; the machine was short of warps.
+    // SPARKINFER_K3_KDA_QKVG_ROWS=0 restores ROWS=4 (bit-identical either way).
+    static const int rows = [] {
+        const char* e = std::getenv("SPARKINFER_K3_KDA_QKVG_ROWS");
+        if (e && e[0] == '0') return 4;
+        return 2;
+    }();
+    if (N < rows) return false;
 
     const int nb = K / 32;
     const int TB = block_for(nb);
@@ -400,17 +407,25 @@ bool k3_proj_q8_fused4_1bar(float* y0, float* y1, float* y2, float* y3, const fl
     constexpr int QT = 128;
     if (!x_pre_q8) k3_quantize_q8_0(q8_scratch, x, nb, stream);
 
-    const unsigned grid = (unsigned)((N + ROWS - 1) / ROWS);
+    const unsigned grid = (unsigned)((N + rows - 1) / rows);
     const BlockQ8_0* xq = (const BlockQ8_0*)q8_scratch;
-#define K3_1BAR4_LAUNCH(BS)                                                      \
+#define K3_1BAR4_LAUNCH(BS, R)                                                   \
     k3_pdl_launch(dim3(grid), dim3(BS), 0, stream,                               \
-                  proj_q8_fused4_1bar_kernel<BS, ROWS>,                           \
+                  proj_q8_fused4_1bar_kernel<BS, R>,                             \
                   y0, y1, y2, y3, xq, (const BlockQ8_0*)W0, (const BlockQ8_0*)W1, \
                   (const BlockQ8_0*)W2, (const BlockQ8_0*)W3, nb, N)
-    switch (TB) {
-        case 32:  K3_1BAR4_LAUNCH(32);  break;
-        case 64:  K3_1BAR4_LAUNCH(64);  break;
-        default:  K3_1BAR4_LAUNCH(128); break;
+    if (rows == 2) {
+        switch (TB) {
+            case 32:  K3_1BAR4_LAUNCH(32, 2);  break;
+            case 64:  K3_1BAR4_LAUNCH(64, 2);  break;
+            default:  K3_1BAR4_LAUNCH(128, 2); break;
+        }
+    } else {
+        switch (TB) {
+            case 32:  K3_1BAR4_LAUNCH(32, 4);  break;
+            case 64:  K3_1BAR4_LAUNCH(64, 4);  break;
+            default:  K3_1BAR4_LAUNCH(128, 4); break;
+        }
     }
 #undef K3_1BAR4_LAUNCH
     return true;

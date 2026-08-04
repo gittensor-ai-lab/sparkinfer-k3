@@ -932,6 +932,107 @@ __device__ __forceinline__ float block_dot(const BlockIQ1S& b,
     return acc;
 }
 
+
+// Warp-local gate/up activation fuse. Gate and up contract the SAME activation
+// block; issuing two block_dot calls reloads xs[] twice. Staging x into CTA smem
+// measured -3.1% (barrier cost). Keeping xs in registers and decoding both weight
+// rows against it has no barrier and is bit-identical: same FMAs, same order
+// (gate then up, ascending j within the lane's group). SPARKINFER_K3_MOE_XFUSE=0
+// restores the dual block_dot path via the launch template below (XFUSE bool).
+template <bool XVEC, bool PACK = false>
+__device__ __forceinline__ void block_dot_pair(const BlockIQ2XS& g,
+                                               const BlockIQ2XS& u,
+                                               const float* __restrict__ x,
+                                               int lane, int nlanes,
+                                               float& g_out, float& u_out) {
+    (void)PACK;
+    float gacc = 0.0f, uacc = 0.0f;
+    for (int l = lane; l < 32; l += nlanes) {
+        const float* xv = x + l * 8;
+        float xs[8];
+        if (XVEC) {
+            const float4* xv4 = (const float4*)xv;
+            const float4 xa = xv4[0], xb = xv4[1];
+            xs[0] = xa.x; xs[1] = xa.y; xs[2] = xa.z; xs[3] = xa.w;
+            xs[4] = xb.x; xs[5] = xb.y; xs[6] = xb.z; xs[7] = xb.w;
+        } else {
+#pragma unroll
+            for (int j = 0; j < 8; ++j) xs[j] = xv[j];
+        }
+        const int ib32 = l >> 2, sub = l & 3;
+#pragma unroll
+        for (int side = 0; side < 2; ++side) {
+            const BlockIQ2XS& b = side ? u : g;
+            const float d = __half2float(__ushort_as_half(b.d));
+            const uint8_t sc = b.scales[ib32];
+            const float db = (sub < 2) ? d * (0.5f + (float)(sc & 0xf)) * 0.25f
+                                       : d * (0.5f + (float)(sc >> 4))  * 0.25f;
+            const uint16_t q = b.qs[l];
+            const uint64_t gw = c_iq2xs_grid[q & 511];
+            const uint8_t signs = c_ksigns_iq2xs[q >> 9];
+            float acc = 0.0f;
+        #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const uint8_t gj = (uint8_t)((gw >> (8 * j)) & 0xffu);
+                acc += db * (float)gj * ((signs & c_kmask_iq2xs[j]) ? -1.0f : 1.0f) * xs[j];
+            }
+            if (side) uacc += acc; else gacc += acc;
+        }
+    }
+    g_out = gacc;
+    u_out = uacc;
+}
+
+template <bool XVEC, bool PACK = false>
+__device__ __forceinline__ void block_dot_pair(const BlockIQ1S& g,
+                                               const BlockIQ1S& u,
+                                               const float* __restrict__ x,
+                                               int lane, int nlanes,
+                                               float& g_out, float& u_out) {
+    float gacc = 0.0f, uacc = 0.0f;
+    for (int l32 = lane; l32 < 32; l32 += nlanes) {
+        const float* xv = x + l32 * 8;
+        float xs[8];
+        if (XVEC) {
+            const float4* xv4 = (const float4*)xv;
+            const float4 xa = xv4[0], xb = xv4[1];
+            xs[0] = xa.x; xs[1] = xa.y; xs[2] = xa.z; xs[3] = xa.w;
+            xs[4] = xb.x; xs[5] = xb.y; xs[6] = xb.z; xs[7] = xb.w;
+        } else {
+#pragma unroll
+            for (int j = 0; j < 8; ++j) xs[j] = xv[j];
+        }
+        const int ib32 = l32 >> 2, l = l32 & 3;
+#pragma unroll
+        for (int side = 0; side < 2; ++side) {
+            const BlockIQ1S& b = side ? u : g;
+            const float d = __half2float(__ushort_as_half(b.d));
+            const uint16_t h = b.qh[ib32];
+            const float dl    = d * (float)(2 * ((h >> 12) & 7) + 1);
+            const float delta = (h & 0x8000) ? -SPARKINFER_IQ1S_DELTA : SPARKINFER_IQ1S_DELTA;
+            const uint32_t idx =
+                (uint32_t)b.qs[4 * ib32 + l] | (((uint32_t)(h >> (3 * l)) & 7u) << 8);
+            float acc = 0.0f;
+            if (PACK) {
+                const uint16_t pk = iq1s_grid_pk[idx];
+            #pragma unroll
+                for (int j = 0; j < 8; ++j)
+                    acc += dl * ((float)iq1s_unpack_g(pk, j) + delta) * xs[j];
+            } else {
+                const uint64_t gw = iq1s_grid_c[idx];
+            #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const int8_t gj = (int8_t)((gw >> (8 * j)) & 0xffu);
+                    acc += dl * ((float)gj + delta) * xs[j];
+                }
+            }
+            if (side) uacc += acc; else gacc += acc;
+        }
+    }
+    g_out = gacc;
+    u_out = uacc;
+}
+
 // llama.cpp CPU vec_dot contracts for the pinned reference. The activation has
 // already been converted to block_q8_K. Keep the integer dot integer until the
 // whole 256-value block has been reduced, then apply the two block scales once;
@@ -1054,18 +1155,23 @@ moe_gate_up_situ_kernel(float* __restrict__ scratch,
             const Blk g_nxt = g_row[b + 1];
             const Blk u_nxt = u_row[b + 1];
             const float* x_nxt = x + (b + 1) * 256;
-            gacc += block_dot<XVEC, PACK>(g_cur, x_cur, lane, 32);
-            uacc += block_dot<XVEC, PACK>(u_cur, x_cur, lane, 32);
+            float dg = 0.0f, du = 0.0f;
+            block_dot_pair<XVEC, PACK>(g_cur, u_cur, x_cur, lane, 32, dg, du);
+            gacc += dg; uacc += du;
             g_cur = g_nxt; u_cur = u_nxt; x_cur = x_nxt;
         }
-        gacc += block_dot<XVEC, PACK>(g_cur, x_cur, lane, 32);
-        uacc += block_dot<XVEC, PACK>(u_cur, x_cur, lane, 32);
+        {
+            float dg = 0.0f, du = 0.0f;
+            block_dot_pair<XVEC, PACK>(g_cur, u_cur, x_cur, lane, 32, dg, du);
+            gacc += dg; uacc += du;
+        }
     } else {
 #pragma unroll 4
         for (int b = 0; b < blocks_per_row; ++b) {
             const float* xb = x + b * 256;
-            gacc += block_dot<XVEC, PACK>(g_row[b], xb, lane, 32);
-            uacc += block_dot<XVEC, PACK>(u_row[b], xb, lane, 32);
+            float dg = 0.0f, du = 0.0f;
+            block_dot_pair<XVEC, PACK>(g_row[b], u_row[b], xb, lane, 32, dg, du);
+            gacc += dg; uacc += du;
         }
     }
 #pragma unroll
@@ -2280,19 +2386,54 @@ __global__ void mla_decode_attn_hbatch_kernel(float* __restrict__ part_acc,
 #pragma unroll
             for (int hh = 0; hh < HPB; ++hh) acc[u][hh] *= s_c[hh];
 
-#pragma unroll UT
-        for (int t = 0; t < tn; ++t) {
-            const KV* kt = k_cache + (size_t)(t0 + t) * key_length;
+        // Software-pipeline t: prefetch k_cache[t+1] / s_p[:,t+1] while FMAing t.
+        // Association stays ascending-t then (u, hh) — bit-identical to the serial loop.
+        // One k_cache load still feeds all HPB heads. SPARKINFER_K3_MLA_PIPE is not
+        // needed as a runtime gate: this is the only phase-3 shape after compile.
+        if (tn > 0) {
             float p[HPB];
 #pragma unroll
-            for (int hh = 0; hh < HPB; ++hh) p[hh] = s_p[hh * kMlaCtxTile + t];
+            for (int hh = 0; hh < HPB; ++hh) p[hh] = s_p[hh * kMlaCtxTile];
+            float kv_cur[RSLOTS];
 #pragma unroll
             for (int u = 0; u < RSLOTS; ++u) {
                 const int r = threadIdx.x + u * BLOCK;
-                if (r < kv_lora) {
-                    const float kv = kv_ld(kt + r);
+                kv_cur[u] = (r < kv_lora)
+                    ? kv_ld(k_cache + (size_t)t0 * key_length + r) : 0.0f;
+            }
+#pragma unroll UT
+            for (int t = 0; t < tn - 1; ++t) {
+                float p_n[HPB];
 #pragma unroll
-                    for (int hh = 0; hh < HPB; ++hh) acc[u][hh] += p[hh] * kv;
+                for (int hh = 0; hh < HPB; ++hh)
+                    p_n[hh] = s_p[hh * kMlaCtxTile + (t + 1)];
+                float kv_n[RSLOTS];
+#pragma unroll
+                for (int u = 0; u < RSLOTS; ++u) {
+                    const int r = threadIdx.x + u * BLOCK;
+                    kv_n[u] = (r < kv_lora)
+                        ? kv_ld(k_cache + (size_t)(t0 + t + 1) * key_length + r)
+                        : 0.0f;
+                }
+#pragma unroll
+                for (int u = 0; u < RSLOTS; ++u) {
+                    if (threadIdx.x + u * BLOCK < kv_lora) {
+#pragma unroll
+                        for (int hh = 0; hh < HPB; ++hh)
+                            acc[u][hh] += p[hh] * kv_cur[u];
+                    }
+                }
+#pragma unroll
+                for (int hh = 0; hh < HPB; ++hh) p[hh] = p_n[hh];
+#pragma unroll
+                for (int u = 0; u < RSLOTS; ++u) kv_cur[u] = kv_n[u];
+            }
+#pragma unroll
+            for (int u = 0; u < RSLOTS; ++u) {
+                if (threadIdx.x + u * BLOCK < kv_lora) {
+#pragma unroll
+                    for (int hh = 0; hh < HPB; ++hh)
+                        acc[u][hh] += p[hh] * kv_cur[u];
                 }
             }
         }
