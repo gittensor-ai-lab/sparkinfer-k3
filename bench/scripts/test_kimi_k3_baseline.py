@@ -1265,19 +1265,31 @@ class CiWorkflowTest(unittest.TestCase):
         was otherwise fine, and the same skew made its reference.lock resolve frontier=0 and
         label a real speedup BASELINE.
 
-        refdata/ is NO LONGER shipped to the box, and that is the point. Restoring the answer
-        key into the same working tree the PR's binary runs in -- fixed relative path, cwd at
-        the repo root -- meant a bench could open bench/refdata/hello.spkl and write it back
-        out as its own --logits dump: top1 1.0, KL 0.0, no work done. Nothing rejected a
+        The ANSWER KEY is never shipped to the box, and that is the point. Restoring it into
+        the same working tree the PR's binary runs in -- fixed relative path, cwd at the repo
+        root -- meant a bench could open bench/refdata/hello.spkl and write it back out as
+        its own --logits dump: top1 1.0, KL 0.0, no work done. Nothing rejected a
         suspiciously exact result either, since label.py only bounds top1 >= 0.90 and
-        KL <= 0.05 while honest main measures 0.004."""
+        KL <= 0.05 while honest main measures 0.004.
+
+        The .ids ARE restored, from origin/main. They are inputs, not answers: which tokens
+        the executor is fed is public in the repo, and the 32k-token parity prompt is ~200 KB
+        -- past MAX_ARG_STRLEN, so it cannot be passed as an ssh argument and has to be read
+        from the box's own checkout. Taking them from origin/main rather than the PR is what
+        stops a PR swapping in a shorter prompt and being graded on it."""
         src = (ROOT / "eval/k3_eval_bot.py").read_text()
         self.assertIn("git checkout -q origin/main -- bench/scripts", src,
                       "the bot grades with the PR's own harness")
+        # The pathspec must be .ids-only: a bare bench/refdata pathspec would write every
+        # .spkl to the box, even if a later step deletes them.
+        self.assertIn("origin/main -- bench/scripts 'bench/refdata/*.ids'", src,
+                      "only the ids may be restored, and they must come from origin/main")
         self.assertNotIn("origin/main -- bench/scripts bench/refdata", src,
                          "the answer key must not be shipped to the box")
-        self.assertIn('"rm -rf bench/refdata"', src,
+        self.assertIn('"rm -f bench/refdata/*.spkl"', src,
                       "a PR could otherwise carry its own copy of the answer key")
+        self.assertNotIn(".spkl", src.split("git checkout -q origin/main")[1].split(",")[0],
+                         "no .spkl may be named in the restore pathspec")
         self.assertLess(src.index("origin/main -- bench/scripts"),
                         src.index("kimi_k3_eval.sh --node"),
                         "the harness must be restored BEFORE the eval runs")
@@ -2455,6 +2467,174 @@ class CiWorkflowTest(unittest.TestCase):
             self.assertEqual(verdict, "ok", f"{label} became a blocking verdict")
             self.assertIn("unavailable", note, f"{label} did not say why")
 
+    # ---- the gate was ONE 4-token probe, n=1 --------------------------------------------
+    DEEP_DEPTHS = (128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768)
+
+    def test_parity_is_probed_at_ten_depths_not_one_point(self):
+        """The gate graded a single next-token distribution after a 4-token prompt.
+
+        One row of one .spkl -- n=1, KV cache essentially empty -- deciding whether a change
+        that is SCORED at 131,072 tokens preserved accuracy. Everything that only appears
+        with a populated cache (F16 latent cache, per-rank CUDA graphs, banded LM head, 2-D
+        MoE sharding) was gated by a measurement that barely touches it: a kernel can be
+        bit-exact at 4 tokens and wrong at 100k and pass clean."""
+        bot = self._bot()
+        self.assertEqual(tuple(bot.PARITY_DEPTHS), self.DEEP_DEPTHS)
+        probes = bot._parity_probes()
+        self.assertEqual(len(probes), 1 + len(self.DEEP_DEPTHS),
+                         "the suite is not ten probes")
+        self.assertEqual(probes[0][0], "ctx4",
+                         "the historical 4-token probe must be kept, so the number this "
+                         "gate has always reported stays comparable")
+
+    def test_every_probed_depth_has_a_committed_reference(self):
+        """A depth whose answer key is missing is a depth that silently stops being checked,
+        and the suite would quietly shrink back toward the single probe it replaced."""
+        bot = self._bot()
+        refdata = ROOT / "bench" / "refdata"
+        for depth in bot.PARITY_DEPTHS:
+            spkl = refdata / f"longctx.ctx{depth}.spkl"
+            ids = refdata / f"longctx.ctx{depth}.ids"
+            self.assertTrue(spkl.is_file(), f"missing answer key {spkl.name}")
+            self.assertTrue(ids.is_file(), f"missing prompt ids {ids.name}")
+            # SPKL = 4-byte magic + 3 u32 + n_vocab f32, one row.
+            self.assertEqual(spkl.stat().st_size, 16 + 163840 * 4,
+                             f"{spkl.name} is not one 163840-wide logit row")
+            self.assertEqual(sum(1 for ln in ids.read_text().split() if ln.strip()), depth,
+                             f"{ids.name} does not hold exactly {depth} ids")
+
+    def test_the_worst_depth_decides_not_the_average(self):
+        """A suite is only as strong as the depth it fails at.
+
+        Averaging would let a real 32k regression hide behind nine good shallow probes --
+        which is the exact failure mode the single-probe gate had, reintroduced."""
+        bot = self._bot()
+        main = {f"ctx{d}": {"kl": 0.004} for d in (4, 128, 32768)}
+        pr = {"ctx4": {"kl": 0.004}, "ctx128": {"kl": 0.004}, "ctx32768": {"kl": 0.010}}
+        verdict, ratio, note = bot.kl_ratchet(pr, main)
+        self.assertEqual(verdict, "reject", "a 2.5x regression at 32k was not rejected")
+        self.assertAlmostEqual(ratio, 2.5, places=6)
+        self.assertIn("ctx32768", note, "the note does not say WHICH depth failed")
+        # The mean ratio here is 1.5x -- a warn, not a reject. With the full nine deep
+        # probes it would have been ~1.17x: silent.
+        mean_ratio = sum(pr[k]["kl"] / main[k]["kl"] for k in pr) / len(pr)
+        self.assertLess(mean_ratio, bot.KL_RATCHET_REJECT,
+                        "this case no longer distinguishes worst-case from mean")
+
+    def test_a_depth_the_pr_did_not_measure_is_called_out(self):
+        """Comparing only the depths both sides happen to share would let a narrowed
+        K3_PARITY_DEPTHS on one side silently shrink the gate to whatever overlaps."""
+        bot = self._bot()
+        main = {f"ctx{d}": {"kl": 0.004} for d in (4, 128, 32768)}
+        pr = {"ctx4": {"kl": 0.004}}
+        verdict, _, note = bot.kl_ratchet(pr, main)
+        self.assertEqual(verdict, "ok", "the shared depth genuinely passed")
+        self.assertIn("ctx128", note)
+        self.assertIn("ctx32768", note)
+        self.assertIn("not measured on the PR", note)
+
+    def test_the_ratchet_reads_the_controllers_number_not_the_rounded_receipt(self):
+        """res["kl"] is not the measured value: it goes to the box as --kl and comes back
+        through label.py's round(kl, 4). The ratchet used to compare that against main's
+        un-rounded value -- 4 decimals against 9. At KL ~0.0067 that quantises the ratio by
+        ~1.5%, one-sided, right where the 1.25x line sits, and it printed as "0.0067000" so
+        the lost precision was invisible in the log."""
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        loop = src[src.index("for pr in eligible:"):]
+        self.assertIn('kl_ratchet(res.get("kl_depths")', loop,
+                      "the ratchet is fed the round-tripped receipt value")
+        self.assertNotIn('kl_ratchet(res.get("kl"), ', loop)
+        self.assertIn('res["kl_depths"] = depths', src,
+                      "the controller's full-precision measurement is never attached")
+        # The RESULT_JSON field specifically -- the prose warning at KL_PREFER may format
+        # however it likes, since nothing parses it.
+        lab = (ROOT / "bench/scripts/label.py").read_text()
+        self.assertIn('"kl": round(kl, 9)', lab,
+                      "the receipt still records only 4 decimals of KL")
+        self.assertNotIn('"kl": round(kl, 4)', lab)
+
+    def test_the_deep_pass_is_one_pass_over_nested_prefixes(self):
+        """The depths are nested prefixes of one document and the executor decodes a prompt
+        one token at a time, so after L tokens the logits ARE the L-token prefix's answer.
+        One pass therefore yields every depth -- no cache reset the runtime does not expose,
+        and no re-feeding of every shorter prefix."""
+        src = (ROOT / "runtime/examples/kimi_k3_tp_bench.cpp").read_text()
+        self.assertIn("--checkpoints", src)
+        self.assertIn("--logits-prefix", src)
+        # A checkpoint that cannot be honoured must stop the run, not vanish: a missing dump
+        # becomes "no comparison at that depth", which is what this exists to remove.
+        self.assertIn("out of range", src)
+        self.assertIn("exceeds --ctx", src)
+        self.assertIn("FAILED to write", src)
+        self.assertIn("--checkpoints needs --logits-prefix", src)
+
+    def test_a_partial_parity_suite_is_never_scored(self):
+        """Nine of ten probes returning is not a pass at 90%. It is an unmeasured depth."""
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        acc = src[src.index("def measure_accuracy("):src.index("def _hello_ids_csv(")]
+        self.assertIn("partial parity suite", acc)
+        self.assertIn("raise RuntimeError", acc)
+        # worst-case aggregation, not mean
+        self.assertIn("min(d[\"top1\"]", acc)
+        self.assertIn("max(d[\"kl\"]", acc)
+
+    def test_the_probe_archive_cannot_write_outside_its_extract_dir(self):
+        """The suite now comes back as a tar, and that tar is BUILT ON THE BOX -- the
+        machine running unmodified PR code. A bench that dropped a symlink or a '..' entry
+        into its output directory could otherwise turn the extract into an arbitrary write
+        on the controller, which is the one machine holding the answer key and the merge
+        credentials."""
+        import io as _io, tarfile as _tar, tempfile as _tmp
+        bot = self._bot()
+        work = _tmp.mkdtemp()
+
+        # a well-formed archive still extracts
+        good = os.path.join(work, "good.tar")
+        payload = os.path.join(work, "hello.spkl")
+        with open(payload, "wb") as f:
+            f.write(b"x" * 32)
+        with _tar.open(good, "w") as tf:
+            tf.add(payload, arcname="hello.spkl")
+        dest = _tmp.mkdtemp()
+        with _tar.open(good) as tf:
+            bot._extract_probes(tf, dest)
+        self.assertEqual(sorted(os.listdir(dest)), ["hello.spkl"])
+
+        # a symlink is refused
+        eviltar = os.path.join(work, "evil.tar")
+        with _tar.open(eviltar, "w") as tf:
+            info = _tar.TarInfo("sneaky.spkl")
+            info.type, info.linkname = _tar.SYMTYPE, "/etc/passwd"
+            tf.addfile(info)
+        with _tar.open(eviltar) as tf:
+            with self.assertRaises(RuntimeError):
+                bot._extract_probes(tf, _tmp.mkdtemp())
+
+        # a traversal entry is refused
+        travtar = os.path.join(work, "trav.tar")
+        with _tar.open(travtar, "w") as tf:
+            info = _tar.TarInfo("../escape.spkl")
+            info.size = 0
+            tf.addfile(info, _io.BytesIO(b""))
+        with _tar.open(travtar) as tf:
+            with self.assertRaises(RuntimeError):
+                bot._extract_probes(tf, _tmp.mkdtemp())
+
+    def test_the_answer_key_capture_is_reproducible(self):
+        """The corpus is committed with its hash and the capture is one documented command,
+        so a reference nobody can regenerate never becomes the thing everything is scored
+        against."""
+        corpus = ROOT / "bench" / "refdata" / "longctx.txt"
+        self.assertTrue(corpus.is_file())
+        import hashlib
+        digest = hashlib.sha256(corpus.read_bytes()).hexdigest()
+        readme = (ROOT / "bench" / "refdata" / "README.md").read_text()
+        self.assertIn(digest, readme,
+                      "the corpus hash in README.md does not match the committed corpus")
+        self.assertTrue((ROOT / "bench" / "scripts" / "capture_parity_refs.sh").is_file())
+        # and the README must not overclaim: 32768 is not the scored context
+        self.assertIn("32768 is not 131072", readme)
+
     def test_a_rejected_pr_cannot_be_merged_by_the_round(self):
         """The label is the enforcement, so it has to be one the merge path already refuses."""
         bot = self._bot()
@@ -2479,8 +2659,12 @@ class CiWorkflowTest(unittest.TestCase):
         self.assertIn("parity=parity", loop, "post() is called without the parity it needs")
         # --frontier must still define the baseline or the round dies on NameError.
         head = src[src.index("if args.frontier is not None:"):src.index("for pr in eligible:")]
-        self.assertIn("main_kl = 0.0", head,
-                      "main_kl is unbound on the --frontier path — NameError mid-round")
+        self.assertIn("main_parity = {}", head,
+                      "main_parity is unbound on the --frontier path — NameError mid-round")
+        # An empty suite must read as "unavailable", never as a comparison against zero.
+        bot = self._bot()
+        self.assertEqual(bot.kl_ratchet({"ctx4": {"kl": 0.005}}, {})[0], "ok")
+        self.assertIn("unavailable", bot.kl_ratchet({"ctx4": {"kl": 0.005}}, {})[2])
 
     def test_a_transient_box_failure_does_not_discard_the_whole_round(self):
         """One frontier failure used to throw away every PR in the round.

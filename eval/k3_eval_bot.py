@@ -46,8 +46,10 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import urllib.parse
@@ -412,8 +414,25 @@ def _box_build(sha, what):
         # bench/refdata/hello.spkl and write it back out as its own --logits dump: top1 1.0,
         # KL 0.0, for a binary that computed nothing. Accuracy is measured by the controller
         # now (measure_accuracy), against a reference this box never receives.
-        "git checkout -q origin/main -- bench/scripts",
-        "rm -rf bench/refdata",
+        # bench/refdata comes back, but WITHOUT its answer key.
+        #
+        # The .ids are INPUTS: which tokens the executor is fed. They are public in the
+        # repo, so withholding them protects nothing, and the 32k-token parity prompt is
+        # ~200 KB -- far past MAX_ARG_STRLEN, so shipping it per round over ssh is not
+        # possible anyway. They come from origin/main precisely so a PR cannot swap in a
+        # shorter or easier prompt and be graded on it.
+        #
+        # The .spkl are the ANSWERS, and they still never reach this box. That is the
+        # attack this defends: a bench could open bench/refdata/*.spkl and write it back
+        # out as its own --logits dump -- top1 1.0, KL 0.0, for a binary that computed
+        # nothing. Accuracy is graded by the controller (measure_accuracy) against the
+        # controller's own copy.
+        # NOTE THE PATHSPEC: '*.ids' ONLY. The answer key is never written to this disk at
+        # all, not even for the instant before a delete.
+        "git checkout -q origin/main -- bench/scripts 'bench/refdata/*.ids'",
+        # …and any .spkl the PR's OWN checkout carried is removed, since bench/refdata is
+        # committed and a branch can contain whatever it likes.
+        "rm -f bench/refdata/*.spkl",
         "export PATH=/usr/local/cuda/bin:$PATH",
         # EVERY BUILD IS FROM SCRATCH.
         #
@@ -469,6 +488,36 @@ def _box_build(sha, what):
 REFDATA = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                        "bench", "refdata")
 
+# THE DEPTHS THE PARITY SUITE PROBES, BEYOND THE HISTORICAL 4-TOKEN ONE.
+#
+# WHY MORE THAN ONE PROBE. The gate used to be a single next-token distribution after a
+# 4-token prompt -- one row of one .spkl, n=1. Everything the engine is actually scored on
+# happens at 131,072 tokens, and everything that only appears once the KV cache is
+# populated (the F16 latent cache, per-rank CUDA graphs, the banded LM head, 2-D MoE
+# sharding) was gated by a measurement that barely touches it. A change can be bit-exact
+# at 4 tokens and wrong at 100k and the old gate would pass it clean.
+#
+# These are nested prefixes of ONE document (bench/refdata/longctx.txt), so they test
+# genuine long-range dependency rather than ten unrelated short prompts, and one pass over
+# the longest prefix produces all of them.
+#
+# WHY NOT 131072. The reference has to come from llama.cpp, and the capture cost grows
+# with depth; 32768 is what fits in a sane capture. This narrows the untested gap from
+# "everything past 4 tokens" to "everything past 32k" -- it does not close it, and
+# README/CONTRIBUTING say so rather than implying full-context parity is proven.
+#
+# COST. The deep pass feeds the longest prefix through the decode path one token at a
+# time (there is no batched prefill in the runtime), so it costs roughly
+# max(depth)/decode_tok_s seconds per measured build -- about 8-13 minutes at 32768 --
+# and a round pays it once for main plus once per PR. Trim this list to shorten a round.
+PARITY_DEPTHS = [int(x) for x in os.environ.get(
+    "K3_PARITY_DEPTHS",
+    "128,256,512,1024,2048,4096,8192,16384,32768").split(",") if x.strip()]
+PARITY_CORPUS = os.environ.get("K3_PARITY_CORPUS", "longctx")
+# The deep pass is minutes of decode, not seconds, and it runs behind the same ssh call
+# as the 4-token probe. 3600 was sized for the latter alone.
+PARITY_TIMEOUT = int(os.environ.get("K3_PARITY_TIMEOUT", "10800"))
+
 
 def measure_accuracy(what):
     """Grade the box's logits HERE, against a reference the box never sees.
@@ -483,73 +532,181 @@ def measure_accuracy(what):
     against this machine's copy of the reference. The box cannot match a file it does not
     have.
 
-    Returns (top1, kl) or raises RuntimeError.
-    """
-    ids_file = os.path.join(REFDATA, "hello.ids")
-    ref_spkl = os.path.join(REFDATA, "hello.spkl")
-    for p in (ids_file, ref_spkl):
-        if not os.path.isfile(p):
-            raise RuntimeError(f"missing controller-side reference {p} — refusing to score "
-                               f"without a correctness gate")
-    with open(ids_file) as f:
-        # hello.ids holds prompt ids THEN the reference continuations; the prompt is the
-        # first 4. Taking the whole file would score a different step.
-        ids_csv = ",".join(l.strip() for l in list(f)[:4] if l.strip())
+    Returns (top1, kl, depths):
 
-    remote = "/tmp/k3acc_$$.spkl"
-    # base64 back over the same ssh channel: no scp, no second auth, and the transfer is
-    # part of the command whose exit status we already check.
-    cmd = (f"cd {BOX_REPO_DIR} && "
-           f"env -u POLARIS_API_KEY {BOX_REPO_DIR}/build/runtime/kimi_k3_tp_bench "
-           f"$(ls {BOX_MODELS_DIR}/*/*-00001-of-*.gguf | head -1) "
-           f"{len(DEVICES.split(','))} 93 1 --ids {ids_csv} --logits {remote} "
-           f">/dev/null 2>&1; "
-           f"[ -s {remote} ] && base64 -w0 {remote}; rm -f {remote}")
-    r = sh(cmd, timeout=3600)
+        top1    the WORST top-1 agreement across the suite
+        kl      the WORST (highest) mean KLD across the suite
+        depths  {probe_name: {"top1": float, "kl": float}} for every probe
+
+    The two scalars are worst-case on purpose. A suite is only as strong as the depth it
+    fails at, and averaging would let a 32k regression hide behind nine good shallow
+    probes -- which is the exact failure mode this replaced.
+
+    Raises RuntimeError if any probe fails to come back: a missing depth would silently
+    become "no comparison at that depth", which is what this exists to remove.
+    """
+    probes = _parity_probes()
+
+    outdir = "/tmp/k3par_$$"
+    ndev = len(DEVICES.split(","))
+    gguf = f"$(ls {BOX_MODELS_DIR}/*/*-00001-of-*.gguf | head -1)"
+    binary = f"{BOX_REPO_DIR}/build/runtime/kimi_k3_tp_bench"
+    steps = [f"cd {BOX_REPO_DIR}", f"mkdir -p {outdir}"]
+
+    # The 4-token probe: fed inline exactly as it always was, so its number stays
+    # comparable with every round this gate has ever reported.
+    steps.append(f"env -u POLARIS_API_KEY {binary} {gguf} {ndev} 93 1 "
+                 f"--ids {_hello_ids_csv()} --logits {outdir}/hello.spkl >/dev/null 2>&1")
+
+    # The deep suite: ONE pass over the longest prefix, dumping at each checkpoint. The
+    # ids are read from the box's own origin/main checkout -- 32768 ids is ~200 KB, far
+    # past MAX_ARG_STRLEN, so they cannot be passed as an argument.
+    if PARITY_DEPTHS:
+        deep_ids = f"{BOX_REPO_DIR}/bench/refdata/{PARITY_CORPUS}.ctx{max(PARITY_DEPTHS)}.ids"
+        # Say so on stderr rather than letting the bench fail obscurely on a missing file:
+        # the ids come from origin/main's checkout, so an absent one means the restore
+        # pathspec in _box_build and the depths configured here have drifted apart.
+        steps.append(f'test -s {deep_ids} || echo "MISSING PARITY IDS: {deep_ids}" >&2')
+        steps.append(f"env -u POLARIS_API_KEY {binary} {gguf} {ndev} 93 1 "
+                     f"--ids @{deep_ids} "
+                     f"--checkpoints {','.join(str(d) for d in PARITY_DEPTHS)} "
+                     f"--logits-prefix {outdir}/{PARITY_CORPUS} "
+                     f"--ctx {max(PARITY_DEPTHS) + 16} >/dev/null 2>&1")
+
+    # tar+base64 back over the same ssh channel: no scp, no second auth, and the transfer
+    # is part of the command whose exit status we already check.
+    cmd = ("; ".join(steps) +
+           f"; tar cf - -C {outdir} . | base64 -w0; rm -rf {outdir}")
+    r = sh(cmd, timeout=PARITY_TIMEOUT)
     blob = (r.stdout or "").strip()
     if not blob:
         raise RuntimeError(f"no logits dump came back for {what} — cannot grade correctness"
                            + (f": {(r.stderr or '').strip()[:200]}" if r.stderr else ""))
-    fd, ours = tempfile.mkstemp(prefix="k3acc_", suffix=".spkl")
-    with os.fdopen(fd, "wb") as f:
-        f.write(base64.b64decode(blob))
+
+    workdir = tempfile.mkdtemp(prefix="k3par_")
     try:
-        cmp_py = os.path.join(os.path.dirname(REFDATA), "scripts", "compare_logits.py")
-        p = subprocess.run([sys.executable, cmp_py, ref_spkl, ours, "--json"],
-                           capture_output=True, text=True, timeout=600)
-        # ITS EXIT CODE IS A VERDICT, NOT AN ERROR, AND IT IS ALWAYS 1 FOR K3.
-        #
-        # compare_logits returns 0 only for mean_kld < 1e-5 -- a SAME-IMPLEMENTATION bar,
-        # "two implementations of one arithmetic". K3's accepted parity is 4.05e-03, about
-        # 400x that, from a known cause: K3 keeps f32 activations where ggml quantizes them
-        # before a quantized mat-vec. CONTRIBUTING documents it. So the tool says FAIL on a
-        # perfectly good run, every time.
-        #
-        # The shell this replaced ran it with `|| true` and read the JSON; porting it to
-        # Python without that turned every round into "compare_logits failed" with an empty
-        # stderr, which is how the first hardened round died. The gate that matters is
-        # label.py's (top1 >= 0.90, kl <= 0.20), applied downstream.
-        #
-        # So parse the output and let the numbers speak. Only a MISSING or unparseable
-        # payload is a real failure -- that means the tool did not run, which is different
-        # from it disagreeing.
-        out = (p.stdout or "").strip()
-        if not out:
-            raise RuntimeError(f"compare_logits produced no output for {what} (rc="
-                               f"{p.returncode}): {(p.stderr or '').strip()[:300]}")
-        try:
-            d = json.loads(out)
-            top1, kl = float(d["top1_agreement"]), float(d["mean_kld"])
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
-            raise RuntimeError(f"compare_logits output for {what} is not the expected JSON "
-                               f"({exc}): {out[:200]}") from exc
+        tar_path = os.path.join(workdir, "probes.tar")
+        with open(tar_path, "wb") as f:
+            f.write(base64.b64decode(blob))
+        with tarfile.open(tar_path) as tf:
+            _extract_probes(tf, workdir)
+
+        depths = {}
+        for name, ref_spkl, remote_name in probes:
+            ours = os.path.join(workdir, remote_name)
+            if not os.path.isfile(ours) or os.path.getsize(ours) == 0:
+                raise RuntimeError(
+                    f"{what}: probe {name} produced no logits — refusing to score a "
+                    f"partial parity suite. Came back: "
+                    f"{sorted(f for f in os.listdir(workdir) if f.endswith('.spkl'))}"
+                    + (f"; box stderr: {(r.stderr or '').strip()[:300]}" if r.stderr else ""))
+            depths[name] = _compare_logits_here(ref_spkl, ours, what, name)
     finally:
-        try:
-            os.unlink(ours)
-        except OSError:
-            pass
-    print(f"{what}: accuracy measured HERE — top1={top1} kl={kl}")
-    return top1, kl
+        shutil.rmtree(workdir, ignore_errors=True)
+
+    top1 = min(d["top1"] for d in depths.values())
+    kl = max(d["kl"] for d in depths.values())
+    width = max(len(n) for n in depths)
+    for name, d in depths.items():
+        print(f"  {name:>{width}}: top1={d['top1']:.6f} kl={d['kl']:.9f}")
+    print(f"{what}: accuracy measured HERE over {len(depths)} depths — "
+          f"worst top1={top1} worst kl={kl}")
+    return top1, kl, depths
+
+
+def _extract_probes(tf, dest):
+    """Unpack the probe tar, refusing anything that is not a plain file under dest.
+
+    THIS TAR IS BUILT ON THE BOX, and the box is the machine running unmodified PR code.
+    A bench that dropped a symlink or a "../.." entry into its output directory could
+    otherwise turn this extract into an arbitrary write on the CONTROLLER -- the one
+    machine in this system that holds the answer key and the merge credentials. Nothing
+    legitimate here is anything but a regular .spkl file.
+    """
+    root = os.path.realpath(dest)
+    for m in tf.getmembers():
+        if m.name in (".", "./"):
+            continue
+        if not m.isfile():
+            raise RuntimeError(f"probe archive contains a non-regular entry {m.name!r} "
+                               f"({'symlink' if m.issym() or m.islnk() else 'special'}) — "
+                               f"refusing to extract anything the box may have planted")
+        target = os.path.realpath(os.path.join(root, m.name))
+        if target != root and not target.startswith(root + os.sep):
+            raise RuntimeError(f"probe archive entry {m.name!r} escapes the extract "
+                               f"directory — refusing to extract")
+    # filter="data" is the belt to the above braces on 3.12+; older runtimes get the
+    # validation loop alone, which already covers the same cases.
+    try:
+        tf.extractall(dest, filter="data")
+    except TypeError:
+        tf.extractall(dest)
+
+
+def _hello_ids_csv():
+    """The historical 4-token probe's ids, from the controller's own copy."""
+    ids_file = os.path.join(REFDATA, "hello.ids")
+    if not os.path.isfile(ids_file):
+        raise RuntimeError(f"missing controller-side reference {ids_file} — refusing to "
+                           f"score without a correctness gate")
+    with open(ids_file) as f:
+        # hello.ids holds prompt ids THEN the reference continuations; the prompt is the
+        # first 4. Taking the whole file would score a different step.
+        return ",".join(l.strip() for l in list(f)[:4] if l.strip())
+
+
+def _parity_probes():
+    """[(name, controller-side ref .spkl, filename the box will produce)] for the suite.
+
+    Every reference must exist HERE before a single GPU-second is spent: discovering a
+    missing answer key after the run would either waste the round or, worse, tempt a
+    partial score.
+    """
+    probes = [("ctx4", os.path.join(REFDATA, "hello.spkl"), "hello.spkl")]
+    for depth in PARITY_DEPTHS:
+        probes.append((f"ctx{depth}",
+                       os.path.join(REFDATA, f"{PARITY_CORPUS}.ctx{depth}.spkl"),
+                       f"{PARITY_CORPUS}.ctx{depth}.spkl"))
+    missing = [p for _, p, _ in probes if not os.path.isfile(p)]
+    if missing:
+        raise RuntimeError(
+            "missing controller-side parity reference(s) — refusing to score without the "
+            "full correctness gate: " + ", ".join(os.path.basename(m) for m in missing) +
+            ". Capture them with bench/scripts/capture_parity_refs.sh")
+    return probes
+
+
+def _compare_logits_here(ref_spkl, ours, what, tag):
+    """Run compare_logits.py on THIS machine and return {"top1":…, "kl":…}."""
+    cmp_py = os.path.join(os.path.dirname(REFDATA), "scripts", "compare_logits.py")
+    p = subprocess.run([sys.executable, cmp_py, ref_spkl, ours, "--json"],
+                       capture_output=True, text=True, timeout=600)
+    # ITS EXIT CODE IS A VERDICT, NOT AN ERROR, AND IT IS ALWAYS 1 FOR K3.
+    #
+    # compare_logits returns 0 only for mean_kld < 1e-5 -- a SAME-IMPLEMENTATION bar,
+    # "two implementations of one arithmetic". K3's accepted parity is 4.05e-03, about
+    # 400x that, from a known cause: K3 keeps f32 activations where ggml quantizes them
+    # before a quantized mat-vec. CONTRIBUTING documents it. So the tool says FAIL on a
+    # perfectly good run, every time.
+    #
+    # The shell this replaced ran it with `|| true` and read the JSON; porting it to
+    # Python without that turned every round into "compare_logits failed" with an empty
+    # stderr, which is how the first hardened round died. The gate that matters is
+    # label.py's (top1 >= 0.90, kl <= 0.20), applied downstream.
+    #
+    # So parse the output and let the numbers speak. Only a MISSING or unparseable
+    # payload is a real failure -- that means the tool did not run, which is different
+    # from it disagreeing.
+    out = (p.stdout or "").strip()
+    if not out:
+        raise RuntimeError(f"compare_logits produced no output for {what} {tag} (rc="
+                           f"{p.returncode}): {(p.stderr or '').strip()[:300]}")
+    try:
+        d = json.loads(out)
+        return {"top1": float(d["top1_agreement"]), "kl": float(d["mean_kld"])}
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(f"compare_logits output for {what} {tag} is not the expected "
+                           f"JSON ({exc}): {out[:200]}") from exc
 
 
 def _box_eval(what, frontier=None, seal=False, top1=None, kl=None):
@@ -631,7 +788,7 @@ def measure_frontier(repo):
     _box_build(sha, "main")
     # frontier=0 makes label.py return BASELINE, which is what we want: this run is not a
     # submission and must not be sealed or scored. Only its tps is used.
-    top1, kl = measure_accuracy("main")
+    top1, kl, depths = measure_accuracy("main")
     res, _, _ = _box_eval("main", frontier=0, seal=False, top1=top1, kl=kl)
     tps = float(res.get("tps") or 0)
     if tps <= 0:
@@ -640,9 +797,11 @@ def measure_frontier(repo):
     if not sha.lower().startswith(got) or len(got) < 7:
         raise RuntimeError(f"harness measured commit {got!r} but main is {sha[:12]!r}")
     print(f"main: frontier = {tps} tok/s @ {sha[:8]}")
-    # main's KL is the round's PARITY BASELINE, measured on the same box minutes before every
-    # PR in the round. The absolute bars cannot see drift; only this can. See kl_ratchet().
-    return sha, tps, str(res.get("quant") or "UD-IQ1_S"), float(kl or 0)
+    # main's PER-DEPTH KL is the round's PARITY BASELINE, measured on the same box minutes
+    # before every PR in the round. The absolute bars cannot see drift; only this can.
+    # Returned per depth, not collapsed: a PR that is fine at 4 tokens and 2x worse at 32k
+    # is exactly the case a single number cannot express. See kl_ratchet().
+    return sha, tps, str(res.get("quant") or "UD-IQ1_S"), depths
 
 
 # THE ACCURACY GATE WAS A FLOOR, NOT A RATCHET.
@@ -667,22 +826,66 @@ KL_RATCHET_REJECT = float(os.environ.get("K3_KL_RATCHET_REJECT", "2.0"))
 KL_REGRESSION_LABEL = "accuracy-regression"
 
 
-def kl_ratchet(pr_kl, main_kl):
-    """Return (verdict, ratio, note) comparing a PR's parity against main's this round.
+def _depth_sort_key(name):
+    """ctx4 < ctx128 < … < ctx32768, so notes read in depth order rather than lexically."""
+    m = re.search(r"(\d+)", str(name))
+    return int(m.group(1)) if m else 0
 
-    verdict is "ok", "warn" or "reject". A missing or zero baseline yields "ok" with a note --
-    an unmeasurable baseline must not become a silent reject, and the absolute bars still
-    apply underneath. This only ever ADDS a constraint; it never lets through anything the
-    floor would have caught.
+
+def _as_depth_kls(v):
+    """Normalise a parity result to {depth_name: kl_float}.
+
+    Accepts the suite's {name: {"top1":…, "kl":…}}, a plain {name: float}, or a bare float
+    (treated as the single historical 4-token probe) so a caller holding only the old
+    scalar still gets a meaningful comparison rather than a crash.
     """
+    if isinstance(v, dict):
+        out = {}
+        for k, d in v.items():
+            try:
+                out[str(k)] = float(d["kl"] if isinstance(d, dict) else d)
+            except (TypeError, ValueError, KeyError):
+                continue
+        return out
     try:
-        pr_kl, main_kl = float(pr_kl), float(main_kl)
+        return {"ctx4": float(v)}
     except (TypeError, ValueError):
-        return "ok", 0.0, "parity vs main: unavailable (unparseable KL)"
-    if main_kl <= 0 or pr_kl < 0:
+        return {}
+
+
+def kl_ratchet(pr_kl, main_kl):
+    """Return (verdict, worst_ratio, note) comparing a PR's parity against main's.
+
+    Compares DEPTH BY DEPTH and reports the worst. A PR that is bit-identical at 4 tokens
+    and 2x worse at 32k is precisely the regression a single scalar cannot express, and
+    precisely the one that matters: the engine is scored at 131,072, not at 4.
+
+    verdict is "ok", "warn" or "reject". A missing or zero baseline yields "ok" with a note
+    -- an unmeasurable baseline must not become a silent reject, and the absolute bars
+    still apply underneath. This only ever ADDS a constraint; it never lets through
+    anything the floor would have caught.
+    """
+    pr = _as_depth_kls(pr_kl)
+    mn = _as_depth_kls(main_kl)
+    shared = [k for k in pr if k in mn and mn[k] > 0 and pr[k] >= 0]
+    if not shared:
         return "ok", 0.0, "parity vs main: unavailable (no baseline measured this round)"
-    ratio = pr_kl / main_kl
-    note = f"KLD {pr_kl:.7f} vs main {main_kl:.7f} — {ratio:.2f}x"
+
+    ratios = {k: pr[k] / mn[k] for k in shared}
+    order = sorted(shared, key=_depth_sort_key)
+    worst = max(shared, key=lambda k: ratios[k])
+    ratio = ratios[worst]
+
+    detail = " ".join(f"{k}={ratios[k]:.2f}x" for k in order)
+    note = (f"KLD {pr[worst]:.9f} vs main {mn[worst]:.9f} — {ratio:.2f}x at {worst} "
+            f"(worst of {len(shared)} depths) [{detail}]")
+    # A depth main measured but the PR did not is lost coverage, not a pass. measure_accuracy
+    # already hard-fails on a partial suite; this catches the case where the two sides were
+    # measured with different K3_PARITY_DEPTHS, which would otherwise silently narrow the gate.
+    dropped = sorted(set(mn) - set(pr), key=_depth_sort_key)
+    if dropped:
+        note += f"  [WARNING: not measured on the PR: {', '.join(dropped)}]"
+
     if ratio >= KL_RATCHET_REJECT:
         return "reject", ratio, f"{note} (>= {KL_RATCHET_REJECT}x — accuracy regression)"
     if ratio >= KL_RATCHET_WARN:
@@ -866,8 +1069,16 @@ def evaluate(pr, repo, frontier, seal=False):
     sha = pr["headRefOid"]
     num = pr["number"]
     _box_build(sha, f"#{num}")
-    top1, kl = measure_accuracy(f"#{num}")
+    top1, kl, depths = measure_accuracy(f"#{num}")
     res, out, rc = _box_eval(f"#{num}", frontier=frontier, seal=seal, top1=top1, kl=kl)
+    # Carry the FULL-PRECISION per-depth parity beside the harness payload.
+    #
+    # res["kl"] is not this number: it went to the box as --kl, and label.py writes it into
+    # RESULT_JSON as round(kl, 4). The ratchet used to read it back from there and compare
+    # it against main's un-rounded value -- 4 significant decimals against 9. At KL ~0.0067
+    # that quantises the ratio by about 1.5%, one-sided, right where the 1.25x line sits,
+    # and it printed as "0.0067000" so the lost precision was invisible in the log.
+    res["kl_depths"] = depths
     # --seal publishes to sparkinfer-k3-log and prints the receipt id. Carry it in the
     # payload: eval-label.yml looks it up there when REQUIRE_EVAL_RECEIPT is on, and
     # without it a sealed run is indistinguishable from an unsealed one.
@@ -1798,9 +2009,9 @@ def main():
             main_tps = float(args.frontier)
             quant = "UD-IQ1_S"
             # --frontier skips the main measurement, so there is NO parity baseline for this
-            # round. 0 makes kl_ratchet report "unavailable" rather than inventing a
-            # comparison; the absolute KL bars still apply underneath, unchanged.
-            main_kl = 0.0
+            # round. An empty suite makes kl_ratchet report "unavailable" rather than
+            # inventing a comparison; the absolute KL bars still apply underneath, unchanged.
+            main_parity = {}
             print(f">> frontier: {main_tps} tok/s (--frontier, main not re-measured; "
                   "no parity baseline, so the KL ratchet is inactive this round)")
             r = gh(["api", f"repos/{args.repo}/commits/main", "--jq", ".sha"])
@@ -1809,7 +2020,7 @@ def main():
             # Retried, because this one failure discards every PR in the round. A persistent
             # failure still stops it -- falling back to the pinned lock value would score the
             # round against a number main has already beaten, which is the #20 mispricing.
-            main_sha, main_tps, quant, main_kl = with_box_retry(
+            main_sha, main_tps, quant, main_parity = with_box_retry(
                 "frontier", lambda: measure_frontier(args.repo))
     except RuntimeError as exc:
         print(f"frontier measurement failed after retries — {exc}", file=sys.stderr)
@@ -1873,9 +2084,12 @@ def main():
             continue
         print(f"#{num}: tps={res.get('tps')} top1={res.get('top1')} kl={res.get('kl')} "
               f"ms/token={res.get('ms_per_token')} — tier is eval-label.yml's to derive")
-        # Parity against main measured minutes ago on this same box. Reported every time,
-        # blocking only past KL_RATCHET_REJECT.
-        parity = kl_ratchet(res.get("kl"), main_kl)
+        # Parity against main measured minutes ago on this same box, depth by depth.
+        # Reported every time, blocking only past KL_RATCHET_REJECT.
+        #
+        # Fed from res["kl_depths"] -- the controller's own full-precision measurement --
+        # NOT res["kl"], which has been through label.py's round(kl, 4).
+        parity = kl_ratchet(res.get("kl_depths"), main_parity)
         print(f"#{num}: {parity[2]}")
         if parity[0] == "reject":
             print(f"!! #{num}: accuracy regression — labelling {KL_REGRESSION_LABEL}, which "

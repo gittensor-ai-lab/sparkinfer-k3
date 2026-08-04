@@ -2,12 +2,19 @@
 //
 //   kimi_k3_tp_bench <first-shard.gguf> [tp_size] [n_layers] [n_tokens] [--ctx N] [--seek]
 //                    [--ids a,b,c | --ids @FILE] [--logits FILE]
+//                    [--logits-prefix P --checkpoints L1,L2,...]
 //
 // --ids feeds an exact prompt (ids, not text) instead of the synthetic sequence, and
 // --logits dumps the final step's logits in .spkl. Together they are what compares a
 // full 93-layer TP run against the captured llama.cpp reference in bench/refdata/ —
 // the only correctness check available at full depth, since no single GPU can hold
 // 553 GiB to serve as a tp=1 baseline.
+//
+// --checkpoints extends that from one depth to many: with a long --ids prompt it dumps
+// <P>.ctx<L>.spkl at each requested prefix length in a single pass, so parity is
+// established at 4…32768 tokens rather than only at a 4-token prompt. One number from
+// one short probe cannot distinguish "correct" from "correct only while the KV cache is
+// nearly empty"; ten depths can.
 //
 // Reports ms/token and ms/layer, and extrapolates ms/layer to the full 93. The
 // extrapolation is the useful number: no single GPU can hold 93 layers of this model,
@@ -126,11 +133,27 @@ int main(int argc, char** argv) {
     int  max_ctx = 64;
     bool do_seek = false;
     std::vector<int> ids;
+    // --checkpoints: dump logits at several DEPTHS of one prompt in a single pass.
+    //
+    // The depths are nested prefixes of one document, and this executor consumes a prompt
+    // one token at a time (kimi_k3_tp_forward_token is the decode step, not a prefill
+    // batch), so after L tokens the logits ARE the L-token prefix's next-token
+    // distribution -- on exactly the code path production runs. That makes one pass over
+    // the longest prefix equivalent to N separate runs, without needing a cache reset the
+    // runtime does not expose, and without paying to re-feed every shorter prefix.
+    std::vector<int> checkpoints;
+    const char* logits_prefix = nullptr;
     for (int i = 2; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--ids") && i + 1 < argc) ids = parse_ids(argv[++i]);
         else if (!std::strcmp(argv[i], "--logits") && i + 1 < argc) logits_path = argv[++i];
+        else if (!std::strcmp(argv[i], "--logits-prefix") && i + 1 < argc) logits_prefix = argv[++i];
+        else if (!std::strcmp(argv[i], "--checkpoints") && i + 1 < argc) checkpoints = parse_ids(argv[++i]);
         else if (!std::strcmp(argv[i], "--ctx") && i + 1 < argc) max_ctx = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--seek")) do_seek = true;
+    }
+    if (!checkpoints.empty() && !logits_prefix) {
+        std::printf("--checkpoints needs --logits-prefix\n");
+        return 1;
     }
 
     GGUF g; KimiK3Config cfg; KimiK3LayerCoverage cov;
@@ -205,9 +228,45 @@ int main(int argc, char** argv) {
     // discarded warm-up token would advance position and corrupt the comparison.
     if (!ids.empty()) {
         std::printf("prompt: %zu ids from --ids\n", ids.size());
+        // The KV cache was allocated for max_ctx; feeding more than that walks off the end
+        // of it. Silently producing logits from a corrupted cache would be worse than
+        // stopping, because the result still looks like a number.
+        if ((int)ids.size() > max_ctx) {
+            std::printf("--ids has %zu ids but --ctx is only %d\n", ids.size(), max_ctx);
+            return 1;
+        }
+        for (int L : checkpoints) {
+            if (L <= 0 || (size_t)L > ids.size()) {
+                std::printf("checkpoint %d out of range (prompt has %zu ids)\n", L, ids.size());
+                return 1;
+            }
+            if (L > max_ctx) {
+                std::printf("checkpoint %d exceeds --ctx %d\n", L, max_ctx);
+                return 1;
+            }
+        }
         for (size_t i = 0; i < ids.size(); ++i) {
             if (!kimi_k3_tp_forward_token(p, ids[i], logits.data())) {
                 std::printf("prompt token %zu (id %d) failed\n", i, ids[i]); return 1;
+            }
+            // Depth i+1 is now complete: these logits are the (i+1)-token prefix's answer.
+            const int depth = (int)i + 1;
+            for (int L : checkpoints) {
+                if (L != depth) continue;
+                const std::string path = std::string(logits_prefix) + ".ctx" +
+                                         std::to_string(L) + ".spkl";
+                if (!write_spkl(path.c_str(), logits, cfg.vocab)) {
+                    // A missing dump would silently become "no comparison at this depth",
+                    // which is exactly the failure this suite exists to remove.
+                    std::printf("FAILED to write %s\n", path.c_str());
+                    return 1;
+                }
+                int b = 0;
+                for (int v = 1; v < cfg.vocab; ++v)
+                    if (logits[(size_t)v] > logits[(size_t)b]) b = v;
+                std::printf("ctx %6d -> argmax %d  logit %.6f  [%s]\n",
+                            L, b, logits[(size_t)b], path.c_str());
+                std::fflush(stdout);
             }
         }
         int best = 0;

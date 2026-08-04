@@ -1,18 +1,37 @@
 // Capture llama.cpp's reference logits + tokenization for a K3 model, as the ground
-// truth sparkinfer's implementation is validated against. Emits:
-//   <out>.spkl   — the last prompt token's next-token logits (bench compare_logits.py
-//                  format: SPKL | u32 ver | u32 n_tokens | u32 n_vocab | f32[][])
-//   <out>.ids    — the prompt token ids (one per line), so OUR executor is fed the
-//                  IDENTICAL tokenization (the acceptance test compares two runs on
-//                  the same ids, so they must come from one tokenizer — llama.cpp's).
-//   <out>.txt    — the prompt text and a human-readable head of the top logits.
+// truth sparkinfer's implementation is validated against. Emits, per context depth:
+//   <out>.ctx<L>.spkl  — the next-token logits after the first L prompt tokens
+//                        (bench compare_logits.py format:
+//                         SPKL | u32 ver | u32 n_tokens | u32 n_vocab | f32[][])
+//   <out>.ctx<L>.ids   — those L token ids, one per line, so OUR executor is fed the
+//                        IDENTICAL tokenization (the acceptance test compares two runs
+//                        on the same ids, so they must come from one tokenizer —
+//                        llama.cpp's).
+//   <out>.depths.txt   — a human-readable summary: each depth, its argmax and top logit.
+//                        NOT <out>.txt, which is typically the corpus this reads from.
 //
-// Built against the K3-supporting unslothai/llama.cpp branch (kimi-k3-fullsize-vision,
-// efc8bc38 — the same commit sparkinfer's kernels transcribe). Runs on CPU with mmap
-// so it fits a single box: the 594 GB weights page from disk on demand rather than
-// needing 594 GB of RAM.
+// With no --prefixes the old single-shot behaviour is kept exactly: <out>.spkl/.ids/.txt
+// for the whole prompt, plus <out>.step<k>.spkl for [n_predict] greedy continuations.
 //
-// Usage: dump_ref_logits <model.gguf> <out-prefix> "<prompt text>" [n_predict]
+// WHY MANY DEPTHS. A single short probe cannot certify parity at the context the engine
+// is actually scored on. Prefixes of ONE document at 4…32768 tokens exercise the KV
+// cache, the attention paths and the routing at the depths that matter, and each depth
+// is an independent comparison rather than a single number. See bench/refdata/README.md.
+//
+// WHY A FRESH CONTEXT PER DEPTH, rather than one pass with logits at many positions:
+// causal masking means position L-1 of a long pass is mathematically the same
+// distribution, but it is not the same CODE PATH — batch splitting, cache growth and
+// graph selection all differ. A reference is only useful if it was produced the way the
+// thing under test will be run, so each depth gets its own context. The model is loaded
+// once; only the (cheap) context is rebuilt, so this costs prefill time, not load time.
+//
+// Built against the K3-supporting unslothai/llama.cpp branch (kimi-k3-fullsize-vision).
+// Defaults to CPU + mmap so it fits a single box (the weights page from disk on demand);
+// pass --ngl 999 to offload to GPU, which is what makes the deep prefixes tractable —
+// a 32k CPU prefill re-reads the whole model per ubatch and is effectively unbounded.
+//
+// Usage: dump_ref_logits <model.gguf> <out-prefix> <"prompt"|@file> [n_predict]
+//                        [--ngl N] [--ubatch N] [--prefixes L1,L2,...]
 
 #include "llama.h"
 
@@ -36,21 +55,66 @@ static bool write_spkl(const std::string& path, const float* logits, int n_vocab
     return ok;
 }
 
+static bool write_ids(const std::string& path, const llama_token* toks, int n) {
+    FILE* f = std::fopen(path.c_str(), "w");
+    if (!f) return false;
+    for (int i = 0; i < n; ++i) std::fprintf(f, "%d\n", (int)toks[i]);
+    std::fclose(f);
+    return true;
+}
+
+// "@path" reads the prompt from a file: a 32k-token prompt is ~130 KB of text, which is
+// at Linux's MAX_ARG_STRLEN (32 pages) and cannot be passed as one argv element.
+static bool load_prompt(const std::string& spec, std::string& out) {
+    if (spec.empty() || spec[0] != '@') { out = spec; return true; }
+    FILE* f = std::fopen(spec.c_str() + 1, "rb");
+    if (!f) { std::fprintf(stderr, "cannot open prompt file %s\n", spec.c_str() + 1); return false; }
+    char buf[65536];
+    size_t n;
+    out.clear();
+    while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) out.append(buf, n);
+    std::fclose(f);
+    return true;
+}
+
+static std::vector<int> parse_csv_ints(const char* s) {
+    std::vector<int> out;
+    while (s && *s) {
+        while (*s == ',' || *s == ' ') ++s;
+        if (!*s) break;
+        out.push_back(std::atoi(s));
+        while (*s && *s != ',' && *s != ' ') ++s;
+    }
+    return out;
+}
+
 int main(int argc, char** argv) {
     if (argc < 4) {
         std::fprintf(stderr,
-            "usage: %s <model.gguf> <out-prefix> \"<prompt>\" [n_predict]\n", argv[0]);
+            "usage: %s <model.gguf> <out-prefix> <\"prompt\"|@file> [n_predict]\n"
+            "          [--ngl N] [--ubatch N] [--prefixes L1,L2,...]\n", argv[0]);
         return 2;
     }
     const std::string model_path = argv[1];
     const std::string out_prefix = argv[2];
-    const std::string prompt = argv[3];
-    const int n_predict = argc > 4 ? std::atoi(argv[4]) : 0;
+    std::string prompt;
+    if (!load_prompt(argv[3], prompt)) return 1;
+
+    int n_predict = 0;
+    int n_gpu_layers = 0;      // CPU + mmap by default: page the weights from disk
+    int n_ubatch = 0;          // 0 = leave llama.cpp's default
+    std::vector<int> prefixes;
+    for (int i = 4; i < argc; ++i) {
+        if (!std::strcmp(argv[i], "--ngl") && i + 1 < argc) n_gpu_layers = std::atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "--ubatch") && i + 1 < argc) n_ubatch = std::atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "--prefixes") && i + 1 < argc) prefixes = parse_csv_ints(argv[++i]);
+        else if (argv[i][0] != '-') n_predict = std::atoi(argv[i]);
+    }
 
     llama_backend_init();
 
     llama_model_params mp = llama_model_default_params();
-    mp.n_gpu_layers = 0;         // CPU + mmap: page the 594 GB from disk, no VRAM need
+    mp.n_gpu_layers = n_gpu_layers;
     llama_model* model = llama_model_load_from_file(model_path.c_str(), mp);
     if (!model) { std::fprintf(stderr, "failed to load model\n"); return 1; }
 
@@ -67,68 +131,113 @@ int main(int argc, char** argv) {
                            toks.data(), (int)toks.size(), true, true); }
     if (n <= 0) { std::fprintf(stderr, "tokenize failed\n"); return 1; }
     toks.resize(n);
-    std::printf("prompt %zu chars -> %d tokens, vocab %d\n", prompt.size(), n, n_vocab);
+    std::printf("prompt %zu chars -> %d tokens, vocab %d, ngl %d\n",
+                prompt.size(), n, n_vocab, n_gpu_layers);
 
-    llama_context_params cp = llama_context_default_params();
-    cp.n_ctx = (uint32_t)(n + n_predict + 16);
-    cp.n_batch = (uint32_t)(n + 16);
-    llama_context* ctx = llama_init_from_model(model, cp);
-    if (!ctx) { std::fprintf(stderr, "failed to create context\n"); return 1; }
+    // No --prefixes: the whole prompt is the one depth, and the greedy continuation
+    // still runs. This is the historical contract and hello.* was captured with it.
+    const bool multi = !prefixes.empty();
+    if (!multi) prefixes.push_back(n);
 
-    // Decode the whole prompt in one batch; logits at the last position are the
-    // next-token distribution — the thing to compare against.
-    llama_batch batch = llama_batch_get_one(toks.data(), n);
-    if (llama_decode(ctx, batch) != 0) { std::fprintf(stderr, "decode failed\n"); return 1; }
-
-    const float* logits = llama_get_logits_ith(ctx, n - 1);
-    if (!logits) { std::fprintf(stderr, "no logits\n"); return 1; }
-
-    if (!write_spkl(out_prefix + ".spkl", logits, n_vocab)) {
-        std::fprintf(stderr, "failed to write .spkl\n"); return 1;
+    for (int L : prefixes) {
+        if (L <= 0 || L > n) {
+            std::fprintf(stderr, "prefix %d out of range (prompt has %d tokens) — "
+                                 "refusing to emit a reference that is not the depth "
+                                 "it claims\n", L, n);
+            return 1;
+        }
     }
 
-    // ids file
-    {
-        FILE* f = std::fopen((out_prefix + ".ids").c_str(), "w");
-        for (int i = 0; i < n; ++i) std::fprintf(f, "%d\n", (int)toks[i]);
-        std::fclose(f);
+    // One line per depth, so the capture is auditable at a glance.
+    //
+    // In multi-depth mode this is <out>.depths.txt, NOT <out>.txt: the natural invocation
+    // is `dump_ref_logits … refdata/longctx @refdata/longctx.txt`, where <out>.txt IS the
+    // corpus. Writing the summary there silently truncates the prompt file to a few hundred
+    // bytes -- the run in progress survives (the corpus is read into memory before any
+    // output), so the damage only surfaces the NEXT time someone regenerates, against a
+    // corpus that is now the previous run's summary.
+    const std::string summary_path = out_prefix + (multi ? ".depths.txt" : ".txt");
+    if (summary_path == std::string(argv[3]).substr(argv[3][0] == '@' ? 1 : 0)) {
+        std::fprintf(stderr, "refusing to write the summary over the prompt file %s\n",
+                     summary_path.c_str());
+        return 1;
+    }
+    FILE* summary = std::fopen(summary_path.c_str(), "w");
+    if (summary) {
+        std::fprintf(summary, "model: %s\ntokens available: %d  vocab: %d  ngl: %d\n",
+                     model_path.c_str(), n, n_vocab, n_gpu_layers);
+        if (!multi) std::fprintf(summary, "prompt: %s\n", prompt.c_str());
     }
 
-    // argmax + a small human-readable summary
-    int amax = 0;
-    for (int i = 1; i < n_vocab; ++i) if (logits[i] > logits[amax]) amax = i;
-    char piece[256];
-    const int pl = llama_token_to_piece(vocab, amax, piece, sizeof(piece), 0, true);
-    std::string tok_txt(piece, pl > 0 ? pl : 0);
-    {
-        FILE* f = std::fopen((out_prefix + ".txt").c_str(), "w");
-        std::fprintf(f, "model: %s\nprompt: %s\ntokens: %d  vocab: %d\n",
-                     model_path.c_str(), prompt.c_str(), n, n_vocab);
-        std::fprintf(f, "argmax next-token id: %d  logit: %.6f  piece: '%s'\n",
-                     amax, logits[amax], tok_txt.c_str());
-        std::fclose(f);
-    }
-    std::printf("argmax next token: %d (logit %.4f) '%s'\n", amax, logits[amax], tok_txt.c_str());
-    std::printf("wrote %s.spkl / .ids / .txt\n", out_prefix.c_str());
+    for (size_t pi = 0; pi < prefixes.size(); ++pi) {
+        const int L = prefixes[pi];
+        const std::string tag = multi ? (".ctx" + std::to_string(L)) : std::string();
 
-    // Optionally continue greedy for a few tokens, dumping each step's logits too,
-    // so a multi-token comparison is possible later. Kept simple: append to the ids
-    // file and write per-step .spkl as <prefix>.step<k>.spkl.
-    llama_token cur = amax;
-    int pos = n;
-    for (int k = 0; k < n_predict; ++k) {
-        llama_batch b1 = llama_batch_get_one(&cur, 1);
-        if (llama_decode(ctx, b1) != 0) break;
-        const float* lg = llama_get_logits_ith(ctx, 0);
-        if (!lg) break;
-        write_spkl(out_prefix + ".step" + std::to_string(k) + ".spkl", lg, n_vocab);
-        int a = 0; for (int i = 1; i < n_vocab; ++i) if (lg[i] > lg[a]) a = i;
-        FILE* f = std::fopen((out_prefix + ".ids").c_str(), "a");
-        std::fprintf(f, "%d\n", (int)cur); std::fclose(f);
-        cur = a; ++pos;
+        // A fresh context per depth: same reason the engine under test gets a fresh run
+        // per depth. Rebuilding the context does NOT reload the model.
+        llama_context_params cp = llama_context_default_params();
+        cp.n_ctx = (uint32_t)(L + n_predict + 16);
+        cp.n_batch = (uint32_t)(L + 16);
+        if (n_ubatch > 0) cp.n_ubatch = (uint32_t)n_ubatch;
+        llama_context* ctx = llama_init_from_model(model, cp);
+        if (!ctx) { std::fprintf(stderr, "failed to create context at L=%d\n", L); return 1; }
+
+        // Decode the prefix in one batch; logits at the last position are the
+        // next-token distribution — the thing to compare against.
+        llama_batch batch = llama_batch_get_one(toks.data(), L);
+        if (llama_decode(ctx, batch) != 0) {
+            std::fprintf(stderr, "decode failed at L=%d\n", L);
+            return 1;
+        }
+
+        const float* logits = llama_get_logits_ith(ctx, L - 1);
+        if (!logits) { std::fprintf(stderr, "no logits at L=%d\n", L); return 1; }
+
+        if (!write_spkl(out_prefix + tag + ".spkl", logits, n_vocab)) {
+            std::fprintf(stderr, "failed to write %s%s.spkl\n", out_prefix.c_str(), tag.c_str());
+            return 1;
+        }
+        write_ids(out_prefix + tag + ".ids", toks.data(), L);
+
+        int amax = 0;
+        for (int i = 1; i < n_vocab; ++i) if (logits[i] > logits[amax]) amax = i;
+        char piece[256];
+        const int pl = llama_token_to_piece(vocab, amax, piece, sizeof(piece), 0, true);
+        const std::string tok_txt(piece, pl > 0 ? pl : 0);
+        if (summary) {
+            std::fprintf(summary, "ctx %6d  argmax %6d  logit %10.6f  piece '%s'\n",
+                         L, amax, logits[amax], tok_txt.c_str());
+            std::fflush(summary);
+        }
+        std::printf("ctx %6d -> argmax %d (logit %.4f) '%s'  [%s%s.spkl]\n",
+                    L, amax, logits[amax], tok_txt.c_str(), out_prefix.c_str(), tag.c_str());
+        std::fflush(stdout);
+
+        // Greedy continuation, single-depth mode only: append to the ids file and write
+        // per-step logits as <prefix>.step<k>.spkl, so a multi-STEP comparison is
+        // possible as well as a multi-DEPTH one.
+        if (!multi) {
+            llama_token cur = amax;
+            for (int k = 0; k < n_predict; ++k) {
+                llama_batch b1 = llama_batch_get_one(&cur, 1);
+                if (llama_decode(ctx, b1) != 0) break;
+                const float* lg = llama_get_logits_ith(ctx, 0);
+                if (!lg) break;
+                write_spkl(out_prefix + ".step" + std::to_string(k) + ".spkl", lg, n_vocab);
+                int a = 0; for (int i = 1; i < n_vocab; ++i) if (lg[i] > lg[a]) a = i;
+                FILE* f = std::fopen((out_prefix + ".ids").c_str(), "a");
+                if (f) { std::fprintf(f, "%d\n", (int)cur); std::fclose(f); }
+                cur = a;
+            }
+        }
+
+        llama_free(ctx);
     }
 
-    llama_free(ctx);
+    if (summary) std::fclose(summary);
+    std::printf("wrote %zu reference depth(s) under %s (summary: %s)\n",
+                prefixes.size(), out_prefix.c_str(), summary_path.c_str());
+
     llama_model_free(model);
     llama_backend_free();
     return 0;
