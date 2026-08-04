@@ -49,11 +49,34 @@ against the captured llama.cpp reference (`bench/refdata/`) on identical weights
 identical token ids. `label.py` REJECTs below **top-1 0.90** or **mean KL 0.05** no matter
 how fast the run was — a speedup that erodes parity is not a speedup worth taking.
 
-Current measured parity on `main`: **top-1 100%, mean KLD 4.05e-03**. Note that KLD is
-~400x the 1e-5 same-implementation bar, from a known and accepted cause (K3 keeps f32
-activations where ggml quantizes them before a quantized mat-vec). Do not go hunting it
-as a bug; do not make it worse. If `compute-sanitizer` is available, your kernels
-must be clean (0 errors).
+**It is measured at eight context depths.** The evaluator probes 4, 128, 256, 512, 1024,
+2048, 4096 and 8192 tokens — nested prefixes of one document — and takes the **worst**
+depth, not the average. Until 2026-08-04 the gate was a single 4-token prompt graded on
+one next-token distribution, which could not distinguish "correct" from "correct only
+while the KV cache is nearly empty". If your change touches the KV cache, attention,
+routing or the LM head, expect the deep probes to be the ones that catch it.
+
+References at 16384 and 32768 are also committed and can be switched on with
+`K3_PARITY_DEPTHS`; they are off by default because the deep pass runs through the decode
+path one token at a time, so 32768 costs 809 s per measured build against 233 s for 8192.
+
+Two consequences for you:
+
+- A regression at one depth fails the gate even if the other nine are perfect.
+- Parity is also **ratcheted against `main` measured in the same round, per depth**: 1.25x
+  worse than main is annotated, 2.0x worse is rejected and labelled `accuracy-regression`.
+  Reduction-order changes move these numbers legitimately, which is why the factors are
+  not 1.0 — but drift that nobody is told about is what the ratchet exists to stop.
+
+Note that KLD is ~400x the 1e-5 same-implementation bar, from a known and accepted cause
+(K3 keeps f32 activations where ggml quantizes them before a quantized mat-vec). Do not go
+hunting it as a bug; do not make it worse. If `compute-sanitizer` is available, your
+kernels must be clean (0 errors).
+
+**What the gate still does not prove.** 8192 is not the 131,072 you are scored at. The
+reference must come from llama.cpp and capture cost grows with depth, so the untested gap
+is "everything past 8k" — 32k with the opt-in depths on — not "nothing". See
+`bench/refdata/README.md`.
 
 ## How rewards work (SN74 on Gittensor)
 

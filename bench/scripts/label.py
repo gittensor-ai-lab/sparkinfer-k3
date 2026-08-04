@@ -165,8 +165,12 @@ def difficulty_mult(frontier):
         return min(1.0 + DIFF_K * max(0.0, DIFF_REF / frontier - 1.0), DIFF_MAX)
     return min(1.0 + DIFF_K * max(0.0, frontier / DIFF_REF - 1.0), DIFF_MAX)
 
+# kl to 9 decimals, not 4. K3's parity sits around 5e-03, where 4 decimals quantise the
+# value by ~1.5% -- coarse enough to matter against a ratchet whose warn line is 1.25x, and
+# invisible in a log that prints it as "0.0067000". top1 is a fraction of a few hundred
+# comparisons, so 4 decimals is already finer than its resolution.
 res = {"commit": commit, "tps": round(tps, 6 if LOWER_IS_BETTER else 2),
-       "top1": round(top1, 4), "kl": round(kl, 4),
+       "top1": round(top1, 4), "kl": round(kl, 9),
        "frontier_tps": round(frontier, 6 if LOWER_IS_BETTER else 2)}
 if LOWER_IS_BETTER:
     res["lower_is_better"] = True
