@@ -501,18 +501,33 @@ REFDATA = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 # genuine long-range dependency rather than ten unrelated short prompts, and one pass over
 # the longest prefix produces all of them.
 #
-# WHY NOT 131072. The reference has to come from llama.cpp, and the capture cost grows
-# with depth; 32768 is what fits in a sane capture. This narrows the untested gap from
-# "everything past 4 tokens" to "everything past 32k" -- it does not close it, and
-# README/CONTRIBUTING say so rather than implying full-context parity is proven.
+# WHY IT STOPS AT 8192, AND WHAT IT COSTS.
 #
-# COST. The deep pass feeds the longest prefix through the decode path one token at a
-# time (there is no batched prefill in the runtime), so it costs roughly
-# max(depth)/decode_tok_s seconds per measured build -- about 8-13 minutes at 32768 --
-# and a round pays it once for main plus once per PR. Trim this list to shorten a round.
+# The deep pass feeds the prefix through the DECODE path one token at a time -- the
+# runtime has no batched prefill -- so the cost is max(depth)/decode_tok_s per measured
+# build, paid once for main plus once per PR in a round. Measured on the 8x H200 node,
+# main @ be3c818, one continuous pass:
+#
+#     to  8192   233 s   (3.9 min)   <-- the default
+#     to 16384   427 s   (7.1 min)
+#     to 32768   809 s  (13.5 min)
+#
+# Decode rate is flat at ~42 tok/s across those segments: per-token cost is dominated by
+# streaming the active weights, and MLA keeps the context-dependent term small. So the
+# cost is very close to linear in max(depth), and 32768 triples a round's parity budget
+# to buy two more depths.
+#
+# References for 16384 and 32768 ARE captured and committed. Opt in with
+# K3_PARITY_DEPTHS=...,16384,32768 when a change plausibly breaks only very deep, and
+# accept the extra ~10 minutes per build.
+#
+# WHY NOT 131072. The reference has to come from llama.cpp and the capture cost grows with
+# depth. This narrows the untested gap from "everything past 4 tokens" to "everything past
+# 8k" (32k when opted in) -- it does not close it, and README/CONTRIBUTING say so rather
+# than implying full-context parity is proven.
 PARITY_DEPTHS = [int(x) for x in os.environ.get(
     "K3_PARITY_DEPTHS",
-    "128,256,512,1024,2048,4096,8192,16384,32768").split(",") if x.strip()]
+    "128,256,512,1024,2048,4096,8192").split(",") if x.strip()]
 PARITY_CORPUS = os.environ.get("K3_PARITY_CORPUS", "longctx")
 # The deep pass is minutes of decode, not seconds, and it runs behind the same ssh call
 # as the 4-token probe. 3600 was sized for the latter alone.

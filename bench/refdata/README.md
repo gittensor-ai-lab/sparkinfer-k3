@@ -23,17 +23,36 @@ appears once the cache is populated (the F16 latent cache, per-rank CUDA graphs,
 banded LM head, 2-D MoE sharding) was gated by a measurement that barely touches it. A
 change can be bit-exact at 4 tokens and wrong at 100k, and that gate passes it clean.
 
-The suite is now ten probes:
+The suite is now eight probes by default, with two more captured and one env var away:
 
-| probe | tokens | source | reference captured on |
-|---|--:|---|---|
-| `ctx4` | 4 | `hello.*` | llama.cpp CPU |
-| `ctx128` … `ctx32768` | 128 … 32768 | `longctx.*` | llama.cpp CUDA |
+| probe | tokens | source | reference captured on | default |
+|---|--:|---|---|:--:|
+| `ctx4` | 4 | `hello.*` | llama.cpp CPU | on |
+| `ctx128` … `ctx8192` | 128 … 8192 | `longctx.*` | llama.cpp CUDA | on |
+| `ctx16384`, `ctx32768` | 16384, 32768 | `longctx.*` | llama.cpp CUDA | **off** |
 
 `longctx.ctx<L>.*` are nested prefixes of ONE document, so they test genuine long-range
-dependency rather than nine unrelated short prompts — and because they are nested, the
+dependency rather than several unrelated short prompts — and because they are nested, the
 executor produces all of them in a single pass (`kimi_k3_tp_bench --checkpoints`), and
 llama.cpp captures all of them from a single model load.
+
+**Why 8192 is the default.** The executor has no batched prefill, so the deep pass runs
+through the decode path one token at a time and costs `max(depth) / decode_tok_s` per
+measured build — paid once for main plus once per PR in a round. Measured on the 8× H200
+node against main @ `be3c818`, one continuous pass:
+
+| to depth | elapsed | |
+|---|--:|---|
+| 8192 | 233 s (3.9 min) | default |
+| 16384 | 427 s (7.1 min) | |
+| 32768 | 809 s (13.5 min) | opt-in |
+
+Decode holds a flat **~42 tok/s** across those segments — per-token cost is dominated by
+streaming the active weights, and MLA keeps the context-dependent term small — so cost is
+near-linear in `max(depth)`, and 32768 triples the parity budget to buy two more depths.
+Turn them on for a change that plausibly breaks only very deep:
+
+    K3_PARITY_DEPTHS=128,256,512,1024,2048,4096,8192,16384,32768
 
 **The two capture backends are not interchangeable.** `hello.spkl` was captured on CPU
 (the historical run, preserved so the number this gate has always reported stays
@@ -44,10 +63,11 @@ float reduction order, so an absolute KL at `ctx4` is NOT comparable to an absol
 in the same round against the same reference file, depth by depth, so every comparison is
 within one depth.
 
-**What this does not prove.** 32768 is not 131072. The reference has to come from
-llama.cpp and the capture cost grows with depth, so this narrows the untested gap from
-"everything past 4 tokens" to "everything past 32k". It does not close it. No claim of
-verified parity at the full scored context is supported by these files.
+**What this does not prove.** 8192 is not 131072, and neither is 32768. The reference has
+to come from llama.cpp and the capture cost grows with depth, so this narrows the untested
+gap from "everything past 4 tokens" to "everything past 8k" — 32k with the opt-in depths
+on. It does not close it. No claim of verified parity at the full scored context is
+supported by these files.
 
 ## Captured references
 

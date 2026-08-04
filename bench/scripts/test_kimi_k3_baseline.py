@@ -2468,9 +2468,10 @@ class CiWorkflowTest(unittest.TestCase):
             self.assertIn("unavailable", note, f"{label} did not say why")
 
     # ---- the gate was ONE 4-token probe, n=1 --------------------------------------------
-    DEEP_DEPTHS = (128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768)
+    DEEP_DEPTHS = (128, 256, 512, 1024, 2048, 4096, 8192)
+    OPT_IN_DEPTHS = (16384, 32768)      # captured and committed, off by default on cost
 
-    def test_parity_is_probed_at_ten_depths_not_one_point(self):
+    def test_parity_is_probed_at_many_depths_not_one_point(self):
         """The gate graded a single next-token distribution after a 4-token prompt.
 
         One row of one .spkl -- n=1, KV cache essentially empty -- deciding whether a change
@@ -2482,10 +2483,24 @@ class CiWorkflowTest(unittest.TestCase):
         self.assertEqual(tuple(bot.PARITY_DEPTHS), self.DEEP_DEPTHS)
         probes = bot._parity_probes()
         self.assertEqual(len(probes), 1 + len(self.DEEP_DEPTHS),
-                         "the suite is not ten probes")
+                         "the default suite is not ctx4 + seven depths")
         self.assertEqual(probes[0][0], "ctx4",
                          "the historical 4-token probe must be kept, so the number this "
                          "gate has always reported stays comparable")
+
+    def test_the_deeper_depths_are_captured_even_though_they_are_off_by_default(self):
+        """8192 is the default because the deep pass costs max(depth)/decode_tok_s per
+        measured build -- 233 s to 8192 against 809 s to 32768, at a flat ~42 tok/s. The
+        deeper references are still committed so K3_PARITY_DEPTHS can turn them on without
+        a fresh 554 GB capture; dropping the files would make that a lie."""
+        refdata = ROOT / "bench" / "refdata"
+        for depth in self.OPT_IN_DEPTHS:
+            self.assertTrue((refdata / f"longctx.ctx{depth}.spkl").is_file(),
+                            f"opt-in depth {depth} has no committed reference")
+            self.assertTrue((refdata / f"longctx.ctx{depth}.ids").is_file())
+        # and the knob that turns them on must be the documented one
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        self.assertIn("K3_PARITY_DEPTHS", src)
 
     def test_every_probed_depth_has_a_committed_reference(self):
         """A depth whose answer key is missing is a depth that silently stops being checked,
@@ -2632,8 +2647,8 @@ class CiWorkflowTest(unittest.TestCase):
         self.assertIn(digest, readme,
                       "the corpus hash in README.md does not match the committed corpus")
         self.assertTrue((ROOT / "bench" / "scripts" / "capture_parity_refs.sh").is_file())
-        # and the README must not overclaim: 32768 is not the scored context
-        self.assertIn("32768 is not 131072", readme)
+        # and the README must not overclaim: the deepest probe is not the scored context
+        self.assertIn("is not 131072", readme)
 
     def test_a_rejected_pr_cannot_be_merged_by_the_round(self):
         """The label is the enforcement, so it has to be one the merge path already refuses."""
