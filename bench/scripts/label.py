@@ -210,7 +210,29 @@ def _speed_tier_fields(tps, frontier, ceiling):
     else:
         g_fair = delta / ref
     D = difficulty_mult(frontier)                       # hard-gain boost once past the reference
-    g_eff = min(g_fair * D, 2 * g)                      # strict cap: tier credit ≤ 2× measured speedup
+    # CAP AT THE MEASURED SPEEDUP, NOT TWICE IT.
+    #
+    # The cap used to be 2*g, which was invisible while the frontier sat below llama.cpp --
+    # there g_fair < g and the llama anchor bound. Once the frontier passed 2x the reference
+    # (40.02 vs 18.4435 on h200x8) the anchor stopped binding and the CAP became the rule, so
+    # every tier was awarded at twice the real gain: XL for 9% over main instead of 18%.
+    # Re-scored from the sealed receipts, that inflated 8 of the last 18 scored runs --
+    # #89/#90/#96/#107/#114 all took XL for 12-18% gains.
+    #
+    # min(g_fair, g) is the CONSERVATIVE of the two bases, and it keeps both protections:
+    #   frontier below llama -> g_fair is smaller, the anchor still stops an un-optimized
+    #                           baseline minting XLs from low-hanging fruit (#64: 10.5% raw
+    #                           over a weak frontier, held to S at 5.7% of llama)
+    #   frontier above llama -> g is smaller, so a gain must beat the CURRENT BEST by the
+    #                           full tier percentage, which is what "marginal speedup over
+    #                           the frontier" means
+    # The early XLs are unaffected (#63 35.4%, #57 27.9%, #49 21.0% -- all llama-bound).
+    #
+    # NOTE ON DIFF_BOOST: with the boost on, g_fair*D can exceed g and this cap makes it
+    # inert past the reference. That is deliberate -- the boost multiplies a tier for
+    # difficulty, and paying 2x the measured gain is not a difficulty adjustment. The boost
+    # is off by default (SPARKINFER_DIFFICULTY_BOOST=0) and is not set on the K3 path.
+    g_eff = min(g_fair * D, g)                          # tier credit ≤ the measured speedup
     # A verified improvement over the frontier floors at XS (real but small); the higher tiers
     # (S/M/L/XL) are earned by the llama-anchored size. So "none" always means "not a verified
     # improvement", never "real but tiny".
