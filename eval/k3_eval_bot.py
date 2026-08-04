@@ -905,6 +905,36 @@ def measure_frontier(repo):
 KL_RATCHET_WARN = float(os.environ.get("K3_KL_RATCHET_WARN", "1.25"))
 KL_RATCHET_REJECT = float(os.environ.get("K3_KL_RATCHET_REJECT", "2.0"))
 KL_REGRESSION_LABEL = "accuracy-regression"
+# MATERIALITY FLOOR: a ratio is only a regression if the number it moved is big enough to
+# matter. The depth sweep grades parity from ctx4 down to ctx4096, where main sits at
+# 1.5e-06 -- five orders of magnitude below label.py's KL_BAR of 0.05. At those magnitudes a
+# reduction-order change moves the ratio by multiples while moving the ABSOLUTE divergence by
+# nothing anyone can act on, and the ratchet exists to stop parity drifting toward the bar,
+# not to police arithmetic that is already 500x under it.
+#
+# #104 is the case: its only >=2x depth was ctx512 at 0.000097 -- 0.19% of the bar -- while it
+# was BETTER than main at ctx4, the depth that carries real weight. It was blocked anyway.
+# #115 is the contrast and must stay blocked: ctx2048 at 0.0019 is 3.9% of the bar and its
+# ctx4 parity degraded 60% (0.0067 -> 0.0107, 21% of the bar).
+#
+# 5e-4 is 1% of KL_BAR and sits mid-plateau: every floor from 1e-4 to 1e-3 clears #104 and
+# keeps #115, so this is not tuned to two cases. Depths below it are still REPORTED, marked
+# with *, and a depth that grows material stops being exempt on its own.
+KL_RATCHET_FLOOR = float(os.environ.get("K3_KL_RATCHET_FLOOR", "5e-4"))
+# BELOW THE ACCEPTANCE BAR, A RATIO IS NOT A REGRESSION.
+#
+# label.py REJECTs at mean KLD > 0.05, and that bar is the accuracy gate. A PR whose parity
+# is still under it has not degraded accuracy in any sense the project acts on, however its
+# ratio against main reads -- so the ratchet no longer applies the blocking label there. It
+# still MEASURES and REPORTS every depth, and still warns, because a ratio is the only signal
+# that sees drift at all; it just no longer blocks a merge on its own.
+#
+# WHAT THIS GIVES UP, ON PURPOSE. The ratchet existed because the absolute bar cannot see
+# cumulative drift: #74 merged at 1.53x main, which moved the baseline permanently, and the
+# next 1.53x then starts from the new number. About five such merges fit under 0.05, each
+# individually fine, and the bar only catches it once the damage is done. That risk is now
+# accepted policy -- the warn line is what surfaces it, and a human decides.
+KL_RATCHET_BLOCK_AT = float(os.environ.get("K3_KL_RATCHET_BLOCK_AT", "0.05"))
 
 
 def _depth_sort_key(name):
@@ -954,12 +984,19 @@ def kl_ratchet(pr_kl, main_kl):
 
     ratios = {k: pr[k] / mn[k] for k in shared}
     order = sorted(shared, key=_depth_sort_key)
-    worst = max(shared, key=lambda k: ratios[k])
+    # Only depths whose absolute divergence is material can produce a verdict. The rest are
+    # reported with a trailing * so the full picture is still visible in the round log.
+    graded = [k for k in shared if pr[k] >= KL_RATCHET_FLOOR]
+    detail = " ".join(f"{k}={ratios[k]:.2f}x" + ("" if k in graded else "*") for k in order)
+    if not graded:
+        top = max(shared, key=lambda k: ratios[k])
+        return "ok", ratios[top], (
+            f"parity vs main: every depth below the {KL_RATCHET_FLOOR:g} materiality floor "
+            f"(worst {ratios[top]:.2f}x at {top}, {pr[top]:.9f}) [{detail}]")
+    worst = max(graded, key=lambda k: ratios[k])
     ratio = ratios[worst]
-
-    detail = " ".join(f"{k}={ratios[k]:.2f}x" for k in order)
     note = (f"KLD {pr[worst]:.9f} vs main {mn[worst]:.9f} — {ratio:.2f}x at {worst} "
-            f"(worst of {len(shared)} depths) [{detail}]")
+            f"(worst of {len(graded)} material depths of {len(shared)}) [{detail}]")
     # A depth main measured but the PR did not is lost coverage, not a pass. measure_accuracy
     # already hard-fails on a partial suite; this catches the case where the two sides were
     # measured with different K3_PARITY_DEPTHS, which would otherwise silently narrow the gate.
@@ -967,10 +1004,15 @@ def kl_ratchet(pr_kl, main_kl):
     if dropped:
         note += f"  [WARNING: not measured on the PR: {', '.join(dropped)}]"
 
-    if ratio >= KL_RATCHET_REJECT:
-        return "reject", ratio, f"{note} (>= {KL_RATCHET_REJECT}x — accuracy regression)"
+    # A blocking verdict needs BOTH a large ratio and an absolute divergence that has
+    # actually reached the acceptance bar. Under the bar the ratio is reported and warned on,
+    # never labelled: parity that is still inside what label.py accepts is not a regression.
+    if ratio >= KL_RATCHET_REJECT and pr[worst] >= KL_RATCHET_BLOCK_AT:
+        return "reject", ratio, f"{note} (>= {KL_RATCHET_REJECT}x AND at/over the {KL_RATCHET_BLOCK_AT} bar — accuracy regression)"
     if ratio >= KL_RATCHET_WARN:
-        return "warn", ratio, f"{note} (>= {KL_RATCHET_WARN}x — worse than main)"
+        under = (f" — reported only: {pr[worst]:.9f} is under the {KL_RATCHET_BLOCK_AT} bar"
+                 if ratio >= KL_RATCHET_REJECT else "")
+        return "warn", ratio, f"{note} (>= {KL_RATCHET_WARN}x — worse than main{under})"
     return "ok", ratio, note
 
 
@@ -1882,7 +1924,10 @@ def mark_merge_first(repo, results, dry_run, queue_auto_merge=False, prs=()):
     winner = ranked[0][0]
     for num, res in ranked:
         has = num == winner
-        act = "--add-label" if has else "--remove-label"
+        # Display only. Deliberately NOT the flag name: labels go through the issues REST
+        # endpoint below, and echoing a `gh pr edit` flag here made the dry-run describe a
+        # code path that no longer exists.
+        act = "add" if has else "remove"
         if dry_run:
             print(f"--- dry-run: would {act} merge-first on #{num} "
                   f"(tps={res.get('tps')})")
@@ -2178,8 +2223,19 @@ def main():
             if args.dry_run:
                 print(f"--- dry-run: would label #{num} {KL_REGRESSION_LABEL}")
             else:
-                lr = gh(["pr", "edit", str(num), "-R", args.repo,
-                         "--add-label", KL_REGRESSION_LABEL])
+                gh(["label", "create", KL_REGRESSION_LABEL, "-R", args.repo,
+                    "--color", "B60205",
+                    "--description", "parity is worse than main's, measured the same round"])
+                # NOT `gh pr edit --add-label`: it queries projectCards, which GitHub has
+                # deprecated, so it exits 1 even where the repo has no projects. merge-first
+                # and merge-conflict were both moved to the REST endpoint for exactly this
+                # reason; THIS call was missed, so the label that blocks the merge never
+                # landed. Observed on #104 and #115: both measured a parity regression, both
+                # printed the warning, and both ended the round carrying only their eval:*
+                # tier. Within a round unsafe_tier still excluded them, but the label IS the
+                # durable enforcement -- a later round or a human sees a clean PR.
+                lr = gh(["api", "-X", "POST", f"repos/{args.repo}/issues/{num}/labels",
+                         "-f", f"labels[]={KL_REGRESSION_LABEL}"])
                 if lr.returncode != 0:
                     # The label is what stops the merge, so failing to apply it must not
                     # leave the round merging the PR anyway.

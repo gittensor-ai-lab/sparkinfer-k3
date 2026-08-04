@@ -287,9 +287,10 @@ already scores for the other models, so K3 needs no second scoring path:
 - **Correctness gate first.** top-1 ≥ 0.90 and KL ≤ 0.20 against the captured reference,
   else `REJECT` — regardless of speed. A speedup that erodes parity is not a speedup.
 - **Significance gate.** The gain must beat 2% of the frontier, else `none`.
-- **Tier is anchored to llama.cpp**, not the frontier. The same tok/s of real work earns
-  the same tier whether the frontier is fast or slow — so an un-optimized model cannot
-  mint `XL`s from low-hanging fruit.
+- **Tier is the worse of two bases** — `min(delta/llama_ref, delta/frontier)` — so it can
+  never exceed the speedup actually measured. Below llama.cpp the anchor binds, so an
+  un-optimized model cannot mint `XL`s from low-hanging fruit; past llama.cpp (K3 is at
+  2.2×) the frontier binds, so `XL` costs a real 18% over main.
 
 A node run posts its verdict to a PR with `/eval RESULT_JSON {...}`;
 [`.github/workflows/eval-label.yml`](.github/workflows/eval-label.yml) **re-derives** the
