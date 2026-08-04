@@ -7,9 +7,11 @@
 #include "sparkinfer/tp/k3_coll_1bar.h"
 #include "sparkinfer/tp/shard.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
 #include <vector>
 #include <string>
 #include <thread>
@@ -543,6 +545,307 @@ bool kimi_k3_tp_init(const GGUF& g, const KimiK3Config& cfg, const K3PlanOptions
         if (out.n_coll_slots <= 1) out.zc_in_slot.clear();
     }
     return true;
+}
+
+// WHICH LAUNCHES CANNOT FILL THE MACHINE — read off the captured graph, not guessed.
+//
+// SPARKINFER_K3_GRAPH_CENSUS=1. Diagnostic only: it runs once, after capture, and
+// changes nothing about the decode.
+//
+// The count of nodes is NOT the quantity that matters, and treating it as one has
+// already cost a measurement here: collapsing 370 nodes out of the attention-residual
+// combine measured -6.0%, because it turned 28 CTAs into 1. A launch is cheap; an
+// under-occupied launch is not. So rank by IDLE SM-SLOTS -- how many of the 132 SMs a
+// launch leaves unused, times how often it is issued -- which is the quantity that
+// widening actually recovers.
+//
+// blocks >= 132 is scored as full. That is a floor, not a ceiling: a kernel with 132
+// blocks of 32 threads still wastes most of each SM. The blockDim column is printed so
+// that case stays visible rather than being hidden by a passing block count.
+void k3_graph_census(cudaGraph_t g, size_t nnodes) {
+    static const bool on = [] {
+        const char* e = std::getenv("SPARKINFER_K3_GRAPH_CENSUS");
+        return e && e[0] == '1';
+    }();
+    if (!on || !g || nnodes == 0) return;
+
+    int nsm = 132;
+    {
+        int dev = 0;
+        if (cudaGetDevice(&dev) == cudaSuccess)
+            cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, dev);
+    }
+
+    std::vector<cudaGraphNode_t> nodes(nnodes);
+    if (cudaGraphGetNodes(g, nodes.data(), &nnodes) != cudaSuccess) return;
+
+    struct Row {
+        long count = 0, blocks = 0, threads = 0;   // blocks/threads: sums, for the mean
+        long idle = 0;                             // SM-slots left unused, summed
+        long min_blocks = -1, max_blocks = 0;
+    };
+    std::map<std::string, Row> by_kernel;
+    // The aggregate row hides the shape of the problem. 557 launches spanning 1..132
+    // blocks could be one fat kernel plus noise, or 550 tiny ones -- and the fix differs
+    // completely between those two. So group by (kernel, grid, block) as well.
+    std::map<std::string, Row> by_shape;
+    long total_idle = 0, n_kernel = 0;
+
+    for (size_t i = 0; i < nnodes; ++i) {
+        cudaGraphNodeType t;
+        if (cudaGraphNodeGetType(nodes[i], &t) != cudaSuccess) continue;
+        if (t != cudaGraphNodeTypeKernel) continue;
+        cudaKernelNodeParams kp{};
+        if (cudaGraphKernelNodeGetParams(nodes[i], &kp) != cudaSuccess) continue;
+
+        const char* nm = nullptr;
+#if CUDART_VERSION >= 12030
+        // cudaFuncGetName resolves the mangled symbol; without it every row would be a
+        // hex address and the census would name nothing.
+        if (cudaFuncGetName(&nm, kp.func) != cudaSuccess) nm = nullptr;
+#endif
+        std::string name = nm ? nm : "<unresolved>";
+        // Trim the template/argument tail so <1024> and <512> instantiations of the same
+        // kernel do not split into rows that each look small.
+        const std::size_t lt = name.find('<');
+        if (lt != std::string::npos) name = name.substr(0, lt);
+
+        const long blocks  = (long)kp.gridDim.x * kp.gridDim.y * kp.gridDim.z;
+        const long threads = (long)kp.blockDim.x * kp.blockDim.y * kp.blockDim.z;
+        const long idle    = blocks >= nsm ? 0 : (nsm - blocks);
+
+        Row& r = by_kernel[name];
+        ++r.count;
+        r.blocks  += blocks;
+        r.threads += threads;
+        r.idle    += idle;
+        if (r.min_blocks < 0 || blocks < r.min_blocks) r.min_blocks = blocks;
+        if (blocks > r.max_blocks) r.max_blocks = blocks;
+        total_idle += idle;
+        ++n_kernel;
+
+        char shape[64];
+        std::snprintf(shape, sizeof shape, "%8ld blk x %-5ld thr  ", blocks, threads);
+        Row& sr = by_shape[std::string(shape) + name];
+        ++sr.count;
+        sr.idle += idle;
+        sr.blocks += blocks;
+        sr.threads += threads;
+        sr.min_blocks = sr.max_blocks = blocks;
+    }
+
+    std::vector<std::pair<std::string, Row>> rows(by_kernel.begin(), by_kernel.end());
+    std::sort(rows.begin(), rows.end(),
+              [](const auto& a, const auto& b) { return a.second.idle > b.second.idle; });
+
+    std::fprintf(stderr,
+                 "\n[k3-census] %ld kernel nodes of %zu, %d SMs. Ranked by IDLE SM-SLOTS "
+                 "(count x unused SMs) — total %ld:\n", n_kernel, nnodes, nsm, total_idle);
+    std::fprintf(stderr, "  %9s %6s %8s %8s %8s  %s\n",
+                 "idle", "%", "count", "blocks", "thr", "kernel");
+    for (const auto& kv : rows) {
+        const Row& r = kv.second;
+        char bs[48];
+        if (r.min_blocks == r.max_blocks) std::snprintf(bs, sizeof bs, "%ld", r.max_blocks);
+        else std::snprintf(bs, sizeof bs, "%ld-%ld", r.min_blocks, r.max_blocks);
+        std::fprintf(stderr, "  %9ld %5.1f%% %8ld %8s %8ld  %s\n",
+                     r.idle, total_idle > 0 ? 100.0 * r.idle / total_idle : 0.0,
+                     r.count, bs, r.count ? r.threads / r.count : 0, kv.first.c_str());
+    }
+
+    // THE CRITICAL PATH, WHICH IS THE ONLY PLACE REMOVING A LAUNCH PAYS.
+    //
+    // Three fusions on this branch removed launches and measured 0.00%, -6.0% and
+    // -0.70%. The census above cannot explain that and neither can node count, because
+    // both treat the graph as a BAG of launches. It is a DAG: the token takes as long as
+    // its longest dependency chain, so a node off that chain is already overlapped with
+    // one on it, and deleting it buys exactly nothing. That is the 0.00%.
+    //
+    // The shape bench measured every small decode kernel at a flat ~2.9 us no matter how
+    // much work it does, so cost is modelled per NODE, not per byte. That is crude for
+    // the wide kernels (the MoE experts do real work and are not at the floor), so the
+    // path length below is a LOWER bound on the small-kernel chain, not a token estimate.
+    // What it ranks correctly is which kernels sit on the chain and how often.
+    {
+        std::map<cudaGraphNode_t, std::vector<cudaGraphNode_t>> succ;
+        std::map<cudaGraphNode_t, int> indeg;
+        std::map<cudaGraphNode_t, std::string> nm_of;
+        for (size_t i = 0; i < nnodes; ++i) { indeg[nodes[i]] += 0; }
+
+        // PER-NODE DEPENDENCIES, NOT cudaGraphGetEdges.
+        //
+        // The two-call GetEdges form silently produced an empty edge set here: the count
+        // query returned 4186, the fill call did not populate, and every node then looked
+        // like a root. The symptom was a "critical path" of 1 node out of 3449 -- absurd
+        // on its face, which is the only reason it was caught. A path length that comes
+        // back equal to the node count, or equal to 1, is a BUG REPORT, not a finding.
+        // CLEAR THE STICKY ERROR FIRST.
+        //
+        // The census pass above calls cudaFuncGetName on every kernel node, and it does
+        // not resolve every symbol. A failed call leaves the runtime's last-error latched,
+        // and the NEXT unrelated call returns that stale code -- so the dependency walk
+        // reported "failed" after 2 edges while actually working fine. Checking a return
+        // value is not enough when the value can be inherited; the error state has to be
+        // reset at the boundary.
+        cudaGetLastError();
+        size_t n_edges = 0, n_failed = 0;
+        cudaError_t first_err = cudaSuccess;
+        size_t first_bad = 0;
+#if CUDART_VERSION >= 12030
+        // THE _v2 FORM IS REQUIRED HERE, and the reason is specific to this codebase.
+        //
+        // The v1 query returns cudaErrorLossyQuery -- "attempted introspection would be
+        // semantically lossy" -- on 3388 of 3449 nodes. That is not a bug and not a
+        // permission problem: this decode is captured with PROGRAMMATIC DEPENDENT LAUNCH
+        // (k3_pdl_sync, 51 call sites), so its edges carry cudaGraphEdgeData naming the
+        // trigger type. v1 has nowhere to put that, so it refuses rather than hand back a
+        // plain edge that quietly loses the annotation. The 61 nodes that DID answer are
+        // the ones with no PDL edge on them.
+        //
+        // Reading the v1 failure as "the API is broken" would have been the third wrong
+        // diagnosis in a row; the error string says precisely what it means.
+        {
+            size_t ne = 0;
+            if (cudaGraphGetEdges_v2(g, nullptr, nullptr, nullptr, &ne) == cudaSuccess && ne) {
+                std::vector<cudaGraphNode_t> from(ne), to(ne);
+                std::vector<cudaGraphEdgeData> ed(ne);
+                if (cudaGraphGetEdges_v2(g, from.data(), to.data(), ed.data(), &ne)
+                    == cudaSuccess) {
+                    for (size_t e = 0; e < ne; ++e) {
+                        succ[from[e]].push_back(to[e]);
+                        ++indeg[to[e]];
+                        ++n_edges;
+                    }
+                }
+            }
+        }
+#endif
+        if (n_edges == 0)
+        // DO NOT ABORT ON THE FIRST FAILURE. Two earlier revisions of this walk bailed on
+        // node 3 and reported "0 edges", which said nothing about whether the API works,
+        // which node is odd, or how many are affected. Count the failures, keep the edges
+        // that DO resolve, and report both -- a walk that covers 99% of the graph is still
+        // worth reading, and one that covers 0.1% names its own problem.
+        for (size_t i = 0; i < nnodes; ++i) {
+            size_t nd = 0;
+            cudaError_t e = cudaGraphNodeGetDependencies(nodes[i], nullptr, &nd);
+            if (e != cudaSuccess) {
+                if (!n_failed) { first_err = e; first_bad = i; }
+                ++n_failed;
+                cudaGetLastError();
+                continue;
+            }
+            if (!nd) continue;
+            std::vector<cudaGraphNode_t> deps(nd);
+            e = cudaGraphNodeGetDependencies(nodes[i], deps.data(), &nd);
+            if (e != cudaSuccess) {
+                if (!n_failed) { first_err = e; first_bad = i; }
+                ++n_failed;
+                cudaGetLastError();
+                continue;
+            }
+            for (size_t d = 0; d < nd; ++d) {
+                succ[deps[d]].push_back(nodes[i]);
+                ++indeg[nodes[i]];
+                ++n_edges;
+            }
+        }
+        if (n_failed)
+            std::fprintf(stderr, "[k3-census] dependency query failed on %zu of %zu nodes; "
+                                 "first at index %zu: %s\n",
+                         n_failed, nnodes, first_bad, cudaGetErrorString(first_err));
+        const bool edges_ok = n_failed == 0;
+        // A path from an INCOMPLETE DAG is an underestimate, never an overestimate: a
+        // missing edge can only break a chain, never lengthen one. So a partial walk is
+        // reportable as a LOWER BOUND provided the gap is stated -- which is different
+        // from the earlier revisions that reported a number and called it the answer.
+        const bool path_ok = n_edges > 0;
+        if (!path_ok)
+            std::fprintf(stderr, "\n[k3-census] critical path SKIPPED: no edges resolved "
+                                 "— refusing to report a path\n");
+        for (size_t i = 0; path_ok && i < nnodes; ++i) {
+            cudaGraphNodeType t;
+            if (cudaGraphNodeGetType(nodes[i], &t) != cudaSuccess) continue;
+            std::string name = "<non-kernel>";
+            if (t == cudaGraphNodeTypeKernel) {
+                cudaKernelNodeParams kp{};
+                if (cudaGraphKernelNodeGetParams(nodes[i], &kp) == cudaSuccess) {
+                    const char* nn = nullptr;
+#if CUDART_VERSION >= 12030
+                    if (cudaFuncGetName(&nn, kp.func) != cudaSuccess) nn = nullptr;
+#endif
+                    name = nn ? nn : "<unresolved>";
+                    const std::size_t lt = name.find('<');
+                    if (lt != std::string::npos) name = name.substr(0, lt);
+                }
+            }
+            nm_of[nodes[i]] = name;
+        }
+
+        // Longest path by Kahn order. Every node costs 1, so "length" is a node count
+        // along the chain -- the quantity a fusion actually shortens.
+        std::map<cudaGraphNode_t, long> dist;
+        std::map<cudaGraphNode_t, cudaGraphNode_t> prev;
+        std::vector<cudaGraphNode_t> q;
+        for (const auto& kv : indeg) if (kv.second == 0) { q.push_back(kv.first); dist[kv.first] = 1; }
+        std::map<cudaGraphNode_t, int> deg = indeg;
+        for (size_t qi = 0; qi < q.size(); ++qi) {
+            const cudaGraphNode_t u = q[qi];
+            for (cudaGraphNode_t v : succ[u]) {
+                if (dist[u] + 1 > dist[v]) { dist[v] = dist[u] + 1; prev[v] = u; }
+                if (--deg[v] == 0) q.push_back(v);
+            }
+        }
+        if (!path_ok) {
+            // already reported above
+        } else if (q.size() != nnodes) {
+            std::fprintf(stderr, "\n[k3-census] critical path SKIPPED: visited %zu of %zu "
+                                 "nodes (cycle or missing edges) — not reporting a number "
+                                 "derived from a partial walk\n", q.size(), nnodes);
+        } else {
+            cudaGraphNode_t end = nullptr;
+            long best = 0;
+            for (const auto& kv : dist) if (kv.second > best) { best = kv.second; end = kv.first; }
+            std::vector<cudaGraphNode_t> path;
+            for (cudaGraphNode_t c = end; c; ) {
+                path.push_back(c);
+                auto it = prev.find(c);
+                if (it == prev.end()) break;
+                c = it->second;
+            }
+            std::map<std::string, long> on_path;
+            for (cudaGraphNode_t c : path) ++on_path[nm_of[c]];
+            std::vector<std::pair<std::string, long>> pr(on_path.begin(), on_path.end());
+            std::sort(pr.begin(), pr.end(),
+                      [](const auto& a, const auto& b) { return a.second > b.second; });
+            std::fprintf(stderr,
+                         "\n[k3-census] CRITICAL PATH: %ld nodes of %zu (%.1f%%), %zu edges%s.\n"
+                         "            Fusing anything NOT on this list is worth 0.00%% — which\n"
+                         "            is exactly what the KDA launch fusion measured.\n",
+                         best, nnodes, 100.0 * (double)best / (double)nnodes, n_edges,
+                         edges_ok ? "" : " (PARTIAL — this is a LOWER bound)");
+            std::fprintf(stderr, "  %8s  %s\n", "on-path", "kernel");
+            int shown_p = 0;
+            for (const auto& kv : pr) {
+                if (shown_p++ >= 25) break;
+                std::fprintf(stderr, "  %8ld  %s\n", kv.second, kv.first.c_str());
+            }
+        }
+    }
+
+    std::vector<std::pair<std::string, Row>> shapes(by_shape.begin(), by_shape.end());
+    std::sort(shapes.begin(), shapes.end(),
+              [](const auto& a, const auto& b) { return a.second.idle > b.second.idle; });
+    std::fprintf(stderr, "\n[k3-census] by LAUNCH SHAPE (top 30) — this is the row that says\n"
+                         "            whether a kernel is one wide launch or many narrow ones:\n");
+    std::fprintf(stderr, "  %9s %6s %8s  %s\n", "idle", "%", "count", "shape / kernel");
+    int shown = 0;
+    for (const auto& kv : shapes) {
+        if (shown++ >= 30) break;
+        std::fprintf(stderr, "  %9ld %5.1f%% %8ld  %s\n", kv.second.idle,
+                     total_idle > 0 ? 100.0 * kv.second.idle / total_idle : 0.0,
+                     kv.second.count, kv.first.c_str());
+    }
 }
 
 bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
@@ -1088,6 +1391,7 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
         std::fprintf(stderr, "[k3-graph] captured decode step: %zu nodes/rank, "
                              "%ld collectives/token, mla splits=%d, from position %d\n",
                      nnodes, p.n_collectives, live_plan, p.ranks[0].state.position);
+        k3_graph_census(p.ranks[0].graph, nnodes);
     }
 
     if (graph_on) {
