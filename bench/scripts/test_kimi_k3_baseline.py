@@ -2468,8 +2468,8 @@ class CiWorkflowTest(unittest.TestCase):
             self.assertIn("unavailable", note, f"{label} did not say why")
 
     # ---- the gate was ONE 4-token probe, n=1 --------------------------------------------
-    DEEP_DEPTHS = (128, 256, 512, 1024, 2048, 4096, 8192)
-    OPT_IN_DEPTHS = (16384, 32768)      # captured and committed, off by default on cost
+    DEEP_DEPTHS = (128, 256, 512, 1024, 2048, 4096)
+    OPT_IN_DEPTHS = (8192, 16384, 32768)   # captured and committed, off by default on cost
 
     def test_parity_is_probed_at_many_depths_not_one_point(self):
         """The gate graded a single next-token distribution after a 4-token prompt.
@@ -2483,14 +2483,14 @@ class CiWorkflowTest(unittest.TestCase):
         self.assertEqual(tuple(bot.PARITY_DEPTHS), self.DEEP_DEPTHS)
         probes = bot._parity_probes()
         self.assertEqual(len(probes), 1 + len(self.DEEP_DEPTHS),
-                         "the default suite is not ctx4 + seven depths")
+                         "the default suite is not ctx4 + six depths")
         self.assertEqual(probes[0][0], "ctx4",
                          "the historical 4-token probe must be kept, so the number this "
                          "gate has always reported stays comparable")
 
     def test_the_deeper_depths_are_captured_even_though_they_are_off_by_default(self):
-        """8192 is the default because the deep pass costs max(depth)/decode_tok_s per
-        measured build -- 233 s to 8192 against 809 s to 32768, at a flat ~42 tok/s. The
+        """4096 is the default because the deep pass costs max(depth)/decode_tok_s per
+        measured build -- 136 s to 4096 against 812 s to 32768, at a flat ~42 tok/s. The
         deeper references are still committed so K3_PARITY_DEPTHS can turn them on without
         a fresh 554 GB capture; dropping the files would make that a lie."""
         refdata = ROOT / "bench" / "refdata"
@@ -2587,7 +2587,7 @@ class CiWorkflowTest(unittest.TestCase):
         """Nine of ten probes returning is not a pass at 90%. It is an unmeasured depth."""
         src = (ROOT / "eval/k3_eval_bot.py").read_text()
         acc = src[src.index("def measure_accuracy("):src.index("def _hello_ids_csv(")]
-        self.assertIn("partial parity suite", acc)
+        self.assertIn("incomplete parity suite", acc)
         self.assertIn("raise RuntimeError", acc)
         # worst-case aggregation, not mean
         self.assertIn("min(d[\"top1\"]", acc)
@@ -2634,6 +2634,78 @@ class CiWorkflowTest(unittest.TestCase):
         with _tar.open(travtar) as tf:
             with self.assertRaises(RuntimeError):
                 bot._extract_probes(tf, _tmp.mkdtemp())
+
+    def test_a_busy_node_is_waited_for_and_a_dead_probe_explains_itself(self):
+        """2026-08-04: a round walked into another tenant's benchmark on the rented box.
+        Both jobs tried to allocate ~70 GiB/GPU and both died on cudaMalloc.
+
+        Two separate failures, two separate fixes:
+
+        The bot did not WAIT. The harness has settle_gpus(), but that runs in _box_eval --
+        by which point measure_accuracy has already tried to load 553 GiB. The wait has to
+        be where the first allocation happens.
+
+        The bot could not SAY WHY. Both probes were run with `>/dev/null 2>&1`, so an
+        out-of-memory death surfaced as "probe ctx4 produced no logits — refusing to score
+        a partial parity suite", which reads as a bug in the parity suite and sends the
+        investigation to entirely the wrong place. One line of `cudaMalloc failed` was
+        thrown away."""
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        acc = src[src.index("def measure_accuracy("):src.index("def _extract_probes(")]
+        # the probes must not discard their own diagnostics
+        self.assertNotIn(">/dev/null 2>&1", acc,
+                         "a probe's stderr is thrown away, so a dead probe cannot say why")
+        self.assertIn("hello.log", acc)
+        self.assertIn("deep.log", acc)
+        # …and the failure path must actually read them back
+        self.assertIn('os.path.join(workdir, log)', acc,
+                      "the failure path never opens the probe logs it captured")
+        # the wait happens before the first big allocation
+        self.assertIn("nvidia-smi", acc, "measure_accuracy never checks whether the node is free")
+        self.assertLess(acc.index("nvidia-smi"), acc.index("--logits"),
+                        "the settle must come BEFORE the first probe, not after")
+        bot = self._bot()
+        self.assertGreater(bot.PARITY_SETTLE_TRIES * bot.PARITY_SETTLE_SLEEP, 300,
+                           "the wait is too short to outlast a neighbour's run")
+
+    def test_a_busy_node_is_retried_not_treated_as_a_verdict(self):
+        """The round that died on 2026-08-04 should have retried and probably succeeded.
+
+        is_transient() treats a VERDICT_MARKER anywhere in the message as decisive, and the
+        incomplete-suite error said "refusing to score a partial parity suite" -- so
+        `cudaMalloc failed`, which TRANSIENT_RE explicitly lists as retryable, was
+        classified as a permanent verdict about the PR and with_box_retry gave up on the
+        first attempt.
+
+        The refusal is not the bug and does not change: 7 of 8 probes is not parity and is
+        never scored. What changes is that a BUSY BOX is the box failing, not the harness
+        reaching a conclusion, so it gets the retry it always should have had."""
+        bot = self._bot()
+
+        # The phrasing that poisoned the classifier must be gone from the RAISED MESSAGE.
+        # Scoped to the raise expression, not the whole function: is_transient() only ever
+        # sees str(exc), so a comment explaining the trap is not itself the trap.
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        start = src.index('f"{what}: incomplete parity suite')
+        raised = src[start:start + 600]
+        for marker in bot.VERDICT_MARKERS:
+            self.assertNotIn(marker, raised,
+                             f"the incomplete-suite message says {marker!r}, which "
+                             f"is_transient() reads as a permanent verdict")
+
+        # a real incomplete-suite message, carrying the probe log the box actually emits
+        busy = ("main: incomplete parity suite — probe ctx4 produced no logits. "
+                "Came back: ['longctx.ctx128.spkl']\n"
+                "hello.log: …[k3] cudaMalloc failed for blk.92.ffn_gate_exps.weight "
+                "rank slice (240844800 bytes)\n[k3-tp] rank 0: weight load failed\n"
+                "init failed at tp=8, 93 layers")
+        self.assertTrue(bot.is_transient(RuntimeError(busy)),
+                        "a node that was merely busy is still not retried")
+
+        # …while a genuine scoring refusal must still never be retried
+        verdict = "main measured 0 tok/s — refusing to score a round against it"
+        self.assertFalse(bot.is_transient(RuntimeError(verdict)),
+                         "a real verdict became retryable — the guard is now advisory")
 
     def test_the_answer_key_capture_is_reproducible(self):
         """The corpus is committed with its hash and the capture is one documented command,

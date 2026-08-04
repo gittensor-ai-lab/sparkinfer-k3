@@ -245,6 +245,19 @@ int main(int argc, char** argv) {
                 return 1;
             }
         }
+        // TIME THE INGESTION. Prompt ingestion is prefill, and there is no batched path --
+        // every prompt token goes through the same single-token decode step, so a prompt
+        // costs exactly what generating the same number of tokens costs. Nothing in this
+        // bench reported that, so the only prefill numbers the project had were inferred
+        // from checkpoint file mtimes. PREFILL lines below are the measurement.
+        //
+        // Measured from AFTER init: model load is a separate, one-off cost and folding it
+        // in would flatter longer prompts.
+        const auto t_pf0 = std::chrono::steady_clock::now();
+        auto ms_since = [&](const std::chrono::steady_clock::time_point& t0) {
+            return std::chrono::duration<double, std::milli>(
+                       std::chrono::steady_clock::now() - t0).count();
+        };
         for (size_t i = 0; i < ids.size(); ++i) {
             if (!kimi_k3_tp_forward_token(p, ids[i], logits.data())) {
                 std::printf("prompt token %zu (id %d) failed\n", i, ids[i]); return 1;
@@ -253,6 +266,12 @@ int main(int argc, char** argv) {
             const int depth = (int)i + 1;
             for (int L : checkpoints) {
                 if (L != depth) continue;
+                // Report the cumulative ingestion cost at this depth BEFORE the dump, so
+                // the .spkl write and the argmax scan are not charged to prefill.
+                const double el = ms_since(t_pf0);
+                std::printf("PREFILL tokens=%d ms=%.1f tok_s=%.2f ms_per_token=%.3f\n",
+                            L, el, L * 1000.0 / el, el / L);
+                std::fflush(stdout);
                 const std::string path = std::string(logits_prefix) + ".ctx" +
                                          std::to_string(L) + ".spkl";
                 if (!write_spkl(path.c_str(), logits, cfg.vocab)) {
@@ -269,6 +288,15 @@ int main(int argc, char** argv) {
                 std::fflush(stdout);
             }
         }
+        // Whole-prompt ingestion: this is TTFT for a prompt of this length, minus load.
+        {
+            const double el = ms_since(t_pf0);
+            const size_t n = ids.size();
+            std::printf("PREFILL_TOTAL tokens=%zu ms=%.1f tok_s=%.2f ms_per_token=%.3f\n",
+                        n, el, n * 1000.0 / el, el / (double)n);
+            std::fflush(stdout);
+        }
+
         int best = 0;
         for (int i = 1; i < cfg.vocab; ++i)
             if (logits[(size_t)i] > logits[(size_t)best]) best = i;
