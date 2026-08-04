@@ -834,10 +834,21 @@ __global__ void moe_router_noaux_tc_kernel(float* __restrict__ out_w,
 // across the warp, so the scalar form issues 8 loads that each span 1024 bytes to use
 // 128 of them. It is the same sector-amplification the projection GEMV had, one level
 // down.
-template <bool XVEC>
+// Offset-packed IQ1_S lattice: each {-1,0,+1} becomes (g+1) in 2 bits.
+// Distinct from a two's-complement pack — same floats after decode, 4 KB table,
+// one 16-bit load instead of a divergent uint64 gather. SPARKINFER_K3_IQ1S_PACK=0
+// restores the uint64 path on one binary.
+__device__ static uint16_t iq1s_grid_pk[SPARKINFER_IQ1S_NGRID];
+
+__device__ __forceinline__ int iq1s_unpack_g(uint16_t pk, int j) {
+    return (int)((pk >> (2 * j)) & 3u) - 1;
+}
+
+template <bool XVEC, bool PACK = false>
 __device__ __forceinline__ float block_dot(const BlockIQ2XS& b,
                                                  const float* __restrict__ x,
                                                  int lane, int nlanes) {
+    (void)PACK;
     const float d = __half2float(__ushort_as_half(b.d));
     float acc = 0.0f;
     // 32 groups of 8 values per block; spread them over the lanes.
@@ -876,7 +887,7 @@ __device__ __forceinline__ float block_dot(const BlockIQ2XS& b,
 // dequantised weights. Overloaded on the block type so the MoE kernels below are
 // written once and instantiated per quant type — the combine logic must not exist
 // twice, or the two copies will drift.
-template <bool XVEC>
+template <bool XVEC, bool PACK = false>
 __device__ __forceinline__ float block_dot(const BlockIQ1S& b,
                                            const float* __restrict__ x,
                                            int lane, int nlanes) {
@@ -890,14 +901,23 @@ __device__ __forceinline__ float block_dot(const BlockIQ1S& b,
         const uint32_t idx =
             (uint32_t)b.qs[4 * ib32 + l] | (((uint32_t)(h >> (3 * l)) & 7u) << 8);
         const float* xv = x + l32 * 8;
+        float xs[8];
         if (XVEC) {
-            // The table IS a uint64 per codepoint, so read it as one -- the byte
-            // pointer form makes the compiler emit eight dependent 1-byte loads off a
-            // divergent address.
-            const uint64_t gw = iq1s_grid_c[idx];
             const float4* xv4 = (const float4*)xv;
             const float4 xa = xv4[0], xb = xv4[1];
-            const float xs[8] = { xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w };
+            xs[0] = xa.x; xs[1] = xa.y; xs[2] = xa.z; xs[3] = xa.w;
+            xs[4] = xb.x; xs[5] = xb.y; xs[6] = xb.z; xs[7] = xb.w;
+        } else {
+#pragma unroll
+            for (int j = 0; j < 8; ++j) xs[j] = xv[j];
+        }
+        if (PACK) {
+            const uint16_t pk = iq1s_grid_pk[idx];
+        #pragma unroll
+            for (int j = 0; j < 8; ++j)
+                acc += dl * ((float)iq1s_unpack_g(pk, j) + delta) * xs[j];
+        } else if (XVEC) {
+            const uint64_t gw = iq1s_grid_c[idx];
         #pragma unroll
             for (int j = 0; j < 8; ++j) {
                 const int8_t gj = (int8_t)((gw >> (8 * j)) & 0xffu);
@@ -988,8 +1008,14 @@ __device__ __forceinline__ float block_dot_q8k(const BlockIQ1S& b,
 // What changed is the cost. At tp=8, 14 of every 16 selections are foreign, so this was
 // 43,008 CTAs launched per MoE layer to store one scattered float each. One memset does
 // the same job coalesced.
-template <int WARPS_PER_CTA, bool XVEC, typename Blk>
-__global__ void moe_gate_up_situ_kernel(float* __restrict__ scratch,
+// PACK: IQ1_S reads the 4 KB offset-packed lattice (ignored for IQ2_XS).
+// BLKS>0: compile-time blocks_per_row (K3 latent 3584 → 14) so nvcc fully unrolls
+// and software-pipelines the next weight/act load. BLKS==0: runtime width.
+// launch_bounds keeps 8 CTAs/SM eligible at 256 threads — MoE is latency-bound on
+// the divergent lattice gather, so occupancy is the other half of the win.
+template <int WARPS_PER_CTA, bool XVEC, typename Blk, bool PACK = false, int BLKS = 0>
+__global__ void __launch_bounds__(256, 8)
+moe_gate_up_situ_kernel(float* __restrict__ scratch,
                                         const float* __restrict__ x,
                                         const int* __restrict__ ids,
                                         const Blk* __restrict__ gate_exps,
@@ -1012,21 +1038,35 @@ __global__ void moe_gate_up_situ_kernel(float* __restrict__ scratch,
     // the all-reduce that follows sums the bands back into the full top_k combine.
     const int e = ids[k] - expert_begin;
     if (e < 0 || e >= n_local_experts) return;   // memset already left this slot at 0
-    const int blocks_per_row = latent / 256;
+    const int blocks_per_row = BLKS > 0 ? BLKS : (latent / 256);
 
     const Blk* g_row = gate_exps + (size_t)(e * ffn + j) * blocks_per_row;
     const Blk* u_row = up_exps   + (size_t)(e * ffn + j) * blocks_per_row;
 
     float gacc = 0.0f, uacc = 0.0f;
-    // blocks_per_row arrives as a runtime argument, so nvcc cannot unroll this and each
-    // iteration's divergent iq1s_grid_c gather sits alone on a dependent chain. Unrolling
-    // puts four independent gathers and four weight loads in flight. Accumulation order
-    // is unchanged, so this is bit-identical.
+    // Software-pipeline: prefetch weight+act for b+1 while contracting b. Same
+    // ascending-b association as the unrolled loop — bit-identical.
+    if (BLKS > 0) {
+        Blk g_cur = g_row[0], u_cur = u_row[0];
+        const float* x_cur = x;
+#pragma unroll
+        for (int b = 0; b < BLKS - 1; ++b) {
+            const Blk g_nxt = g_row[b + 1];
+            const Blk u_nxt = u_row[b + 1];
+            const float* x_nxt = x + (b + 1) * 256;
+            gacc += block_dot<XVEC, PACK>(g_cur, x_cur, lane, 32);
+            uacc += block_dot<XVEC, PACK>(u_cur, x_cur, lane, 32);
+            g_cur = g_nxt; u_cur = u_nxt; x_cur = x_nxt;
+        }
+        gacc += block_dot<XVEC, PACK>(g_cur, x_cur, lane, 32);
+        uacc += block_dot<XVEC, PACK>(u_cur, x_cur, lane, 32);
+    } else {
 #pragma unroll 4
-    for (int b = 0; b < blocks_per_row; ++b) {
-        const float* xb = x + b * 256;
-        gacc += block_dot<XVEC>(g_row[b], xb, lane, 32);
-        uacc += block_dot<XVEC>(u_row[b], xb, lane, 32);
+        for (int b = 0; b < blocks_per_row; ++b) {
+            const float* xb = x + b * 256;
+            gacc += block_dot<XVEC, PACK>(g_row[b], xb, lane, 32);
+            uacc += block_dot<XVEC, PACK>(u_row[b], xb, lane, 32);
+        }
     }
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
@@ -1069,8 +1109,9 @@ __global__ void moe_gate_up_situ_kernel(float* __restrict__ scratch,
 // operation into two rounded ones. That measured as a 8.4e-13 KLD divergence from main
 // on the node — numerically nothing, but it is the difference between "bit-identical"
 // and "very close", and only the first one is verifiable by byte comparison.
-template <int WARPS_PER_CTA, bool XVEC, typename Blk>
-__global__ void moe_down_combine_kernel(float* __restrict__ out,
+template <int WARPS_PER_CTA, bool XVEC, typename Blk, bool PACK = false, int BLKS = 0>
+__global__ void __launch_bounds__(256, 8)
+moe_down_combine_kernel(float* __restrict__ out,
                                         const float* __restrict__ scratch,
                                         const int* __restrict__ ids,
                                         const float* __restrict__ w,
@@ -1082,7 +1123,7 @@ __global__ void moe_down_combine_kernel(float* __restrict__ out,
     if (o >= latent) return;
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
-    const int blocks_per_row = ffn / 256;
+    const int blocks_per_row = BLKS > 0 ? BLKS : (ffn / 256);
     extern __shared__ float partial[];        // top_k floats
 
     for (int k = warp; k < top_k; k += WARPS_PER_CTA) {
@@ -1095,8 +1136,21 @@ __global__ void moe_down_combine_kernel(float* __restrict__ out,
         const Blk* d_row = down_exps + (size_t)(e * latent + o) * blocks_per_row;
         const float* act = scratch + (size_t)k * ffn;
         float acc = 0.0f;
-        for (int b = 0; b < blocks_per_row; ++b)
-            acc += block_dot<XVEC>(d_row[b], act + b * 256, lane, 32);
+        if (BLKS > 0) {
+            Blk d_cur = d_row[0];
+            const float* a_cur = act;
+#pragma unroll
+            for (int b = 0; b < BLKS - 1; ++b) {
+                const Blk d_nxt = d_row[b + 1];
+                const float* a_nxt = act + (b + 1) * 256;
+                acc += block_dot<XVEC, PACK>(d_cur, a_cur, lane, 32);
+                d_cur = d_nxt; a_cur = a_nxt;
+            }
+            acc += block_dot<XVEC, PACK>(d_cur, a_cur, lane, 32);
+        } else {
+            for (int b = 0; b < blocks_per_row; ++b)
+                acc += block_dot<XVEC, PACK>(d_row[b], act + b * 256, lane, 32);
+        }
 #pragma unroll
         for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffff, acc, off);
         if (lane == 0) partial[k] = acc;      // RAW; w[k] is applied in the fold
@@ -3167,6 +3221,18 @@ static void ensure_iq1s_tables() {
     const int dev = current_device_index();
     if (dev >= 0 && ready[dev]) return;
     cudaMemcpyToSymbol(iq1s_grid_c, iq1s_grid_host, sizeof(iq1s_grid_host));
+    // Offset pack: g in {-1,0,+1} → (g+1) as 2 bits. Same floats after unpack.
+    uint16_t packed[SPARKINFER_IQ1S_NGRID];
+    for (int i = 0; i < SPARKINFER_IQ1S_NGRID; ++i) {
+        const uint64_t gw = iq1s_grid_host[i];
+        uint16_t pk = 0;
+        for (int j = 0; j < 8; ++j) {
+            const int8_t g = (int8_t)((gw >> (8 * j)) & 0xffu);
+            pk |= (uint16_t)(((int)g + 1) & 3) << (2 * j);
+        }
+        packed[i] = pk;
+    }
+    cudaMemcpyToSymbol(iq1s_grid_pk, packed, sizeof(packed));
     if (dev >= 0) ready[dev] = true;
 }
 
@@ -3251,27 +3317,56 @@ static void moe_expert_ffn_launch(float* out, float* scratch,
     // so the bases alone decide it.
     const bool xvec = ((((uintptr_t)x) | ((uintptr_t)scratch)) & 15u) == 0;
 
+    // Offset-packed IQ1_S lattice. Default ON for IQ1_S MoE (the scored quant);
+    // SPARKINFER_K3_IQ1S_PACK=0 restores the uint64 gather. IQ2_XS ignores PACK.
+    static const bool pack_on = [] {
+        const char* e = std::getenv("SPARKINFER_K3_IQ1S_PACK");
+        return !(e && e[0] == '0');
+    }();
+    constexpr bool is_iq1s = sizeof(Blk) == sizeof(BlockIQ1S);
+    const bool pack = pack_on && is_iq1s;
+
+    // K3 scored geometry: latent 3584 → 14 act blocks; ffn band 768 → 3 weight blocks.
+    // Specialize those so the pipeline fully unrolls. Other shapes stay on BLKS=0.
+    const int gate_blks = (latent == 3584) ? 14 : 0;
+    const int down_blks = (ffn == 768) ? 3 : ((ffn == 1536) ? 6 : ((ffn == 3072) ? 12 : 0));
+
     const dim3 g1((unsigned)((ffn + WARPS - 1) / WARPS), (unsigned)top_k);
     const size_t dshm = (size_t)top_k * sizeof(float);
     const float inv_lb = lb_active ? 1.0f / situ_linear_beta : 1.0f;
 
+#define K3_MOE_LAUNCH(XV, PK, GB, DB)                                            \
+    do {                                                                         \
+        k3_pdl_launch(g1, WARPS * 32, 0, stream,                                 \
+            moe_gate_up_situ_kernel<WARPS, XV, Blk, PK, GB>,                     \
+            scratch, x, ids, (const Blk*)gate_exps, (const Blk*)up_exps, latent, \
+            ffn, situ_beta, 1.0f / situ_beta, situ_linear_beta, inv_lb,          \
+            lb_active, expert_begin, n_local);                                   \
+        k3_pdl_launch((unsigned)latent, WARPS * 32, dshm, stream,                \
+            moe_down_combine_kernel<WARPS, XV, Blk, PK, DB>,                     \
+            out, scratch, ids, w, (const Blk*)down_exps, latent, ffn, top_k,     \
+            expert_begin, n_local);                                              \
+    } while (0)
+
     if (xvec) {
-        k3_pdl_launch(g1, WARPS * 32, 0, stream, moe_gate_up_situ_kernel<WARPS, true, Blk>, 
-            scratch, x, ids, (const Blk*)gate_exps, (const Blk*)up_exps, latent, ffn,
-            situ_beta, 1.0f / situ_beta, situ_linear_beta, inv_lb, lb_active,
-            expert_begin, n_local);
-        k3_pdl_launch((unsigned)latent, WARPS * 32, dshm, stream, moe_down_combine_kernel<WARPS, true, Blk>, 
-                out, scratch, ids, w, (const Blk*)down_exps, latent, ffn, top_k,
-                expert_begin, n_local);
+        if (pack) {
+            if (gate_blks == 14 && down_blks == 3) K3_MOE_LAUNCH(true, true, 14, 3);
+            else if (gate_blks == 14 && down_blks == 6) K3_MOE_LAUNCH(true, true, 14, 6);
+            else if (gate_blks == 14 && down_blks == 12) K3_MOE_LAUNCH(true, true, 14, 12);
+            else if (gate_blks == 14) K3_MOE_LAUNCH(true, true, 14, 0);
+            else K3_MOE_LAUNCH(true, true, 0, 0);
+        } else {
+            if (gate_blks == 14 && down_blks == 3) K3_MOE_LAUNCH(true, false, 14, 3);
+            else if (gate_blks == 14 && down_blks == 6) K3_MOE_LAUNCH(true, false, 14, 6);
+            else if (gate_blks == 14 && down_blks == 12) K3_MOE_LAUNCH(true, false, 14, 12);
+            else if (gate_blks == 14) K3_MOE_LAUNCH(true, false, 14, 0);
+            else K3_MOE_LAUNCH(true, false, 0, 0);
+        }
     } else {
-        k3_pdl_launch(g1, WARPS * 32, 0, stream, moe_gate_up_situ_kernel<WARPS, false, Blk>, 
-            scratch, x, ids, (const Blk*)gate_exps, (const Blk*)up_exps, latent, ffn,
-            situ_beta, 1.0f / situ_beta, situ_linear_beta, inv_lb, lb_active,
-            expert_begin, n_local);
-        k3_pdl_launch((unsigned)latent, WARPS * 32, dshm, stream, moe_down_combine_kernel<WARPS, false, Blk>, 
-                out, scratch, ids, w, (const Blk*)down_exps, latent, ffn, top_k,
-                expert_begin, n_local);
+        if (pack) K3_MOE_LAUNCH(false, true, 0, 0);
+        else K3_MOE_LAUNCH(false, false, 0, 0);
     }
+#undef K3_MOE_LAUNCH
 }
 
 void moe_expert_ffn_iq2xs_f32(float* out, float* scratch,

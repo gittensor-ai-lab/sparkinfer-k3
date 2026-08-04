@@ -258,8 +258,12 @@ void moe_router_noaux_tc_f32(float* out_w, int* out_ids, const float* logits,
 // DEQUANT IS FUSED, not staged. Materialising one expert's gate+up at f32 costs
 // 3584*3072*2*4 B = 88 MB per expert per token; at top-16 that is 1.4 GB of
 // traffic per token for weights that are 2.3 bpw on disk. The whole point of
-// IQ2_XS is that the weights stay small in memory, so the blocks are decoded
-// inside the dot product and never written out.
+// IQ2_XS / IQ1_S is that the weights stay small in memory, so the blocks are
+// decoded inside the dot product and never written out.
+//
+// IQ1_S MoE (default): lattice reads go through a 4 KB offset-packed table
+// (SPARKINFER_K3_IQ1S_PACK=0 restores the uint64 gather). Gate/down specialize
+// the scored K3 block counts and software-pipeline the next weight load.
 //
 // Weights are ggml IQ2_XS (type 17), rows of `latent` values = latent/256 blocks.
 // Expert e's gate/up row j starts at block (e*ffn + j) * (latent/256).
