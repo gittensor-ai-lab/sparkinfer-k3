@@ -508,9 +508,10 @@ REFDATA = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 # build, paid once for main plus once per PR in a round. Measured on the 8x H200 node,
 # main @ be3c818, decode time for one continuous pass:
 #
-#     to  8192   233 s   (3.9 min)   <-- the default
-#     to 16384   427 s   (7.1 min)
-#     to 32768   809 s  (13.5 min)
+#     to  4096   136 s   (2.3 min)   <-- the default
+#     to  8192   236 s   (3.9 min)
+#     to 16384   429 s   (7.2 min)
+#     to 32768   812 s  (13.5 min)
 #
 # END TO END this function costs MORE than the decode figure, because it pays TWO model
 # loads: the 4-token probe and the deep pass are separate invocations (tp_bench takes one
@@ -523,17 +524,23 @@ REFDATA = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 # cost is very close to linear in max(depth), and 32768 triples a round's parity budget
 # to buy two more depths.
 #
-# References for 16384 and 32768 ARE captured and committed. Opt in with
-# K3_PARITY_DEPTHS=...,16384,32768 when a change plausibly breaks only very deep, and
-# accept the extra ~10 minutes per build.
+# References for 8192, 16384 and 32768 ARE captured and committed. Opt in with
+# K3_PARITY_DEPTHS=...,8192,16384,32768 when a change plausibly breaks only very deep.
 #
-# WHY NOT 131072. The reference has to come from llama.cpp and the capture cost grows with
-# depth. This narrows the untested gap from "everything past 4 tokens" to "everything past
-# 8k" (32k when opted in) -- it does not close it, and README/CONTRIBUTING say so rather
-# than implying full-context parity is proven.
+# 4096 is the default because ingestion is the round's dominant cost and buys no extra
+# coverage per second: a 6-build round pays 35 min at 4096 against 45 min at 8192. That
+# ceiling is a deliberate trade against the 131,072 the engine is SCORED at -- see #119.
+# It moves back up for free the moment batched prefill exists.
+#
+# WHY NOT 131072. Two reasons, and only one of them is the reference. The capture side
+# grows with depth, but OUR side is the binding one: ingestion runs at decode speed
+# (measured 42.80 tok/s, 1.03x our scored decode rate), so a 131,072-token probe costs
+# ~52 minutes PER BUILD. This narrows the untested gap from "everything past 4 tokens" to
+# "everything past 4k" (32k when opted in) -- it does not close it, and README/CONTRIBUTING
+# say so rather than implying full-context parity is proven.
 PARITY_DEPTHS = [int(x) for x in os.environ.get(
     "K3_PARITY_DEPTHS",
-    "128,256,512,1024,2048,4096,8192").split(",") if x.strip()]
+    "128,256,512,1024,2048,4096").split(",") if x.strip()]
 PARITY_CORPUS = os.environ.get("K3_PARITY_CORPUS", "longctx")
 # The deep pass is minutes of decode, not seconds, and it runs behind the same ssh call
 # as the 4-token probe. 3600 was sized for the latter alone.
