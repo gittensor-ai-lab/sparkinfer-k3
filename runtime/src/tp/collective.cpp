@@ -606,6 +606,10 @@ std::unique_ptr<Collective> make_collective(const std::vector<int>& devices,
         }
 
         case Backend::Multimem: {
+            // Auto prefers multimem when the multicast bind probe passes. If
+            // construction still fails (bind race, mapping, permissions), do NOT
+            // fall straight to NCCL — that would regress ~7% vs peer-oneshot
+            // (#59 measured at 128k). Try peer first; NCCL is the last resort.
             std::string e;
             auto c = make_multimem_collective(devices, max_count, &e);
             if (c) {
@@ -614,7 +618,21 @@ std::unique_ptr<Collective> make_collective(const std::vector<int>& devices,
                              tp_size, max_count);
                 return c;
             }
-            return try_nccl(e.c_str());
+            std::fprintf(stderr,
+                "[tp] multimem construction failed (%s) — trying peer-oneshot "
+                "before nccl (Auto chose multimem; nccl would regress ~7%% vs peer)\n",
+                e.c_str());
+            std::string peer_e;
+            auto peer = make_peer_oneshot_collective(devices, max_count, &peer_e);
+            if (peer) {
+                std::fprintf(stderr, "[tp] all-reduce backend: peer-oneshot "
+                                     "(multimem unavailable), %d rank(s), "
+                                     "max_count %zu (owned buffers)\n",
+                             tp_size, max_count);
+                return peer;
+            }
+            std::string both = e + "; peer-oneshot also failed: " + peer_e;
+            return try_nccl(both.c_str());
         }
 
         case Backend::None:

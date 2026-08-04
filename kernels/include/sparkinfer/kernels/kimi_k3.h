@@ -883,6 +883,24 @@ void rms_norm_f32(float* out, const float* x, const float* w, int n, float eps,
 bool rms_norm_f32_rows(float* out, const float* x, const float* w, int n, float eps,
                        int rows, long long row_stride, cudaStream_t stream);
 
+// Fused residual combine + RMS for the pre-FFN seam when nothing is banked
+// for the mix (n_ckpt==0) OR the caller already produced `cur` and only needs
+// RMS. Bit-identical to k3_add_f32 + rms_norm_f32 when do_add=true, or to
+// rms_norm_f32 alone when do_add=false (cur is used as x).
+// SPARKINFER_K3_FFN_PREP=0 declines to the separate launches.
+bool k3_ffn_prep_f32(float* normed_out, float* residual_out,
+                     const float* hidden_in, const float* attn_out,
+                     const float* rms_w, int n, float eps, bool do_add,
+                     cudaStream_t stream);
+
+// Fused identity-mix + RMS for the pre-attention seam when nothing is banked
+// (res_bs==0): the separate path is memcpy(hidden_in → mixed) then
+// rms_norm(normed, mixed). Bit-identical to that pair; mixed_out may be null
+// to skip the identity store. SPARKINFER_K3_ATTN_PREP=0 declines.
+bool k3_attn_prep_f32(float* normed_out, float* mixed_out,
+                      const float* hidden_in, const float* rms_w,
+                      int n, float eps, cudaStream_t stream);
+
 // ---------------------------------------------------------------------------
 // 16. Elementwise add (residual combine)
 // ---------------------------------------------------------------------------

@@ -9,12 +9,10 @@
 // instead of N strided peer loads. This is the lever to make TP=8 decode scale
 // (see docs/TP8_DECODE_OPTIMIZATION.md, logs/h200-8-june1-tp8-decode/).
 //
-// UNTESTED on hardware as committed — validate with `multimem_allreduce_bench`
-// before integrating into the decode path (cuda/src/qwen2_forward_tp.cu). The
-// implementation uses the CUDA driver multicast VMM API (cuMulticast*) +
-// multimem.* PTX; alignment/granularity/PTX-variant details must be confirmed
-// on the target 8× H200 box. Gated + fallback-safe: callers must check
-// multimem_allreduce_supported() and fall back to the peer-N all-reduce.
+// f32 path + rotating slots (kInputSlots=3) land for Kimi K3's residual stream.
+// Auto prefers this backend when multimem_allreduce_supported() passes (real
+// multicast bind probe, not the device attribute alone). Construction failure
+// falls back to peer-oneshot, then NCCL. Validate with `tp_allreduce_check`.
 
 #pragma once
 
@@ -68,9 +66,11 @@ public:
     // design, so a bf16-only surface forced every K3 multimem request down to
     // NCCL before construction.
     static constexpr bool kSupportsF32 = true;
-    // No rotating input slots: this backend keeps its exit barrier and its single
-    // peer-visible input. See sparkinfer/tp/k3_coll_1bar.h.
-    static constexpr int kInputSlots = 1;
+    // Rotating input slots for the single-barrier f32 path — same contract as
+    // PeerOneShotAllreduce. THREE, and the count is load-bearing; see
+    // sparkinfer/tp/k3_coll_1bar.h. static_assert'd against tp_allreduce.cuh's
+    // kSlotCount in the .cu.
+    static constexpr int kInputSlots = 3;
 
     // Unusable instance if unsupported; check ok() before use. `count` = max
     // elements (e.g. hidden_size); buffers are sized for this.
@@ -85,6 +85,11 @@ public:
     // Rank r's input device pointer (on devices[r]): write the rank's input
     // here before allreduce_bf16()/allreduce_f32(). nullptr if !ok().
     void* rank_buffer(int rank) const noexcept;
+    // Slot-addressed input, for the single-barrier f32 path. Slot 0 is the
+    // buffer rank_buffer(rank) returns, so a caller that never rotates sees
+    // main exactly. See sparkinfer/tp/k3_coll_1bar.h.
+    void* rank_buffer(int rank, int slot) const noexcept;
+    static int slots() noexcept;
 
     // Rank r's output device pointer (on devices[r]): holds the reduced sum
     // after allreduce_bf16()/allreduce_f32(). Distinct region from
@@ -103,6 +108,10 @@ public:
     // multiple of 4 (the ctor's multiple-of-8 gate already guarantees it). Exists
     // because Kimi K3 keeps its residual stream f32 by design.
     void allreduce_f32(std::size_t count, const std::vector<void*>& streams);
+    // slot >= 0 reduces out of that input slot with ONE rendezvous instead of
+    // two; slot < 0 is main's two-barrier kernel over slot 0. The caller owns
+    // the rotation and must have written its partial into rank_buffer(rank, slot).
+    void allreduce_f32(std::size_t count, const std::vector<void*>& streams, int slot);
 
     // Opaque PIMPL, defined in the .cu. Declared public so the file-local
     // setup/launch helpers can name the type; impl_ itself stays private.

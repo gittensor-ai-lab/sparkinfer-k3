@@ -1015,6 +1015,22 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
                 for (std::size_t r = 0; r < p.ranks.size(); ++r)
                     kimi_k3_swap_partial_buffer(p.ranks[r].fwd, K3LayerPhase::FfnPartial,
                                                 p.zc_out[r]);
+                // Overlap ffn_routed_norm with remaining host issue / peer exit
+                // rendezvous. After the 1-bar reduce each rank's result is private
+                // in reduce_out; launching the RMS here hides it behind issue of
+                // later ranks and behind peer barrier work. FfnFinish then skips
+                // the re-launch. SPARKINFER_K3_AR_RMS=0 keeps the Finish path.
+                static const bool ar_rms = [] {
+                    const char* e = std::getenv("SPARKINFER_K3_AR_RMS");
+                    return !(e && e[0] == '0');
+                }();
+                if (ar_rms) {
+                    if (!issue_all([&](int r) {
+                            return kimi_k3_issue_routed_norm(p.ranks[(size_t)r].fwd,
+                                                             layer);
+                        }))
+                        return false;
+                }
             }
         }
 

@@ -447,6 +447,9 @@ bool kimi_k3_forward_layer(KimiK3Forward& fwd, int layer, const float* hidden_in
 //               Everything here is Replicate and reads the ALREADY-REDUCED value,
 //               which is exactly why the collective cannot be deferred past it:
 //               routed_norm is an rms_norm and rms_norm is not linear.
+//               Optionally, kimi_k3_issue_routed_norm may have already enqueued the
+//               RMS on moe_out right after the MoE all-reduce (overlap with host
+//               issue / peer exit); FfnFinish then skips the re-launch.
 //
 // `All` runs all three back to back and is what kimi_k3_forward_layer calls, so the
 // tp_size 1 path is unchanged. Running All must be bit-identical to running the
@@ -525,6 +528,12 @@ void kimi_k3_forward_select_slot(KimiK3Forward& fwd, int slot);
 void kimi_k3_forward_batch_end(KimiK3Forward& fwd);
 float* kimi_k3_batch_partial_buffer(KimiK3Forward& fwd, int layer,
                                     K3LayerPhase phase, int n_slots, int* count);
+
+// Enqueue ffn_routed_norm on moe_out (in place) for this layer. Returns true if
+// launched (or layer has no routed_norm). Sets an internal skip so the next
+// FfnFinish on this Forward will not re-run the same RMS. SPARKINFER_K3_AR_RMS=0
+// makes this a no-op that returns false (caller keeps the FfnFinish path).
+bool kimi_k3_issue_routed_norm(KimiK3Forward& fwd, int layer);
 
 // Print the SPARKINFER_K3_PROFILE=1 phase breakdown to stderr (no-op when unset).
 void kimi_k3_profile_report();
