@@ -20,6 +20,29 @@ namespace k3k = sparkinfer::kernels::k3;
 
 namespace {
 
+// Rejoins any DAG lane still outstanding when its scope exits, on every path
+// including the error returns inside the layer phases. Joining is idempotent at
+// the graph level -- a lane that did no work contributes a no-op edge -- so
+// over-joining costs nothing, while under-joining fails the whole capture.
+template <class F>
+struct K3LaneScope {
+    unsigned* open;
+    F join;
+    K3LaneScope(const K3LaneScope&) = delete;
+    K3LaneScope& operator=(const K3LaneScope&) = delete;
+    ~K3LaneScope() {
+        while (*open) {
+            const unsigned bit = *open & (~*open + 1u);   // lowest set lane
+            int i = 0;
+            while (!((bit >> i) & 1u)) ++i;
+            *open &= ~bit;                                // clear FIRST, so this
+            join(i);                                      // always terminates
+        }
+    }
+};
+template <class F> K3LaneScope(unsigned*, F) -> K3LaneScope<F>;
+
+
 std::string blk(int i, const char* suffix) {
     char buf[96];
     std::snprintf(buf, sizeof(buf), "blk.%d.%s", i, suffix);
@@ -828,6 +851,36 @@ struct KimiK3Forward::Scratch {
     void* act_q8 = nullptr;
     void* moe_q8 = nullptr;            // optional llama CPU-compat block_q8_K scratch
 
+    // ---- DAG LANES -------------------------------------------------------
+    //
+    // The capture is one linear chain per rank, but a layer is not a chain. On an
+    // MLA layer the kv_a branch and the attention-gate projection depend only on
+    // `normed`, and neither is read until the decode kernel and the gate fold
+    // respectively -- so main's stream order makes ~7 launches wait on work no
+    // consumer of theirs is waiting for. Same shape on KDA (ssm_f_a/f_b/decay and
+    // ssm_beta hang off `normed`) and on every MoE layer (the shared expert hangs
+    // off `normed2` and is not read until the collective).
+    //
+    // Two side streams are enough for all three sites: the widest fork here is
+    // main + 2. They are created ONCE per rank, on the rank's device, because a
+    // stream created inside a capture is not capturable and one created per token
+    // would be a per-token cudaStreamCreate on the critical path.
+    static constexpr int kLanes = 2;
+    cudaStream_t lane[kLanes] = {nullptr, nullptr};
+    cudaEvent_t  ev_fork = nullptr;              // main -> lanes
+    cudaEvent_t  ev_lane[kLanes] = {nullptr, nullptr};   // lane -> main
+    // PER-LANE Q8 SCRATCH, AND WHY IT IS NOT AN OPTIMISATION.
+    //
+    // Every un-hoisted k3_proj_ggml_f32 / k3_proj_q8_multirow_1bar quantises its
+    // activation into a scratch buffer and then reads it back. On one stream that
+    // is a straight-line write-then-read; the moment two projections run
+    // CONCURRENTLY they interleave a write with the other's read and both get a
+    // torn activation. It is silent -- fluent output, wrong logits -- and it is
+    // exactly the aliasing failure recorded above for act_q8. A lane therefore
+    // never shares proj_q8 with the main stream or with the other lane.
+    void* proj_q8_lane[kLanes] = {nullptr, nullptr};
+    bool  lanes_ok = false;            // every lane object above was created
+
     std::vector<void*> owned;
 };
 
@@ -958,11 +1011,38 @@ bool kimi_k3_forward_alloc_scratch(const KimiK3Config& cfg, KimiK3Forward& fwd) 
                       k3k::k3_moe_q8_k_bytes(cfg.expert_latent, moe_ffn_local, cfg.top_k));
 
     if (!ok) { kimi_k3_forward_free_scratch(fwd); return false; }
+
+    // ---- DAG lanes ----
+    //
+    // NON-BLOCKING on purpose. A stream from cudaStreamCreate carries an implicit
+    // dependency on the legacy default stream; under SPARKINFER_K3_GRAPH=0 -- the
+    // A/B control and the only mode the profiler runs in -- that would serialise
+    // the lanes against anything the process does on the default stream and make
+    // the fork measure as a loss for a reason that has nothing to do with the fork.
+    //
+    // Failing to create a lane is NOT fatal: lanes_ok stays false, the forward
+    // issues main's linear order, and the run is a correct slow run rather than a
+    // dead one. Same policy as every other decline in this file.
+    bool lok = true;
+    for (int i = 0; i < KimiK3Forward::Scratch::kLanes; ++i) {
+        lok &= cudaStreamCreateWithFlags(&s.lane[i], cudaStreamNonBlocking) == cudaSuccess;
+        lok &= cudaEventCreateWithFlags(&s.ev_lane[i], cudaEventDisableTiming) == cudaSuccess;
+        // Sized like s.proj_q8 -- dense_ffn is the widest K any projection contracts
+        // over, so one allocation per lane covers every activation a lane quantises.
+        lok &= alloc_bytes(s.proj_q8_lane[i], k3k::k3_q8_0_bytes(cfg.dense_ffn));
+    }
+    lok &= cudaEventCreateWithFlags(&s.ev_fork, cudaEventDisableTiming) == cudaSuccess;
+    s.lanes_ok = lok;
     return true;
 }
 
 void kimi_k3_forward_free_scratch(KimiK3Forward& fwd) {
     if (!fwd.s) return;
+    for (int i = 0; i < KimiK3Forward::Scratch::kLanes; ++i) {
+        if (fwd.s->lane[i])    cudaStreamDestroy(fwd.s->lane[i]);
+        if (fwd.s->ev_lane[i]) cudaEventDestroy(fwd.s->ev_lane[i]);
+    }
+    if (fwd.s->ev_fork) cudaEventDestroy(fwd.s->ev_fork);
     for (void* p : fwd.s->owned) cudaFree(p);
     delete fwd.s;
     fwd.s = nullptr;
@@ -1112,19 +1192,90 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
     const bool ggml_qact_proj = qact_proj();
     const bool ggml_qact_moe = qact_moe();
 
-    auto proj = [&](float* y, const float* x, const KimiK3Tensor& W, int N, int K) {
+    // ---- DAG lanes: which stream (and which q8 scratch) a call is issued on ----
+    //
+    // A LANE IS A STREAM PLUS ITS OWN QUANTISATION SCRATCH, never one without the
+    // other. Threading the stream alone through the projections would leave both
+    // lanes writing s.proj_q8 and is the torn-activation race described on
+    // Scratch::proj_q8_lane.
+    struct Lane { cudaStream_t st; void* q8; };
+    const Lane main_lane{stream, s.proj_q8};
+    // Every site is gated twice: SPARKINFER_K3_DAG turns the whole thing off in one
+    // move, and a per-site switch isolates one fork on ONE binary. A bundle whose
+    // members cannot be measured separately hides a regression inside a win --
+    // which is how the -2.6% bundle shipped.
+    static const bool dag_all = [] {
+        const char* e = std::getenv("SPARKINFER_K3_DAG");
+        return !(e && e[0] == '0');
+    }();
+    auto site_on = [](const char* name) {
+        const char* e = std::getenv(name);
+        return !(e && e[0] == '0');
+    };
+    static const bool dag_mla = site_on("SPARKINFER_K3_DAG_MLA");
+    static const bool dag_kda = site_on("SPARKINFER_K3_DAG_KDA");
+    static const bool dag_moe = site_on("SPARKINFER_K3_DAG_MOE");
+    // THE DEBUG TAPS ARE NOT DAG-SAFE, AND THAT IS THE RIGHT TRADE.
+    //
+    // fwd.debug reads a scratch buffer straight after the launch that wrote it, on
+    // the MAIN stream. A buffer written on a lane is not ordered against that read
+    // until the join, so under a fork the taps would compare a value that has not
+    // been computed yet -- reporting a mismatch in the one mode whose whole job is
+    // to localise mismatches. The per-layer validation path runs main's linear
+    // order instead; the scored path never sets fwd.debug.
+    const bool dag = dag_all && s.lanes_ok && !fwd.debug;
+
+    // Fork n lanes off the main stream HERE. One event, n waiters: the lanes all
+    // branch from the same point, so recording once is the same graph as recording
+    // n times and one node smaller.
+    // OPEN-LANE BOOKKEEPING. Which lanes are outstanding is tracked in a bitmask
+    // rather than assumed from control flow, because the phases below have error
+    // returns between a fork and its join -- a refused projection, a weight that
+    // fails .ok(). Returning with work still queued on a side stream makes the
+    // enclosing cudaStreamEndCapture fail far from the cause. A mask, not a count:
+    // joins do not always run in index order, so a count cannot say WHICH lane is
+    // still open. These paths cannot fire on a well-formed model, which is exactly
+    // why they must not be left to reasoning.
+    unsigned lanes_open = 0;
+    auto dag_fork = [&](int n) {
+        if (!dag) return;
+        cudaEventRecord(s.ev_fork, stream);
+        for (int i = 0; i < n; ++i) cudaStreamWaitEvent(s.lane[i], s.ev_fork, 0);
+        lanes_open |= (1u << n) - 1u;
+    };
+    // Join lane i back. MUST run for every lane that was forked, before the phase
+    // returns: cudaStreamEndCapture fails outright on a capture with unjoined work,
+    // so a missed join is a loud failure at capture rather than a quiet race.
+    auto dag_join = [&](int i) {
+        if (!dag) return;
+        cudaEventRecord(s.ev_lane[i], s.lane[i]);
+        cudaStreamWaitEvent(stream, s.ev_lane[i], 0);
+        lanes_open &= ~(1u << i);
+    };
+    // Closes whatever is still open when this function returns, however it returns.
+    // On the normal path every lane is already joined and this is a no-op.
+    const K3LaneScope lane_scope{&lanes_open, dag_join};
+    auto lane_of = [&](int i) {
+        return dag ? Lane{s.lane[i], s.proj_q8_lane[i]} : main_lane;
+    };
+
+    auto proj_on = [&](Lane ln, float* y, const float* x, const KimiK3Tensor& W,
+                       int N, int K) {
         if (!W.ok()) return false;
         if (ggml_qact_proj) {
             // The one-barrier multi-row kernel is bit-identical and declines every
             // shape it does not improve, so this is a launch-geometry choice and not
             // a numerical one.
             if (k3k::k3_proj_q8_multirow_1bar(y, x, W.data, W.type, N, K,
-                                              s.proj_q8, stream))
+                                              ln.q8, ln.st))
                 return true;
             return k3k::k3_proj_ggml_f32(y, x, W.data, W.type, N, K,
-                                         s.proj_q8, stream);
+                                         ln.q8, ln.st);
         }
-        return k3k::k3_proj_f32(y, x, W.data, W.type, N, K, stream);
+        return k3k::k3_proj_f32(y, x, W.data, W.type, N, K, ln.st);
+    };
+    auto proj = [&](float* y, const float* x, const KimiK3Tensor& W, int N, int K) {
+        return proj_on(main_lane, y, x, W, N, K);
     };
 
     // ---- quantise an activation ONCE, then project from it repeatedly ----
@@ -1155,7 +1306,8 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
     // The pointer check is not a staleness guard -- it only asks "is this the activation
     // I just hoisted", and both are set within a few lines of each other. Anything else
     // takes the ordinary path.
-    auto proj_h = [&](float* y, const float* x, const KimiK3Tensor& W, int N, int K) {
+    auto proj_h_on = [&](Lane ln, float* y, const float* x, const KimiK3Tensor& W,
+                         int N, int K) {
         if (!W.ok()) return false;
         if (hoisted_src == x && W.type == 8) {
             // THE HOIST WAS SHORT-CIRCUITING THE ONE-BARRIER EPILOGUE.
@@ -1178,12 +1330,19 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             // does not write the scratch, so later proj_h calls on the same hoisted
             // activation are unaffected. k3_proj_q8_fused4_1bar at the KDA group is
             // the precedent -- it has passed qkvg_pre this way since #94.
+            // s.act_q8 is READ-ONLY here (x_pre_q8 skips the re-quantise), so every
+            // lane can share it. That is the whole reason the hoist and proj_q8 are
+            // separate buffers: a read-only activation is safe to fan out, a
+            // scratch that each call rewrites is not.
             if (k3k::k3_proj_q8_multirow_1bar(y, x, W.data, W.type, N, K,
-                                              s.act_q8, stream, /*x_pre_q8=*/true))
+                                              s.act_q8, ln.st, /*x_pre_q8=*/true))
                 return true;
-            return k3k::k3_proj_q8act_f32(y, s.act_q8, W.data, W.type, N, K, stream);
+            return k3k::k3_proj_q8act_f32(y, s.act_q8, W.data, W.type, N, K, ln.st);
         }
-        return proj(y, x, W, N, K);
+        return proj_on(ln, y, x, W, N, K);
+    };
+    auto proj_h = [&](float* y, const float* x, const KimiK3Tensor& W, int N, int K) {
+        return proj_h_on(main_lane, y, x, W, N, K);
     };
 
     // ---- phase 1: attention. Ends holding a FULL-WIDTH PARTIAL SUM,
@@ -1234,6 +1393,28 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             const float* w_cv = (const float*)L.ssm_conv1d_v.data + (size_t)ch_off * cfg.kda_conv_kernel;
             const float* w_dt = (const float*)L.ssm_dt_bias.data + ch_off;
             const float* w_a  = (const float*)L.ssm_a.data + hd_off;
+
+            // --- FORK: the decay chain and beta ------------------------------
+            //
+            // ssm_f_a -> ssm_f_b -> decay_gate is three dependent launches that
+            // read `normed` and are read only by the decode step; ssm_beta is one
+            // more of the same. Main's order runs them AFTER the convs and the two
+            // L2 norms, so the decode step waits for the sum of both chains when it
+            // only ever needed the longer one.
+            //
+            // Every tensor either chain touches is checked here, before the fork,
+            // so the failure paths below stay on a linear stream.
+            const bool kda_fork = dag && dag_kda &&
+                L.ssm_f_a.ok() && L.ssm_f_b.ok() && L.ssm_beta.ok() &&
+                L.ssm_dt_bias.ok() && L.ssm_a.ok() &&
+                // The convs are on the MAIN branch, but their check sits between
+                // the fork and the join. Folding it in here keeps a missing conv a
+                // plain early return on a linear stream instead of one that leaves
+                // the capture unjoined.
+                L.ssm_conv1d_q.ok() && L.ssm_conv1d_k.ok() && L.ssm_conv1d_v.ok();
+            if (kda_fork) dag_fork(2);
+            const Lane l_dec  = kda_fork ? lane_of(0) : main_lane;   // f_a -> f_b -> decay
+            const Lane l_beta = kda_fork ? lane_of(1) : main_lane;   // beta
 
             // attn_q / attn_k / attn_v / ssm_g all read the SAME s.normed at the same
             // [qkv, H] shape, so they go out as one launch instead of four, and one
@@ -1298,37 +1479,58 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
 
             if (!L.ssm_conv1d_q.ok() || !L.ssm_conv1d_k.ok() || !L.ssm_conv1d_v.ok())
                 return false;
-            k3k::kda_conv_step_f32(s.conv_q, st.conv_state_q[kda_ord], s.qkv_q,
-                                   w_cq, cfg.kda_conv_kernel,
-                                   qkv, stream);
-            k3k::kda_conv_step_f32(s.conv_k, st.conv_state_k[kda_ord], s.qkv_k,
-                                   w_ck, cfg.kda_conv_kernel,
-                                   qkv, stream);
-            k3k::kda_conv_step_f32(s.conv_v, st.conv_state_v[kda_ord], s.qkv_v,
-                                   w_cv, cfg.kda_conv_kernel,
-                                   qkv, stream);
-            if (fwd.debug) fwd.debug("dbg_conv_q", layer, s.conv_q, qkv);
-            if (fwd.debug) fwd.debug("dbg_conv_v", layer, s.conv_v, qkv);
-
             // q gets the extra 1/sqrt(head_dim) scale the reference applies before the
             // scan; k does not (see kda_decode_step_f32's contract on pre-scaled q).
-            k3k::l2_norm_heads_f32(s.conv_q, s.conv_q, head_dim, n_head,
-                                   1.0f / std::sqrt((float)head_dim), eps, stream);
-            k3k::l2_norm_heads_f32(s.conv_k, s.conv_k, head_dim, n_head, 1.0f, eps, stream);
+            const float q_l2_scale = 1.0f / std::sqrt((float)head_dim);
+
+            // FIVE DEPENDENT LAUNCHES FOR ~330 KB, ON ALL 69 KDA LAYERS.
+            //
+            // The three convs are mutually independent, and the q/k norms reduce over
+            // exactly the channels their own conv just wrote — so the group is one
+            // kernel over grid (n_head, 3). The two norms are the reason this is worth
+            // doing: they ran at n_head = 12 blocks on a 132-SM part.
+            //
+            // The debug taps below still see the same values; they just observe the
+            // fused kernel's output. The fused path declines (and we fall through to
+            // the five launches) for any head_dim wider than the block.
+            const bool kda_fused = !fwd.debug &&
+                k3k::k3_kda_conv_l2_fused(
+                    s.conv_q, s.conv_k, s.conv_v,
+                    st.conv_state_q[kda_ord], st.conv_state_k[kda_ord],
+                    st.conv_state_v[kda_ord],
+                    s.qkv_q, s.qkv_k, s.qkv_v, w_cq, w_ck, w_cv,
+                    cfg.kda_conv_kernel, head_dim, n_head, q_l2_scale, eps, stream);
+
+            if (!kda_fused) {
+                k3k::kda_conv_step_f32(s.conv_q, st.conv_state_q[kda_ord], s.qkv_q,
+                                       w_cq, cfg.kda_conv_kernel,
+                                       qkv, stream);
+                k3k::kda_conv_step_f32(s.conv_k, st.conv_state_k[kda_ord], s.qkv_k,
+                                       w_ck, cfg.kda_conv_kernel,
+                                       qkv, stream);
+                k3k::kda_conv_step_f32(s.conv_v, st.conv_state_v[kda_ord], s.qkv_v,
+                                       w_cv, cfg.kda_conv_kernel,
+                                       qkv, stream);
+                if (fwd.debug) fwd.debug("dbg_conv_q", layer, s.conv_q, qkv);
+                if (fwd.debug) fwd.debug("dbg_conv_v", layer, s.conv_v, qkv);
+                k3k::l2_norm_heads_f32(s.conv_q, s.conv_q, head_dim, n_head,
+                                       q_l2_scale, eps, stream);
+                k3k::l2_norm_heads_f32(s.conv_k, s.conv_k, head_dim, n_head, 1.0f, eps, stream);
+            }
             if (fwd.debug) fwd.debug("dbg_l2_q", layer, s.conv_q, qkv);
 
-            if (!proj_h(s.f_a_out, s.normed, L.ssm_f_a, head_dim, H)) return false;
-            if (!proj(s.g_raw, s.f_a_out, L.ssm_f_b, qkv, head_dim)) return false;
+            if (!proj_h_on(l_dec, s.f_a_out, s.normed, L.ssm_f_a, head_dim, H)) return false;
+            if (!proj_on(l_dec, s.g_raw, s.f_a_out, L.ssm_f_b, qkv, head_dim)) return false;
             if (!L.ssm_dt_bias.ok()) return false;
             if (!L.ssm_a.ok()) return false;
             // The gate reads g_raw anyway, so it adds the bias on the way in — one
             // launch instead of two, bit-identical. Declining runs both as main does.
             if (!k3k::k3_kda_decay_gate_dt(s.decay_g, s.g_raw, w_dt, w_a, head_dim,
-                                           n_head, cfg.kda_gate_lower_bound, stream)) {
-                k3k::k3_add_f32(s.g_raw, s.g_raw, w_dt, qkv, stream);
+                                           n_head, cfg.kda_gate_lower_bound, l_dec.st)) {
+                k3k::k3_add_f32(s.g_raw, s.g_raw, w_dt, qkv, l_dec.st);
                 k3k::kda_decay_gate_f32(s.decay_g, s.g_raw, w_a,
                                         head_dim, n_head, cfg.kda_gate_lower_bound,
-                                        stream);
+                                        l_dec.st);
             }
 
             // ssm_beta is [n_heads, hidden] and stays REPLICATED: its suffix is shared
@@ -1382,13 +1584,13 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
                 const bool okb =
                     (hoisted_src == s.normed && L.ssm_beta.type == 8)
                         ? k3k::k3_proj_q8act_f32(s.beta_out + r_off, s.act_q8, wbase,
-                                                 L.ssm_beta.type, n_rows, H, stream)
+                                                 L.ssm_beta.type, n_rows, H, l_beta.st)
                         : (ggml_qact_proj
                                ? k3k::k3_proj_ggml_f32(s.beta_out + r_off, s.normed,
                                                        wbase, L.ssm_beta.type, n_rows, H,
-                                                       s.proj_q8, stream)
+                                                       l_beta.q8, l_beta.st)
                                : k3k::k3_proj_f32(s.beta_out + r_off, s.normed, wbase,
-                                                  L.ssm_beta.type, n_rows, H, stream));
+                                                  L.ssm_beta.type, n_rows, H, l_beta.st));
                 if (!okb) return false;
             }
             // beta is the delta-rule update rate: llama.cpp's build_kda_layer applies
@@ -1401,10 +1603,14 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             if (!beta_sig_fused)
                 // Only the rows the projection above actually wrote — the rest of the
                 // scratch is stale and never read.
-                k3k::sigmoid_inplace_f32(s.beta_out + beta_off, beta_rows, stream);
+                k3k::sigmoid_inplace_f32(s.beta_out + beta_off, beta_rows, l_beta.st);
 
             if (fwd.debug) fwd.debug("dbg_decay_g", layer, s.decay_g, qkv);
             if (fwd.debug) fwd.debug("dbg_beta", layer, s.beta_out, cfg.n_q_heads);
+            // JOIN both lanes. The decode step below reads decay_g (lane 0) and
+            // beta_out (lane 1) alongside the convs it read from the main stream,
+            // so this is the point where the three chains have to meet.
+            if (kda_fork) { dag_join(0); dag_join(1); }
             // The warp-per-column step declines at any shape or alignment it is not
             // written for, and the tiled kernel below is then exactly what main runs.
             // Both read the same f32 state, so a decline is a slower path and never a
@@ -1436,6 +1642,27 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             const int mla_ord = kimi_k3_mla_ordinal(cfg, layer);
             if (mla_ord < 0) return false;
 
+            // --- FORK: the latent-KV branch and the attention gate ------------
+            //
+            // Both read `normed` and nothing else this layer produces, and neither
+            // is consumed until much later: the cache row not until the decode
+            // kernel, the gate not until the fold after it. On one stream they sit
+            // between the query projections and their own consumers for no reason
+            // other than that they were written there.
+            //
+            // The weights are checked BEFORE the fork. An early return with a lane
+            // still outstanding would leave the capture unjoined, so every path
+            // that can fail a lane is resolved while the stream is still linear.
+            const bool mla_fork = dag && dag_mla;
+            const int  mla_lanes = mla_fork ? (L.has_attn_gate ? 2 : 1) : 0;
+            if (mla_fork) {
+                if (!L.attn_kv_a_mqa.ok() || !L.attn_kv_a_norm.ok()) return false;
+                if (L.has_attn_gate && !L.attn_gate.ok()) return false;
+                dag_fork(mla_lanes);
+            }
+            const Lane l_kv   = mla_fork ? lane_of(0) : main_lane;
+            const Lane l_gate = mla_fork ? lane_of(1) : main_lane;
+
             if (L.has_q_lora) {
                 if (!proj_h(s.q_lora_out, s.normed, L.attn_q_a, cfg.q_lora_rank, H)) return false;
                 if (!L.attn_q_a_norm.ok()) return false;
@@ -1456,11 +1683,12 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             // decided below and recorded so the call site stays a single decision.
             bool absorb_strided = false;
 
-            if (!proj_h(s.kv_a_out, s.normed, L.attn_kv_a_mqa, cfg.key_length, H)) return false;
+            if (!proj_h_on(l_kv, s.kv_a_out, s.normed, L.attn_kv_a_mqa, cfg.key_length, H))
+                return false;
             if (!L.attn_kv_a_norm.ok()) return false;
             k3k::rms_norm_f32(s.kv_cmpr_normed, s.kv_a_out,
                               (const float*)L.attn_kv_a_norm.data, cfg.kv_lora_rank, eps,
-                              stream);
+                              l_kv.st);
             if (fwd.debug) fwd.debug("dbg_kvcmpr", layer, s.kv_cmpr_normed, cfg.kv_lora_rank);
 
             // K-cache row for this position: concat(normed kv_cmpr, RAW k_pe).
@@ -1474,11 +1702,11 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             if (st.kv_f16)
                 k3k::k3_mla_kv_store_f16(st.mla_kv_cache[mla_ord], s.kv_cmpr_normed,
                                          s.kv_a_out, st.d_pos, cfg.kv_lora_rank,
-                                         cfg.rope_dim, cfg.key_length, stream);
+                                         cfg.rope_dim, cfg.key_length, l_kv.st);
             else
                 k3k::k3_mla_kv_store_f32(st.mla_kv_cache[mla_ord], s.kv_cmpr_normed,
                                          s.kv_a_out, st.d_pos, cfg.kv_lora_rank,
-                                         cfg.rope_dim, cfg.key_length, stream);
+                                         cfg.rope_dim, cfg.key_length, l_kv.st);
 
             if (!L.attn_k_b.ok() || !L.attn_v_b.ok()) return false;
             absorb_strided = k3k::k3_mla_absorb_q_strided(
@@ -1502,6 +1730,10 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             }
             if (fwd.debug) fwd.debug("mla_absorb_q", layer, s.absorbed_q, qh * cfg.key_length);
 
+            // JOIN the KV lane. The decode kernel reads the row this token's store
+            // just wrote, so this is the edge that makes the fork legal at all.
+            if (mla_fork) dag_join(0);
+
             const float mla_scale = 1.0f / std::sqrt((float)cfg.key_length_mla);
             // host length: picks the launch plan only.
             // device length: what the kernel attends over.
@@ -1520,9 +1752,15 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             if (fwd.debug) fwd.debug("dbg_preattn", layer, s.mla_attn_out, qh * cfg.value_length_mla);
 
             if (L.has_attn_gate) {
-                if (!proj_h(s.gate_proj_out, s.normed, L.attn_gate, qh * cfg.value_length_mla, H))
+                // Issued on its own lane so it runs UNDER the attention rather than
+                // after it. Host issue order is irrelevant here -- every launch is
+                // async and the lane's only dependency is the fork event, so the
+                // gate is free to start the moment the fork retires.
+                if (!proj_h_on(l_gate, s.gate_proj_out, s.normed, L.attn_gate,
+                               qh * cfg.value_length_mla, H))
                     return false;
                 if (fwd.debug) fwd.debug("dbg_gateproj", layer, s.gate_proj_out, qh * cfg.value_length_mla);
+                if (mla_fork) dag_join(1);
                 k3k::mla_gate_out_f32(s.mla_attn_out, s.mla_attn_out, s.gate_proj_out,
                                       (int64_t)qh * cfg.value_length_mla, stream);
                 if (fwd.debug) fwd.debug("dbg_postgate", layer, s.mla_attn_out, qh * cfg.value_length_mla);
@@ -1576,6 +1814,33 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             if (fwd.debug) fwd.debug("dbg_dense_situ", layer, s.dense_situ, cfg.dense_ffn);
             if (!proj(s.ffn_out, s.dense_situ, L.ffn_down, H, cfg.dense_ffn)) return false;
         } else {
+            // --- FORK: routed_down and the whole shared expert ----------------
+            //
+            // Both read `normed2`. routed_down does NOT depend on the router --
+            // it is the dispatch's activation, not its selection -- so main's
+            // order makes a [3584 x 7168] projection wait behind a [896 x 7168]
+            // one and a top-k it has no relationship with. The shared expert is
+            // four more launches that nothing reads until the collective.
+            //
+            // moe_out and shexp_out are DISJOINT VIEWS of one allocation (see
+            // kimi_k3_forward_alloc_scratch): the dispatch writes [0, expert_latent)
+            // from the main stream while the lane writes [expert_latent, +H). One
+            // buffer, two ranges, no overlap -- which is what makes it safe to have
+            // two streams writing what one collective then reduces.
+            // Every tensor touched between the fork and the joins is checked HERE, for
+            // the same reason as the KDA site: an early return with a lane outstanding
+            // leaves the capture unjoined, and "EndCapture failed" is a much worse
+            // report than "this weight is missing". Declining to fork is always safe —
+            // the checks below still run and still return false, just on a linear stream.
+            const bool moe_fork = dag && dag_moe &&
+                L.ffn_routed_down.ok() && L.ffn_gate_inp.ok() && L.exp_probs_b.ok() &&
+                L.ffn_gate_exps.ok() && L.ffn_up_exps.ok() && L.ffn_down_exps.ok() &&
+                (!L.has_shared_experts ||
+                 (L.ffn_gate_shexp.ok() && L.ffn_up_shexp.ok() && L.ffn_down_shexp.ok()));
+            if (moe_fork) dag_fork(2);
+            const Lane l_rd  = moe_fork ? lane_of(0) : main_lane;   // routed_down
+            const Lane l_shx = moe_fork ? lane_of(1) : main_lane;   // shared expert
+
             if (!proj_h(s.router_logits, s.normed2, L.ffn_gate_inp, cfg.n_experts, H))
                 return false;
             if (fwd.debug) fwd.debug("dbg_router_logits", layer, s.router_logits, cfg.n_experts);
@@ -1598,11 +1863,14 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             // moe_out = build_norm(moe_out, ...)", and only after that does
             // ffn_routed_up run. Getting this backwards (norm between routed_down and
             // the dispatch) was an earlier version's bug, same class as the ssm_norm fix.
-            if (!proj_h(s.routed_down_out, s.normed2, L.ffn_routed_down, cfg.expert_latent, H))
+            if (!proj_h_on(l_rd, s.routed_down_out, s.normed2, L.ffn_routed_down,
+                           cfg.expert_latent, H))
                 return false;
 
             if (!L.ffn_gate_exps.ok() || !L.ffn_up_exps.ok() || !L.ffn_down_exps.ok())
                 return false;
+            // JOIN routed_down: the dispatch reads it as its activation.
+            if (moe_fork) dag_join(0);
             // THE EXPERT BAND. The router above ran on the replicated ffn_gate_inp,
             // so every rank picked the SAME top_k global ids; this rank evaluates only
             // the ones whose weights it holds, leaving a partial sum in s.moe_out that
@@ -1667,20 +1935,30 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
                                  cfg.moe_ffn * cfg.n_shared, tp_size);
                     return false;
                 }
-                if (!proj_h(s.dense_gate, s.normed2, L.ffn_gate_shexp, shexp_band, H))
+                if (!proj_h_on(l_shx, s.dense_gate, s.normed2, L.ffn_gate_shexp,
+                               shexp_band, H))
                     return false;
-                if (!proj_h(s.dense_up, s.normed2, L.ffn_up_shexp, shexp_band, H))
+                if (!proj_h_on(l_shx, s.dense_up, s.normed2, L.ffn_up_shexp,
+                               shexp_band, H))
                     return false;
                 k3k::situ_f32(s.dense_situ, s.dense_gate, s.dense_up, shexp_band,
-                             cfg.situ_beta, cfg.situ_linear_beta, stream);
-                if (!proj(s.shexp_out, s.dense_situ, L.ffn_down_shexp, H, shexp_band))
+                             cfg.situ_beta, cfg.situ_linear_beta, l_shx.st);
+                if (!proj_on(l_shx, s.shexp_out, s.dense_situ, L.ffn_down_shexp, H,
+                             shexp_band))
                     return false;
                 if (fwd.debug) fwd.debug("dbg_shexp_partial", layer, s.shexp_out, H);
             } else {
                 // The fused buffer is reduced whole, so a layer without a shared
                 // expert must still present a well-defined summand there.
-                cudaMemsetAsync(s.shexp_out, 0, (size_t)H * sizeof(float), stream);
+                cudaMemsetAsync(s.shexp_out, 0, (size_t)H * sizeof(float), l_shx.st);
             }
+            // JOIN the shared expert. Nothing on the main stream reads shexp_out,
+            // but the DRIVER reduces it the moment this phase returns, and the
+            // collective is enqueued on the main stream — so the join has to happen
+            // here, inside the phase, or the reduce races the lane that fills it.
+            // It is also what keeps the capture joined: an outstanding lane at
+            // cudaStreamEndCapture fails the capture outright.
+            if (moe_fork) dag_join(1);
         }
     }
 

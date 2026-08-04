@@ -157,6 +157,19 @@ void attn_res_mix_f32(float* out, const float* ckpts, const float* cur,
 //
 // x, out are [d_inner]; state is [d_conv-1, d_inner] with the time index fastest;
 // w is [d_conv, d_inner] with the time index fastest.
+// The three KDA short convs and the q/k L2 norms as ONE launch, grid (n_head, 3).
+// Replaces five dependent launches per KDA layer — two of which ran at n_head = 12
+// blocks on a 132-SM part. Bit-identical: the conv is per-channel and untouched, and
+// at kda_head_dim = 128 the norm already reduced exactly one element per thread over
+// one head, which is the mapping this keeps. Returns false (and changes nothing) when
+// head_dim exceeds the block width, so the caller keeps the unfused path.
+bool k3_kda_conv_l2_fused(float* out_q, float* out_k, float* out_v,
+                          float* st_q, float* st_k, float* st_v,
+                          const float* x_q, const float* x_k, const float* x_v,
+                          const float* w_q, const float* w_k, const float* w_v,
+                          int d_conv, int head_dim, int n_head,
+                          float q_scale, float eps, cudaStream_t stream);
+
 void kda_conv_step_f32(float* out, float* state, const float* x, const float* w,
                        int d_conv, int d_inner, cudaStream_t stream);
 
