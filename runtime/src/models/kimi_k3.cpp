@@ -10,6 +10,7 @@
 #include <cstring>
 #include <algorithm>
 #include <cstdlib>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -395,6 +396,10 @@ bool upload_force_f32(const GGUF& g, const std::string& name, KimiK3Weights& w,
 struct K3Profiler {
     struct Slot { cudaEvent_t a = nullptr, b = nullptr; bool pending = false; double ms = 0; long n = 0; };
     std::unordered_map<std::string, Slot> slots;   // key: "tag@device"
+    // Rank threads issue concurrently; slots[key] inserts and may rehash. Without a
+    // lock, a concurrent insert can invalidate Slot& held by another rank and hand
+    // back a destroyed cudaEvent ("invalid resource handle") mid-forward.
+    std::mutex mu;
     bool on = false;
     K3Profiler() { const char* e = std::getenv("SPARKINFER_K3_PROFILE"); on = e && e[0] == '1'; }
 
@@ -405,6 +410,7 @@ struct K3Profiler {
     }
     void start(const std::string& tag, cudaStream_t st) {
         if (!on) return;
+        std::lock_guard<std::mutex> lock(mu);
         auto& sl = slots[key_for(tag)];
         if (!sl.a) { cudaEventCreate(&sl.a); cudaEventCreate(&sl.b); }
         if (sl.pending) {   // drain the previous pair for this tag+device first
@@ -417,11 +423,13 @@ struct K3Profiler {
     }
     void stop(const std::string& tag, cudaStream_t st) {
         if (!on) return;
+        std::lock_guard<std::mutex> lock(mu);
         auto it = slots.find(key_for(tag));
         if (it != slots.end() && it->second.b) cudaEventRecord(it->second.b, st);
     }
     void report() {
         if (!on) return;
+        std::lock_guard<std::mutex> lock(mu);
         // Aggregate per TAG across devices. Every rank runs the same phases, so the
         // per-tag sum is total GPU time in that phase across the node, and the shares
         // are what the optimisation decision needs.
