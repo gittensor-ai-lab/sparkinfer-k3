@@ -1882,7 +1882,10 @@ def mark_merge_first(repo, results, dry_run, queue_auto_merge=False, prs=()):
     winner = ranked[0][0]
     for num, res in ranked:
         has = num == winner
-        act = "--add-label" if has else "--remove-label"
+        # Display only. Deliberately NOT the flag name: labels go through the issues REST
+        # endpoint below, and echoing a `gh pr edit` flag here made the dry-run describe a
+        # code path that no longer exists.
+        act = "add" if has else "remove"
         if dry_run:
             print(f"--- dry-run: would {act} merge-first on #{num} "
                   f"(tps={res.get('tps')})")
@@ -2178,8 +2181,19 @@ def main():
             if args.dry_run:
                 print(f"--- dry-run: would label #{num} {KL_REGRESSION_LABEL}")
             else:
-                lr = gh(["pr", "edit", str(num), "-R", args.repo,
-                         "--add-label", KL_REGRESSION_LABEL])
+                gh(["label", "create", KL_REGRESSION_LABEL, "-R", args.repo,
+                    "--color", "B60205",
+                    "--description", "parity is worse than main's, measured the same round"])
+                # NOT `gh pr edit --add-label`: it queries projectCards, which GitHub has
+                # deprecated, so it exits 1 even where the repo has no projects. merge-first
+                # and merge-conflict were both moved to the REST endpoint for exactly this
+                # reason; THIS call was missed, so the label that blocks the merge never
+                # landed. Observed on #104 and #115: both measured a parity regression, both
+                # printed the warning, and both ended the round carrying only their eval:*
+                # tier. Within a round unsafe_tier still excluded them, but the label IS the
+                # durable enforcement -- a later round or a human sees a clean PR.
+                lr = gh(["api", "-X", "POST", f"repos/{args.repo}/issues/{num}/labels",
+                         "-f", f"labels[]={KL_REGRESSION_LABEL}"])
                 if lr.returncode != 0:
                     # The label is what stops the merge, so failing to apply it must not
                     # leave the round merging the PR anyway.
