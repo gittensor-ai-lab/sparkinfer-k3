@@ -628,16 +628,42 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
     }
     const bool replaying = graph_on && p.graph_ready;
     const bool capturing = graph_on && !p.graph_ready;
+    bool launch_fused = false;   // set when the embed job also launched the graph
 
     {
         const IClock::time_point t0 = ip.on ? IClock::now() : IClock::time_point{};
-        if (!issue_all([&](int r) {
-                KimiK3TPRank& R = p.ranks[(size_t)r];
-                return embed_token(R.weights, cfg, token_id, R.x, R.stream);
-            })) return false;
-        if (ip.on) {
-            ip.t_issue += secs_since(t0);
-            if (!parallel_issue) ip.n_setdev += tp_size;
+        // ON REPLAY, fuse the embed and the graph launch into ONE pool job per
+        // rank: they are back-to-back on the same stream from the same worker,
+        // so one rendezvous (wake + join) is pure overhead. Stream order is
+        // identical, so this is bit-identical trivially. Capture tokens keep
+        // the two-step form — cudaStreamBeginCapture must sit between them.
+        // SPARKINFER_K3_FUSE_ISSUE=0 opts out.
+        static const bool fuse_issue = [] {
+            const char* e = std::getenv("SPARKINFER_K3_FUSE_ISSUE");
+            return !(e && e[0] == '0');
+        }();
+        if (replaying && fuse_issue) {
+            if (!issue_all([&](int r) {
+                    KimiK3TPRank& R = p.ranks[(size_t)r];
+                    if (!embed_token(R.weights, cfg, token_id, R.x, R.stream))
+                        return false;
+                    return cudaGraphLaunch(R.exec, R.stream) == cudaSuccess;
+                })) return false;
+            if (ip.on) {
+                ip.t_issue += secs_since(t0);
+                if (!parallel_issue) ip.n_setdev += tp_size;
+            }
+            launch_fused = true;
+        }
+        if (!launch_fused) {
+            if (!issue_all([&](int r) {
+                    KimiK3TPRank& R = p.ranks[(size_t)r];
+                    return embed_token(R.weights, cfg, token_id, R.x, R.stream);
+                })) return false;
+            if (ip.on) {
+                ip.t_issue += secs_since(t0);
+                if (!parallel_issue) ip.n_setdev += tp_size;
+            }
         }
     }
 
@@ -1107,7 +1133,8 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
         //
         // The issue pool already owns one thread per rank with its device pinned at thread
         // start, so dispatching the launch through it costs nothing and removes the ordering.
-        if (!issue_all([&](int r) {
+        // Skipped when the embed job already launched the graph (FUSE_ISSUE).
+        if (!launch_fused && !issue_all([&](int r) {
                 return cudaGraphLaunch(p.ranks[(size_t)r].exec,
                                        p.ranks[(size_t)r].stream) == cudaSuccess;
             })) {
@@ -1125,6 +1152,25 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
         // the ranks finish within a few microseconds of each other (the last layer's
         // all-reduce is a rendezvous), so waiting on them in parallel costs about
         // what waiting on rank 0 alone used to.
+        // PIN THE LANDING BUFFER, once, lazily. The caller's out_logits is
+        // pageable (the bench hands us a std::vector), so 8 workers each pay a
+        // driver bounce-buffer staging on every token. cudaHostRegister makes
+        // the same bytes DMA-able in place; cached by pointer so the cost is
+        // one-time. Same bytes, same destination — bit-identical trivially.
+        // SPARKINFER_K3_PIN_LOGITS=0 opts out.
+        static const bool pin_logits = [] {
+            const char* e = std::getenv("SPARKINFER_K3_PIN_LOGITS");
+            return !(e && e[0] == '0');
+        }();
+        static float* pinned_ptr = nullptr;
+        if (pin_logits && out_logits != pinned_ptr) {
+            if (pinned_ptr) cudaHostUnregister(pinned_ptr);
+            pinned_ptr = (cudaHostRegister(out_logits,
+                              (size_t)cfg.vocab * sizeof(float),
+                              cudaHostRegisterDefault) == cudaSuccess)
+                             ? out_logits : nullptr;
+            if (!pinned_ptr) cudaGetLastError();   // clear; pageable path still works
+        }
         if (!issue_all([&](int r) {
                 KimiK3TPRank& R = p.ranks[(size_t)r];
                 K3HeadBand hb;

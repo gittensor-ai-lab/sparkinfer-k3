@@ -89,6 +89,20 @@ __device__ __forceinline__ int get_int_b2(const int8_t* __restrict__ qs, int i32
     return x32;
 }
 
+// The same four bytes from 32-BIT loads: read the aligned word containing them
+// and splice neighbours with a funnel shift when the base is 2-byte offset.
+// Consecutive i32 share words, so an unrolled block collapses 16 16-bit loads
+// into ~9 32-bit ones (CSE). Identical bits in identical lane order — the
+// caller's dp4a chain and accumulator are untouched. The <=2 B over-read past a
+// tensor's final block is covered by cudaMalloc granularity; sanitizer-checked
+// before this ever defaults on.
+__device__ __forceinline__ int get_int_b2w(const int8_t* __restrict__ qs, int i32) {
+    const uintptr_t a = (uintptr_t)(qs + 4 * i32);
+    const uint32_t* __restrict__ w = (const uint32_t*)(a & ~(uintptr_t)3);
+    const int sh = (int)(a & 3u) * 8;   // 0 or 16, uniform across the tensor
+    return sh ? (int)__funnelshift_r(w[0], w[1], sh) : (int)w[0];
+}
+
 // ONE WARP PER QUANT BLOCK, not one thread.
 //
 // k3_kernels.cu gives one CUDA THREAD to each 32-value quant block, so the launch is
@@ -149,16 +163,21 @@ __global__ void quantize_q8_0_same_kernel(BlockQ8_0* __restrict__ out,
         out[b].qs[j] = (int8_t)__float2int_rn(xb[j] * id);
 }
 
-template <int BLOCK, int ROWS>
+// GT here splits ROWS across warp-groups (group g takes rows r == g mod GT),
+// giving GT x the resident warps at constant grid and constant 1/ROWS
+// activation re-read — the same lever as fused4's, on the larger pool.
+template <int BLOCK, int ROWS, bool WIDE = false, int GT = 1>
 __global__ void proj_q8_multirow_1bar_kernel(float* __restrict__ y,
                                              const BlockQ8_0* __restrict__ x,
                                              const BlockQ8_0* __restrict__ W,
                                              int blocks_per_row, int n_rows) {
     k3_pdl_sync();   // no-op unless launched programmatically
-    constexpr int NWARP = BLOCK / 32;
+    constexpr int NWARP = BLOCK / 32;          // warps per GROUP
     const int n0   = blockIdx.x * ROWS;
     const int lane = threadIdx.x & 31;
-    const int warp = threadIdx.x >> 5;
+    const int tx   = (int)threadIdx.x % BLOCK;  // b-index: unchanged by GT
+    const int grp  = (int)threadIdx.x / BLOCK;
+    const int warp = tx >> 5;                   // warp WITHIN the group
 
     __shared__ float shm[NWARP * ROWS];
 
@@ -166,7 +185,7 @@ __global__ void proj_q8_multirow_1bar_kernel(float* __restrict__ y,
 #pragma unroll
     for (int r = 0; r < ROWS; ++r) acc[r] = 0.0f;
 
-    for (int b = threadIdx.x; b < blocks_per_row; b += BLOCK) {
+    for (int b = tx; b < blocks_per_row; b += BLOCK) {
         // ONE activation block, staged once and reused by every row in this block.
         int xq[8];
 #pragma unroll
@@ -176,11 +195,13 @@ __global__ void proj_q8_multirow_1bar_kernel(float* __restrict__ y,
 #pragma unroll
         for (int r = 0; r < ROWS; ++r) {
             if (n0 + r >= n_rows) continue;
+            if (GT > 1 && (r % GT) != grp) continue;   // this group's rows
             const BlockQ8_0* row = W + (size_t)(n0 + r) * blocks_per_row;
             int sumi = 0;
 #pragma unroll
             for (int i = 0; i < 8; ++i)
-                sumi = __dp4a(get_int_b2(row[b].qs, i), xq[i], sumi);
+                sumi = __dp4a(WIDE ? get_int_b2w(row[b].qs, i)
+                                   : get_int_b2(row[b].qs, i), xq[i], sumi);
             const float dw = __half2float(__ushort_as_half(row[b].d));
             acc[r] += (float)sumi * (dw * dx);
         }
@@ -194,7 +215,7 @@ __global__ void proj_q8_multirow_1bar_kernel(float* __restrict__ y,
 #pragma unroll
         for (int off = 16; off > 0; off >>= 1)
             acc[r] += __shfl_down_sync(0xffffffff, acc[r], off);
-        if (lane == 0) shm[warp * ROWS + r] = acc[r];
+        if (lane == 0 && (GT == 1 || (r % GT) == grp)) shm[warp * ROWS + r] = acc[r];
     }
 
     __syncthreads();   // the only one
@@ -218,7 +239,23 @@ __global__ void proj_q8_multirow_1bar_kernel(float* __restrict__ y,
 //
 // Identical fix, identical bit-identity argument: the sixteen reductions are
 // independent, so they need to be separated from the shared write, not from each other.
-template <int BLOCK, int ROWS>
+// GTILE: the CTA is BLOCK*GT threads, but the b-stride stays BLOCK. Warp-group
+// g = threadIdx.x / BLOCK owns tensor g (GT=4) and does its own dp4a chain; the
+// b-index is tx = threadIdx.x % BLOCK, exactly what a BLOCK-wide CTA used.
+//
+// WHY THIS IS THE LEVER. These kernels are GRID-limited, not occupancy-limited:
+// fused4 launches 384 CTAs on 132 SMs = 11.6 warps/SM of a 64-warp machine, and
+// the row-budget ladder can only add warps by cutting ROWS, which pays 1/ROWS
+// activation re-read. GT adds warps at CONSTANT grid and CONSTANT re-read, and
+// each thread carries ROWS accumulators for ONE tensor instead of four, so
+// registers fall too. Measured evidence this is the right axis: warp-target
+// 3584 (more CTAs) = +0.82, while the instruction-width thesis measured +0.10.
+//
+// BIT-IDENTICAL: row (t,r)'s accumulator still strides b = tx, tx+BLOCK, ...
+// over all of K in ascending order; its warp still folds with the same
+// shfl_down butterfly over the same lanes; the epilogue still sums NWARP
+// partials in ascending w. GT changes only which warp holds which accumulator.
+template <int BLOCK, int ROWS, bool WIDE = false, int GT = 1>
 __global__ void proj_q8_fused4_1bar_kernel(float* __restrict__ y0, float* __restrict__ y1,
                                            float* __restrict__ y2, float* __restrict__ y3,
                                            const BlockQ8_0* __restrict__ x,
@@ -228,11 +265,13 @@ __global__ void proj_q8_fused4_1bar_kernel(float* __restrict__ y0, float* __rest
                                            const BlockQ8_0* __restrict__ W3,
                                            int blocks_per_row, int n_rows) {
     k3_pdl_sync();   // no-op unless launched programmatically
-    constexpr int NWARP = BLOCK / 32;
+    constexpr int NWARP = BLOCK / 32;          // warps per GROUP (b-stride width)
     constexpr int SLOTS = 4 * ROWS;
     const int n0   = blockIdx.x * ROWS;
     const int lane = threadIdx.x & 31;
-    const int warp = threadIdx.x >> 5;
+    const int tx   = (int)threadIdx.x % BLOCK;  // b-index: unchanged by GT
+    const int grp  = (int)threadIdx.x / BLOCK;  // warp-group == tensor at GT=4
+    const int warp = tx >> 5;                   // warp WITHIN the group
 
     __shared__ float shm[NWARP * SLOTS];
     const BlockQ8_0* Wt[4] = {W0, W1, W2, W3};
@@ -244,13 +283,14 @@ __global__ void proj_q8_fused4_1bar_kernel(float* __restrict__ y0, float* __rest
 #pragma unroll
         for (int r = 0; r < ROWS; ++r) acc[t][r] = 0.0f;
 
-    for (int b = threadIdx.x; b < blocks_per_row; b += BLOCK) {
+    for (int b = tx; b < blocks_per_row; b += BLOCK) {
         int xq[8];
 #pragma unroll
         for (int i = 0; i < 8; ++i) xq[i] = get_int_b2(x[b].qs, i);
         const float dx = __half2float(__ushort_as_half(x[b].d));
 #pragma unroll
         for (int t = 0; t < 4; ++t) {
+            if (GT > 1 && t != grp) continue;   // this group owns tensor `grp`
 #pragma unroll
             for (int r = 0; r < ROWS; ++r) {
                 if (n0 + r >= n_rows) continue;
@@ -258,7 +298,8 @@ __global__ void proj_q8_fused4_1bar_kernel(float* __restrict__ y0, float* __rest
                 int sumi = 0;
 #pragma unroll
                 for (int i = 0; i < 8; ++i)
-                    sumi = __dp4a(get_int_b2(row[b].qs, i), xq[i], sumi);
+                    sumi = __dp4a(WIDE ? get_int_b2w(row[b].qs, i)
+                                   : get_int_b2(row[b].qs, i), xq[i], sumi);
                 const float dw = __half2float(__ushort_as_half(row[b].d));
                 acc[t][r] += (float)sumi * (dw * dx);
             }
@@ -273,7 +314,8 @@ __global__ void proj_q8_fused4_1bar_kernel(float* __restrict__ y0, float* __rest
 #pragma unroll
             for (int off = 16; off > 0; off >>= 1)
                 v += __shfl_down_sync(0xffffffff, v, off);
-            if (lane == 0) shm[warp * SLOTS + t * ROWS + r] = v;
+            if (lane == 0 && (GT == 1 || t == grp))
+                shm[warp * SLOTS + t * ROWS + r] = v;
         }
 
     __syncthreads();   // the only one
@@ -351,10 +393,37 @@ bool k3_proj_q8_multirow_1bar(float* y, const float* x, const void* W, int wtype
     constexpr int QT = 128;
     if (!x_pre_q8) k3_quantize_q8_0(q8_scratch, x, nb, stream);
 
+    // SPARKINFER_K3_FASTB2W=1 swaps the weight-side Q8_0 accessor for the
+    // 32-bit funnel-shift form in BOTH fast kernels. DEFAULT OFF until measured
+    // (the identical mechanism measured +0.23 tok/s as B2WIDE on the small
+    // kernels; this pool is ~4x larger). One binary, one env, exact A/B.
+    static const bool b2w = [] {
+        const char* e = std::getenv("SPARKINFER_K3_FASTB2W");
+        return e && e[0] == '1';
+    }();
+    static const int projg_m = [] {
+        const char* e = std::getenv("SPARKINFER_K3_PROJ_G");
+        const int v = e ? atoi(e) : 1;
+        return (v == 2 || v == 4) ? v : 1;
+    }();
 #define K3_1BAR_LAUNCH(B, R)                                                        \
+    do { if (projg_m == 4 && (R) >= 4)                                              \
+    k3_pdl_launch(dim3((unsigned)((N + (R) - 1) / (R))), dim3((B) * 4), 0, stream,  \
+                  proj_q8_multirow_1bar_kernel<B, R, false, 4>,                     \
+                  y, (const BlockQ8_0*)q8_scratch, (const BlockQ8_0*)W, nb, N);     \
+    else if (projg_m == 2 && (R) >= 2)                                              \
+    k3_pdl_launch(dim3((unsigned)((N + (R) - 1) / (R))), dim3((B) * 2), 0, stream,  \
+                  proj_q8_multirow_1bar_kernel<B, R, false, 2>,                     \
+                  y, (const BlockQ8_0*)q8_scratch, (const BlockQ8_0*)W, nb, N);     \
+    else if (b2w)                                                                   \
+    k3_pdl_launch(dim3((unsigned)((N + (R) - 1) / (R))), dim3(B), 0, stream,        \
+                  proj_q8_multirow_1bar_kernel<B, R, true>,                         \
+                  y, (const BlockQ8_0*)q8_scratch, (const BlockQ8_0*)W, nb, N);     \
+    else                                                                            \
     k3_pdl_launch(dim3((unsigned)((N + (R) - 1) / (R))), dim3(B), 0, stream,        \
                   proj_q8_multirow_1bar_kernel<B, R>,                               \
-                  y, (const BlockQ8_0*)q8_scratch, (const BlockQ8_0*)W, nb, N)
+                  y, (const BlockQ8_0*)q8_scratch, (const BlockQ8_0*)W, nb, N);     \
+    } while (0)
 
     switch (TB * 100 + rows) {
         case 32 * 100 + 16: K3_1BAR_LAUNCH(32, 16); break;
@@ -390,6 +459,24 @@ bool k3_proj_q8_fused4_1bar(float* y0, float* y1, float* y2, float* y3, const fl
     if (N <= 0 || K <= 0 || wtype != 8 || K % 32 != 0) return false;
     if (!y0 || !y1 || !y2 || !y3 || !W0 || !W1 || !W2 || !W3 || !q8_scratch) return false;
 
+    // FUSED4_ROWS: the qkvg group is the LARGEST single weight stream in the
+    // token (4 x 1536x7168 x 69 layers = 3.23 GB/token/rank) and it is EXCLUDED
+    // from the warp budget by comment, never by measurement (k3_proj_rowbudget.h
+    // :44-47). At ROWS=4 it launches 384 CTAs = 11.6 warps/SM on a 132-SM part.
+    // ROWS=2 doubles the grid — the SAME grid-spread axis that measured POSITIVE
+    // as WARP_TARGET=3584, and the opposite of the intra-CTA packing axis that
+    // measured NEGATIVE as PROJ_G. Activation re-read doubles (+2.9 MB of L2
+    // against 3.23 GB of DRAM: negligible) and acc[4][ROWS] halves, so registers
+    // fall. Bit-identical: ROWS decides only which rows share a CTA; BLOCK, which
+    // sets accumulation order, is picked from K and untouched.
+    static const int f4rows = [] {
+        const char* e = std::getenv("SPARKINFER_K3_FUSED4_ROWS");
+        // MEASURED at the scored shape: 2 is the peak (+0.81 tok/s — the qkvg
+        // grid doubles to 768 CTAs); 1 gives it back (−0.09 vs base), so the
+        // win is the second wave of CTAs, not maximal spreading. =4 restores.
+        const int v = e ? atoi(e) : 2;
+        return (v == 1 || v == 2 || v == 4) ? v : 4;
+    }();
     constexpr int ROWS = 4;      // k3_proj_ggml_f32_x4's, so the two arms differ only
     if (N < ROWS) return false;  // in the epilogue
 
@@ -402,11 +489,51 @@ bool k3_proj_q8_fused4_1bar(float* y0, float* y1, float* y2, float* y3, const fl
 
     const unsigned grid = (unsigned)((N + ROWS - 1) / ROWS);
     const BlockQ8_0* xq = (const BlockQ8_0*)q8_scratch;
+    static const bool b2w4 = [] {
+        const char* e = std::getenv("SPARKINFER_K3_FASTB2W");
+        return e && e[0] == '1';
+    }();
+    static const int projg = [] {
+        const char* e = std::getenv("SPARKINFER_K3_PROJ_G");
+        const int v = e ? atoi(e) : 1;
+        return (v == 4) ? 4 : 1;
+    }();
 #define K3_1BAR4_LAUNCH(BS)                                                      \
+    do { if (projg == 4)                                                         \
+    k3_pdl_launch(dim3(grid), dim3((BS) * 4), 0, stream,                         \
+                  proj_q8_fused4_1bar_kernel<BS, ROWS, false, 4>,                \
+                  y0, y1, y2, y3, xq, (const BlockQ8_0*)W0, (const BlockQ8_0*)W1, \
+                  (const BlockQ8_0*)W2, (const BlockQ8_0*)W3, nb, N);            \
+    else if (b2w4)                                                               \
+    k3_pdl_launch(dim3(grid), dim3(BS), 0, stream,                               \
+                  proj_q8_fused4_1bar_kernel<BS, ROWS, true>,                    \
+                  y0, y1, y2, y3, xq, (const BlockQ8_0*)W0, (const BlockQ8_0*)W1, \
+                  (const BlockQ8_0*)W2, (const BlockQ8_0*)W3, nb, N);            \
+    else                                                                         \
     k3_pdl_launch(dim3(grid), dim3(BS), 0, stream,                               \
                   proj_q8_fused4_1bar_kernel<BS, ROWS>,                           \
                   y0, y1, y2, y3, xq, (const BlockQ8_0*)W0, (const BlockQ8_0*)W1, \
-                  (const BlockQ8_0*)W2, (const BlockQ8_0*)W3, nb, N)
+                  (const BlockQ8_0*)W2, (const BlockQ8_0*)W3, nb, N);            \
+    } while (0)
+    if (f4rows != ROWS) {
+        // ROWS=2 / 1 arms: same kernel, narrower row block, wider grid.
+        const unsigned g2 = (unsigned)((N + f4rows - 1) / f4rows);
+        if (f4rows == 2)
+            k3_pdl_launch(dim3(g2), dim3(TB == 32 ? 32 : (TB == 64 ? 64 : 128)), 0, stream,
+                TB == 32 ? proj_q8_fused4_1bar_kernel<32, 2>
+                         : (TB == 64 ? proj_q8_fused4_1bar_kernel<64, 2>
+                                     : proj_q8_fused4_1bar_kernel<128, 2>),
+                y0, y1, y2, y3, xq, (const BlockQ8_0*)W0, (const BlockQ8_0*)W1,
+                (const BlockQ8_0*)W2, (const BlockQ8_0*)W3, nb, N);
+        else
+            k3_pdl_launch(dim3(g2), dim3(TB == 32 ? 32 : (TB == 64 ? 64 : 128)), 0, stream,
+                TB == 32 ? proj_q8_fused4_1bar_kernel<32, 1>
+                         : (TB == 64 ? proj_q8_fused4_1bar_kernel<64, 1>
+                                     : proj_q8_fused4_1bar_kernel<128, 1>),
+                y0, y1, y2, y3, xq, (const BlockQ8_0*)W0, (const BlockQ8_0*)W1,
+                (const BlockQ8_0*)W2, (const BlockQ8_0*)W3, nb, N);
+        return true;
+    }
     switch (TB) {
         case 32:  K3_1BAR4_LAUNCH(32);  break;
         case 64:  K3_1BAR4_LAUNCH(64);  break;

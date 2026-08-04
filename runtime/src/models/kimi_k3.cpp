@@ -134,6 +134,9 @@ bool upload_sliced(const GGUF& g, const std::string& name, KimiK3Weights& w,
         out.type = t->ggml_type;
         out.n_bytes = t->n_bytes;
         for (int k = 0; k < 4; ++k) out.rank_ne[k] = t->dims[k];
+        // Load-time only (never inside a capture): build the SoA view of Q8_0
+        // weights. Declines everything it does not apply to.
+        k3k::k3_q8soa_register(out.data, out.type, out.rank_ne);
         return true;
     }
 
@@ -219,6 +222,7 @@ bool upload_sliced(const GGUF& g, const std::string& name, KimiK3Weights& w,
             out.type = t->ggml_type;
             out.n_bytes = t->n_bytes;
             for (int k = 0; k < 4; ++k) out.rank_ne[k] = t->dims[k];
+            k3k::k3_q8soa_register(out.data, out.type, out.rank_ne);
             return true;
         }
     }
@@ -672,6 +676,9 @@ bool kimi_k3_alloc_state(const KimiK3Config& cfg, int max_ctx, KimiK3RuntimeStat
         if (cudaMalloc(&p, sizeof(int)) != cudaSuccess) return false;
         out.owned.push_back(p);
         out.d_pos = (int*)p;
+        // The expert-weight threshold's depth gate reads this same mirror; bind it
+        // here, with the rank's device current and no capture in flight.
+        k3k::k3_weps_bind_pos(out.d_pos);
     }
 
     // Pre-warm the MLA split scratch while allocation is still legal. Inside a stream
@@ -802,6 +809,11 @@ struct KimiK3Forward::Scratch {
     float* normed2 = nullptr;      // [H]
     float* attn_out = nullptr;     // [H]
     float* ffn_out = nullptr;      // [H]
+    // routed_norm's out-of-place target, [expert_latent]. The norm used to run
+    // in place on moe_out, and in-place is the one shape rms_norm_f32 cannot
+    // grid-spread (a CTA that finished its reduction would overwrite x while
+    // another CTA is still reading it). 14 KB buys the spread on 92 launches.
+    float* moe_normed = nullptr;
 
     // KDA
     float* qkv_q = nullptr, *qkv_k = nullptr, *qkv_v = nullptr;   // [qkv]
@@ -933,6 +945,7 @@ bool kimi_k3_forward_alloc_scratch(const KimiK3Config& cfg, KimiK3Forward& fwd) 
     ok &= alloc_f(s.normed2, H);
     ok &= alloc_f(s.attn_out, H);
     ok &= alloc_f(s.ffn_out, H);
+    ok &= alloc_f(s.moe_normed, cfg.expert_latent);
 
     ok &= alloc_f(s.qkv_q, qkv);
     ok &= alloc_f(s.qkv_k, qkv);
@@ -1263,6 +1276,13 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
                        int N, int K) {
         if (!W.ok()) return false;
         if (ggml_qact_proj) {
+            // SoA-FIRST, restored deliberately: the SoA kernel now carries the
+            // one-barrier stash/fold verbatim (P2), so the epilogue confound that
+            // poisoned the first A/B is gone — enabling Q8SOA now changes ONLY the
+            // load width (2x LDG.128 per block vs 17 narrow loads). Gate off, and
+            // this line never fires; gate on, the A/B is clean.
+            if (k3k::k3_proj_q8soa_f32(y, x, W.data, N, K, ln.q8, ln.st))
+                return true;
             // The one-barrier multi-row kernel is bit-identical and declines every
             // shape it does not improve, so this is a launch-geometry choice and not
             // a numerical one.
@@ -1779,22 +1799,40 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
         // --- combine: replace on a checkpoint layer, add otherwise. Uses hidden_in
         // (the RAW pre-mix value), not s.mixed — the reference's residual add is
         // against the unmixed prefix_sum, only the norm/attention input was mixed. ---
-        if (banked) {
-            cudaMemcpyAsync(hidden_out, s.attn_out, (size_t)H * sizeof(float),
-                            cudaMemcpyDeviceToDevice, stream);
-        } else {
-            k3k::k3_add_f32(hidden_out, hidden_in, s.attn_out, H, stream);
-        }
-
-        // --- pre-FFN mix, no bank push ---
-        if (res_bs > 0) {
+        // The residual combine and the pre-FFN mix used to be separate launches: an
+        // add (or, banked, a D2D copy) materialised hidden_out, then the mix re-read
+        // it. The mix kernels now take the unsummed pair and write hidden_out
+        // themselves — same adds, same rounding, one launch fewer on all 93 layers.
+        // SPARKINFER_K3_RES_FUSE=0 restores the split form on one binary.
+        static const bool res_fuse = [] {
+            const char* e = std::getenv("SPARKINFER_K3_RES_FUSE");
+            return !(e && e[0] == '0');
+        }();
+        if (res_fuse && res_bs > 0 && st.n_ckpt > 0) {
             if (!L.ffn_res_score.ok()) return false;
-            k3k::attn_res_mix_f32(s.mixed2, st.res_bank, hidden_out,
+            k3k::attn_res_mix_f32(s.mixed2, st.res_bank,
+                                  banked ? s.attn_out : hidden_in,
                                   (const float*)L.ffn_res_score.data, H, st.n_ckpt, eps,
-                                  stream, s.res_scores);
+                                  stream, s.res_scores,
+                                  banked ? nullptr : s.attn_out, hidden_out);
         } else {
-            cudaMemcpyAsync(s.mixed2, hidden_out, (size_t)H * sizeof(float),
-                            cudaMemcpyDeviceToDevice, stream);
+            if (banked) {
+                cudaMemcpyAsync(hidden_out, s.attn_out, (size_t)H * sizeof(float),
+                                cudaMemcpyDeviceToDevice, stream);
+            } else {
+                k3k::k3_add_f32(hidden_out, hidden_in, s.attn_out, H, stream);
+            }
+
+            // --- pre-FFN mix, no bank push ---
+            if (res_bs > 0) {
+                if (!L.ffn_res_score.ok()) return false;
+                k3k::attn_res_mix_f32(s.mixed2, st.res_bank, hidden_out,
+                                      (const float*)L.ffn_res_score.data, H, st.n_ckpt, eps,
+                                      stream, s.res_scores);
+            } else {
+                cudaMemcpyAsync(s.mixed2, hidden_out, (size_t)H * sizeof(float),
+                                cudaMemcpyDeviceToDevice, stream);
+            }
         }
         if (!L.ffn_norm.ok()) return false;
         k3k::rms_norm_f32(s.normed2, s.mixed2, (const float*)L.ffn_norm.data, H, eps, stream);
@@ -1975,15 +2013,20 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             // reduce is wrong; if it matches and ffn_out still differs, the fault is
             // downstream in routed_norm / routed_up / shexp.
             if (fwd.debug) fwd.debug("dbg_moe_reduced", layer, s.moe_out, cfg.expert_latent);
+            // Out of place into moe_normed: same kernel, same reduction, same
+            // values — but out != x is what lets rms_norm_f32 grid-spread its
+            // output sweep (RMSG), which the in-place form must decline.
+            const float* moe_src = s.moe_out;
             if (L.has_routed_norm) {
                 if (!L.ffn_routed_norm.ok()) return false;
-                k3k::rms_norm_f32(s.moe_out, s.moe_out,
+                k3k::rms_norm_f32(s.moe_normed, s.moe_out,
                                   (const float*)L.ffn_routed_norm.data, cfg.expert_latent,
                                   eps, stream);
+                moe_src = s.moe_normed;
             }
 
-            if (fwd.debug) fwd.debug("dbg_moe_normed", layer, s.moe_out, cfg.expert_latent);
-            if (!proj(s.ffn_out, s.moe_out, L.ffn_routed_up, H, cfg.expert_latent))
+            if (fwd.debug) fwd.debug("dbg_moe_normed", layer, moe_src, cfg.expert_latent);
+            if (!proj(s.ffn_out, moe_src, L.ffn_routed_up, H, cfg.expert_latent))
                 return false;
             if (fwd.debug) fwd.debug("dbg_routed_up", layer, s.ffn_out, H);
 
