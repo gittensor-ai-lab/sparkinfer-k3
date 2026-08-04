@@ -1195,8 +1195,8 @@ class CiWorkflowTest(unittest.TestCase):
             self._bot().mark_merge_first(
                 "r", [(20, {"tps": 8.17}), (25, {"tps": 9.55})], True)
         out = buf.getvalue()
-        self.assertIn("--add-label merge-first on #25", out)
-        self.assertIn("--remove-label merge-first on #20", out)
+        self.assertIn("would add merge-first on #25", out)
+        self.assertIn("would remove merge-first on #20", out)
 
     def test_admin_merge_is_reachable_only_through_the_guards(self):
         """The bot may now bypass branch protection, by explicit operator choice. What must
@@ -2706,6 +2706,54 @@ class CiWorkflowTest(unittest.TestCase):
         verdict = "main measured 0 tok/s — refusing to score a round against it"
         self.assertFalse(bot.is_transient(RuntimeError(verdict)),
                          "a real verdict became retryable — the guard is now advisory")
+
+    def test_the_regression_label_uses_the_endpoint_that_works(self):
+        """`gh pr edit --add-label` queries projectCards, which GitHub deprecated, so it
+        exits 1 even where the repo has no projects. merge-first and merge-conflict were
+        both moved to the issues REST endpoint for exactly that reason; the
+        accuracy-regression call was missed.
+
+        Observed live on #104 and #115: both measured a parity regression, both printed the
+        warning, and both finished the round carrying only their eval:* tier. unsafe_tier
+        still excluded them from THAT round's merge decision, but the label is the durable
+        enforcement -- it is what NEVER_MERGE_LABELS reads, so without it a later round or a
+        human sees a clean PR."""
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        self.assertNotIn('"--add-label"', src,
+                         "a label is still applied via the deprecated projectCards path")
+        bot = self._bot()
+        # every label the merge path depends on must go through the REST endpoint
+        for lbl in ("merge-first", bot.KL_REGRESSION_LABEL, bot.CONFLICT_LABEL):
+            self.assertIn(f'labels[]={lbl}', src.replace('{KL_REGRESSION_LABEL}',
+                                                         bot.KL_REGRESSION_LABEL)
+                                               .replace('{CONFLICT_LABEL}',
+                                                        bot.CONFLICT_LABEL),
+                          f"{lbl} is not applied via issues/N/labels")
+        self.assertIn(bot.KL_REGRESSION_LABEL, bot.NEVER_MERGE_LABELS)
+
+    def test_the_wall_clock_margin_dominates_load_jitter(self):
+        """The differential is a BOUND carrying load variance, not a reading. At 512 marginal
+        tokens and a ~40 tok/s frontier the signal was ~12.8 s against jitter measured at up
+        to 17 s -- larger than the thing being measured -- and one round produced all three
+        mutually exclusive failures of this check on code that never changed: #104 too fast
+        (WORK_TOL), #109 too slow (SPEED_TOL), #113 negative delta.
+
+        The tolerances are deliberately NOT the fix: raising SPEED_TOL buys the same pass
+        rate by letting a binary claim 2x its measured speed, which is the fabrication this
+        guard refuses."""
+        ev = (ROOT / "bench/scripts/kimi_k3_eval.sh").read_text()
+        import re
+        m = re.search(r'MARGIN_TOKENS="\$\{KIMI_K3_MARGIN_TOKENS:-(\d+)\}"', ev)
+        self.assertIsNotNone(m, "MARGIN_TOKENS is no longer env-tunable with a default")
+        margin = int(m.group(1))
+        WORST_JITTER_S, FRONTIER = 17.0, 45.0
+        self.assertGreaterEqual(margin / FRONTIER, 2 * WORST_JITTER_S,
+                                f"{margin} tokens is {margin/FRONTIER:.1f}s of signal against "
+                                f"{WORST_JITTER_S}s of measured jitter — the bound carries no "
+                                f"information")
+        # and the tolerances must not have been loosened to compensate
+        self.assertIn("KIMI_K3_SPEED_TOL:-1.5", ev, "the fabrication tolerance was widened")
+        self.assertIn("KIMI_K3_WORK_TOL:-2.0", ev)
 
     def test_the_answer_key_capture_is_reproducible(self):
         """The corpus is committed with its hash and the capture is one documented command,
