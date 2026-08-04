@@ -2441,13 +2441,19 @@ class CiWorkflowTest(unittest.TestCase):
                          "a bit-identical PR (#77, #81) must be silent")
         verdict, ratio, note = bot.kl_ratchet(self.PR74_KL, m)
         self.assertEqual(verdict, "warn", "#74's 1.53x regression was reported as clean again")
+        # and crossing the bar is still a hard block
+        self.assertEqual(bot.kl_ratchet(0.06, m)[0], "reject")
         self.assertAlmostEqual(ratio, 1.528, places=2)
         self.assertIn("1.53x", note)
         self.assertIn("main", note)
 
         # The bars themselves would have said nothing about any of these.
+        # POLICY 2026-08-04: parity under label.py's 0.05 bar is not a regression, so the
+        # >=2x cases WARN rather than block -- main is 0.0039, so even 5x is 0.019, well
+        # inside what the bar accepts. The ratchet still SEES the drift, which is the
+        # property this test is really about; it no longer blocks on it alone.
         for mult, want in ((1.2499, "ok"), (1.25, "warn"), (1.9999, "warn"),
-                           (2.0, "reject"), (5.0, "reject")):
+                           (2.0, "warn"), (5.0, "warn")):
             self.assertEqual(bot.kl_ratchet(m * mult, m)[0], want,
                              f"{mult}x main classified wrong")
             self.assertLess(m * mult, 0.05 if mult < 12 else 1e9,
@@ -2527,7 +2533,9 @@ class CiWorkflowTest(unittest.TestCase):
         main = {f"ctx{d}": {"kl": 0.004} for d in (4, 128, 32768)}
         pr = {"ctx4": {"kl": 0.004}, "ctx128": {"kl": 0.004}, "ctx32768": {"kl": 0.010}}
         verdict, ratio, note = bot.kl_ratchet(pr, main)
-        self.assertEqual(verdict, "reject", "a 2.5x regression at 32k was not rejected")
+        # 0.010 is under the 0.05 bar, so this warns rather than blocks; the point of the
+        # test is that the WORST depth decides and is named, not that it blocks.
+        self.assertEqual(verdict, "warn", "a 2.5x regression at 32k went unreported")
         self.assertAlmostEqual(ratio, 2.5, places=6)
         self.assertIn("ctx32768", note, "the note does not say WHICH depth failed")
         # The mean ratio here is 1.5x -- a warn, not a reject. With the full nine deep
@@ -2572,9 +2580,13 @@ class CiWorkflowTest(unittest.TestCase):
                  "ctx512": 0.000065321, "ctx1024": 0.000067953, "ctx2048": 0.001943870,
                  "ctx4096": 0.000000325}
         v, r, note = bot.kl_ratchet(self._d(pr115), self._d(self.MAIN_DEPTHS))
-        self.assertEqual(v, "reject")
+        # POLICY: parity still under label.py's 0.05 bar is not a regression, however the
+        # ratio reads. 0.0019 at ctx2048 is 3.9% of the bar, so this WARNS and is reported
+        # -- visible in the round log and the PR comment -- but does not block a merge.
+        self.assertEqual(v, "warn")
         self.assertAlmostEqual(r, 4.632, places=2)
         self.assertIn("ctx2048", note)
+        self.assertIn("under the", note)
 
     def test_the_floor_is_not_tuned_to_two_cases(self):
         """Every floor from 1e-4 to 1e-3 clears #104 and keeps #115, so the default sits
@@ -2593,7 +2605,7 @@ class CiWorkflowTest(unittest.TestCase):
                 self.assertEqual(bot.kl_ratchet(self._d(pr104), self._d(self.MAIN_DEPTHS))[0],
                                  "ok", f"floor {f:g} blocks #104")
                 self.assertEqual(bot.kl_ratchet(self._d(pr115), self._d(self.MAIN_DEPTHS))[0],
-                                 "reject", f"floor {f:g} lets #115 through")
+                                 "warn", f"floor {f:g} silences #115 entirely")
         finally:
             bot.KL_RATCHET_FLOOR = orig
         self.assertGreaterEqual(orig, 1e-4)
@@ -2605,8 +2617,11 @@ class CiWorkflowTest(unittest.TestCase):
         bot = self._bot()
         self.assertGreater(self.MAIN_DEPTHS["ctx4"], bot.KL_RATCHET_FLOOR)
         worse = dict(self.MAIN_DEPTHS)
-        worse["ctx4"] = self.MAIN_DEPTHS["ctx4"] * 2.5
-        self.assertEqual(bot.kl_ratchet(self._d(worse), self._d(self.MAIN_DEPTHS))[0], "reject")
+        worse["ctx4"] = self.MAIN_DEPTHS["ctx4"] * 2.5      # 0.0167 — still under the bar
+        self.assertEqual(bot.kl_ratchet(self._d(worse), self._d(self.MAIN_DEPTHS))[0], "warn")
+        over = dict(self.MAIN_DEPTHS)
+        over["ctx4"] = 0.06                                  # at/over the 0.05 bar
+        self.assertEqual(bot.kl_ratchet(self._d(over), self._d(self.MAIN_DEPTHS))[0], "reject")
 
     def test_a_depth_the_pr_did_not_measure_is_called_out(self):
         """Comparing only the depths both sides happen to share would let a narrowed
@@ -3710,3 +3725,41 @@ class CiWorkflowTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class RatchetBlocksOnlyAtTheBarTest(unittest.TestCase):
+    """Parity under label.py's KL_BAR is not a regression, whatever the ratio says.
+
+    The ratchet still measures and reports every depth and still warns, because a ratio is
+    the only signal that sees drift at all. It no longer applies the blocking label below the
+    bar. What that gives up is deliberate and recorded: the absolute bar cannot see
+    cumulative drift -- #74 merged at 1.53x main, which moved the baseline permanently, and
+    about five such merges fit under 0.05 before the bar notices."""
+
+    MAIN = {"ctx4": 0.006694998, "ctx2048": 0.000419637}
+
+    def _bot(self):
+        import importlib.util
+        s = importlib.util.spec_from_file_location("b", str(ROOT / "eval/k3_eval_bot.py"))
+        m = importlib.util.module_from_spec(s); s.loader.exec_module(m); return m
+
+    @staticmethod
+    def _d(m):
+        return {k: {"kl": v} for k, v in m.items()}
+
+    def test_a_big_ratio_under_the_bar_warns_but_never_blocks(self):
+        bot = self._bot()
+        for mult in (2.0, 5.0, 7.0):                     # 0.0134, 0.0335, 0.0469 — all < 0.05
+            pr = dict(self.MAIN); pr["ctx4"] = self.MAIN["ctx4"] * mult
+            v, _, _ = bot.kl_ratchet(self._d(pr), self._d(self.MAIN))
+            self.assertEqual(v, "warn", f"{mult}x main is under the bar and must not block")
+
+    def test_crossing_the_bar_still_blocks(self):
+        bot = self._bot()
+        pr = dict(self.MAIN); pr["ctx4"] = 0.051
+        self.assertEqual(bot.kl_ratchet(self._d(pr), self._d(self.MAIN))[0], "reject")
+
+    def test_the_block_threshold_is_the_acceptance_bar(self):
+        bot = self._bot()
+        self.assertEqual(bot.KL_RATCHET_BLOCK_AT, 0.05,
+                         "the ratchet must block at label.py's KL_BAR, not a separate number")
