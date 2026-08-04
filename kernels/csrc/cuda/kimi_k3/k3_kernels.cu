@@ -988,7 +988,7 @@ __device__ __forceinline__ float block_dot_q8k(const BlockIQ1S& b,
 // What changed is the cost. At tp=8, 14 of every 16 selections are foreign, so this was
 // 43,008 CTAs launched per MoE layer to store one scattered float each. One memset does
 // the same job coalesced.
-template <int WARPS_PER_CTA, bool XVEC, typename Blk>
+template <int WARPS_PER_CTA, bool XVEC, typename Blk, int BPR = 0>
 __global__ void moe_gate_up_situ_kernel(float* __restrict__ scratch,
                                         const float* __restrict__ x,
                                         const int* __restrict__ ids,
@@ -1002,17 +1002,26 @@ __global__ void moe_gate_up_situ_kernel(float* __restrict__ scratch,
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
     const int k = blockIdx.y;                                  // which selected expert
-    const int j = blockIdx.x * WARPS_PER_CTA + warp;           // which ffn output row
-    if (j >= ffn) return;
 
     // EXPERT PARALLELISM. `ids` holds GLOBAL expert indices — every rank's router
     // sees the same replicated ffn_gate_inp and therefore selects the same top_k —
     // but this rank stores only experts [expert_begin, expert_begin+n_local).
     // Selections outside that band belong to another rank and contribute ZERO here;
     // the all-reduce that follows sums the bands back into the full top_k combine.
+    //
     const int e = ids[k] - expert_begin;
     if (e < 0 || e >= n_local_experts) return;   // memset already left this slot at 0
     const int blocks_per_row = latent / 256;
+
+    // MEASURED NEGATIVE, kept as a note rather than a gate: staging x in shared memory
+    // costs 39.89 -> 41.63 us here. Every warp in the CTA reads the same 14 KB x, which
+    // looks like 224 KB of re-reads per CTA worth eliminating -- but x is 14 KB and stays
+    // L1-RESIDENT, so those re-reads were already hits. The staging only adds a 14 KB
+    // copy and a __syncthreads() to a kernel that had neither.
+    const float* xsrc = x;
+
+    const int j = blockIdx.x * WARPS_PER_CTA + warp;           // which ffn output row
+    if (j >= ffn) return;
 
     const Blk* g_row = gate_exps + (size_t)(e * ffn + j) * blocks_per_row;
     const Blk* u_row = up_exps   + (size_t)(e * ffn + j) * blocks_per_row;
@@ -1022,11 +1031,33 @@ __global__ void moe_gate_up_situ_kernel(float* __restrict__ scratch,
     // iteration's divergent iq1s_grid_c gather sits alone on a dependent chain. Unrolling
     // puts four independent gathers and four weight loads in flight. Accumulation order
     // is unchanged, so this is bit-identical.
+    //
+    // BPR CLOSES THE REST OF THAT GAP. `#pragma unroll 4` is all nvcc can do with a
+    // runtime trip count: it still emits the loop, still re-tests the bound, and caps
+    // the gathers in flight at four. But blocks_per_row is latent/256 = 14 at every K3
+    // shape, a compile-time constant that merely arrives as an argument. Passing it as a
+    // template parameter lets nvcc unroll all 14 iterations and hoist 28 independent
+    // gathers (gate and up) onto one dependency graph — and this kernel is latency-bound
+    // on exactly those gathers, not on bandwidth: at IQ1_S's 0.195 B/param the expert
+    // weights are ~0.25 ms/token/rank against 4.8 TB/s, while the kernel measures 3.69 ms.
+    //
+    // Bit-identical: same operations, same order, same accumulators. Only the trip count
+    // moves from a register to an immediate. BPR = 0 keeps the runtime loop for any shape
+    // that is not specialised, so an unexpected latent is slow, never wrong.
+    if constexpr (BPR > 0) {
+#pragma unroll
+        for (int b = 0; b < BPR; ++b) {
+            const float* xb = xsrc + b * 256;
+            gacc += block_dot<XVEC>(g_row[b], xb, lane, 32);
+            uacc += block_dot<XVEC>(u_row[b], xb, lane, 32);
+        }
+    } else {
 #pragma unroll 4
-    for (int b = 0; b < blocks_per_row; ++b) {
-        const float* xb = x + b * 256;
-        gacc += block_dot<XVEC>(g_row[b], xb, lane, 32);
-        uacc += block_dot<XVEC>(u_row[b], xb, lane, 32);
+        for (int b = 0; b < blocks_per_row; ++b) {
+            const float* xb = xsrc + b * 256;
+            gacc += block_dot<XVEC>(g_row[b], xb, lane, 32);
+            uacc += block_dot<XVEC>(u_row[b], xb, lane, 32);
+        }
     }
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
@@ -1069,7 +1100,7 @@ __global__ void moe_gate_up_situ_kernel(float* __restrict__ scratch,
 // operation into two rounded ones. That measured as a 8.4e-13 KLD divergence from main
 // on the node — numerically nothing, but it is the difference between "bit-identical"
 // and "very close", and only the first one is verifiable by byte comparison.
-template <int WARPS_PER_CTA, bool XVEC, typename Blk>
+template <int WARPS_PER_CTA, bool XVEC, typename Blk, int BPR = 0>
 __global__ void moe_down_combine_kernel(float* __restrict__ out,
                                         const float* __restrict__ scratch,
                                         const int* __restrict__ ids,
@@ -1095,8 +1126,18 @@ __global__ void moe_down_combine_kernel(float* __restrict__ out,
         const Blk* d_row = down_exps + (size_t)(e * latent + o) * blocks_per_row;
         const float* act = scratch + (size_t)k * ffn;
         float acc = 0.0f;
-        for (int b = 0; b < blocks_per_row; ++b)
-            acc += block_dot<XVEC>(d_row[b], act + b * 256, lane, 32);
+        // Same compile-time trip count as the gate/up pass, and the same reason. Here
+        // blocks_per_row is ffn/256, which is 3 at the scored 2-D MoE band (768) — short
+        // enough that the loop overhead and the bound test are a real fraction of the
+        // body, and short enough to unroll completely. Bit-identical: same order.
+        if constexpr (BPR > 0) {
+#pragma unroll
+            for (int b = 0; b < BPR; ++b)
+                acc += block_dot<XVEC>(d_row[b], act + b * 256, lane, 32);
+        } else {
+            for (int b = 0; b < blocks_per_row; ++b)
+                acc += block_dot<XVEC>(d_row[b], act + b * 256, lane, 32);
+        }
 #pragma unroll
         for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffff, acc, off);
         if (lane == 0) partial[k] = acc;      // RAW; w[k] is applied in the fold
@@ -3280,7 +3321,11 @@ static void moe_expert_ffn_launch(float* out, float* scratch,
                                   float situ_beta, float situ_linear_beta,
                                   cudaStream_t stream,
                                   int expert_begin, int n_local_experts) {
-    constexpr int WARPS = 8;                       // 256-thread CTAs
+    // 256-thread CTAs. WARPS is a pure LAUNCH-GEOMETRY knob and changing it cannot move
+    // a bit: gate/up gives each warp its own output row with no cross-warp reduction, and
+    // down_combine's warps write partial[k] which is folded in increasing k whichever
+    // warp produced it. So this is safe to tune, and 8 was a choice rather than a
+    // measurement — see SPARKINFER_K3_MOE_WARPS below.
     const int lb_active = situ_linear_beta > 0.0f ? 1 : 0;
     // n_local <= 0 means "this rank holds every expert" — the tp_size 1 case, where
     // the band test must never reject. INT_MAX makes it a no-op rather than a branch.
@@ -3304,27 +3349,64 @@ static void moe_expert_ffn_launch(float* out, float* scratch,
     // so the bases alone decide it.
     const bool xvec = ((((uintptr_t)x) | ((uintptr_t)scratch)) & 15u) == 0;
 
-    const dim3 g1((unsigned)((ffn + WARPS - 1) / WARPS), (unsigned)top_k);
     const size_t dshm = (size_t)top_k * sizeof(float);
     const float inv_lb = lb_active ? 1.0f / situ_linear_beta : 1.0f;
 
+    // SPECIALISE THE TRIP COUNT THE MODEL ACTUALLY RUNS.
+    //
+    // latent/256 and ffn/256 are constants of the K3 shape (14 and 3 at the scored 2-D
+    // MoE band) that reach the kernel as runtime arguments, so nvcc can only manage
+    // `#pragma unroll 4` and the gathers in flight stay capped at four. Instantiating on
+    // the measured values lets it unroll fully. MEASURED 39.85 -> 37.74 us standalone
+    // (-5.3%, reproducible to 0.01 us over three reps).
+    //
+    // Only the two shapes K3 decodes at are specialised; anything else falls through to
+    // BPR = 0 and the runtime loop, unchanged. An unspecialised shape is slower, never
+    // wrong. SPARKINFER_K3_MOE_BPR=0 restores the runtime loop on ONE BINARY.
+    static const bool moe_bpr = [] {
+        const char* e = std::getenv("SPARKINFER_K3_MOE_BPR");
+        return !(e && e[0] == '0');
+    }();
+    const bool spec = moe_bpr && (latent == 3584) && (ffn == 768);
+
+    // WARPS per CTA. 8 was hard-coded and never swept; this makes it measurable on one
+    // binary. Bit-identical for the reason given above the declaration.
+    static const int moe_warps = [] {
+        const char* e = std::getenv("SPARKINFER_K3_MOE_WARPS");
+        const int v = e ? atoi(e) : 8;
+        return (v == 4 || v == 8 || v == 16) ? v : 8;
+    }();
+
+#define K3_MOE_BODY(W, XV, GU_BPR, DN_BPR)                                               \
+    do {                                                                                 \
+        const dim3 g1((unsigned)((ffn + (W) - 1) / (W)), (unsigned)top_k);                \
+        k3_pdl_launch(g1, (W) * 32, 0, stream,                                           \
+            moe_gate_up_situ_kernel<(W), XV, Blk, GU_BPR>,                               \
+            scratch, x, ids, (const Blk*)gate_exps, (const Blk*)up_exps, latent, ffn,    \
+            situ_beta, 1.0f / situ_beta, situ_linear_beta, inv_lb, lb_active,            \
+            expert_begin, n_local);                                                      \
+        k3_pdl_launch((unsigned)latent, (W) * 32, dshm, stream,                          \
+            moe_down_combine_kernel<(W), XV, Blk, DN_BPR>,                               \
+                out, scratch, ids, w, (const Blk*)down_exps, latent, ffn, top_k,         \
+                expert_begin, n_local);                                                  \
+    } while (0)
+
+#define K3_MOE_BY_WARPS(XV, GU_BPR, DN_BPR)                                              \
+    do {                                                                                 \
+        if (moe_warps == 4)       K3_MOE_BODY(4,  XV, GU_BPR, DN_BPR);                   \
+        else if (moe_warps == 16) K3_MOE_BODY(16, XV, GU_BPR, DN_BPR);                   \
+        else                      K3_MOE_BODY(8,  XV, GU_BPR, DN_BPR);                   \
+    } while (0)
+
     if (xvec) {
-        k3_pdl_launch(g1, WARPS * 32, 0, stream, moe_gate_up_situ_kernel<WARPS, true, Blk>, 
-            scratch, x, ids, (const Blk*)gate_exps, (const Blk*)up_exps, latent, ffn,
-            situ_beta, 1.0f / situ_beta, situ_linear_beta, inv_lb, lb_active,
-            expert_begin, n_local);
-        k3_pdl_launch((unsigned)latent, WARPS * 32, dshm, stream, moe_down_combine_kernel<WARPS, true, Blk>, 
-                out, scratch, ids, w, (const Blk*)down_exps, latent, ffn, top_k,
-                expert_begin, n_local);
+        if (spec) K3_MOE_BY_WARPS(true, 14, 3);
+        else      K3_MOE_BY_WARPS(true, 0, 0);
     } else {
-        k3_pdl_launch(g1, WARPS * 32, 0, stream, moe_gate_up_situ_kernel<WARPS, false, Blk>, 
-            scratch, x, ids, (const Blk*)gate_exps, (const Blk*)up_exps, latent, ffn,
-            situ_beta, 1.0f / situ_beta, situ_linear_beta, inv_lb, lb_active,
-            expert_begin, n_local);
-        k3_pdl_launch((unsigned)latent, WARPS * 32, dshm, stream, moe_down_combine_kernel<WARPS, false, Blk>, 
-                out, scratch, ids, w, (const Blk*)down_exps, latent, ffn, top_k,
-                expert_begin, n_local);
+        if (spec) K3_MOE_BY_WARPS(false, 14, 3);
+        else      K3_MOE_BY_WARPS(false, 0, 0);
     }
+#undef K3_MOE_BY_WARPS
+#undef K3_MOE_BODY
 }
 
 void moe_expert_ffn_iq2xs_f32(float* out, float* scratch,

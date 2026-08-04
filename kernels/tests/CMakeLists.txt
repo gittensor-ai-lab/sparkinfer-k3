@@ -48,6 +48,21 @@ target_link_libraries(kimi_k3_rms_norm_test PRIVATE si_k3)
 target_include_directories(kimi_k3_rms_norm_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
 add_test(NAME kimi_k3_rms_norm_test COMMAND kimi_k3_rms_norm_test)
 
+# Per-kernel time at the shapes the captured graph actually launches. A BENCH, not a
+# test: no add_test, because it asserts nothing and its numbers are machine-specific.
+#
+# It exists because the two cheap proxies for "where is the time" both misled a decision
+# on this model: node COUNT said a fusion worth 370 launches was a win (it measured
+# -6.0%, having collapsed 28 CTAs into 1), and idle SM-SLOTS said the activation
+# quantiser was 25.7% of the problem (370 of its 557 launches are on K <= 1536, already
+# at the launch-latency floor). nsys cannot run in the target container and the in-tree
+# K3Profiler is phase-level and illegal under graph capture, so this is what is left:
+# microseconds per launch at the real shapes, screened in seconds rather than in a
+# twenty-minute decode A/B.
+add_executable(k3_decode_shape_bench k3_decode_shape_bench.cu)
+target_link_libraries(k3_decode_shape_bench PRIVATE si_k3)
+target_include_directories(k3_decode_shape_bench PRIVATE ${PROJECT_SOURCE_DIR}/include)
+
 # K3 decode fast paths — ONE TEST BINARY PER OPTIMISATION, mirroring one source file
 # per optimisation (kernels/csrc/cuda/kimi_k3/k3_*.cu). A factor that has to be dropped
 # after a re-measurement takes its own test with it and leaves the others building.
