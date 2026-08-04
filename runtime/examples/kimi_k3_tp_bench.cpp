@@ -1,6 +1,7 @@
 // What does tensor parallelism actually buy on Kimi K3 decode?
 //
 //   kimi_k3_tp_bench <first-shard.gguf> [tp_size] [n_layers] [n_tokens] [--ctx N] [--seek]
+//                    [--repeat N]
 //                    [--ids a,b,c | --ids @FILE] [--logits FILE]
 //                    [--logits-prefix P --checkpoints L1,L2,...]
 //
@@ -313,14 +314,61 @@ int main(int argc, char** argv) {
     // Warm-up token, discarded: one-time context/module/lattice-table costs.
     if (!kimi_k3_tp_forward_token(p, 1000, logits.data())) { std::printf("warmup failed\n"); return 1; }
 
-    const auto t0 = std::chrono::steady_clock::now();
-    for (int t = 0; t < n_tokens; ++t) {
-        if (!kimi_k3_tp_forward_token(p, 1000 + t, logits.data())) {
-            std::printf("token %d failed\n", t); return 1;
+    // --repeat N: N TIMED PASSES FROM ONE LOAD.
+    //
+    // The weight load is ~90 s and a single timed pass is ~3 s, so a process that measures
+    // once spends 97% of its life loading. That is not a small annoyance: a 2-rep ABBA A/B
+    // at one context is 8 processes, so ~12 minutes of loading buys ~25 seconds of data,
+    // and a four-context guard sweep costs ~24 minutes the same way.
+    //
+    // The load is not the thing to fix — it is close to the floor already. Measured on this
+    // node: the weights are 554 GB, they ARE page-cache resident (cgroup file cache 608 GB
+    // against a ~2 TB limit), and host->device runs at 14.55 GB/s pageable across 8 threads
+    // (18.58 GB/s pinned), so ~554 GB / 14.55 GB/s is most of the 90 s. Pinning the staging
+    // buffers would win maybe 1.3x. Amortising the load over N passes wins N.
+    //
+    // Each pass is reported separately rather than averaged, because the caller wants the
+    // spread: an outlier pass is the signal that something on the box moved, and a mean
+    // would hide exactly that.
+    int repeat = 1;
+    for (int i = 2; i < argc; ++i)
+        if (!std::strcmp(argv[i], "--repeat") && i + 1 < argc) repeat = std::atoi(argv[i + 1]);
+    if (repeat < 1) repeat = 1;
+
+    // RE-SEEK BEFORE EVERY PASS, or the passes are not measuring the same thing.
+    //
+    // Each pass advances position by n_tokens. Without a reset, pass 2 starts where pass 1
+    // ended: at the scored context that walks off the end of the KV cache and the run dies
+    // with "token 1 failed", and even before it dies the MLA split plan changes underneath
+    // (observed: splits 32 -> 33, forcing a re-capture mid-measurement), so the later
+    // passes would time a different graph than the first. Caught by the first --repeat run;
+    // it would have quietly produced drifting numbers had the context been deeper.
+    auto reseek = [&](int target) -> bool {
+        for (auto& r : p.ranks) {
+            cudaSetDevice(r.device);
+            if (!kimi_k3_set_position(r.state, target)) return false;
         }
+        return true;
+    };
+    const int seek_target = do_seek ? max_ctx - n_tokens - 2 : -1;
+
+    double ms = 0.0;
+    for (int rep = 0; rep < repeat; ++rep) {
+        if (do_seek && rep > 0 && !reseek(seek_target)) {
+            std::printf("re-seek failed before pass %d\n", rep + 1); return 1;
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int t = 0; t < n_tokens; ++t) {
+            if (!kimi_k3_tp_forward_token(p, 1000 + t, logits.data())) {
+                std::printf("token %d failed\n", t); return 1;
+            }
+        }
+        const auto t1 = std::chrono::steady_clock::now();
+        ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / n_tokens;
+        if (repeat > 1)
+            std::printf("  pass %2d/%d          %.3f ms/token  (%.2f tok/s)\n",
+                        rep + 1, repeat, ms, 1000.0 / ms);
     }
-    const auto t1 = std::chrono::steady_clock::now();
-    const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / n_tokens;
 
     size_t free_b = 0, total_b = 0;
     cudaSetDevice(devs[0]);
