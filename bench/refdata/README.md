@@ -54,6 +54,11 @@ Turn them on for a change that plausibly breaks only very deep:
 
     K3_PARITY_DEPTHS=128,256,512,1024,2048,4096,8192,16384,32768
 
+End to end, `measure_accuracy` costs more than the decode figure because it pays **two
+model loads** — the 4-token probe and the deep pass are separate `kimi_k3_tp_bench`
+invocations on different prompts. Measured at the 8192 default: **452 s** per measured
+build, roughly 219 s of it model loading.
+
 **The two capture backends are not interchangeable.** `hello.spkl` was captured on CPU
 (the historical run, preserved so the number this gate has always reported stays
 comparable); the deep set was captured with `--ngl 999` because a 32k CPU prefill pages

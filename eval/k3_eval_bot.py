@@ -506,11 +506,17 @@ REFDATA = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 # The deep pass feeds the prefix through the DECODE path one token at a time -- the
 # runtime has no batched prefill -- so the cost is max(depth)/decode_tok_s per measured
 # build, paid once for main plus once per PR in a round. Measured on the 8x H200 node,
-# main @ be3c818, one continuous pass:
+# main @ be3c818, decode time for one continuous pass:
 #
 #     to  8192   233 s   (3.9 min)   <-- the default
 #     to 16384   427 s   (7.1 min)
 #     to 32768   809 s  (13.5 min)
+#
+# END TO END this function costs MORE than the decode figure, because it pays TWO model
+# loads: the 4-token probe and the deep pass are separate invocations (tp_bench takes one
+# --ids set, and they are different prompts). Measured at the 8192 default: 452 s per
+# measured build, of which ~219 s is model loading. A round pays that once for main plus
+# once per PR.
 #
 # Decode rate is flat at ~42 tok/s across those segments: per-token cost is dominated by
 # streaming the active weights, and MLA keeps the context-dependent term small. So the
