@@ -280,6 +280,25 @@ int main() {
             });
             std::printf("      (blocks_per_row: gate/up %d, down %d — both compile-time "
                         "constants passed as runtime args)\n", gu_blocks, dn_blocks);
+
+            // THE OTHER EXPERT PATH. Passing q8k_scratch selects block_dot_q8k, which
+            // quantises the activation to Q8_K and keeps the dot in INTEGERS until the
+            // whole 256-value block is reduced, instead of decoding each lattice entry to
+            // float inside the inner loop. It is the llama.cpp-contract path and the
+            // decode never takes it. Whether that is leaving time on the table has, as far
+            // as this tree records, never been measured — so measure it.
+            //
+            // NOT bit-identical to the f32 path and not proposed as a drop-in: quantising
+            // the activation is a real numerical change that would need a KLD argument.
+            // This is a scouting number to decide whether that argument is worth making.
+            void* q8k = nullptr;
+            if (cudaMalloc(&q8k, 1u << 20) == cudaSuccess) {
+                bench("moe_expert_ffn IQ1_S via Q8_K (integer dot)", 92, [&](cudaStream_t s){
+                    moe_expert_ffn_f32_by_type(out_lat, scratch, x_lat2, ids, wsel,
+                                               gate_e, up_e, down_e, LATENT, FFN, TOPK,
+                                               1.0f, 1.0f, 19, s, 0, NLOCAL, q8k);
+                });
+            }
         }
     }
 

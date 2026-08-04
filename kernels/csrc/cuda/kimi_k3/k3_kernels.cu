@@ -1002,26 +1002,31 @@ __global__ void moe_gate_up_situ_kernel(float* __restrict__ scratch,
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
     const int k = blockIdx.y;                                  // which selected expert
+    const int j = blockIdx.x * WARPS_PER_CTA + warp;           // which ffn output row
+    if (j >= ffn) return;
 
     // EXPERT PARALLELISM. `ids` holds GLOBAL expert indices — every rank's router
     // sees the same replicated ffn_gate_inp and therefore selects the same top_k —
     // but this rank stores only experts [expert_begin, expert_begin+n_local).
     // Selections outside that band belong to another rank and contribute ZERO here;
     // the all-reduce that follows sums the bands back into the full top_k combine.
-    //
     const int e = ids[k] - expert_begin;
     if (e < 0 || e >= n_local_experts) return;   // memset already left this slot at 0
     const int blocks_per_row = latent / 256;
 
-    // MEASURED NEGATIVE, kept as a note rather than a gate: staging x in shared memory
-    // costs 39.89 -> 41.63 us here. Every warp in the CTA reads the same 14 KB x, which
-    // looks like 224 KB of re-reads per CTA worth eliminating -- but x is 14 KB and stays
-    // L1-RESIDENT, so those re-reads were already hits. The staging only adds a 14 KB
-    // copy and a __syncthreads() to a kernel that had neither.
-    const float* xsrc = x;
-
-    const int j = blockIdx.x * WARPS_PER_CTA + warp;           // which ffn output row
-    if (j >= ffn) return;
+    // TWO STAGING EXPERIMENTS FAILED HERE, both measured, and they fail for one reason.
+    //
+    //   the activation x in shared memory   39.89 -> 41.63 us
+    //   the IQ1_S lattice in shared memory  39.91 alone, 37.67 -> 38.27 us with BPR
+    //
+    // x is 14 KB and read COALESCED; the lattice is 16 KB and read FULLY DIVERGENT (idx
+    // is an 11-bit codepoint built from each lane's own qs/qh byte, so 32 lanes want 32
+    // unrelated uint64s). Divergence made the lattice much the more plausible candidate
+    // and it still lost. Both are small enough to stay L1-RESIDENT, so in both cases the
+    // re-reads were already hits and staging only added a copy, a __syncthreads() and
+    // shared-memory carveout. The data has to actually be missing from L1 before staging
+    // it can pay -- counting traffic does not decide that, only asking which level of the
+    // hierarchy serves it does.
 
     const Blk* g_row = gate_exps + (size_t)(e * ffn + j) * blocks_per_row;
     const Blk* u_row = up_exps   + (size_t)(e * ffn + j) * blocks_per_row;
@@ -1047,14 +1052,14 @@ __global__ void moe_gate_up_situ_kernel(float* __restrict__ scratch,
     if constexpr (BPR > 0) {
 #pragma unroll
         for (int b = 0; b < BPR; ++b) {
-            const float* xb = xsrc + b * 256;
+            const float* xb = x + b * 256;
             gacc += block_dot<XVEC>(g_row[b], xb, lane, 32);
             uacc += block_dot<XVEC>(u_row[b], xb, lane, 32);
         }
     } else {
 #pragma unroll 4
         for (int b = 0; b < blocks_per_row; ++b) {
-            const float* xb = xsrc + b * 256;
+            const float* xb = x + b * 256;
             gacc += block_dot<XVEC>(g_row[b], xb, lane, 32);
             uacc += block_dot<XVEC>(u_row[b], xb, lane, 32);
         }
@@ -3393,9 +3398,9 @@ static void moe_expert_ffn_launch(float* out, float* scratch,
 
 #define K3_MOE_BY_WARPS(XV, GU_BPR, DN_BPR)                                              \
     do {                                                                                 \
-        if (moe_warps == 4)       K3_MOE_BODY(4,  XV, GU_BPR, DN_BPR);                   \
-        else if (moe_warps == 16) K3_MOE_BODY(16, XV, GU_BPR, DN_BPR);                   \
-        else                      K3_MOE_BODY(8,  XV, GU_BPR, DN_BPR);                   \
+        if (moe_warps == 4)       K3_MOE_BODY(4,  XV, GU_BPR, DN_BPR);               \
+        else if (moe_warps == 16) K3_MOE_BODY(16, XV, GU_BPR, DN_BPR);               \
+        else                      K3_MOE_BODY(8,  XV, GU_BPR, DN_BPR);               \
     } while (0)
 
     if (xvec) {
