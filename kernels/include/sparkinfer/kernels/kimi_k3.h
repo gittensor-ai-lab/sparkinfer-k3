@@ -322,6 +322,55 @@ void moe_expert_ffn_iq1s_f32(float* out, float* scratch,
                              cudaStream_t stream,
                              int expert_begin = 0, int n_local_experts = 0);
 
+// ---------------------------------------------------------------------------
+// 4c. IQ1_S on the int8 tensor cores — the BATCHED expert GEMM
+// ---------------------------------------------------------------------------
+// The routed experts are ~531 of UD-IQ1_S's 553 GiB, so this is the only tensor-core
+// opportunity in K3 whose prize is the model rather than a corner of it.
+//
+// IQ1_S is an int8 format EXACTLY: w = dl*(g + delta) with g in {-1,0,+1} and
+// delta = +/-0.125 rearranges to w = (dl/8)*(8g + s) with 8g + s in {-9,-7,-1,1,7,9},
+// and dl/8 is constant across the 32-value sub-block. mma.sync.m16n8k32.s8 reduces
+// exactly 32 values of k, so the scale domain and the instruction's k-extent coincide
+// and the int32 accumulator is drained once per mma. The conversion is bit-for-bit
+// lossless — not "higher precision than what is stored", which is what the Q4_K/Q6_K
+// int8 path can claim; this is an equality. k3_moe_iq1s_mma_cpu_test proves it over a
+// million values with no GPU, and measures the resulting reduction as 5x MORE accurate
+// than the shipped f32 scalar path (112 rounded adds at K=3584 against 3584).
+//
+// THESE ARE NOT ON ANY LIVE PATH. At M=1 — every path K3 runs today, decode and
+// prefill alike, since prompt ingestion is a forward_token loop — an m16 tile is 1/16
+// occupied and the shipped GEMV wins. They become correct only once a batched prefill
+// supplies M>1, and they are landed first because whether IQ1_S can reach the tensor
+// cores losslessly is what decides the value of building that batching at all.
+//
+// Tiled BM=32, not 128: 896 experts at top_k 16 send only T*16/896 rows to an expert
+// (~36 at a 2048-token chunk), so the expert GEMM is structurally skinny in M and no
+// chunk size a 32k prefill can offer changes that.
+
+// Per-row symmetric int8 quantization of f32 activations, one warp per row. The f32
+// twin of launch_prefill_quantize_rows_i8 (which takes bf16). Per-ROW scales, because
+// a scale constant in k is what lets the GEMM hoist it out of the reduction entirely.
+// `cols` must be a multiple of 32. Returns false if the shape is unsupported.
+bool k3_moe_iq1s_mma_quantize_rows(signed char* q, float* scale, const float* x,
+                                   int rows, int cols, cudaStream_t stream = nullptr);
+
+// C[M,N] = A[M,K] @ W[N,K]^T, W the native GGUF IQ1_S [N,K] blocks, A int8 with the
+// per-row scales `sa` above. C is f32 (K3 is f32 end to end) and COMPACT — row m of C
+// is the m'th row of this expert's group.
+//
+// `rows` optionally gathers A's M rows out of a larger token buffer (a MoE dispatch's
+// per-expert row list); null means identity. When it is given, `sa` is indexed by the
+// SOURCE token while C stays compact, so the caller scatters C itself.
+//
+// K must be a whole number of 256-value IQ1_S blocks — the tile derives the sub-block
+// index by shift and mask and has no partial-block form. K3's expert dims (3584, 3072,
+// 7168) all qualify. Returns false if the shape is unsupported or the lattice upload
+// failed; the caller must fall back rather than emit a wrong result.
+bool k3_moe_iq1s_mma_gemm(float* C, const signed char* A, const float* sa,
+                          const void* W, const int* rows,
+                          int M, int N, int K, cudaStream_t stream = nullptr);
+
 // Type-dispatched front doors. PREFER THESE over the per-type entry points.
 //
 // An unsloth dynamic quant mixes types per tensor, so the expert type is a property

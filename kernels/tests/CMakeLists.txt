@@ -61,8 +61,19 @@ add_executable(k3_kda_step_cpu_test k3_kda_step_cpu_test.cpp)
 set_target_properties(k3_kda_step_cpu_test PROPERTIES CXX_STANDARD 17)
 add_test(NAME k3_kda_step_cpu_test COMMAND k3_kda_step_cpu_test)
 
+# IQ1_S -> int8 tensor cores (k3_moe_iq1s_mma.cu). The load-bearing claim is that
+# IQ1_S IS an int8 format exactly — w = (dl/8)*(8g+s) — and that the 32-value
+# sub-block coincides with mma.m16n8k32's k-extent. Both are integer and
+# exactly-representable-float facts, so the CPU is the right place to prove them and a
+# GPU would only obscure them. Includes the negative control the GPU tests use: the
+# plausible simplification (drop the delta) must be measurably wrong.
+add_executable(k3_moe_iq1s_mma_cpu_test k3_moe_iq1s_mma_cpu_test.cpp)
+set_target_properties(k3_moe_iq1s_mma_cpu_test PROPERTIES CXX_STANDARD 17)
+target_include_directories(k3_moe_iq1s_mma_cpu_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
+add_test(NAME k3_moe_iq1s_mma_cpu_test COMMAND k3_moe_iq1s_mma_cpu_test)
+
 foreach(k3t k3_kda_step_gpu_test k3_mla_absorb_gpu_test
-            k3_proj_1bar_gpu_test)
+            k3_proj_1bar_gpu_test k3_moe_iq1s_mma_gpu_test)
     add_executable(${k3t} ${k3t}.cu)
     target_link_libraries(${k3t} PRIVATE si_k3)
     target_include_directories(${k3t} PRIVATE ${PROJECT_SOURCE_DIR}/include)
