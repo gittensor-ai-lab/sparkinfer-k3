@@ -96,6 +96,20 @@ bool embed_token(const KimiK3Weights& w, const KimiK3Config& cfg, int token_id,
     return k3k::dequant_f32_by_type(x, base, cfg.hidden, w.token_embd.type, stream);
 }
 
+// The chunk size for kimi_k3_tp_forward_prompt. Read HERE rather than at the use
+// site because kimi_k3_tp_init has to size the collective's owned buffers against
+// it: a chunk reduces B partials in one call, and a collective sized for one
+// token's 10752 floats fails the very first reduce — after a two-minute weight
+// load, which is the most expensive possible place to discover it.
+int prefill_batch_env() {
+    static const int v = [] {
+        const char* e = std::getenv("SPARKINFER_K3_PREFILL_BATCH");
+        const int x = e ? std::atoi(e) : 1;
+        return x > 0 ? x : 1;
+    }();
+    return v;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -440,7 +454,28 @@ bool kimi_k3_tp_init(const GGUF& g, const KimiK3Config& cfg, const K3PlanOptions
     // after a two-minute weight load.
     const size_t attn_count = (size_t)cfg.hidden;
     const size_t moe_count  = (size_t)cfg.expert_latent + (size_t)cfg.hidden;
-    const size_t max_count  = attn_count > moe_count ? attn_count : moe_count;
+    // ...times the chunk size, because kimi_k3_tp_forward_prompt reduces a whole
+    // chunk's partials in ONE call. They are contiguous by construction (the batch
+    // arena in kimi_k3.cpp lays slots out end to end), so the payload is exactly
+    // B * the per-token width. At B=1 this is the value it has always been.
+    // Scaled by the prefill chunk size, because kimi_k3_tp_forward_prompt reduces
+    // a chunk's partials in one call and they are contiguous by construction.
+    //
+    // AN EARLIER ATTEMPT AT THIS WAS BACKED OUT ON A BAD DIAGNOSIS. Scaling it
+    // coincided with an 8-token chunk failing the WEIGHT load at layer 68, and that
+    // was recorded here as "the owned buffers are peer-mapped per rank per slot, so
+    // the multiplier lands on the allocation the model has no headroom for". The
+    // arithmetic does not support it: PeerOneShotAllreduce allocates
+    // count*4*(kSlotCount+2) bytes PER DEVICE, which at B=8 is ~1.7 MB against ~70
+    // GiB of headroom. The real cause was the driver still reclaiming the previous
+    // run's 1.1 TiB — nvidia-smi reads 0 MiB before reclamation completes, which is
+    // exactly the race kimi_k3_eval.sh's settle_gpus() exists for and which my
+    // launcher did not wait out.
+    //
+    // Capped so a mistyped SPARKINFER_K3_PREFILL_BATCH cannot ask for gigabytes.
+    const size_t per_tok    = attn_count > moe_count ? attn_count : moe_count;
+    const int    pb_cap     = prefill_batch_env() > 512 ? 512 : prefill_batch_env();
+    const size_t max_count  = per_tok * (size_t)pb_cap;
     out.coll = tp::make_collective(devices, requested, &err, max_count,
                                    /*need_f32=*/true);
     if (!out.coll) {
@@ -1839,6 +1874,289 @@ bool kimi_k3_tp_prefill(KimiK3TP& p, const int* ids, int n_ids, float* out_logit
     }
     for (int i = n_tiled; i < n_ids; ++i)
         if (!kimi_k3_tp_forward_token(p, ids[i], out_logits)) return false;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Chunked prompt ingestion
+// ---------------------------------------------------------------------------
+namespace {
+
+// Grow (once) the per-rank chunk buffers and the per-rank batch arena.
+bool prompt_alloc(KimiK3TP& p, int B) {
+    const KimiK3Config& cfg = p.cfg;
+    const int H = cfg.hidden;
+    for (auto& R : p.ranks) {
+        if (R.b_cap >= B) continue;
+        if (R.b_cap > 0) return false;   // regrow would strand the old allocations
+        if (cudaSetDevice(R.device) != cudaSuccess) return false;
+        void* a = nullptr; void* b = nullptr; void* c = nullptr;
+        if (cudaMalloc(&a, (size_t)B * H * sizeof(float)) != cudaSuccess) return false;
+        if (cudaMalloc(&b, (size_t)B * H * sizeof(float)) != cudaSuccess) return false;
+        if (cudaMalloc(&c, sizeof(int)) != cudaSuccess) return false;
+        R.xb = (float*)a; R.xnb = (float*)b; R.d_pos_base = (int*)c;
+        R.b_cap = B;
+        // The forward's own arena: attn_out / moe_fused / ffn_out / res_bank, xB.
+        // fwd.state must already be wired, because the residual bank is sized from
+        // state->max_ckpt — allocating before that silently gives a zero-row bank
+        // and every checkpoint push lands out of bounds.
+        if (!R.fwd.state) return false;
+        if (!kimi_k3_forward_alloc_batch(cfg, R.fwd, B)) return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+bool kimi_k3_tp_forward_prompt(KimiK3TP& p, const int* ids, int n,
+                               float* out_logits) {
+    if (p.ranks.empty() || !p.coll || !ids || n <= 0) return false;
+    const KimiK3Config& cfg = p.cfg;
+    const int H = cfg.hidden;
+    const int tp_size = (int)p.ranks.size();
+
+    static const int want_B = [] {
+        const char* e = std::getenv("SPARKINFER_K3_PREFILL_BATCH");
+        const int v = e ? std::atoi(e) : 1;
+        return v > 0 ? v : 1;
+    }();
+    // B == 1 IS NOT SHORT-CIRCUITED TO forward_token. It runs the chunked walk
+    // through a one-slot arena so that "B=1 matches main" is evidence about THIS
+    // code, not about code it bypassed.
+    const int B = want_B;
+
+    if (!prompt_alloc(p, B)) {
+        std::fprintf(stderr, "[k3-tp] prefill: chunk arena alloc failed (B=%d)\n", B);
+        return false;
+    }
+
+    // GRAPH CAPTURE IS OFF ON THIS PATH, AND IT IS NOT FREE. Measured 53.10 tok/s
+    // captured against 29.30 uncaptured at 1k context: the graph is worth ~1.8x,
+    // so a chunk has to earn that back before it earns anything. The walk below is
+    // deliberately a CONSTANT shape for a full chunk (same layers, same phase
+    // order, same B) precisely so it can be captured later; the ragged tail is the
+    // only variable part and it is split off into its own pass.
+    const bool serial_issue = std::getenv("SPARKINFER_K3_SERIAL_ISSUE") != nullptr;
+    const bool parallel_issue = (tp_size > 1) && !serial_issue;
+    if (parallel_issue && !p.issue.started()) {
+        std::vector<int> devs;
+        devs.reserve(p.ranks.size());
+        for (auto& R : p.ranks) devs.push_back(R.device);
+        p.issue.start(devs);
+    }
+    auto issue_all = [&](const std::function<bool(int)>& job) -> bool {
+        if (parallel_issue) return p.issue.run(job);
+        for (int r = 0; r < tp_size; ++r) {
+            if (cudaSetDevice(p.ranks[(size_t)r].device) != cudaSuccess) return false;
+            if (!job(r)) return false;
+        }
+        return true;
+    };
+
+    // Reduce a chunk's partials IN SLICES THAT FIT THE COLLECTIVE'S CAPACITY.
+    //
+    // The obvious move — size the collective B-fold at init — does not survive
+    // contact with this model: its owned buffers are peer-mapped and replicated per
+    // rank per slot, and multiplying them by 8 made the WEIGHT load fail at layer
+    // 68 on an idle box. There is no headroom to buy.
+    //
+    // So the payload is sliced instead. Slots are contiguous, so slice s covers
+    // tokens [s*k, (s+1)*k) and one call still carries k tokens rather than one —
+    // the collective count drops from B per layer to ceil(B/k), which is the whole
+    // point, just bounded by what fits. cap == 0 means the backend states no limit
+    // (NCCL reduces in place) and the chunk goes in one call.
+    auto reduce_chunk = [&](int layer, K3LayerPhase phase, int Bc) -> bool {
+        int count = 0;
+        std::vector<float*> bases((size_t)tp_size, nullptr);
+        for (int r = 0; r < tp_size; ++r) {
+            int nn = 0;
+            float* buf = kimi_k3_batch_partial_buffer(p.ranks[(size_t)r].fwd, layer,
+                                                      phase, Bc, &nn);
+            if (!buf || nn <= 0) return false;
+            if (r == 0) count = nn; else if (nn != count) return false;
+            bases[(size_t)r] = buf;
+        }
+        const int per_tok = count / Bc;              // exact: the arena is [B][width]
+        const size_t cap = p.coll->max_count();
+        int per_call = Bc;
+        if (cap > 0 && (size_t)count > cap) {
+            per_call = (int)(cap / (size_t)per_tok);
+            if (per_call < 1) return false;          // one token does not even fit
+        }
+        for (int off = 0; off < Bc; off += per_call) {
+            const int m = std::min(per_call, Bc - off);
+            for (int r = 0; r < tp_size; ++r)
+                p.reduce_bufs[(size_t)r] = bases[(size_t)r] + (size_t)off * per_tok;
+            if (!p.coll->allreduce_f32_group(p.reduce_bufs,
+                                             (size_t)m * per_tok, p.streams))
+                return false;
+            ++p.n_collectives;
+        }
+        return true;
+    };
+
+    for (int base = 0; base < n; base += B) {
+        const int Bc = std::min(B, n - base);
+        const int pos0 = p.ranks[0].state.position;
+
+        // ---- embed the chunk, and plant the chunk's base position -------------
+        if (!issue_all([&](int r) {
+                KimiK3TPRank& R = p.ranks[(size_t)r];
+                for (int t = 0; t < Bc; ++t)
+                    if (!embed_token(R.weights, cfg, ids[base + t],
+                                     R.xb + (size_t)t * H, R.stream)) return false;
+                if (R.d_pos_base &&
+                    cudaMemcpyAsync(R.d_pos_base, &pos0, sizeof(int),
+                                    cudaMemcpyHostToDevice, R.stream) != cudaSuccess)
+                    return false;
+                return true;
+            })) return false;
+
+        for (auto& R : p.ranks) kimi_k3_forward_batch_begin(R.fwd);
+
+        for (int layer = 0; layer < cfg.n_layers; ++layer) {
+            const bool kda_reduce = tp_size > 1 && cfg.is_kda_layer(layer) &&
+                KimiK3Weights::shards_kda(p.ranks[0].weights.policy);
+            const bool mla_reduce = tp_size > 1 && !cfg.is_kda_layer(layer) &&
+                KimiK3Weights::shards_mla(p.ranks[0].weights.policy);
+            const bool attn_reduce = kda_reduce || mla_reduce;
+
+            // RESET THE DEVICE POSITION TO THE CHUNK BASE, ONCE PER LAYER.
+            //
+            // The token loop only ever moves position forward, so it bumps. A
+            // layer-major walk revisits the same B positions on EVERY layer, so it
+            // has to rewind — and rewinding from the host would be a synchronising
+            // 4-byte copy per layer per rank on the critical path. d_pos_base holds
+            // the chunk's first position in device memory and this is a D2D copy,
+            // stream-ordered and free.
+            if (!issue_all([&](int r) {
+                    KimiK3TPRank& R = p.ranks[(size_t)r];
+                    if (!R.state.d_pos || !R.d_pos_base) return true;
+                    return cudaMemcpyAsync(R.state.d_pos, R.d_pos_base, sizeof(int),
+                                           cudaMemcpyDeviceToDevice,
+                                           R.stream) == cudaSuccess;
+                })) return false;
+
+            // ---- phase 1, token by token ------------------------------------
+            if (!issue_all([&](int r) {
+                    KimiK3TPRank& R = p.ranks[(size_t)r];
+                    for (int t = 0; t < Bc; ++t) {
+                        kimi_k3_forward_select_slot(R.fwd, t);
+                        // Host mirror only; the device side was planted above and is
+                        // advanced by the bump below. Assigning the field directly
+                        // rather than via kimi_k3_set_position is what keeps this off
+                        // the synchronising path.
+                        R.state.position = pos0 + t;
+                        if (!kimi_k3_forward_layer_phase(R.fwd, layer,
+                                                         K3LayerPhase::Attn,
+                                                         R.xb + (size_t)t * H,
+                                                         R.xnb + (size_t)t * H))
+                            return false;
+                        // Only attention indexes the KV store, so the position moves
+                        // here and not around the FFN phases.
+                        if (R.state.d_pos) k3k::k3_bump_pos(R.state.d_pos, R.stream);
+                    }
+                    return true;
+                })) return false;
+
+            // ---- the chunk's attention partials, in capacity-sized slices -----
+            if (attn_reduce && !reduce_chunk(layer, K3LayerPhase::Attn, Bc)) {
+                std::fprintf(stderr,
+                             "[k3-tp] prefill: attention all-reduce failed at "
+                             "layer %d\n", layer);
+                return false;
+            }
+
+            // ---- phase 2, token by token ------------------------------------
+            if (!issue_all([&](int r) {
+                    KimiK3TPRank& R = p.ranks[(size_t)r];
+                    for (int t = 0; t < Bc; ++t) {
+                        kimi_k3_forward_select_slot(R.fwd, t);
+                        R.state.position = pos0 + t;
+                        if (!kimi_k3_forward_layer_phase(R.fwd, layer,
+                                                         K3LayerPhase::FfnPartial,
+                                                         R.xb + (size_t)t * H,
+                                                         R.xnb + (size_t)t * H))
+                            return false;
+                    }
+                    return true;
+                })) return false;
+
+            // ---- the chunk's FFN partials, in capacity-sized slices -----------
+            if (tp_size > 1 &&
+                !reduce_chunk(layer, K3LayerPhase::FfnPartial, Bc)) {
+                std::fprintf(stderr,
+                             "[k3-tp] prefill: FFN all-reduce failed at layer %d\n",
+                             layer);
+                return false;
+            }
+
+            // ---- phase 3, token by token ------------------------------------
+            if (!issue_all([&](int r) {
+                    KimiK3TPRank& R = p.ranks[(size_t)r];
+                    for (int t = 0; t < Bc; ++t) {
+                        kimi_k3_forward_select_slot(R.fwd, t);
+                        R.state.position = pos0 + t;
+                        if (!kimi_k3_forward_layer_phase(R.fwd, layer,
+                                                         K3LayerPhase::FfnFinish,
+                                                         R.xb + (size_t)t * H,
+                                                         R.xnb + (size_t)t * H))
+                            return false;
+                    }
+                    return true;
+                })) return false;
+            // ONE swap for the whole chunk. Per-token buffers are slices of the same
+            // pair, so swapping the bases moves all Bc of them at once — and unlike
+            // the token loop this walk is not inside a captured graph, so the
+            // alternating parity that x_canon exists to defend against cannot bite.
+            for (auto& R : p.ranks) std::swap(R.xb, R.xnb);
+        }
+
+        // ---- advance the host position past the chunk ------------------------
+        for (auto& R : p.ranks) {
+            kimi_k3_forward_batch_end(R.fwd);
+            R.state.position = pos0 + Bc;
+        }
+    }
+
+    // ---- the head, on the LAST token of the prompt only ---------------------
+    //
+    // Prefill needs one distribution: the one after the final prompt token. The
+    // token loop pays a 1.25 GB output projection 32,768 times to throw 32,767 of
+    // them away. Rank 0 alone is enough here — every rank holds the identical
+    // hidden state at this point, and this runs once per prompt rather than once
+    // per token, so banding it would save nothing worth the code.
+    KimiK3TPRank& R0 = p.ranks[0];
+    const KimiK3Weights& w = R0.weights;
+    const int last = (n - 1) % B;
+    if (cudaSetDevice(R0.device) != cudaSuccess) return false;
+    {
+        float* xl = R0.xb + (size_t)last * H;
+        float* xo = R0.xnb + (size_t)last * H;
+        if (cfg.attn_res_block_size > 0) {
+            if (!w.has_output_res_score || !w.output_res_score.ok()) return false;
+            // The bank for the LAST token, which is the slot the head reads. Selecting
+            // it also restores that slot's n_ckpt, which attn_res_mix lengths its
+            // softmax with — reading another token's count here mixes the wrong prefix.
+            kimi_k3_forward_select_slot(R0.fwd, last);
+            k3k::attn_res_mix_f32(xo, R0.state.res_bank, xl,
+                                  (const float*)w.output_res_score.data, H,
+                                  R0.state.n_ckpt, cfg.rms_eps, R0.stream);
+            std::swap(xl, xo);
+        }
+        if (!w.output_norm.ok() || !w.output.ok()) return false;
+        k3k::rms_norm_f32(xo, xl, (const float*)w.output_norm.data, H,
+                          cfg.rms_eps, R0.stream);
+        if (!k3k::k3_proj_f32(R0.logits, xo, w.output.data, w.output.type,
+                              cfg.vocab, H, R0.stream))
+            return false;
+    }
+    if (cudaStreamSynchronize(R0.stream) != cudaSuccess) return false;
+    for (auto& R : p.ranks) kimi_k3_forward_batch_end(R.fwd);
+    if (out_logits &&
+        cudaMemcpy(out_logits, R0.logits, (size_t)cfg.vocab * sizeof(float),
+                   cudaMemcpyDeviceToHost) != cudaSuccess)
+        return false;
     return true;
 }
 

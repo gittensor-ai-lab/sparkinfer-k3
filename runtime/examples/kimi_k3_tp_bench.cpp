@@ -261,6 +261,15 @@ int main(int argc, char** argv) {
             return std::chrono::duration<double, std::milli>(
                        std::chrono::steady_clock::now() - t0).count();
         };
+        // THREE INGESTION ARMS ON ONE BINARY, WHICH IS THE POINT. --prefill is the tile
+        // driver (captured), SPARKINFER_K3_PREFILL_BATCH=B is the chunked walk
+        // (uncaptured, batched collectives), and neither is the token loop below. All
+        // three read the same prompt and write the same .spkl, so a delta is the loop
+        // order and never a rebuild.
+        //
+        // --prefill wins if both are asked for: it is the arm that ships, and silently
+        // running the other one would misattribute its number.
+        //
         // --prefill routes ingestion through the batched tile driver instead of the
         // per-token loop. It is a separate flag rather than the default because the two
         // must stay comparable on ONE binary: the same build, the same prompt, the same
@@ -301,7 +310,33 @@ int main(int argc, char** argv) {
             return 0;
         }
 
-        for (size_t i = 0; i < ids.size(); ++i) {
+        // CHUNKED INGESTION, when asked for. SPARKINFER_K3_PREFILL_BATCH=B carries B
+        // tokens through each layer together; unset (or 1) keeps the token loop below,
+        // so this bench measures both arms on ONE binary and any delta is the walk
+        // rather than a rebuild.
+        //
+        // It is skipped when --checkpoints asks for intermediate depths: those need the
+        // logits after a SPECIFIC prefix, and a chunked walk only materialises them at
+        // chunk boundaries. Refusing loudly beats dumping a .spkl for the wrong depth,
+        // which would be compared against llama's and read as a parity failure.
+        const char* pb_env = std::getenv("SPARKINFER_K3_PREFILL_BATCH");
+        const int pb = pb_env ? std::atoi(pb_env) : 1;
+        if (pb > 1 && !checkpoints.empty()) {
+            std::printf("SPARKINFER_K3_PREFILL_BATCH=%d ignored: --checkpoints needs "
+                        "per-token logits, which a chunked walk does not produce.\n", pb);
+            std::fflush(stdout);
+        }
+        const bool use_chunked = pb > 1 && checkpoints.empty();
+        if (use_chunked) {
+            std::printf("chunked prefill: B=%d over %zu tokens\n", pb, ids.size());
+            std::fflush(stdout);
+            if (!kimi_k3_tp_forward_prompt(p, ids.data(), (int)ids.size(),
+                                           logits.data())) {
+                std::printf("chunked prefill failed\n");
+                return 1;
+            }
+        }
+        for (size_t i = 0; !use_chunked && i < ids.size(); ++i) {
             if (!kimi_k3_tp_forward_token(p, ids[i], logits.data())) {
                 std::printf("prompt token %zu (id %d) failed\n", i, ids[i]); return 1;
             }

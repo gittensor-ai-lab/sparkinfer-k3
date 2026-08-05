@@ -897,6 +897,44 @@ struct KimiK3Forward::Scratch {
     void* proj_q8_lane[kLanes] = {nullptr, nullptr};
     bool  lanes_ok = false;            // every lane object above was created
 
+    // ---- CHUNKED PROMPT INGESTION --------------------------------------
+    //
+    // A chunked walk runs layer L for B tokens before layer L+1, so any buffer
+    // written under one phase and read under a LATER one has to hold B values at
+    // once rather than one. That is a much shorter list than it looks, and getting
+    // it wrong is silent, so it is enumerated rather than guessed:
+    //
+    //   attn_out    written by Attn, read by FfnPartial's residual combine, and
+    //               reduced in between.                                     -> xB
+    //   moe_fused   written by FfnPartial (both views), read by FfnFinish, and
+    //               reduced in between.                                     -> xB
+    //   ffn_out     the LEADING DENSE layer's partial, same shape of use.   -> xB
+    //   res_bank    per-token across ALL layers, with its own live count.   -> xB
+    //
+    // Everything else here (mixed, normed, normed2, the KDA and MLA scratch, the
+    // router, moe_scratch) is written and read inside ONE phase, so the per-token
+    // loop reuses it exactly as the token loop already does. s.mixed in particular
+    // looks like a counterexample and is not: Attn writes it and Attn's own
+    // rms_norm consumes it, so it never crosses a phase boundary.
+    //
+    // Slot selection is POINTER ARITHMETIC, not a copy: kimi_k3_forward_select_slot
+    // repoints the four fields above into slot t and the entire existing layer body
+    // then runs unmodified. That is the whole reason this is a small change — the
+    // alternative, threading a token index through every kernel call in
+    // forward_layer_phase, touches ~200 call sites and cannot be checked by
+    // inspection.
+    bool   batched = false;            // kimi_k3_forward_alloc_batch succeeded
+    int    b_cap = 1;                  // slots allocated
+    int    b_slot = 0;                 // slot the pointers above currently address
+    float* attn_out_b = nullptr;       // [b_cap][hidden]
+    float* ffn_out_b = nullptr;        // [b_cap][hidden]
+    float* moe_fused_b = nullptr;      // [b_cap][expert_latent + hidden]
+    float* res_bank_b = nullptr;       // [b_cap][max_ckpt][hidden]
+    std::vector<int> b_ckpt;           // [b_cap] live checkpoint count per slot
+    // What state->res_bank pointed at before the first select_slot, so the decode
+    // path gets its own bank back when the chunk ends.
+    float* res_bank_orig = nullptr;
+
     std::vector<void*> owned;
 };
 
@@ -1073,6 +1111,142 @@ bool kimi_k3_forward_layer(KimiK3Forward& fwd, int layer, const float* hidden_in
                           float* hidden_out) {
     return kimi_k3_forward_layer_phase(fwd, layer, K3LayerPhase::All,
                                       hidden_in, hidden_out);
+}
+
+// ---------------------------------------------------------------------------
+// Chunked prompt ingestion: allocate B slots, then address them one at a time.
+// ---------------------------------------------------------------------------
+
+bool kimi_k3_forward_alloc_batch(const KimiK3Config& cfg, KimiK3Forward& fwd,
+                                 int batch) {
+    if (!fwd.s || batch < 1) return false;
+    auto& s = *fwd.s;
+    if (s.batched && s.b_cap >= batch) return true;   // already big enough
+    if (s.batched) return false;   // growing in place would strand the old owned ptrs
+
+    // B == 1 IS NOT A SPECIAL CASE, AND THAT IS DELIBERATE. The chunked walk at B=1
+    // must be the token loop bit-for-bit, so it takes the same code path with a
+    // one-slot allocation rather than a bypass — otherwise "B=1 matches main" proves
+    // nothing about B=8, because B=1 would not have run the batched code at all.
+    const int H = cfg.hidden;
+    const int Lat = cfg.expert_latent;
+    const int max_ckpt = fwd.state ? fwd.state->max_ckpt : 0;
+
+    auto alloc_f = [&](float*& ptr, size_t n) {
+        void* p = nullptr;
+        if (n == 0) { ptr = nullptr; return true; }
+        if (cudaMalloc(&p, n * sizeof(float)) != cudaSuccess) return false;
+        s.owned.push_back(p);
+        ptr = (float*)p;
+        return true;
+    };
+
+    bool ok = true;
+    ok &= alloc_f(s.attn_out_b,  (size_t)batch * H);
+    ok &= alloc_f(s.ffn_out_b,   (size_t)batch * H);
+    ok &= alloc_f(s.moe_fused_b, (size_t)batch * (Lat + H));
+    ok &= alloc_f(s.res_bank_b,  (size_t)batch * max_ckpt * H);
+    if (!ok) return false;
+
+    // The foreign-slot-reads-as-zero invariant the single-token allocator establishes
+    // for moe_scratch has a twin here: a chunk shorter than b_cap leaves the tail
+    // slots unwritten, and the collective reduces the WHOLE array. Stale bytes in an
+    // unused slot would be summed across ranks into a value nothing later reads —
+    // harmless today, but it makes every debug comparison of the reduced payload
+    // depend on allocation history. Zero once and the tail is defined forever.
+    if (s.moe_fused_b)
+        cudaMemset(s.moe_fused_b, 0, (size_t)batch * (Lat + H) * sizeof(float));
+    if (s.attn_out_b)
+        cudaMemset(s.attn_out_b, 0, (size_t)batch * H * sizeof(float));
+
+    s.b_ckpt.assign((size_t)batch, 0);
+    s.b_cap = batch;
+    s.b_slot = -1;              // no slot addressed yet; the first select must apply
+    s.batched = true;
+    return true;
+}
+
+int kimi_k3_forward_batch_capacity(const KimiK3Forward& fwd) {
+    return (fwd.s && fwd.s->batched) ? fwd.s->b_cap : 0;
+}
+
+void kimi_k3_forward_select_slot(KimiK3Forward& fwd, int slot) {
+    if (!fwd.s || !fwd.s->batched) return;
+    auto& s = *fwd.s;
+    if (slot < 0 || slot >= s.b_cap) return;
+    const KimiK3Config& cfg = *fwd.cfg;
+    const int H = cfg.hidden;
+    const int Lat = cfg.expert_latent;
+
+    // Park the OUTGOING slot's live checkpoint count before moving. n_ckpt is
+    // per-token state that the layer body increments in place, so a slot switch that
+    // did not save it would carry token t's count into token t+1 and mix the wrong
+    // prefix into the residual — fluent output, wrong logits, and invisible to any
+    // shape or launch check.
+    if (fwd.state && s.b_slot >= 0 && s.b_slot < (int)s.b_ckpt.size())
+        s.b_ckpt[(size_t)s.b_slot] = fwd.state->n_ckpt;
+
+    s.b_slot = slot;
+    s.attn_out  = s.attn_out_b  + (size_t)slot * H;
+    s.ffn_out   = s.ffn_out_b   + (size_t)slot * H;
+    s.moe_fused = s.moe_fused_b + (size_t)slot * (Lat + H);
+    s.moe_out   = s.moe_fused;
+    s.shexp_out = s.moe_fused + Lat;
+
+    if (fwd.state && fwd.state->max_ckpt > 0 && s.res_bank_b) {
+        if (!s.res_bank_orig) s.res_bank_orig = fwd.state->res_bank;
+        fwd.state->res_bank =
+            s.res_bank_b + (size_t)slot * fwd.state->max_ckpt * H;
+        fwd.state->n_ckpt = s.b_ckpt[(size_t)slot];
+    }
+}
+
+void kimi_k3_forward_batch_begin(KimiK3Forward& fwd) {
+    if (!fwd.s || !fwd.s->batched) return;
+    std::fill(fwd.s->b_ckpt.begin(), fwd.s->b_ckpt.end(), 0);
+    fwd.s->b_slot = -1;
+}
+
+void kimi_k3_forward_batch_end(KimiK3Forward& fwd) {
+    if (!fwd.s || !fwd.s->batched) return;
+    auto& s = *fwd.s;
+    // Hand the decode path its own bank back. Leaving state->res_bank aimed inside
+    // the chunk arena would make the next forward_token push checkpoints into slot
+    // b_slot's rows — which is exactly the kind of cross-path aliasing that only
+    // shows up as a wrong answer several thousand tokens later.
+    if (s.res_bank_orig && fwd.state) {
+        fwd.state->res_bank = s.res_bank_orig;
+        fwd.state->n_ckpt = 0;
+    }
+    s.b_slot = -1;
+}
+
+// The BASE of a phase's partial across all `n_slots` slots, and the element count
+// the collective must reduce. Separate from kimi_k3_partial_buffer rather than a
+// flag on it: the single-token entry point is on the decode path and must keep
+// returning exactly what it always did.
+float* kimi_k3_batch_partial_buffer(KimiK3Forward& fwd, int layer,
+                                    K3LayerPhase phase, int n_slots, int* count) {
+    if (!fwd.s || !fwd.s->batched || n_slots < 1 || n_slots > fwd.s->b_cap) {
+        if (count) *count = 0;
+        return nullptr;
+    }
+    const KimiK3Config& cfg = *fwd.cfg;
+    auto& s = *fwd.s;
+    if (phase == K3LayerPhase::Attn) {
+        if (count) *count = n_slots * cfg.hidden;
+        return s.attn_out_b;
+    }
+    if (phase == K3LayerPhase::FfnPartial) {
+        if (layer < cfg.leading_dense) {
+            if (count) *count = n_slots * cfg.hidden;
+            return s.ffn_out_b;
+        }
+        if (count) *count = n_slots * (cfg.expert_latent + cfg.hidden);
+        return s.moe_fused_b;
+    }
+    if (count) *count = 0;
+    return nullptr;
 }
 
 float* kimi_k3_partial_buffer(KimiK3Forward& fwd, int layer, K3LayerPhase phase,
