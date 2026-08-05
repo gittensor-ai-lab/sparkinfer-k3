@@ -111,6 +111,50 @@ ANY_HEADING = re.compile(r"^##\s+")
 # CLAIMS in .github/workflows/node-attestation.yml -- both read the same '## Node run'
 # section of the same body, and disagreeing about what counts as attested is the same class
 # of bug as disagreeing about the frontier.
+# A TICKED BOX IS NOT A MEASUREMENT.
+#
+# #128 ticked all three boxes and wrote "Tables left for the round to write -- I am not
+# inventing numbers", with "*awaits eval round*" where the measured value goes. That is the
+# checkbox being used to REQUEST evaluation rather than to attest one, and the gate could not
+# tell the difference: it checked that a box was ticked, never that anything stood behind it.
+#
+# So a claim must be backed by a number in the "after (this PR)" column of its table. The
+# column is located from the header rather than assumed to be last, because a PR may add a
+# delta column (#133 does) and then the last cell is prose.
+#
+# This refuses assertions as well as placeholders. #136 wrote "no change -- no decode path is
+# touched", which is a reasoned claim and may well be right, but the box says "No 128k decode
+# regression on 8x H200" and that cannot be attested without measuring -- the guard exists
+# precisely because prefill and decode share kernels, as that PR itself notes.
+MEASURED_CELL = re.compile(r"^\s*\**\s*[-+]?\d+(?:\.\d+)?\s*\**\s*$")
+
+
+def _row_cells(line):
+    return [c.strip() for c in line.strip().strip("|").split("|")]
+
+
+def measured_claims(section):
+    """{'prefill','decode'} for rows whose 'after' cell holds a bare number."""
+    found, after_idx = set(), None
+    for ln in section.splitlines():
+        if ln.count("|") < 2:
+            continue
+        cells = _row_cells(ln)
+        low = [c.lower() for c in cells]
+        if any("after" in c for c in low):          # header row -> locate the column
+            after_idx = next(i for i, c in enumerate(low) if "after" in c)
+            continue
+        if after_idx is None or after_idx >= len(cells):
+            continue
+        if not MEASURED_CELL.match(cells[after_idx]):
+            continue
+        if "prefill" in low[0]:
+            found.add("prefill")
+        if "decode" in low[0]:
+            found.add("decode")
+    return found
+
+
 PREFILL_CLAIM = re.compile(r"prefill", re.I)
 DECODE_CLAIM = re.compile(r"decode\s+regression|no\s+.*decode|decode.*no\s+regress", re.I)
 
@@ -231,6 +275,15 @@ def eligibility(pr):
         return False, ("missing attestation in '## Node run': " + "; ".join(missing) +
                        " — the tier is earned on prefill and decode is guarded, so both "
                        "are required")
+
+    # …and the ticked boxes must be backed by measured numbers, not placeholders.
+    have = measured_claims(section)
+    unbacked = [n for n in ("prefill", "decode") if n not in have]
+    if unbacked:
+        return False, ("ticked but not measured: " + ", ".join(unbacked) +
+                       " — put the measured tok/s in the 'after (this PR)' column. A ticked "
+                       "box with '*awaits eval round*' or 'no change' in it is a request to "
+                       "be measured, not an attestation that it was")
     return True, "eligible"
 
 
