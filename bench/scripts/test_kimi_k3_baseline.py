@@ -3964,3 +3964,43 @@ class AttestationNeedsEvidenceTest(unittest.TestCase):
              "| decode @ 128k | **56.81** | **56.80** | -0.02% |\n")
         ok, why = self._bot().eligibility(self._pr(t))
         self.assertTrue(ok, why)
+
+
+class StaleFrontierNoticeTest(unittest.TestCase):
+    """A frontier that overshoots its pin by a lot means the PIN was stale.
+
+    Main does not gain 30% between rounds. The prefill slot was hand-seeded at 40.35 from a
+    measurement taken before #114/#115/#127 landed; prefill shares the single-token path with
+    decode, so those decode wins lifted it to 53.02. Rounds were unaffected -- the bot
+    measures the frontier and passes it explicitly -- but eval-label.yml derives tiers from
+    the pin and contributors read it to decide what to beat, so three PRs optimised against a
+    number that was 31% low."""
+
+    def _bot(self):
+        import importlib.util as u
+        s = u.spec_from_file_location("b", str(ROOT / "eval/k3_eval_bot.py"))
+        m = u.module_from_spec(s); s.loader.exec_module(m); return m
+
+    def test_the_notice_threshold_sits_above_round_to_round_noise(self):
+        bot = self._bot()
+        # observed same-code spread between rounds is ~0.8%; the notice must not fire on that
+        self.assertGreater(bot.FRONTIER_STALE_NOTICE, 0.02)
+        # …and must fire well below the 31% miss that prompted it
+        self.assertLess(bot.FRONTIER_STALE_NOTICE, 0.31)
+
+    def test_reconcile_says_so_when_the_pin_was_stale(self):
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        rec = src[src.index("def reconcile_lock("):src.index("FRONTIER_STALE_NOTICE = ")
+                  if "FRONTIER_STALE_NOTICE = " in src[src.index("def reconcile_lock("):]
+                  else len(src)]
+        self.assertIn("FRONTIER_STALE_NOTICE", src)
+        self.assertIn("the pin was stale by", src,
+                      "a stale pin is corrected silently and nobody learns it was wrong")
+
+    def test_the_lock_records_which_commit_a_seeded_frontier_came_from(self):
+        """The seed was recorded as 'main @ 3b6a3f4' when it was measured on a169ff4 -- both
+        the commit and the staleness were wrong, and the wrong commit is what made it hard to
+        notice."""
+        lock = (ROOT / "bench/scripts/reference.lock").read_text()
+        self.assertIn("a169ff4", lock, "the real measurement commit is not recorded")
+        self.assertIn("53.02", lock)

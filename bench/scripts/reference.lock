@@ -213,15 +213,30 @@ KIMI_K3_H200X8_IQ1S_SPARKINFER_128K="${KIMI_K3_H200X8_IQ1S_SPARKINFER_128K:-56.8
 #
 # THERE IS NO BATCHED PREFILL. Every prompt token goes through the single-token decode step,
 # so a prompt costs what generating it costs: 32,768 tokens took 812.2 s wall clock on
-# main @ 3b6a3f4 (40.35 tok/s), against decode's ~56.8 tok/s. Ingesting is not faster than
-# generating, which is the whole opportunity.
+# main @ a169ff4 (40.35 tok/s), re-measured at 53.02 on main @ c1a1642e once #114/#115/#127
+# had landed. Ingesting is not faster than generating, which is the whole opportunity.
 #
 # llama.cpp reference: llama-bench -p 32768 -n 0 -r 3 -ngl 999 on this node and this GGUF,
 # 143.88 +/- 0.23 tok/s (+/-0.16%). It batches the prompt and we do not, so it is 3.57x
 # faster here while being 3.08x slower at decode.
 KIMI_K3_H200X8_IQ1S_LLAMA_32K_PP="${KIMI_K3_H200X8_IQ1S_LLAMA_32K_PP:-143.88}"
 # frontier: rewritten by eval/k3_eval_bot.py each round, raise-only. Do not hand-edit.
-# Seeded from the 812.2 s / 32,768-token measurement on main @ 3b6a3f4.
+#
+# SEEDED STALE, 2026-08-05. This slot was hand-seeded at 40.35 from an 812.2 s /
+# 32,768-token measurement, recorded here as "main @ 3b6a3f4". BOTH parts were wrong: the
+# measurement was taken on main @ a169ff4, and by the time it was written #114, #115 and
+# #127 had merged. Prefill runs the SAME single-token path as decode, so those decode wins
+# lifted prefill too -- the first round to measure it found 53.02, a 31% understatement.
+#
+# The cost was not mis-scoring: the bot measures the frontier every round and passes it
+# explicitly, so the round that found 53.02 also scored against 53.02. The cost was that
+# three PRs (#135, #136, #138) optimised against the published 40.35 and reported gains of
+# +25.4%, +24.5% and +5.3% which are -4.6%, -5.3% and -19.8% against the real number. Only
+# #133 measured main itself, and landed within 0.23% of the bot (53.14 vs 53.02).
+#
+# A seeded frontier is a claim about main that nobody measured. If one is unavoidable,
+# measure the CURRENT head, and say which commit -- see the notice reconcile_lock now emits
+# when a measured frontier overshoots its pin.
 # frontier: measured by eval/k3_eval_bot.py on main @ c1a1642e250b (h200x8, UD-IQ1_S). Do not hand-edit — the bot rewrites this each round.
 KIMI_K3_H200X8_IQ1S_SPARKINFER_32K_PP="${KIMI_K3_H200X8_IQ1S_SPARKINFER_32K_PP:-53.02}"
 
