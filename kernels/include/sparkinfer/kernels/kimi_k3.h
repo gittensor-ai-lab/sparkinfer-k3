@@ -344,9 +344,9 @@ void moe_expert_ffn_iq1s_f32(float* out, float* scratch,
 // supplies M>1, and they are landed first because whether IQ1_S can reach the tensor
 // cores losslessly is what decides the value of building that batching at all.
 //
-// Tiled BM=32, not 128: 896 experts at top_k 16 send only T*16/896 rows to an expert
-// (~36 at a 2048-token chunk), so the expert GEMM is structurally skinny in M and no
-// chunk size a 32k prefill can offer changes that.
+// Tiled on M at launch: a T-token chunk sends T*16/896 = T/56 rows to each expert on
+// average, so M is the caller's knob (T=8192 -> M=146). BM=32 and BM=128 are both
+// instantiated and picked on M; the measured crossover is near M=70.
 
 // Per-row symmetric int8 quantization of f32 activations, one warp per row. The f32
 // twin of launch_prefill_quantize_rows_i8 (which takes bf16). Per-ROW scales, because

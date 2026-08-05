@@ -41,10 +41,22 @@
 // ---------------------------------------------------------------------------
 // THE SHAPE THIS IS TILED FOR, AND WHY IT IS NOT prefill_gemm_i8's SHAPE
 // ---------------------------------------------------------------------------
-// 896 experts at top_k 16 means a T-token chunk sends only T*16/896 rows to each
-// expert: ~36 rows at T=2048, ~73 at T=4096. The expert GEMM is STRUCTURALLY SKINNY in
-// M and no chunk size available in a 32k prefill changes that — reaching M=128 would
-// need T=7168.
+// M IS A KNOB, NOT A PROPERTY OF THE MODEL. A T-token chunk sends T*16/896 = T/56 rows
+// to each expert on average, and T is the caller's to pick:
+//
+//     T       512   1024   2048   4096   8192  16384  32768
+//     M         9     18     37     73    146    293    585
+//     act mem  15     29     59    117    235    470    940  MB  (T x hidden, f32)
+//
+// An earlier version of this comment called the expert GEMM "structurally skinny in M"
+// and claimed no chunk a 32k prefill could offer would reach M=128. That was wrong: it
+// took T=2048 as given and then reported the consequence as a constraint. T=8192 costs
+// 235 MB of activations on a 143 GB card and divides a 32k prompt into four chunks.
+//
+// Two caveats keep M from being simply "as large as you like". T/56 is the MEAN under
+// uniform routing; a real router is imbalanced, so M is a DISTRIBUTION across experts
+// within one launch and the tail experts sit well above it. And the prefill attention
+// is O(T^2), so T trades against the attention chunk cost rather than being free.
 //
 // The obvious conclusion from that — make BM small so the tile is not mostly empty —
 // is only half right, and this file shipped it as if it were the whole story. Two costs
@@ -116,8 +128,13 @@ constexpr int kSub  = 32;     // values per sub-block == mma.m16n8k32's k-extent
 // happened to land on the correct side for M<70 for a reason that was only half the
 // story. Both shapes are instantiated and the launcher picks on M.
 //
-// 896 experts at top_k 16 put the expected M at ~36 for a 2048-token chunk and ~73 for
-// 4096 — which straddles the crossover, so this dispatch is not academic.
+// The crossover at M~70 lands at T~3900, so a caller that picks T >= 4096 is in BM=128
+// territory for the AVERAGE expert and should simply stay there. The dispatch still
+// earns its place for the two reasons M is not a single number: routing imbalance means
+// one launch contains experts on both sides of the knee, and short prompts (or the last
+// ragged chunk of a long one) genuinely run small. Past M~128 the curve is flat —
+// 4.75 us/token at 128 against 4.67 at 256 — so there is no reason to chase T upward
+// beyond ~8192 on this kernel's account.
 constexpr int kBN   = 128;
 constexpr int kBK   = 64;     // two sub-blocks
 constexpr int kMSwitch = 70;  // measured crossover; see the table above
