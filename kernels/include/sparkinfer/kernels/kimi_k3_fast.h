@@ -112,6 +112,14 @@ bool k3_proj_q8_fused4_1bar(float* y0, float* y1, float* y2, float* y3, const fl
 //
 // Declines — returns false, caller runs the original — on SPARKINFER_K3_ROUTER_FAST=0,
 // a top_k above 32, or a shared request past the 48 KiB budget.
+// Q8_0 structure-of-arrays weights (k3_q8soa.cu). Register at LOAD time;
+// the proj entries decline (return false) for any unregistered tensor.
+bool k3_q8soa_register(const void* wdata, int wtype, const long ne[4]);
+bool k3_proj_q8soa(float* y, const void* q8_act, const void* wdata,
+                   int N, int K, cudaStream_t stream);
+bool k3_proj_q8soa_f32(float* y, const float* x, const void* wdata,
+                       int N, int K, void* q8_scratch, cudaStream_t stream);
+
 bool k3_moe_router_fast(float* out_w, int* out_ids, const float* logits,
                         const float* bias, int n_expert, int top_k, int n_tokens,
                         bool norm_w, float w_scale, cudaStream_t stream);

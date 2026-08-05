@@ -37,6 +37,7 @@
 
 #include "sparkinfer/gguf.h"
 #include "sparkinfer/models/kimi_k3.h"
+#include "sparkinfer/kernels/kimi_k3.h"
 #include "sparkinfer/models/kimi_k3_config.h"
 #include "sparkinfer/models/kimi_k3_gguf_manifest.h"
 #include "sparkinfer/models/kimi_k3_tp.h"
@@ -338,6 +339,18 @@ int main(int argc, char** argv) {
     std::printf("  --> extrapolated to %d layers: %.1f ms/token (%.2f tok/s)\n",
                 n_full, ms / cfg.n_layers * n_full,
                 1000.0 / (ms / cfg.n_layers * n_full));
+
+    // WEPS engagement, summed over ranks. Zero when counting is off (the default) —
+    // the line prints only under SPARKINFER_K3_WEPS_COUNT=1 so ordinary runs are
+    // byte-identical in output.
+    if (const char* wc = std::getenv("SPARKINFER_K3_WEPS_COUNT"); wc && wc[0] == '1') {
+        unsigned long long skips = 0;
+        for (int d : devs) {
+            cudaSetDevice(d);
+            skips += sparkinfer::kernels::k3::k3_weps_skips_read_current_device();
+        }
+        std::printf("  WEPS_SKIPS         %llu\n", skips);
+    }
 
     // SPARKINFER_K3_PROFILE=1 prints the per-phase split. Note it adds cudaEvent
     // pairs around every branch, which roughly doubles ms/token — read the SHARES,

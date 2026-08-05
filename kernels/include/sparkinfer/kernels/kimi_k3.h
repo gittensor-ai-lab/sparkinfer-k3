@@ -128,9 +128,17 @@ void kda_gate_out_f32(float* out, const float* o, const float* norm_w,
 // and live until the launches complete. Pass it on a hot path: the mix runs ~185
 // times per token, and without it each call makes a cudaMallocAsync/cudaFreeAsync
 // pair. Passing nullptr keeps that older behaviour and is correct, just not free.
+//
+// `cur_b`/`sum_out` fold the residual add that used to precede this call into the
+// mix itself: when cur_b is non-null the kernels read the current stream as
+// (cur + cur_b), performing that add with the same single f32 addition per element
+// the deleted standalone kernel used; when sum_out is non-null the apply kernel
+// stores that sum there, exactly once per element. Callers that pass neither get
+// the original behaviour, bit for bit.
 void attn_res_mix_f32(float* out, const float* ckpts, const float* cur,
                       const float* score_w, int n_embd, int n_ckpt,
-                      float eps, cudaStream_t stream, float* scores = nullptr);
+                      float eps, cudaStream_t stream, float* scores = nullptr,
+                      const float* cur_b = nullptr, float* sum_out = nullptr);
 
 // ---------------------------------------------------------------------------
 // 6. KDA causal short conv, decode step
@@ -453,6 +461,18 @@ bool k3_mla_prewarm_split_scratch(int n_head, int kv_lora);
 // illegal inside a stream capture — and under IQ1_S that first use falls on the first MoE
 // layer, so it invalidates a capture that had recorded the dense layer cleanly.
 void k3_prewarm_quant_tables();
+
+// WEPS engagement readout for the current device (reset-on-read). Returns how many
+// expert-slot skips the weight-epsilon gate performed since the last read. Counting
+// is opt-in via SPARKINFER_K3_WEPS_COUNT=1, uploaded pre-capture by
+// k3_prewarm_quant_tables; with counting off this returns 0.
+unsigned long long k3_weps_skips_read_current_device();
+
+// Bind the weight-threshold's depth gate on the current device (pre-capture).
+// d_pos is the device position mirror; the threshold engages only at positions
+// >= SPARKINFER_K3_WEPS_MINPOS (default 16384). Unbound, the threshold is
+// depth-unconditional, which is the pre-gate behaviour.
+void k3_weps_bind_pos(const int* d_pos);
 
 // Store this token's MLA K-cache row at a device-held position. Replaces a host-computed
 // row address that a captured graph would freeze at the capture-time position.

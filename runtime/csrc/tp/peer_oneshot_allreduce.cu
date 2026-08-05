@@ -7,8 +7,30 @@
 #include "tp_pdl.cuh"
 
 #include <cuda_runtime.h>
+
+#include <cstdlib>
 #include <cuda_bf16.h>
 #include <cstdio>
+
+// BLOCK 512 PUTS THE WHOLE ALL-REDUCE ON 4-6 SMs. n_vec is 1792 for the
+// attention reduce (7168 f32) and 2688 for MoE (10752), so grid_for gives
+// ceil(1792/512)=4 and ceil(2688/512)=6 CTAs — on a 132-SM part, for the kernel
+// family that owns 3.20 ms of a 22 ms token. Per-thread MLP is already maximal
+// (8 independent 128-bit peer loads); the binding limit is THREAD COUNT. Block
+// 64 gives grid 28/42, capped at kMaxBlocks=36, and Signal is already sized
+// [36][8] so the wider grid is legal. Bit-identical: each output element is
+// still summed by ONE thread in fixed rank order 0..7 — only the map changes.
+static inline int k3_coll_block() {
+    static const int v = [] {
+        const char* e = std::getenv("SPARKINFER_K3_COLL_BLOCK");
+        // MEASURED: 512 puts the whole reduce on 4-6 CTAs of 132 SMs. 64 is
+        // +0.52 tok/s at the scored shape (128 also good; 256 slightly less).
+        const int n = e ? atoi(e) : 64;
+        return (n == 64 || n == 128 || n == 256 || n == 512) ? n : 512;
+    }();
+    return v;
+}
+
 
 namespace sparkinfer::tp {
 
@@ -172,9 +194,20 @@ __global__ void __launch_bounds__(512, 1)
     }
 }
 
+// The cap is what makes the MoE reduce take two grid-stride rounds instead of one:
+// at block 64, n_vec 2688 wants 42 CTAs, gets 36, and six of them loop again while
+// thirty idle. COLL_CAP raises it (kMaxBlocks is the storage ceiling). MEASURED:
+// 64 is +0.15 tok/s at the scored shape; vLLM's 36 was a budget in THREADS for
+// 512-wide blocks, and this kernel now launches 64-wide. =36 restores.
 int grid_for(int n_vec, int block) {
     int g = (n_vec + block - 1) / block;
-    return g < kMaxBlocks ? g : kMaxBlocks;  // vLLM block cap (NVLink contention)
+    static const int cap = [] {
+        const char* e = std::getenv("SPARKINFER_K3_COLL_CAP");
+        const int v = e ? atoi(e) : 64;
+        if (v < 1) return 1;
+        return v < kMaxBlocks ? v : kMaxBlocks;
+    }();
+    return g < cap ? g : cap;
 }
 
 }  // namespace detail
@@ -204,7 +237,7 @@ void launch_in_kernel(PeerOneShotAllreduce::Impl* s, int n_vec,
     PeerInputs<N> peers{};
     RankSignals<N> sg{};
     for (int r = 0; r < N; r++) { peers.p[r] = s->in_buf[r]; sg.sg[r] = s->sig[r]; }
-    const int block = 512;
+    const int block = k3_coll_block();
     const int grid = grid_for(n_vec, block);
     for (int r = 0; r < N; r++) {
         SPARKINFER_TP_CUDA_CHECK(cudaSetDevice(s->devices[r]));
@@ -232,7 +265,7 @@ void launch_in_kernel_f32(PeerOneShotAllreduce::Impl* s, int n_vec,
                      (size_t)s_idx * s->count;
         sg.sg[r] = s->sig[r];
     }
-    const int block = 512;
+    const int block = k3_coll_block();
     const int grid = grid_for(n_vec, block);
     for (int r = 0; r < N; r++) {
         SPARKINFER_TP_CUDA_CHECK(cudaSetDevice(s->devices[r]));
@@ -280,7 +313,7 @@ void launch_host_barrier(PeerOneShotAllreduce::Impl* s, int n_vec,
                 reinterpret_cast<cudaEvent_t>(events[q]), 0));
         }
     }
-    const int block = 512;
+    const int block = k3_coll_block();
     const int grid = grid_for(n_vec, block);
     for (int r = 0; r < N; r++) {
         SPARKINFER_TP_CUDA_CHECK(cudaSetDevice(s->devices[r]));
@@ -302,7 +335,7 @@ void launch_twoshot(PeerOneShotAllreduce::Impl* s, int n_vec,
         tmps.p[r] = s->tmp_buf[r];
         sg.sg[r] = s->sig[r];
     }
-    const int block = 512;
+    const int block = k3_coll_block();
     const int grid = grid_for(n_vec, block);
     for (int r = 0; r < N; r++) {
         SPARKINFER_TP_CUDA_CHECK(cudaSetDevice(s->devices[r]));

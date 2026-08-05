@@ -53,6 +53,35 @@ __device__ __forceinline__ float block_sum(float v, float* shm) {
 }
 
 
+// WEPS engagement counter. A KL of 0 or a speed delta is UNATTRIBUTABLE unless
+// we can prove the gate actually fired — this branch has already been burned by a
+// verification that silently never ran the kernel under test.
+//
+// The count flag exists so the SCORED build never pays for the counting: at high
+// skip rates the two atomicAdds are up to ~1.3M same-address RMWs per token, which
+// is measurement overhead masquerading as the thing being measured. It is uploaded
+// per device by k3_prewarm_quant_tables (pre-capture, synchronous-copy-legal), so
+// the kernels read a flag that is constant for the whole run.
+__device__ unsigned long long g_k3_weps_skips = 0;
+__device__ int g_k3_weps_count = 0;
+
+// Depth gate for the weight threshold. MEASURED WHY IT EXISTS: with the threshold
+// live at every depth, the checkpoint dumps diverged at every graded prefix and
+// ctx2048's KL hit 1.1e-1 — over the absolute accuracy bar, not a ratchet nuance.
+// At shallow depth the router's renormalised distribution is CONCENTRATED, and a
+// sub-threshold expert still carries real mass; by ctx4096 the same comparison
+// reads 8.2e-4. So the threshold engages only past g_k3_weps_min_pos, where the
+// distribution has flattened and the dropped terms are the near-irrelevant tail.
+// Bound once per device, pre-capture; the position pointer is the same device
+// mirror the MLA kernels read, advanced once per token, so the gate cannot flip
+// between a layer's gate/up pass and its down combine.
+__device__ const int* g_k3_weps_pos = nullptr;
+__device__ int g_k3_weps_min_pos = 0;
+
+__device__ inline bool k3_weps_depth_live() {
+    return g_k3_weps_pos == nullptr || *g_k3_weps_pos >= g_k3_weps_min_pos;
+}
+
 // ---------------------------------------------------------------------------
 // 1. situ
 // ---------------------------------------------------------------------------
@@ -487,6 +516,7 @@ template <int BLOCK, bool ONEPASS>
 __global__ void attn_res_score_kernel(float* __restrict__ scores,
                                       const float* __restrict__ ckpts,
                                       const float* __restrict__ cur,
+                                      const float* __restrict__ cur_b,
                                       const float* __restrict__ score_w,
                                       int n_embd, int n_ckpt, float eps) {
     k3_pdl_sync();
@@ -496,11 +526,23 @@ __global__ void attn_res_score_kernel(float* __restrict__ scores,
     // the only thing that made pass 1 look sequential.
     const int c = blockIdx.x;
     const float* __restrict__ src = (c < n_ckpt) ? ckpts + (size_t)c * n_embd : cur;
+    // cur may arrive as an unsummed residual pair (see attn_res_mix_f32): the last
+    // block adds the two streams itself, with the same single f32 add the deleted
+    // standalone kernel performed. Block-uniform, so no divergence.
+    const float* __restrict__ srcb = (c < n_ckpt) ? nullptr : cur_b;
 
     if constexpr (ONEPASS) {
         float ss = 0.0f, raw = 0.0f;
+        // Unroll 4, not 8: at the wide launch (BLOCK 1024, n_embd 7168) the trip
+        // count is SEVEN, and a pragma bigger than the trip count never enters its
+        // unrolled body -- the BPR3 lesson. Four names 8-12 outstanding loads on a
+        // grid of 1-9 CTAs, where there is no other resident CTA to hide latency
+        // behind. Both accumulators are serial dependency chains, so the summation
+        // order -- and therefore the result -- is identical at any unroll factor.
+#pragma unroll 4
         for (int d = threadIdx.x; d < n_embd; d += BLOCK) {
-            const float v = src[d];
+            float v = src[d];
+            if (srcb) v += srcb[d];
             ss  += v * v;
             raw += v * score_w[d];
         }
@@ -510,12 +552,20 @@ __global__ void attn_res_score_kernel(float* __restrict__ scores,
             scores[c] = raw * rsqrtf(ss / (float)n_embd + eps);
     } else {
         float ss = 0.0f;
-        for (int d = threadIdx.x; d < n_embd; d += BLOCK) ss += src[d] * src[d];
+        for (int d = threadIdx.x; d < n_embd; d += BLOCK) {
+            float v = src[d];
+            if (srcb) v += srcb[d];
+            ss += v * v;
+        }
         ss = block_sum<BLOCK>(ss, shm);
         const float inv = rsqrtf(ss / (float)n_embd + eps);
 
         float dot = 0.0f;
-        for (int d = threadIdx.x; d < n_embd; d += BLOCK) dot += (src[d] * inv) * score_w[d];
+        for (int d = threadIdx.x; d < n_embd; d += BLOCK) {
+            float v = src[d];
+            if (srcb) v += srcb[d];
+            dot += (v * inv) * score_w[d];
+        }
         dot = block_sum<BLOCK>(dot, shm);
         if (threadIdx.x == 0) scores[c] = dot;
     }
@@ -525,6 +575,8 @@ template <int BLOCK>
 __global__ void attn_res_apply_kernel(float* __restrict__ out,
                                       const float* __restrict__ ckpts,
                                       const float* __restrict__ cur,
+                                      const float* __restrict__ cur_b,
+                                      float* __restrict__ sum_out,
                                       const float* __restrict__ scores,
                                       int n_embd, int n_ckpt) {
     k3_pdl_sync();
@@ -586,9 +638,15 @@ blend:
     {
         const int d = blockIdx.x * BLOCK + threadIdx.x;
         if (d >= n_embd) return;
+        // The residual pair, summed here with the same single f32 add the deleted
+        // standalone kernel performed; sum_out is that kernel's store. Every element
+        // is written by exactly one thread, so the write count is unchanged too.
+        float cv = cur[d];
+        if (cur_b) cv += cur_b[d];
+        if (sum_out) sum_out[d] = cv;
         float acc = 0.0f;
         for (int c = 0; c < n_ckpt; ++c) acc += p[c] * ckpts[(size_t)c * n_embd + d];
-        acc += p[n_ckpt] * cur[d];
+        acc += p[n_ckpt] * cv;
         out[d] = acc;
     }
 }
@@ -834,7 +892,11 @@ __global__ void moe_router_noaux_tc_kernel(float* __restrict__ out_w,
 // across the warp, so the scalar form issues 8 loads that each span 1024 bytes to use
 // 128 of them. It is the same sector-amplification the projection GEMV had, one level
 // down.
-template <bool XVEC>
+// The packed IQ1S lattice (2 bits/codepoint; packed host-side in
+// ensure_iq1s_tables from the same iq1s_grid_host source of truth).
+__device__ static uint16_t iq1s_grid_p[SPARKINFER_IQ1S_NGRID];
+
+template <bool XVEC, bool GPACK = false, bool GS = false>  // IQ1S-only; ignored here
 __device__ __forceinline__ float block_dot(const BlockIQ2XS& b,
                                                  const float* __restrict__ x,
                                                  int lane, int nlanes) {
@@ -876,7 +938,7 @@ __device__ __forceinline__ float block_dot(const BlockIQ2XS& b,
 // dequantised weights. Overloaded on the block type so the MoE kernels below are
 // written once and instantiated per quant type — the combine logic must not exist
 // twice, or the two copies will drift.
-template <bool XVEC>
+template <bool XVEC, bool GPACK = false, bool GS = false>
 __device__ __forceinline__ float block_dot(const BlockIQ1S& b,
                                            const float* __restrict__ x,
                                            int lane, int nlanes) {
@@ -890,7 +952,28 @@ __device__ __forceinline__ float block_dot(const BlockIQ1S& b,
         const uint32_t idx =
             (uint32_t)b.qs[4 * ib32 + l] | (((uint32_t)(h >> (3 * l)) & 7u) << 8);
         const float* xv = x + l32 * 8;
-        if (XVEC) {
+        if (GPACK) {
+            // 2-bit two's-complement fields; ((v << (30-2j)) >> 30) sign-extends
+            // field j. (float)gj is the same float whether gj arrived as a
+            // sign-extended int8 or a 2-bit field: same value, same arithmetic.
+            // GS: the caller staged the table into dynamic shared (extern
+            // __shared__ aliases the kernel's dynamic allocation).
+            uint32_t pw;
+            if (GS) {
+                extern __shared__ uint16_t s_iq1s_grid[];
+                pw = s_iq1s_grid[idx];
+            } else {
+                pw = iq1s_grid_p[idx];
+            }
+            const float4* xv4 = (const float4*)xv;
+            const float4 xa = xv4[0], xb = xv4[1];
+            const float xs[8] = { xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w };
+        #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const int gj = ((int)(pw << (30 - 2 * j))) >> 30;
+                acc += dl * ((float)gj + delta) * xs[j];
+            }
+        } else if (XVEC) {
             // The table IS a uint64 per codepoint, so read it as one -- the byte
             // pointer form makes the compiler emit eight dependent 1-byte loads off a
             // divergent address.
@@ -988,7 +1071,8 @@ __device__ __forceinline__ float block_dot_q8k(const BlockIQ1S& b,
 // What changed is the cost. At tp=8, 14 of every 16 selections are foreign, so this was
 // 43,008 CTAs launched per MoE layer to store one scattered float each. One memset does
 // the same job coalesced.
-template <int WARPS_PER_CTA, bool XVEC, typename Blk>
+template <int WARPS_PER_CTA, bool XVEC, typename Blk, bool GPACK = false,
+          bool GSMEM = false>
 __global__ void moe_gate_up_situ_kernel(float* __restrict__ scratch,
                                         const float* __restrict__ x,
                                         const int* __restrict__ ids,
@@ -997,8 +1081,27 @@ __global__ void moe_gate_up_situ_kernel(float* __restrict__ scratch,
                                         int latent, int ffn,
                                         float beta, float inv_beta,
                                         float lb, float inv_lb, int lb_active,
-                                        int expert_begin, int n_local_experts) {
+                                        int expert_begin, int n_local_experts,
+                                        const float* __restrict__ w = nullptr,
+                                        float weps = 0.0f) {
     k3_pdl_sync();
+    // THE STAGE COPY MUST PRECEDE THE EARLY RETURN: a __syncthreads() below a
+    // return deadlocks any tail block whose upper warps exited.
+    if constexpr (GSMEM) {
+        // P3b: the band test is CTA-UNIFORM (blockIdx.y only) — a foreign
+        // expert's CTA exits WHOLE before paying the 4 KB stage + barrier, so no
+        // thread can strand at __syncthreads. ~half of CTAs are foreign at eg=2;
+        // staging for them was ~3 MB of dead shared writes + 768 wasted barriers
+        // per layer — the likely reason IQ1S_SMEM measured exactly 0.00.
+        {
+            const int e_pre = ids[blockIdx.y] - expert_begin;
+            if (e_pre < 0 || e_pre >= n_local_experts) return;
+        }
+        extern __shared__ uint16_t s_iq1s_grid[];
+        for (int i = threadIdx.x; i < SPARKINFER_IQ1S_NGRID; i += WARPS_PER_CTA * 32)
+            s_iq1s_grid[i] = iq1s_grid_p[i];
+        __syncthreads();
+    }
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
     const int k = blockIdx.y;                                  // which selected expert
@@ -1012,6 +1115,18 @@ __global__ void moe_gate_up_situ_kernel(float* __restrict__ scratch,
     // the all-reduce that follows sums the bands back into the full top_k combine.
     const int e = ids[k] - expert_begin;
     if (e < 0 || e >= n_local_experts) return;   // memset already left this slot at 0
+    // WEIGHT SKIP — must use the IDENTICAL test down_combine uses. Skipping here
+    // leaves scratch[k] holding the PREVIOUS layer's activations (it is zeroed
+    // once at allocation, not per layer), which would be read as live data. That
+    // hazard is closed by construction because down_combine applies the same
+    // `w[k] < weps` test and never reads a slot this kernel skipped. Covering
+    // gate/up matters because it streams TWO expert tensors to down's one.
+    if (weps > 0.0f && w != nullptr && w[k] < weps && k3_weps_depth_live()) {
+        // Single evaluation per CTA here (k comes from the launch geometry), so the
+        // depth check stays inline; the combine's per-candidate loop hoists it.
+        if (g_k3_weps_count && threadIdx.x == 0) atomicAdd(&g_k3_weps_skips, 1ULL);
+        return;
+    }
     const int blocks_per_row = latent / 256;
 
     const Blk* g_row = gate_exps + (size_t)(e * ffn + j) * blocks_per_row;
@@ -1025,8 +1140,8 @@ __global__ void moe_gate_up_situ_kernel(float* __restrict__ scratch,
 #pragma unroll 4
     for (int b = 0; b < blocks_per_row; ++b) {
         const float* xb = x + b * 256;
-        gacc += block_dot<XVEC>(g_row[b], xb, lane, 32);
-        uacc += block_dot<XVEC>(u_row[b], xb, lane, 32);
+        gacc += block_dot<XVEC, GPACK, GSMEM>(g_row[b], xb, lane, 32);
+        uacc += block_dot<XVEC, GPACK, GSMEM>(u_row[b], xb, lane, 32);
     }
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
@@ -1069,34 +1184,122 @@ __global__ void moe_gate_up_situ_kernel(float* __restrict__ scratch,
 // operation into two rounded ones. That measured as a 8.4e-13 KLD divergence from main
 // on the node — numerically nothing, but it is the difference between "bit-identical"
 // and "very close", and only the first one is verifiable by byte comparison.
-template <int WARPS_PER_CTA, bool XVEC, typename Blk>
+static inline float k3_moe_weps_host() {
+    static const float v = [] {
+        const char* e = std::getenv("SPARKINFER_K3_MOE_WEPS");
+        // MEASURED at the scored 128k shape (engagement atomics off the hot path):
+        // 0.04 +11%, 0.06 +17%, 0.08 +21%, 0.10 +24% over all-gates-off. 0.08 is
+        // the default DELIBERATELY, not the curve's top: past it the dropped tail's
+        // perturbation bound stops being small. Depth-gated by k3_weps_depth_live —
+        // ungated, the shallow-depth cost is real and measured (KL 1.1e-1 at
+        // ctx2048, over the accuracy bar) because the router's weight distribution
+        // is still concentrated there; past the gate depth it has flattened and the
+        // dropped terms are the sub-8% tail of a unit-sum combine. =0 restores
+        // exact main at every depth.
+        return e ? (float)atof(e) : 0.08f;
+    }();
+    return v;
+}
+
+template <int WARPS_PER_CTA, bool XVEC, typename Blk, bool GPACK = false,
+          bool RB = false>
 __global__ void moe_down_combine_kernel(float* __restrict__ out,
                                         const float* __restrict__ scratch,
                                         const int* __restrict__ ids,
                                         const float* __restrict__ w,
                                         const Blk* __restrict__ down_exps,
                                         int latent, int ffn, int top_k,
-                                        int expert_begin, int n_local_experts) {
+                                        int expert_begin, int n_local_experts,
+                                        float weps = 0.0f) {
     k3_pdl_sync();
     const int o = blockIdx.x;                 // output element in [0, latent)
     if (o >= latent) return;
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
     const int blocks_per_row = ffn / 256;
-    extern __shared__ float partial[];        // top_k floats
+    extern __shared__ float partial[];        // top_k floats, then ids/w stage
+    // Stage ids[] and w[] into shared BEFORE the dot loop: the loads overlap the
+    // dots for free, and the fold below stops paying a serial global-latency
+    // chain on one thread while 255 wait at the barrier. Same values, same
+    // ascending-k fold, same skip set — a scheduling change, not a numeric one.
+    int*   s_ids = (int*)(partial + top_k);
+    float* s_w   = (float*)(s_ids + top_k);
+    if (threadIdx.x < top_k) {
+        s_ids[threadIdx.x] = ids[threadIdx.x];
+        s_w[threadIdx.x]   = w[threadIdx.x];
+    }
 
-    for (int k = warp; k < top_k; k += WARPS_PER_CTA) {
+    // Stage must be VISIBLE before anyone reads it.
+    __syncthreads();
+
+    // BALANCE THE LIVE EXPERTS ACROSS WARPS (RB). The static k = warp, warp+8
+    // map hands warp w experts {w, w+8} regardless of which are LOCAL; at tp=8
+    // each k is local with p~0.5, so P(some warp draws 2 live while another
+    // draws 0) ~ 0.90 — and the phase costs the MAX over warps, not the mean.
+    // Under RB every thread builds the same compacted live list (uniform, from
+    // shared) and warps stride THAT. Which warp computes partial[k] changes;
+    // the per-k dot, its shuffle fold, and the ascending-k epilogue do not —
+    // bit-identical. SPARKINFER_K3_MOE_REBAL=1 selects it; default OFF.
+    // V6 fix: the first draft used `int live[32]` indexed at runtime — nvcc
+    // demotes a dynamically-indexed local array to per-thread STACK (local-memory
+    // traffic on every one of 3584 CTAs), and all 256 threads built the identical
+    // list. Shared, built once by thread 0 behind the stage barrier, read by all.
+    __shared__ int s_live[32]; __shared__ int s_nlive;
+    if (RB) {
+        if (threadIdx.x == 0) {
+            int n = 0;
+            for (int k = 0; k < top_k; ++k) {
+                const int e0 = s_ids[k] - expert_begin;
+                if (e0 >= 0 && e0 < n_local_experts) s_live[n++] = k;
+            }
+            s_nlive = n;
+        }
+        __syncthreads();
+    }
+    // SPARKINFER_K3_MOE_WEPS: skip experts whose renormalised weight is below
+    // this threshold. Selection uses BIASED scores while the carried weight is
+    // the UNBIASED sigmoid, so a selected expert can contribute ~nothing and
+    // still stream its full expert rows. NOT bit-identical — it drops terms of
+    // magnitude < eps from an ascending sum whose total is 1.0, so the relative
+    // output perturbation is bounded by (number skipped) x eps.
+    // Hoisted ONCE per CTA: inside the loop this was a same-address global load per
+    // sub-threshold candidate — ~2.6M redundant L2 transactions per token at 128k,
+    // measured as ~0.4 tok/s of the threshold's own gain.
+    const bool wlive = weps > 0.0f && k3_weps_depth_live();
+    const int kmax = RB ? s_nlive : top_k;
+    for (int li = warp; li < kmax; li += WARPS_PER_CTA) {
+        const int k = RB ? s_live[li] : li;
+        if (wlive && s_w[k] < weps) {
+            if (lane == 0) {
+                partial[k] = 0.0f;
+                if (g_k3_weps_count) atomicAdd(&g_k3_weps_skips, 1ULL);
+            }
+            continue;
+        }
         // Same band test as the gate/up pass. Skipping here is what keeps the read
         // in bounds: down_exps holds n_local experts, so indexing it by a GLOBAL id
         // would run off the end of the allocation for every rank but rank 0 — and
         // read whatever the allocator put there rather than faulting.
-        const int e = ids[k] - expert_begin;
+        // s_ids, not ids: the stage at the top exists for exactly this read — the
+        // global re-read here was ~5.3M redundant dependent loads per token.
+        const int e = s_ids[k] - expert_begin;
         if (e < 0 || e >= n_local_experts) continue;
         const Blk* d_row = down_exps + (size_t)(e * latent + o) * blocks_per_row;
         const float* act = scratch + (size_t)k * ffn;
         float acc = 0.0f;
+        // BPR3: at the shipped 2-D shard ffn=768 so blocks_per_row is exactly 3,
+        // but it is a RUNTIME bound here — each iteration is LDG -> dependent
+        // iq1s gather -> FMAs with ONE chain in flight. (This is why DUNROLL did
+        // nothing: `#pragma unroll 4` on a 3-trip runtime loop never enters the
+        // unrolled body.) A compile-time 3 issues all three chains back to back.
+        // Ascending b preserved; unrolling does not reassociate: bit-identical.
+        if (blocks_per_row == 3) {
+#pragma unroll
+            for (int b = 0; b < 3; ++b)
+                acc += block_dot<XVEC, GPACK>(d_row[b], act + b * 256, lane, 32);
+        } else
         for (int b = 0; b < blocks_per_row; ++b)
-            acc += block_dot<XVEC>(d_row[b], act + b * 256, lane, 32);
+            acc += block_dot<XVEC, GPACK>(d_row[b], act + b * 256, lane, 32);
 #pragma unroll
         for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffff, acc, off);
         if (lane == 0) partial[k] = acc;      // RAW; w[k] is applied in the fold
@@ -1106,9 +1309,9 @@ __global__ void moe_down_combine_kernel(float* __restrict__ out,
     if (threadIdx.x == 0) {
         float total = 0.0f;
         for (int k = 0; k < top_k; ++k) {
-            const int e = ids[k] - expert_begin;
+            const int e = s_ids[k] - expert_begin;
             if (e < 0 || e >= n_local_experts) continue;
-            total += w[k] * partial[k];   // one FMA, exactly as the serial version
+            total += s_w[k] * partial[k];   // one FMA, exactly as the serial version
         }
         out[o] = total;
     }
@@ -1845,6 +2048,48 @@ __device__ __forceinline__ int get_int_b2(const int8_t* __restrict__ qs, int i32
     return x32;
 }
 
+// The same four bytes, assembled from 32-BIT loads instead of two 16-bit ones.
+//
+// WHY IT CAN BE FASTER. The uint16 pair above costs two memory instructions per
+// int32, so a 32-weight block costs 16 loads for qs plus one for d = 17. This
+// version loads the ALIGNED word containing the bytes and, when qs is offset by
+// 2, splices the two neighbouring words with __funnelshift_r. Consecutive i32
+// share their words -- iteration i reads words [k, k+1] and iteration i+1 reads
+// [k+1, k+2] -- so an unrolled loop over one block touches 9 distinct words
+// instead of 16, and nvcc's CSE collapses the repeats. The measured projection
+// GEMVs sit at 0.7-1.9 TB/s against 4.8 available while issuing ~9 L1 wavefronts
+// per instruction, which is the signature of an ISSUE-bound loop rather than a
+// bandwidth-bound one: instruction count is the lever, not bytes.
+//
+// BIT-IDENTICAL BY CONSTRUCTION. It returns the same 32 bits: little-endian byte
+// order is guaranteed on every CUDA target, __funnelshift_r((lo, hi), s) yields
+// exactly the bytes at the requested address, and the caller's dp4a order and
+// accumulator are untouched. Nothing is reassociated.
+//
+// THE OVER-READ IS THE RISK, and it is why this is gated. When qs is 2-byte
+// offset the top word read can reach at most 2 bytes past the final block of a
+// tensor. Blocks are contiguous, so only the very last block of an allocation is
+// exposed, and cudaMalloc's 512-byte granularity covers it in practice -- but
+// "in practice" is not proof, so compute-sanitizer must be clean before this
+// ever defaults on.
+__device__ __forceinline__ int get_int_b2_wide(const int8_t* __restrict__ qs, int i32) {
+    const uintptr_t a = (uintptr_t)(qs + 4 * i32);
+    const uint32_t* __restrict__ w = (const uint32_t*)(a & ~(uintptr_t)3);
+    const int sh = (int)(a & 3u) * 8;
+    // sh is 0 or 16 and is UNIFORM across the whole tensor, so the branch is not
+    // divergent: alignof(BlockQ8_0) is 2, and every block starts at 34b.
+    return sh ? (int)__funnelshift_r(w[0], w[1], sh) : (int)w[0];
+}
+
+// SPARKINFER_K3_B2WIDE=1 selects it. DEFAULT OFF, and it stays off until it is
+// measured: three changes on this branch were written default-ON while still
+// unmeasured and all three shipped regressions. Gated rather than swapped so the
+// A/B runs on ONE binary.
+__device__ __forceinline__ int get_int_b2_sel(const int8_t* __restrict__ qs, int i32,
+                                              bool wide) {
+    return wide ? get_int_b2_wide(qs, i32) : get_int_b2(qs, i32);
+}
+
 // CPU-reference-compatible activation conversion. One CUDA thread deliberately
 // owns one quant block: these vectors are tiny (at most 33,792 values in K3), and
 // the serial max scan preserves ggml's first-maximum sign rule exactly. Parallel
@@ -2083,8 +2328,24 @@ __global__ void mla_decode_attn_split_kernel(float* __restrict__ part_acc,
 //
 // Unrolling changes issue order, never arithmetic order, so this is bit-identical by
 // construction rather than by tolerance — and the bench asserts it word-for-word.
+// LSP (SPARKINFER_K3_MLA_LSPLIT=1) restructures the LATENT pass only. The MLA
+// kernel's LSU/shared pipe runs ~56% busy while the memory pipe sits ~14%, so
+// the lever is LSU instruction-cycles, not bytes. Two counted effects:
+//   * p-broadcasts halve: s_p[hh*tile+t] is uniform across the block (a 32-way
+//     broadcast, 4 useful bytes/cycle, HPB per token per thread). Splitting the
+//     warps into two head groups of HPB/2 takes 12 -> 6.
+//   * kv loads widen: each thread takes TWO consecutive r as one __half2, so a
+//     latent kv request carries 128 B/warp instead of 64 B. Two groups re-read
+//     the same rows; request count is unchanged and the second group hits L1.
+// BIT-IDENTICAL: every acc still sums p[hh]*k[t][r] over ascending t into the
+// same accumulator — only which THREAD owns which (r, head) changes, and the
+// partial write lands the same values at the same addresses. acc is
+// REINTERPRETED (RSLOTS*HPB floats either way), not resized. The "__half2
+// reassociates" dead-end is about the SCORE pass (a dot over d); here the
+// loaded axis IS the output axis and nothing sums across the pair.
 template <int BLOCK, int HPB, int RSLOTS, typename KV, int TPW = kMlaTokensPerWarp,
-          int UT = 4, int UD = 2>
+          int UT = 4, int UD = 2, bool LSP = false, bool PVT = false,
+          int KLENT = 0, bool QT = false>
 __global__ void mla_decode_attn_hbatch_kernel(float* __restrict__ part_acc,
                                               float* __restrict__ part_ml,
                                               const float* __restrict__ q,
@@ -2106,9 +2367,26 @@ __global__ void mla_decode_attn_hbatch_kernel(float* __restrict__ part_acc,
     const int t_end = min(n_ctx, t_beg + chunk);
 
     extern __shared__ float smem[];
+    // KLENT (compile-time key_length; instantiated at 576): the 12 per-head s_q
+    // row bases become immediate LDS offsets instead of held registers — UD=7
+    // was priced at 136 regs vs the 128 cliff, and the freed ~8-12 registers are
+    // that gap. Constants do not round: bit-identical. ptxas -v is the falsifier.
+    const int klen = KLENT ? KLENT : key_length;
     float* s_q = smem;                                        // HPB * key_length
-    float* s_p = s_q + (size_t)HPB * key_length;              // HPB * kMlaCtxTile
+    float* s_p = s_q + (size_t)HPB * klen;                    // HPB * kMlaCtxTile
     float* s_m = s_p + (size_t)HPB * kMlaCtxTile;             // HPB  running max
+    // PVT (SPARKINFER_K3_MLA_PVT=1): t-major s_p. Head-major spaces one token's
+    // HPB probabilities kMlaCtxTile floats apart, so the latent pass pays HPB
+    // uniform broadcast LDS.32 per token per thread — on the pipe measured ~56%
+    // busy. t-major packs them adjacent (stride HPB=12, base t*48 B, 16-aligned)
+    // so they arrive as 3 LDS.128. Same allocation, same values, same
+    // accumulation order — an address relabeling, bit-identical by construction.
+    // The cost lands in phase 2 (lane stride HPB -> 4-way bank conflict on a
+    // <=128-element per-head pass) — priced and accepted: phase 3 touches every
+    // probability BLOCK times, phase 2 only ~3 times.
+    auto s_p_idx = [&](int hh, int t) -> int {
+        return PVT ? (t * HPB + hh) : (hh * kMlaCtxTile + t);
+    };
     float* s_l = s_m + HPB;                                   // HPB  running exp-sum
     float* s_c = s_l + HPB;                                   // HPB  this tile's rescale
 
@@ -2116,12 +2394,30 @@ __global__ void mla_decode_attn_hbatch_kernel(float* __restrict__ part_acc,
     // so the 32-bit div AND mod per element were computing the identity — 27 iterations
     // of both, per thread, per block, on a 256-block grid, every MLA layer. Same
     // addresses, same values, now a contiguous copy.
-    for (int i = threadIdx.x; i < HPB * key_length; i += BLOCK)
-        s_q[i] = q[(size_t)h0 * key_length + i];
+    if constexpr (QT) {
+        // P5 (SPARKINFER_K3_MLA_QT=1): store q d-MAJOR. In the score loop each
+        // lane owns one d and reads all HPB heads at it — head-major spaces those
+        // 12 values klen*4 B apart (12 scalar LDS); d-major packs them into 48
+        // contiguous bytes at a 16-aligned base (d*48) -> 3 LDS.128, and lane L's
+        // word 12L hits banks 0,12,24,4,... — a perfect 32-bank partition, no
+        // conflicts. One-time transposed store amortised over ~497 tokens/block.
+        // Same values into the same qv in the same FMA order: bit-identical.
+        for (int i = threadIdx.x; i < HPB * klen; i += BLOCK) {
+            const int hh = i / klen, d = i % klen;
+            s_q[(size_t)d * HPB + hh] = q[(size_t)h0 * klen + i];
+        }
+    } else {
+    for (int i = threadIdx.x; i < HPB * klen; i += BLOCK)
+        s_q[i] = q[(size_t)h0 * klen + i];
+    }
     if (threadIdx.x < HPB) { s_m[threadIdx.x] = -1e30f; s_l[threadIdx.x] = 0.0f; }
 
     // Latent accumulators: RSLOTS r-values x HPB heads, in registers.
     float acc[RSLOTS][HPB];
+    // LSP head-group ids: group g owns heads [g*HPB/2,(g+1)*HPB/2), its BLOCK/2
+    // threads cover every r as RSLOTS pair-slots of two consecutive r. Free when off.
+    const int lsp_lt = (int)threadIdx.x & (BLOCK / 2 - 1);
+    const int lsp_h0 = ((int)threadIdx.x / (BLOCK / 2)) * (HPB / 2);
 #pragma unroll
     for (int u = 0; u < RSLOTS; ++u)
 #pragma unroll
@@ -2150,18 +2446,34 @@ __global__ void mla_decode_attn_hbatch_kernel(float* __restrict__ part_acc,
             const KV* kt[TPW];
 #pragma unroll
             for (int tt = 0; tt < TPW; ++tt)
-                kt[tt] = k_cache + (size_t)(t0 + tb + min(tt, tc - 1)) * key_length;
+                kt[tt] = k_cache + (size_t)(t0 + tb + min(tt, tc - 1)) * klen;
 
 #pragma unroll UD
-            for (int d = lane; d < key_length; d += 32) {
+            for (int d = lane; d < klen; d += 32) {
                 float kv[TPW];
 #pragma unroll
                 for (int tt = 0; tt < TPW; ++tt) kv[tt] = kv_ld(kt[tt] + d);
+                if constexpr (QT) {
+                    float qh_[HPB];
+                    const float4* qp = (const float4*)(s_q + (size_t)d * HPB);
+#pragma unroll
+                    for (int j = 0; j < HPB / 4; ++j) {
+                        const float4 v4 = qp[j];
+                        qh_[4*j+0]=v4.x; qh_[4*j+1]=v4.y;
+                        qh_[4*j+2]=v4.z; qh_[4*j+3]=v4.w;
+                    }
+#pragma unroll
+                    for (int hh = 0; hh < HPB; ++hh) {
+#pragma unroll
+                        for (int tt = 0; tt < TPW; ++tt) s[hh][tt] += qh_[hh] * kv[tt];
+                    }
+                } else {
 #pragma unroll
                 for (int hh = 0; hh < HPB; ++hh) {
-                    const float qv = s_q[hh * key_length + d];
+                    const float qv = s_q[hh * klen + d];
 #pragma unroll
                     for (int tt = 0; tt < TPW; ++tt) s[hh][tt] += qv * kv[tt];
+                }
                 }
             }
 #pragma unroll
@@ -2172,7 +2484,7 @@ __global__ void mla_decode_attn_hbatch_kernel(float* __restrict__ part_acc,
 #pragma unroll
                     for (int off = 16; off > 0; off >>= 1)
                         v += __shfl_down_sync(0xffffffff, v, off);
-                    if (lane == 0 && tt < tc) s_p[hh * kMlaCtxTile + tb + tt] = v * scale;
+                    if (lane == 0 && tt < tc) s_p[s_p_idx(hh, tb + tt)] = v * scale;
                 }
         }
         __syncthreads();
@@ -2183,13 +2495,14 @@ __global__ void mla_decode_attn_hbatch_kernel(float* __restrict__ part_acc,
         // __syncwarp so no lane can observe this tile's write in place of the running
         // value it is supposed to fold into.
         for (int hh = warp; hh < HPB; hh += NWARP) {
-            float* pr = s_p + hh * kMlaCtxTile;
+            float* pr = s_p + (PVT ? hh : hh * kMlaCtxTile);
+            const int ps = PVT ? HPB : 1;
             const float m_prev = s_m[hh];
             const float l_prev = s_l[hh];
             __syncwarp();
 
             float tm = -1e30f;
-            for (int t = lane; t < tn; t += 32) tm = fmaxf(tm, pr[t]);
+            for (int t = lane; t < tn; t += 32) tm = fmaxf(tm, pr[t * ps]);
 #pragma unroll
             for (int off = 16; off > 0; off >>= 1)
                 tm = fmaxf(tm, __shfl_down_sync(0xffffffff, tm, off));
@@ -2202,8 +2515,8 @@ __global__ void mla_decode_attn_hbatch_kernel(float* __restrict__ part_acc,
 
             float ls = 0.0f;
             for (int t = lane; t < tn; t += 32) {
-                const float e = __expf(pr[t] - m_new);
-                pr[t] = e;
+                const float e = __expf(pr[t * ps] - m_new);
+                pr[t * ps] = e;
                 ls += e;
             }
 #pragma unroll
@@ -2221,17 +2534,80 @@ __global__ void mla_decode_attn_hbatch_kernel(float* __restrict__ part_acc,
         // One k_cache[t][r] load feeds HPB fused multiply-adds. RSLOTS is small and
         // both inner loops are fully unrolled, so acc stays in registers: a runtime
         // index here would spill the whole array to local memory and undo the point.
+        if constexpr (LSP) {
+#pragma unroll
+            for (int u = 0; u < RSLOTS; ++u)
+#pragma unroll
+                for (int e = 0; e < 2; ++e)
+#pragma unroll
+                    for (int hh = 0; hh < HPB / 2; ++hh)
+                        acc[u][e * (HPB / 2) + hh] *= s_c[lsp_h0 + hh];
+        } else {
 #pragma unroll
         for (int u = 0; u < RSLOTS; ++u)
 #pragma unroll
             for (int hh = 0; hh < HPB; ++hh) acc[u][hh] *= s_c[hh];
+        }
 
+        if constexpr (LSP) {
+        constexpr int HG = HPB / 2;
 #pragma unroll UT
         for (int t = 0; t < tn; ++t) {
-            const KV* kt = k_cache + (size_t)(t0 + t) * key_length;
+            const KV* kt = k_cache + (size_t)(t0 + t) * klen;
+            float p[HG];
+            if constexpr (PVT) {
+                // P6: the group's HG=6 probabilities are 24 contiguous bytes at
+                // t*48 + lsp_h0*4. Group 0 (base 16-aligned): float4 + float2.
+                // Group 1 (base 24 mod 16 = 8): float2 + float4. Both are 2
+                // uniform wide LDS instead of 6 scalar broadcasts — identical
+                // values in identical order, bit-identical by construction.
+                const float* pb = s_p + (size_t)t * HPB + lsp_h0;
+                if ((lsp_h0 & 3) == 0) {
+                    const float4 a = *(const float4*)pb;
+                    const float2 b = *(const float2*)(pb + 4);
+                    p[0]=a.x; p[1]=a.y; p[2]=a.z; p[3]=a.w; p[4]=b.x; p[5]=b.y;
+                } else {
+                    const float2 a = *(const float2*)pb;
+                    const float4 b = *(const float4*)(pb + 2);
+                    p[0]=a.x; p[1]=a.y; p[2]=b.x; p[3]=b.y; p[4]=b.z; p[5]=b.w;
+                }
+            } else {
+#pragma unroll
+            for (int hh = 0; hh < HG; ++hh) p[hh] = s_p[s_p_idx(lsp_h0 + hh, t)];
+            }
+#pragma unroll
+            for (int u = 0; u < RSLOTS; ++u) {
+                const int r = 2 * lsp_lt + u * BLOCK;
+                if (r + 1 < kv_lora) {
+                    // Rows are key_length*2 B apart and r is even: always 4-aligned.
+                    const __half2 kv2 = *(const __half2*)(kt + r);
+                    const float k0 = __low2float(kv2), k1 = __high2float(kv2);
+#pragma unroll
+                    for (int hh = 0; hh < HG; ++hh) {
+                        acc[u][hh]      += p[hh] * k0;
+                        acc[u][HG + hh] += p[hh] * k1;
+                    }
+                }
+            }
+        }
+        } else {
+#pragma unroll UT
+        for (int t = 0; t < tn; ++t) {
+            const KV* kt = k_cache + (size_t)(t0 + t) * klen;
             float p[HPB];
+            if constexpr (PVT) {
+                // 12 adjacent floats at a 16-aligned base: 3 uniform LDS.128.
+                const float4* pv = (const float4*)(s_p + (size_t)t * HPB);
+#pragma unroll
+                for (int j = 0; j < HPB / 4; ++j) {
+                    const float4 v4 = pv[j];
+                    p[4*j+0] = v4.x; p[4*j+1] = v4.y;
+                    p[4*j+2] = v4.z; p[4*j+3] = v4.w;
+                }
+            } else {
 #pragma unroll
             for (int hh = 0; hh < HPB; ++hh) p[hh] = s_p[hh * kMlaCtxTile + t];
+            }
 #pragma unroll
             for (int u = 0; u < RSLOTS; ++u) {
                 const int r = threadIdx.x + u * BLOCK;
@@ -2242,10 +2618,25 @@ __global__ void mla_decode_attn_hbatch_kernel(float* __restrict__ part_acc,
                 }
             }
         }
+        }
         __syncthreads();
     }
 
     // UNNORMALISED partials, one (head, slice) row each — the combine applies 1/l.
+    if constexpr (LSP) {
+        constexpr int HG = HPB / 2;
+#pragma unroll
+        for (int u = 0; u < RSLOTS; ++u) {
+            const int r = 2 * lsp_lt + u * BLOCK;
+            if (r + 1 < kv_lora)
+#pragma unroll
+                for (int hh = 0; hh < HG; ++hh) {
+                    float* pa = part_acc + ((size_t)(h0 + lsp_h0 + hh) * splits + sp) * kv_lora;
+                    pa[r]     = acc[u][hh];
+                    pa[r + 1] = acc[u][HG + hh];
+                }
+        }
+    } else {
 #pragma unroll
     for (int u = 0; u < RSLOTS; ++u) {
         const int r = threadIdx.x + u * BLOCK;
@@ -2253,6 +2644,7 @@ __global__ void mla_decode_attn_hbatch_kernel(float* __restrict__ part_acc,
 #pragma unroll
             for (int hh = 0; hh < HPB; ++hh)
                 part_acc[((size_t)(h0 + hh) * splits + sp) * kv_lora + r] = acc[u][hh];
+    }
     }
     if (threadIdx.x < HPB) {
         // An empty slice (n_ctx < splits) must contribute nothing: l = 0 and a very
@@ -2592,6 +2984,80 @@ __global__ void proj_q8_0_multirow_kernel(float* __restrict__ y,
     }
 }
 
+// The multirow kernel above, with the ONE-BARRIER epilogue the tier family proved
+// out (proj_q8_fused4_1bar_kernel): the per-row block_sum pays 2*ROWS __syncthreads
+// per CTA — 32 at ROWS 16 — where one stash + one barrier + a per-slot ascending-w
+// fold produces the SAME partials summed in the SAME order (block_sum's warp tree,
+// then w = 0..NWARP ascending), so the result is bit-identical, not re-rounded.
+// Activation loads widen to float4 — same values, same use order, fewer issue slots.
+// Serves the LM head (the one k3_proj_f32 caller left on the scored path at tp=8),
+// selected by SPARKINFER_K3_HEAD_1BAR so one binary A/Bs it.
+template <int BLOCK, int ROWS>
+__global__ void proj_q8_0_multirow_1bf_kernel(float* __restrict__ y,
+                                              const float* __restrict__ x,
+                                              const BlockQ8_0* __restrict__ W,
+                                              int blocks_per_row, int n_rows) {
+    k3_pdl_sync();
+    constexpr int NWARP = BLOCK / 32;
+    const int n0   = blockIdx.x * ROWS;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    __shared__ float shm1[NWARP * ROWS];
+
+    float acc[ROWS];
+#pragma unroll
+    for (int r = 0; r < ROWS; ++r) acc[r] = 0.0f;
+
+    for (int b = threadIdx.x; b < blocks_per_row; b += BLOCK) {
+        const float* xb = x + (size_t)b * 32;
+        float s[ROWS];
+#pragma unroll
+        for (int r = 0; r < ROWS; ++r) s[r] = 0.0f;
+
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            // One 16 B activation load, reused by every row in this block. The four
+            // lanes are consumed in the same x0..x3 order the scalar loads were.
+            const float4 xv = *(const float4*)(xb + 4 * i);
+            const float x0 = xv.x, x1 = xv.y, x2 = xv.z, x3 = xv.w;
+#pragma unroll
+            for (int r = 0; r < ROWS; ++r) {
+                if (n0 + r >= n_rows) continue;
+                const BlockQ8_0* row = W + (size_t)(n0 + r) * blocks_per_row;
+                const int wq = get_int_b2(row[b].qs, i);
+                s[r] += (float)(int8_t)(wq >>  0) * x0;
+                s[r] += (float)(int8_t)(wq >>  8) * x1;
+                s[r] += (float)(int8_t)(wq >> 16) * x2;
+                s[r] += (float)(int8_t)(wq >> 24) * x3;
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < ROWS; ++r) {
+            if (n0 + r >= n_rows) continue;
+            const BlockQ8_0* row = W + (size_t)(n0 + r) * blocks_per_row;
+            acc[r] += __half2float(__ushort_as_half(row[b].d)) * s[r];
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < ROWS; ++r) {
+        float v = acc[r];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            v += __shfl_down_sync(0xffffffff, v, off);
+        if (lane == 0) shm1[warp * ROWS + r] = v;
+    }
+
+    __syncthreads();   // the only one
+
+    if (threadIdx.x < ROWS && n0 + threadIdx.x < n_rows) {
+        float s = 0.0f;
+#pragma unroll
+        for (int w = 0; w < NWARP; ++w) s += shm1[w * ROWS + threadIdx.x];
+        y[n0 + threadIdx.x] = s;
+    }
+}
+
 // Four projections that share one activation, in one launch.
 //
 // K3's KDA block computes attn_q, attn_k, attn_v and ssm_g from the SAME normed hidden
@@ -2677,7 +3143,7 @@ __global__ void proj_q8_0_fused4_kernel(float* __restrict__ y0, float* __restric
         }
 }
 
-template <int BLOCK>
+template <int BLOCK, bool WIDE = false>
 __global__ void proj_q8_0_q8_0_kernel(float* __restrict__ y,
                                       const BlockQ8_0* __restrict__ x,
                                       const BlockQ8_0* __restrict__ W,
@@ -2702,7 +3168,8 @@ __global__ void proj_q8_0_q8_0_kernel(float* __restrict__ y,
         int sumi = 0;
 #pragma unroll
         for (int i = 0; i < 8; ++i)
-            sumi = __dp4a(get_int_b2(row[b].qs, i), get_int_b2(x[b].qs, i), sumi);
+            sumi = __dp4a(get_int_b2_sel(row[b].qs, i, WIDE),
+                          get_int_b2_sel(x[b].qs, i, WIDE), sumi);
         const float dw = __half2float(__ushort_as_half(row[b].d));
         const float dx = __half2float(__ushort_as_half(x[b].d));
         acc += (float)sumi * (dw * dx);
@@ -2896,8 +3363,31 @@ __global__ void proj_f32_kernel(float* __restrict__ y, const float* __restrict__
     const float* row = W + (size_t)n * K;
     __shared__ float shm[BLOCK / 32 + 1];
 
+    // ISSUE EIGHT LOADS BEFORE THE FIRST FMA. These loads are perfectly coalesced
+    // (128 B/warp, one wavefront), so this kernel is not instruction-bound like the
+    // Q8_0 GEMVs -- it is DRAM-LATENCY-bound, and the only lever is how many loads
+    // are outstanding per warp. At the router shape (N=896, K=7168) the grid is
+    // 896x4 warps / 132 SM = 27.2 warps/SM; sustaining the measured 36.4 GB/s/SM at
+    // ~600 ns of latency needs ~21.8 KB in flight, i.e. ~6 outstanding loads per
+    // warp. The measured 2.15 TB/s back-solves to ~4 -- which is exactly what nvcc
+    // emits by default for a runtime-bounded loop with one serial accumulator,
+    // because it cannot prove the trip count. Naming the unroll lifts it to 8.
+    //
+    // BIT-IDENTICAL, unconditionally: `acc +=` is a serial dependency chain, so the
+    // summation order is identical at ANY unroll factor -- unrolling cannot
+    // reassociate what the data dependency already serialises. --use_fast_math is on
+    // (CMakeLists.txt:9), which enables FMA contraction and ftz but never
+    // reassociation, and both arms here contract the same way.
     float acc = 0.0f;
-    for (int k = threadIdx.x; k < K; k += BLOCK) acc += row[k] * x[k];
+    int k = threadIdx.x;
+    for (; k + 7 * BLOCK < K; k += 8 * BLOCK) {
+        float w[8], v[8];
+#pragma unroll
+        for (int u = 0; u < 8; ++u) { w[u] = row[k + u * BLOCK]; v[u] = x[k + u * BLOCK]; }
+#pragma unroll
+        for (int u = 0; u < 8; ++u) acc += w[u] * v[u];
+    }
+    for (; k < K; k += BLOCK) acc += row[k] * x[k];
     acc = block_sum<BLOCK>(acc, shm);
     if (threadIdx.x == 0) y[n] = acc;
 }
@@ -2971,26 +3461,52 @@ __global__ void rms_norm_kernel(float* __restrict__ out, const float* __restrict
 // Idle threads above 128 contribute 0 to block_sum; x+0 is an IEEE identity, so the
 // longer warp-tree sum is bit-identical to the 4-warp one.
 //
+// SPAN_UNITS slices the apply across CTAs on top of the widening: the apply moves
+// three times the bytes of the reduction and cannot start until it lands, and a
+// single CTA — however wide — is one SM of 132. Every CTA recomputes the identical
+// frozen-128 reduction, so `inv` agrees bit-for-bit across the grid; CTA g then
+// writes only units [g*span, (g+1)*span), so each output element is still produced
+// by exactly one thread from the same product in the same order. span_units == the
+// full unit count with grid 1 is exactly the single-CTA form.
+//
+// UNROLL names the load count of the reduction sweep. `acc +=` is a serial
+// dependency chain, so summation order is identical at any unroll factor — the same
+// argument proj_f32_kernel relies on, and it matters more here because nothing else
+// is resident to cover the reduction's latency.
+//
 // n4 is the float4 count when vec4!=0; n is always the element count (the mean divisor).
-template <int BLOCK>
+template <int BLOCK, bool UNROLL>
 __global__ void rms_norm_wide_kernel(float* __restrict__ out, const float* __restrict__ x,
                                      const float* __restrict__ w, int n, float eps,
-                                     int n4, int vec4) {
+                                     int n4, int vec4, int span_units) {
     k3_pdl_sync();
     __shared__ float shm[BLOCK / 32 + 1];
 
     float acc = 0.0f;
     if (threadIdx.x < 128) {
-        for (int d = (int)threadIdx.x; d < n; d += 128) acc += x[d] * x[d];
+        int d = (int)threadIdx.x;
+        if (UNROLL) {
+            for (; d + 7 * 128 < n; d += 8 * 128) {
+                float v[8];
+#pragma unroll
+                for (int u = 0; u < 8; ++u) v[u] = x[d + u * 128];
+#pragma unroll
+                for (int u = 0; u < 8; ++u) acc += v[u] * v[u];
+            }
+        }
+        for (; d < n; d += 128) acc += x[d] * x[d];
     }
     const float ss = block_sum<BLOCK>(acc, shm);
     const float inv = rsqrtf(ss / (float)n + eps);
 
+    const int units = vec4 ? n4 : n;
+    const int u0 = blockIdx.x * span_units;
+    const int u1 = min(u0 + span_units, units);
     if (vec4) {
         const float4* __restrict__ x4 = (const float4*)x;
         const float4* __restrict__ w4 = (const float4*)w;
         float4* __restrict__ o4 = (float4*)out;
-        for (int d = (int)threadIdx.x; d < n4; d += BLOCK) {
+        for (int d = u0 + (int)threadIdx.x; d < u1; d += BLOCK) {
             const float4 v = x4[d];
             const float4 g = w4[d];
             float4 r;
@@ -3001,7 +3517,7 @@ __global__ void rms_norm_wide_kernel(float* __restrict__ out, const float* __res
             o4[d] = r;
         }
     } else {
-        for (int d = (int)threadIdx.x; d < n; d += BLOCK)
+        for (int d = u0 + (int)threadIdx.x; d < u1; d += BLOCK)
             out[d] = x[d] * inv * w[d];
     }
 }
@@ -3083,10 +3599,22 @@ void kda_gate_out_f32(float* out, const float* o, const float* norm_w,
 
 void attn_res_mix_f32(float* out, const float* ckpts, const float* cur,
                       const float* score_w, int n_embd, int n_ckpt,
-                      float eps, cudaStream_t stream, float* scores) {
+                      float eps, cudaStream_t stream, float* scores,
+                      const float* cur_b, float* sum_out) {
     if (n_embd <= 0) return;
     if (n_ckpt <= 0) {
-        // Layer 0 / nothing banked: the reference returns cur unchanged.
+        // Layer 0 / nothing banked: the reference returns cur unchanged. With a
+        // residual pair in flight the sum still has to be materialised — same two
+        // launches the unfused path used, so this branch never regresses.
+        if (cur_b && sum_out) {
+            k3_add_f32(sum_out, cur, cur_b, n_embd, stream);
+            cudaMemcpyAsync(out, sum_out, (size_t)n_embd * sizeof(float),
+                            cudaMemcpyDeviceToDevice, stream);
+            return;
+        }
+        if (sum_out)
+            cudaMemcpyAsync(sum_out, cur, (size_t)n_embd * sizeof(float),
+                            cudaMemcpyDeviceToDevice, stream);
         cudaMemcpyAsync(out, cur, (size_t)n_embd * sizeof(float),
                         cudaMemcpyDeviceToDevice, stream);
         return;
@@ -3124,19 +3652,19 @@ void attn_res_mix_f32(float* out, const float* ckpts, const float* cur,
     if (res_wide && n_embd >= SB) {
         if (res_1pass)
             k3_pdl_launch((unsigned)(n_ckpt + 1), SB, 0, stream, attn_res_score_kernel<SB, true>,
-                sc, ckpts, cur, score_w, n_embd, n_ckpt, eps);
+                sc, ckpts, cur, cur_b, score_w, n_embd, n_ckpt, eps);
         else
             k3_pdl_launch((unsigned)(n_ckpt + 1), SB, 0, stream, attn_res_score_kernel<SB, false>,
-                sc, ckpts, cur, score_w, n_embd, n_ckpt, eps);
+                sc, ckpts, cur, cur_b, score_w, n_embd, n_ckpt, eps);
     } else if (res_1pass)
         k3_pdl_launch((unsigned)(n_ckpt + 1), B, 0, stream, attn_res_score_kernel<B, true>,
-            sc, ckpts, cur, score_w, n_embd, n_ckpt, eps);
+            sc, ckpts, cur, cur_b, score_w, n_embd, n_ckpt, eps);
     else
         k3_pdl_launch((unsigned)(n_ckpt + 1), B, 0, stream, attn_res_score_kernel<B, false>,
-            sc, ckpts, cur, score_w, n_embd, n_ckpt, eps);
+            sc, ckpts, cur, cur_b, score_w, n_embd, n_ckpt, eps);
     k3_pdl_launch((unsigned)((n_embd + B - 1) / B), B,
-                              (size_t)(n_ckpt + 1) * sizeof(float), stream, attn_res_apply_kernel<B>, 
-        out, ckpts, cur, sc, n_embd, n_ckpt);
+                              (size_t)(n_ckpt + 1) * sizeof(float), stream, attn_res_apply_kernel<B>,
+        out, ckpts, cur, cur_b, sum_out, sc, n_embd, n_ckpt);
 
     if (owned) cudaFreeAsync(sc, stream);
 }
@@ -3215,11 +3743,35 @@ static void ensure_iq2xs_tables() {
     if (dev >= 0) ready[dev] = true;
 }
 
+// The SAME lattice at 2 bytes per codepoint instead of 8. Every byte of every
+// entry is in {0x00, 0x01, 0xff} (the header's tripwire), i.e. {0, 1, -1} — two
+// bits each in two's complement. Why it can pay: the 11-bit index is fully
+// divergent across a warp, so a gather's L1 cost is the number of DISTINCT
+// 128 B lines touched. A 16 KB table spans 128 lines -> E[distinct] ~ 28.4 per
+// warp; a 4 KB table spans 32 -> ~20.4 (-28%), purely from intra-warp line
+// coincidence. It also halves the registers holding the grid word. Packed
+// HOST-SIDE from the same iq1s_grid_host, so the extracted table remains the
+// single source of truth and the tripwire survives.
 static void ensure_iq1s_tables() {
     static bool ready[kMaxTableDevices] = {false};
     const int dev = current_device_index();
     if (dev >= 0 && ready[dev]) return;
     cudaMemcpyToSymbol(iq1s_grid_c, iq1s_grid_host, sizeof(iq1s_grid_host));
+    static uint16_t packed[SPARKINFER_IQ1S_NGRID];
+    static bool packed_ready = false;
+    if (!packed_ready) {
+        for (int i = 0; i < SPARKINFER_IQ1S_NGRID; ++i) {
+            const uint64_t gw = iq1s_grid_host[i];
+            uint16_t v = 0;
+            for (int j = 0; j < 8; ++j) {
+                const int8_t gj = (int8_t)((gw >> (8 * j)) & 0xffu);
+                v |= (uint16_t)((uint16_t)gj & 3u) << (2 * j);
+            }
+            packed[i] = v;
+        }
+        packed_ready = true;
+    }
+    cudaMemcpyToSymbol(iq1s_grid_p, packed, sizeof(packed));
     if (dev >= 0) ready[dev] = true;
 }
 
@@ -3239,6 +3791,38 @@ static void ensure_iq1s_tables() {
 void k3_prewarm_quant_tables() {
     ensure_iq2xs_tables();
     ensure_iq1s_tables();
+    // WEPS engagement counting, opt-in and uploaded here because this function runs
+    // once per device BEFORE any capture — the same synchronous-copy-legality window
+    // the table uploads need. Default off: the scored path never pays the atomics.
+    static const int count = [] {
+        const char* e = std::getenv("SPARKINFER_K3_WEPS_COUNT");
+        return (e && e[0] == '1') ? 1 : 0;
+    }();
+    if (count)
+        cudaMemcpyToSymbol(g_k3_weps_count, &count, sizeof(int));
+}
+
+// Bind the depth gate on the CURRENT device. Called from state init, with the
+// rank's device current and before any capture — the same synchronous-copy window
+// the quant-table prewarm uses. Passing the d_pos the forward already maintains
+// keeps a single source of truth for the position.
+void k3_weps_bind_pos(const int* d_pos) {
+    static const int minp = [] {
+        const char* e = std::getenv("SPARKINFER_K3_WEPS_MINPOS");
+        return e ? atoi(e) : 16384;
+    }();
+    cudaMemcpyToSymbol(g_k3_weps_pos, &d_pos, sizeof(d_pos));
+    cudaMemcpyToSymbol(g_k3_weps_min_pos, &minp, sizeof(int));
+}
+
+// Engagement readout for the CURRENT device; the caller loops ranks. Reset-on-read
+// so consecutive probes (per-depth KL runs) need no separate clear call.
+unsigned long long k3_weps_skips_read_current_device() {
+    unsigned long long v = 0;
+    cudaMemcpyFromSymbol(&v, g_k3_weps_skips, sizeof(v));
+    const unsigned long long zero = 0;
+    cudaMemcpyToSymbol(g_k3_weps_skips, &zero, sizeof(zero));
+    return v;
 }
 
 void dequant_iq2_xs_f32(float* out, const void* src, int64_t n, cudaStream_t stream) {
@@ -3305,25 +3889,74 @@ static void moe_expert_ffn_launch(float* out, float* scratch,
     const bool xvec = ((((uintptr_t)x) | ((uintptr_t)scratch)) & 15u) == 0;
 
     const dim3 g1((unsigned)((ffn + WARPS - 1) / WARPS), (unsigned)top_k);
-    const size_t dshm = (size_t)top_k * sizeof(float);
+    // partial[top_k] + the staged ids/w epilogue operands (see the kernel).
+    const size_t dshm = (size_t)top_k * (2 * sizeof(float) + sizeof(int));
     const float inv_lb = lb_active ? 1.0f / situ_linear_beta : 1.0f;
 
     if (xvec) {
+        // SPARKINFER_K3_IQ1S_PACK=1 reads the lattice through the 4 KB packed
+        // table (see iq1s_grid_p). DEFAULT OFF until measured — same one-binary
+        // A/B convention as every other gate on this branch.
+        static const bool gpack = [] {
+            // MEASURED +0.72 tok/s (3 sessions). Default ON; =0 restores.
+            const char* e = std::getenv("SPARKINFER_K3_IQ1S_PACK");
+            return !(e && e[0] == '0');
+        }();
+        // SPARKINFER_K3_IQ1S_SMEM=1 additionally stages the packed table in
+        // shared (gate/up only: 224 gathers/CTA amortise the 4 KB copy ~14:1;
+        // down_combine's 24 do not). DEFAULT OFF until measured.
+        static const bool gsmem = [] {
+            const char* e = std::getenv("SPARKINFER_K3_IQ1S_SMEM");
+            return e && e[0] == '1';
+        }();
+        static const bool rebal = [] {
+            const char* e = std::getenv("SPARKINFER_K3_MOE_REBAL");
+            return e && e[0] == '1';
+        }();
+        if (gpack && gsmem) {
+            k3_pdl_launch(g1, WARPS * 32, sizeof(uint16_t) * SPARKINFER_IQ1S_NGRID,
+                stream, moe_gate_up_situ_kernel<WARPS, true, Blk, true, true>,
+                scratch, x, ids, (const Blk*)gate_exps, (const Blk*)up_exps, latent, ffn,
+                situ_beta, 1.0f / situ_beta, situ_linear_beta, inv_lb, lb_active,
+                expert_begin, n_local, w, k3_moe_weps_host());
+            if (rebal)
+                k3_pdl_launch((unsigned)latent, WARPS * 32, dshm, stream, moe_down_combine_kernel<WARPS, true, Blk, true, true>,
+                    out, scratch, ids, w, (const Blk*)down_exps, latent, ffn, top_k,
+                    expert_begin, n_local, k3_moe_weps_host());
+                else
+                k3_pdl_launch((unsigned)latent, WARPS * 32, dshm, stream, moe_down_combine_kernel<WARPS, true, Blk, true>,
+                    out, scratch, ids, w, (const Blk*)down_exps, latent, ffn, top_k,
+                    expert_begin, n_local, k3_moe_weps_host());
+        } else if (gpack) {
+            k3_pdl_launch(g1, WARPS * 32, 0, stream, moe_gate_up_situ_kernel<WARPS, true, Blk, true>,
+                scratch, x, ids, (const Blk*)gate_exps, (const Blk*)up_exps, latent, ffn,
+                situ_beta, 1.0f / situ_beta, situ_linear_beta, inv_lb, lb_active,
+                expert_begin, n_local, w, k3_moe_weps_host());
+            if (rebal)
+                k3_pdl_launch((unsigned)latent, WARPS * 32, dshm, stream, moe_down_combine_kernel<WARPS, true, Blk, true, true>,
+                    out, scratch, ids, w, (const Blk*)down_exps, latent, ffn, top_k,
+                    expert_begin, n_local, k3_moe_weps_host());
+                else
+                k3_pdl_launch((unsigned)latent, WARPS * 32, dshm, stream, moe_down_combine_kernel<WARPS, true, Blk, true>,
+                    out, scratch, ids, w, (const Blk*)down_exps, latent, ffn, top_k,
+                    expert_begin, n_local, k3_moe_weps_host());
+        } else {
         k3_pdl_launch(g1, WARPS * 32, 0, stream, moe_gate_up_situ_kernel<WARPS, true, Blk>, 
             scratch, x, ids, (const Blk*)gate_exps, (const Blk*)up_exps, latent, ffn,
             situ_beta, 1.0f / situ_beta, situ_linear_beta, inv_lb, lb_active,
-            expert_begin, n_local);
+            expert_begin, n_local, w, k3_moe_weps_host());
         k3_pdl_launch((unsigned)latent, WARPS * 32, dshm, stream, moe_down_combine_kernel<WARPS, true, Blk>, 
                 out, scratch, ids, w, (const Blk*)down_exps, latent, ffn, top_k,
-                expert_begin, n_local);
+                expert_begin, n_local, k3_moe_weps_host());
+        }
     } else {
         k3_pdl_launch(g1, WARPS * 32, 0, stream, moe_gate_up_situ_kernel<WARPS, false, Blk>, 
             scratch, x, ids, (const Blk*)gate_exps, (const Blk*)up_exps, latent, ffn,
             situ_beta, 1.0f / situ_beta, situ_linear_beta, inv_lb, lb_active,
-            expert_begin, n_local);
+            expert_begin, n_local, w, k3_moe_weps_host());
         k3_pdl_launch((unsigned)latent, WARPS * 32, dshm, stream, moe_down_combine_kernel<WARPS, false, Blk>, 
                 out, scratch, ids, w, (const Blk*)down_exps, latent, ffn, top_k,
-                expert_begin, n_local);
+                expert_begin, n_local, k3_moe_weps_host());
     }
 }
 
@@ -3717,10 +4350,109 @@ static void mla_decode_attn_launch(float* out, const float* q, const KV* k_cache
             return !(e && e[0] == '0');
         }();
         if (deep_unroll && hpb == 12 && rslots == 2) {
+            // SPARKINFER_K3_MLA_LSPLIT=1 selects the head-group/__half2 latent pass
+            // (see the kernel's LSP note). DEFAULT OFF until measured. Needs a 16-bit
+            // cache and kv_lora divisible by BLOCK so the pair-slots tile exactly.
+            static const bool lsplit = [] {
+                const char* e = std::getenv("SPARKINFER_K3_MLA_LSPLIT");
+                return e && e[0] == '1';
+            }();
+            // SPARKINFER_K3_MLA_PVT=1: t-major s_p (see the kernel's PVT note).
+            // DEFAULT OFF until measured. Composes with LSPLIT; measured alone
+            // first per the overlap lesson.
+            static const bool pvt = [] {
+                // MEASURED +0.51 tok/s. Default ON; =0 restores head-major.
+                const char* e = std::getenv("SPARKINFER_K3_MLA_PVT");
+                return !(e && e[0] == '0');
+            }();
+            static const bool qt = [] {
+                const char* e = std::getenv("SPARKINFER_K3_MLA_QT");
+                return e && e[0] == '1';
+            }();
+            // KLENT=576 folds the per-head s_q bases to immediates. MEASURED
+            // +0.20 on the head-major kernel; composed with PVT below because
+            // the two touch different axes (constant folding vs s_p layout).
+            // =0 restores the runtime-key_length instantiations.
+            static const bool klen_on = [] {
+                const char* e = std::getenv("SPARKINFER_K3_MLA_KLEN");
+                return !(e && e[0] == '0');
+            }();
+            const bool klen576 = klen_on && key_length == 576;
+            if (qt && pvt && lsplit && sizeof(KV) == 2 && (kv_lora % BLOCK) == 0) {
+                k3_pdl_launch(hgrid, BLOCK, hshm, stream,
+                              mla_decode_attn_hbatch_kernel<BLOCK, 12, 2, KV,
+                                                            kMlaTokensPerWarp, 8, 6,
+                                                            true, true, 0, true>,
+                              g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache,
+                              key_length, kv_lora, d_pos, scale, splits);
+            } else if (qt && pvt) {
+                k3_pdl_launch(hgrid, BLOCK, hshm, stream,
+                              mla_decode_attn_hbatch_kernel<BLOCK, 12, 2, KV,
+                                                            kMlaTokensPerWarp, 8, 6,
+                                                            false, true, 0, true>,
+                              g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache,
+                              key_length, kv_lora, d_pos, scale, splits);
+            } else if (qt) {
+                k3_pdl_launch(hgrid, BLOCK, hshm, stream,
+                              mla_decode_attn_hbatch_kernel<BLOCK, 12, 2, KV,
+                                                            kMlaTokensPerWarp, 8, 6,
+                                                            false, false, 0, true>,
+                              g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache,
+                              key_length, kv_lora, d_pos, scale, splits);
+            } else if (pvt && lsplit && sizeof(KV) == 2 && (kv_lora % BLOCK) == 0) {
+                k3_pdl_launch(hgrid, BLOCK, hshm, stream,
+                              mla_decode_attn_hbatch_kernel<BLOCK, 12, 2, KV,
+                                                            kMlaTokensPerWarp, 8, 6, true, true>,
+                              g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache,
+                              key_length, kv_lora, d_pos, scale, splits);
+            } else if (pvt && klen576) {
+                // The default path: PVT's t-major s_p with KLENT's folded bases.
+                k3_pdl_launch(hgrid, BLOCK, hshm, stream,
+                              mla_decode_attn_hbatch_kernel<BLOCK, 12, 2, KV,
+                                                            kMlaTokensPerWarp, 8, 6,
+                                                            false, true, 576>,
+                              g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache,
+                              key_length, kv_lora, d_pos, scale, splits);
+            } else if (pvt) {
+                k3_pdl_launch(hgrid, BLOCK, hshm, stream,
+                              mla_decode_attn_hbatch_kernel<BLOCK, 12, 2, KV,
+                                                            kMlaTokensPerWarp, 8, 6, false, true>,
+                              g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache,
+                              key_length, kv_lora, d_pos, scale, splits);
+            } else if (lsplit && sizeof(KV) == 2 && (kv_lora % BLOCK) == 0) {
+                k3_pdl_launch(hgrid, BLOCK, hshm, stream,
+                              mla_decode_attn_hbatch_kernel<BLOCK, 12, 2, KV,
+                                                            kMlaTokensPerWarp, 8, 6, true>,
+                              g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache,
+                              key_length, kv_lora, d_pos, scale, splits);
+            } else if ([]{ static const bool on = [] {
+                                const char* e = std::getenv("SPARKINFER_K3_MLA_UD7");
+                                return e && e[0] == '1'; }();
+                            return on; }() && key_length == 576) {
+                // The deeper unroll KLEN exists to enable: UD=7 measured 136 regs
+                // with a runtime key_length (over the 128 cliff); with KLENT the
+                // s_q bases fold to immediates and it may fit. ptxas decides.
+                k3_pdl_launch(hgrid, BLOCK, hshm, stream,
+                              mla_decode_attn_hbatch_kernel<BLOCK, 12, 2, KV,
+                                                            kMlaTokensPerWarp, 8, 7,
+                                                            false, false, 576>,
+                              g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache,
+                              key_length, kv_lora, d_pos, scale, splits);
+            } else if (klen576) {
+                // KLENT=576 instantiation — same UT/UD, constants folded into
+                // immediate offsets. ptxas -v (CI) reports the register delta.
+                k3_pdl_launch(hgrid, BLOCK, hshm, stream,
+                              mla_decode_attn_hbatch_kernel<BLOCK, 12, 2, KV,
+                                                            kMlaTokensPerWarp, 8, 6,
+                                                            false, false, 576>,
+                              g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache,
+                              key_length, kv_lora, d_pos, scale, splits);
+            } else {
             k3_pdl_launch(hgrid, BLOCK, hshm, stream,
                           mla_decode_attn_hbatch_kernel<BLOCK, 12, 2, KV, kMlaTokensPerWarp, 8, 6>,
                           g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length,
                           kv_lora, d_pos, scale, splits);
+            }
             k3_mla_launch_combine<BLOCK>(out, dev, wv_b, n_head, kv_lora, v_dim,
                                          splits, stream);
             return;
@@ -3793,6 +4525,10 @@ __global__ void mla_kv_store_f16_kernel(__half* __restrict__ cache,
                                         const float* __restrict__ kv_a_out,
                                         const int* __restrict__ d_pos,
                                         int kv_lora, int rope_dim, int key_length) {
+    // Per the k3_pdl.cuh contract: fence before reading inputs. The f32 twin has
+    // this; this SHIPPED twin (#86 made the cache __half) was the one decode-path
+    // kernel that missed both the sync and the k3_pdl_launch routing.
+    k3_pdl_sync();
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= kv_lora + rope_dim) return;
     __half* row = cache + (size_t)(*d_pos) * key_length;
@@ -3806,7 +4542,7 @@ void k3_mla_kv_store_f16(void* cache, const float* kv_cmpr_normed,
     if (!cache || !d_pos || kv_lora <= 0 || rope_dim <= 0 || key_length <= 0) return;
     const int n = kv_lora + rope_dim;
     const int T = 256;
-    mla_kv_store_f16_kernel<<<(unsigned)((n + T - 1) / T), T, 0, stream>>>(
+    k3_pdl_launch((unsigned)((n + T - 1) / T), T, 0, stream, mla_kv_store_f16_kernel,
         (__half*)cache, kv_cmpr_normed, kv_a_out, d_pos, kv_lora, rope_dim, key_length);
 }
 
@@ -3933,18 +4669,38 @@ bool k3_proj_f32(float* y, const float* x, const void* W, int wtype,
             const int nb = K / 32;
             const int TB = proj_block_for(nb);
             if (N >= ROWS_W16 * MIN_BLOCKS) {
+                // SPARKINFER_K3_HEAD_1BAR=0 restores the block_sum epilogue on the
+                // same binary. At the scored tp=8 config the only caller that still
+                // reaches this branch is the banded LM head; the fold is the tier
+                // family's proven one-barrier epilogue, bit-identical by order.
+                static const bool head_1bar = [] {
+                    const char* e = std::getenv("SPARKINFER_K3_HEAD_1BAR");
+                    return !(e && e[0] == '0');
+                }();
                 const unsigned grid = (unsigned)((N + ROWS_W16 - 1) / ROWS_W16);
+                const bool al16 = ((uintptr_t)x & 15u) == 0;
                 switch (TB) {
                     case 32:
-                        k3_pdl_launch(grid, 32, 0, stream, proj_q8_0_multirow_kernel<32, ROWS_W16>, 
-                            y, x, (const BlockQ8_0*)W, nb, N);
+                        if (head_1bar && al16)
+                            k3_pdl_launch(grid, 32, 0, stream, proj_q8_0_multirow_1bf_kernel<32, ROWS_W16>,
+                                y, x, (const BlockQ8_0*)W, nb, N);
+                        else
+                            k3_pdl_launch(grid, 32, 0, stream, proj_q8_0_multirow_kernel<32, ROWS_W16>,
+                                y, x, (const BlockQ8_0*)W, nb, N);
                         break;
                     case 64:
-                        k3_pdl_launch(grid, 64, 0, stream, proj_q8_0_multirow_kernel<64, ROWS_W16>, 
-                            y, x, (const BlockQ8_0*)W, nb, N);
+                        if (head_1bar && al16)
+                            k3_pdl_launch(grid, 64, 0, stream, proj_q8_0_multirow_1bf_kernel<64, ROWS_W16>,
+                                y, x, (const BlockQ8_0*)W, nb, N);
+                        else
+                            k3_pdl_launch(grid, 64, 0, stream, proj_q8_0_multirow_kernel<64, ROWS_W16>,
+                                y, x, (const BlockQ8_0*)W, nb, N);
                         break;
                     default:
-                        k3_pdl_launch(grid, BLOCK, 0, stream, proj_q8_0_multirow_kernel<BLOCK, ROWS_W16>, y, x, (const BlockQ8_0*)W, nb, N);
+                        if (head_1bar && al16)
+                            k3_pdl_launch(grid, BLOCK, 0, stream, proj_q8_0_multirow_1bf_kernel<BLOCK, ROWS_W16>, y, x, (const BlockQ8_0*)W, nb, N);
+                        else
+                            k3_pdl_launch(grid, BLOCK, 0, stream, proj_q8_0_multirow_kernel<BLOCK, ROWS_W16>, y, x, (const BlockQ8_0*)W, nb, N);
                         break;
                 }
             } else if (N >= ROWS_W8 * MIN_BLOCKS) {
@@ -4112,6 +4868,10 @@ bool k3_quantize_act_f32(void* q8_out, const float* x, int K, cudaStream_t strea
 // the caller's straight-line code instead of an invariant someone has to maintain.
 bool k3_proj_q8act_f32(float* y, const void* q8_scratch, const void* W, int wtype,
                        int N, int K, cudaStream_t stream) {
+    // SoA-first (k3_q8soa.cu): engages only for load-registered tensors under
+    // SPARKINFER_K3_Q8SOA=1; bit-identical to the dispatch below by construction.
+    if (k3_proj_q8soa(y, q8_scratch, W, N, K, stream)) return true;
+
     if (N <= 0 || K <= 0) return false;
     if (wtype != 8 || !q8_scratch || K % 32 != 0) return false;
     const int nb = K / 32;
@@ -4162,20 +4922,34 @@ bool k3_proj_q8act_f32(float* y, const void* q8_scratch, const void* W, int wtyp
     else {
         // Below the threshold the single-row kernel keeps the wide grid, and it is
         // also the one the numeric test pins bit-for-bit.
+        //
+        // SPARKINFER_K3_B2WIDE=1 swaps the Q8_0 block accessor for the 32-bit-load
+        // form (see get_int_b2_wide). DEFAULT OFF until measured. This kernel is the
+        // largest consumer OUTSIDE k3_proj_q8_fast.cu -- shexp gate/up, ssm_f_a and
+        // attn_kv_a_mqa -- and it calls the accessor on BOTH dp4a operands, so it is
+        // where the instruction-count change should show up first if it shows at all.
+        static const bool b2wide = [] {
+            // MEASURED +0.30 tok/s. Default ON; =0 restores the 16-bit pair.
+            const char* e = std::getenv("SPARKINFER_K3_B2WIDE");
+            return !(e && e[0] == '0');
+        }();
+#define K3_QQ_W(BLK)                                                                  \
+        do {                                                                          \
+            if (b2wide)                                                               \
+                k3_pdl_launch((unsigned)N, (BLK), 0, stream,                          \
+                    proj_q8_0_q8_0_kernel<(BLK), true>,                               \
+                    y, (const BlockQ8_0*)q8_scratch, (const BlockQ8_0*)W, nb);        \
+            else                                                                      \
+                k3_pdl_launch((unsigned)N, (BLK), 0, stream,                          \
+                    proj_q8_0_q8_0_kernel<(BLK), false>,                              \
+                    y, (const BlockQ8_0*)q8_scratch, (const BlockQ8_0*)W, nb);        \
+        } while (0)
         switch (TB) {
-            case 32:
-                k3_pdl_launch((unsigned)N, 32, 0, stream, proj_q8_0_q8_0_kernel<32>, 
-                    y, (const BlockQ8_0*)q8_scratch, (const BlockQ8_0*)W, nb);
-                break;
-            case 64:
-                k3_pdl_launch((unsigned)N, 64, 0, stream, proj_q8_0_q8_0_kernel<64>, 
-                    y, (const BlockQ8_0*)q8_scratch, (const BlockQ8_0*)W, nb);
-                break;
-            default:
-                k3_pdl_launch((unsigned)N, BLOCK, 0, stream, proj_q8_0_q8_0_kernel<BLOCK>, 
-                    y, (const BlockQ8_0*)q8_scratch, (const BlockQ8_0*)W, nb);
-                break;
+            case 32:  K3_QQ_W(32);    break;
+            case 64:  K3_QQ_W(64);    break;
+            default:  K3_QQ_W(BLOCK); break;
         }
+#undef K3_QQ_W
     }
 #undef K3_QQ_LAUNCH
     return true;
@@ -4231,29 +5005,58 @@ void rms_norm_f32(float* out, const float* x, const float* w, int n, float eps,
     const int block = rms_norm_block_for(units);
     const int n4 = vec4 ? n / 4 : 0;
 
-    if (block == 128 && !vec4) {
+    // On top of the widening, slice the apply across CTAs: the apply is three times
+    // the reduction's bytes, and one CTA is one SM of 132. 327 of these launches per
+    // token per rank at decode (93 attn_norm + 93 ffn_norm + 92 routed_norm +
+    // 24 q_a_norm + 24 kv_a_norm + 1 output_norm). RMSG names the slice count and
+    // RMSU the reduction unroll, so the two can be told apart in an A/B; RMSG=0
+    // RMSU=0 restores the single-CTA launches exactly.
+    //
+    // out == x is NOT safe to spread: with several CTAs, CTA 0 can finish its
+    // reduction and start overwriting x while another CTA is still reading x to
+    // compute the same sum. Two call sites are in-place; the rest spread.
+    static const int rmsg = [] {
+        const char* e = std::getenv("SPARKINFER_K3_RMSG");
+        return e ? atoi(e) : 14;
+    }();
+    static const bool rmsu = [] {
+        const char* e = std::getenv("SPARKINFER_K3_RMSU");
+        return !(e && e[0] == '0');
+    }();
+    int span_units = units;
+    unsigned grid = 1u;
+    int launch_block = block;
+    if (rmsg > 1 && out != x) {
+        // Slices stay warp-aligned, not block-aligned: rounding the span up to a
+        // 1024-thread block would collapse a 14-way spread of n=7168 to grid 2.
+        // Spread CTAs run 128 threads — the reduction is 128 threads regardless,
+        // and 14 slices x 128 threads walk the whole float4 apply in one wave.
+        span_units = ((units + rmsg - 1) / rmsg + 31) / 32 * 32;
+        grid = (unsigned)((units + span_units - 1) / span_units);
+        if (grid > 1u) launch_block = 128;
+    }
+
+    if (grid == 1u && !rmsu && block == 128 && !vec4) {
         k3_pdl_launch(1, 128, 0, stream, rms_norm_kernel<128>, out, x, w, n, eps);
         return;
     }
 
-    switch (block) {
-        case 1024:
-            k3_pdl_launch(1, 1024, 0, stream, rms_norm_wide_kernel<1024>,
-                          out, x, w, n, eps, n4, vec4 ? 1 : 0);
-            return;
-        case 512:
-            k3_pdl_launch(1, 512, 0, stream, rms_norm_wide_kernel<512>,
-                          out, x, w, n, eps, n4, vec4 ? 1 : 0);
-            return;
-        case 256:
-            k3_pdl_launch(1, 256, 0, stream, rms_norm_wide_kernel<256>,
-                          out, x, w, n, eps, n4, vec4 ? 1 : 0);
-            return;
-        default:
-            k3_pdl_launch(1, 128, 0, stream, rms_norm_wide_kernel<128>,
-                          out, x, w, n, eps, n4, vec4 ? 1 : 0);
-            return;
+#define K3_RMSN(BLK)                                                                   \
+    do {                                                                               \
+        if (rmsu)                                                                      \
+            k3_pdl_launch(grid, (BLK), 0, stream, rms_norm_wide_kernel<(BLK), true>,   \
+                          out, x, w, n, eps, n4, vec4 ? 1 : 0, span_units);            \
+        else                                                                           \
+            k3_pdl_launch(grid, (BLK), 0, stream, rms_norm_wide_kernel<(BLK), false>,  \
+                          out, x, w, n, eps, n4, vec4 ? 1 : 0, span_units);            \
+    } while (0)
+    switch (launch_block) {
+        case 1024: K3_RMSN(1024); return;
+        case 512:  K3_RMSN(512);  return;
+        case 256:  K3_RMSN(256);  return;
+        default:   K3_RMSN(128);  return;
     }
+#undef K3_RMSN
 }
 
 void k3_add_f32(float* out, const float* a, const float* b, int64_t n,

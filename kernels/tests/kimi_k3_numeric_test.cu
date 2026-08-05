@@ -17,9 +17,14 @@
 // Build/run (needs a GPU):
 //   nvcc -std=c++17 -arch=sm_90 -I kernels/include \
 //     kernels/tests/kimi_k3_numeric_test.cu kernels/csrc/cuda/kimi_k3/k3_kernels.cu \
+//     kernels/csrc/cuda/kimi_k3/k3_moe_router_fast.cu \
 //     -o /tmp/k3test && /tmp/k3test
+// (the router fast path is a separate TU; the CMake target links all of si_k3.)
 
 #include "sparkinfer/kernels/kimi_k3.h"
+// k3_moe_router_fast lives here, not in kimi_k3.h — the decode path calls it first
+// and this test is the only thing that checks it.
+#include "sparkinfer/kernels/kimi_k3_fast.h"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -592,16 +597,20 @@ static void test_mla_absorb_q() {
 // The long case below is above the old ceiling for these dims (12,215) and is the
 // regression guard: it fails at the LAUNCH, not on a tolerance, if the score vector
 // ever goes back into shared memory.
-static void test_mla_decode_attn(int n_ctx, int H) {
-    std::printf("MLA NoPE decode attn (MQA K-cache + wv_b; scale=1/sqrt(192)), "
-                "n_ctx=%d heads=%d\n", n_ctx, H);
+// Dims default to the SHRUNK set (kv_lora 64, rope 16, v_dim 32, qk_nope 32) so the
+// float64 reference stays cheap across the many context/head shapes above. But the
+// deep-unroll instantiation — and everything only IT runs, like the staged cache
+// walk — is offered solely at rslots == 2, i.e. kv_lora > 256, so a suite that only
+// ever tests the shrunk dims validates every kernel EXCEPT the one the scored config
+// actually runs. The real-dims invocation below exists for exactly that reason; it
+// is the only case in this file that reaches the (12, 2, (8,6)) shape.
+static void test_mla_decode_attn(int n_ctx, int H, int kv_lora = 64, int rope = 16,
+                                 int v_dim = 32, int qk_nope = 32) {
+    std::printf("MLA NoPE decode attn (MQA K-cache + wv_b; scale=1/sqrt(%d)), "
+                "n_ctx=%d heads=%d kv_lora=%d\n", qk_nope + rope, n_ctx, H, kv_lora);
     std::mt19937 rng(77);
-    const int kv_lora = 64;     // shrunk from 512 so the float64 ref stays cheap
-    const int rope = 16;        // shrunk from 64; ratio preserved
-    const int v_dim = 32;       // shrunk from 128
     const int key_length = kv_lora + rope;
     // Correct K3 scale uses n_embd_head_k_mla = qk_nope+rope, NOT key_length.
-    const int qk_nope = 32;     // stand-in for 128
     const float scale = 1.0f / std::sqrt((float)(qk_nope + rope));
     const float wrong_scale = 1.0f / std::sqrt((float)key_length);
 
@@ -648,7 +657,10 @@ static void test_mla_decode_attn(int n_ctx, int H) {
 
     auto ref = run_ref(scale);
     auto wrong = run_ref(wrong_scale);
-    assert_variant_differs(ref, wrong, "vs scale=1/sqrt(key_length=80)");
+    char wrong_label[64];
+    std::snprintf(wrong_label, sizeof wrong_label, "vs scale=1/sqrt(key_length=%d)",
+                  key_length);
+    assert_variant_differs(ref, wrong, wrong_label);
 
     float *dq = to_dev(q), *dk = to_dev(k_cache), *dw = to_dev(wv_b), *dout = nullptr;
     CU(cudaMalloc(&dout, (size_t)v_dim * H * sizeof(float)));
@@ -831,6 +843,71 @@ static void test_moe_router_noaux_tc() {
                 worst < 1e-5 ? "OK" : "FAIL");
     if (worst >= 1e-5) ++g_fail;
 
+    // -----------------------------------------------------------------------
+    // THE FAST PATH, AT THE SHAPE PRODUCTION ACTUALLY RUNS.
+    //
+    // Everything above exercises moe_router_noaux_tc_f32 — the FALLBACK. The decode
+    // path calls k3_moe_router_fast first (kimi_k3.cpp:1850) and only drops to the
+    // fallback when that declines, so until now the kernel that actually runs in a
+    // scored token had NO numeric coverage. That is the same hole that let a broken
+    // MLA instantiation sit unexercised: the test used a shape the real code never
+    // takes.
+    //
+    // n_tokens is 1 here because that is decode, and because the register-resident
+    // specialisation is only selected at n_tokens == 1.
+    //
+    // The bar is EXACT EQUALITY WITH THE FALLBACK, not closeness to the reference.
+    // Both kernels claim to implement the same total order, so any difference at all
+    // is a defect — and equality against a path already checked against float64 is a
+    // stronger statement than a second tolerance check would be.
+    {
+        std::printf("\nk3_moe_router_fast (the path decode actually takes, n_tokens=1)\n");
+        float *fw = nullptr; int* fi = nullptr;
+        CU(cudaMalloc(&fw, (size_t)K * sizeof(float)));
+        CU(cudaMalloc(&fi, (size_t)K * sizeof(int)));
+
+        // Reference arm: the fallback, on token 0 only.
+        CU(cudaMemset(dw, 0, (size_t)K * sizeof(float)));
+        CU(cudaMemset(di, 0, (size_t)K * sizeof(int)));
+        moe_router_noaux_tc_f32(dw, di, dl, db, E, K, /*n_tokens=*/1, true, 1.0f, 0);
+        CU(cudaDeviceSynchronize());
+        auto base_w = from_dev(dw, (size_t)K);
+        std::vector<int> base_id((size_t)K);
+        CU(cudaMemcpy(base_id.data(), di, (size_t)K * sizeof(int), cudaMemcpyDeviceToHost));
+
+        const bool took = k3_moe_router_fast(fw, fi, dl, db, E, K, /*n_tokens=*/1,
+                                             true, 1.0f, 0);
+        CU(cudaDeviceSynchronize());
+        CU(cudaGetLastError());
+        ++g_case;
+        std::printf("  %-34s %s\n", "fast path engaged", took ? "yes" : "NO — declined");
+        if (!took) ++g_fail;   // silently falling back would hide a regression
+
+        if (took) {
+            auto got_w = from_dev(fw, (size_t)K);
+            std::vector<int> gi((size_t)K);
+            CU(cudaMemcpy(gi.data(), fi, (size_t)K * sizeof(int), cudaMemcpyDeviceToHost));
+            int wrong_id = 0, wrong_w = 0;
+            for (int k = 0; k < K; ++k) {
+                if (gi[k] != base_id[k]) ++wrong_id;
+                // BITWISE, not approximate: identical arithmetic must give identical bits.
+                if (std::memcmp(&got_w[k], &base_w[k], sizeof(float)) != 0) ++wrong_w;
+            }
+            ++g_case;
+            std::printf("  %-34s %d/%d differ  %s\n", "ids == fallback", wrong_id, K,
+                        wrong_id ? "FAIL" : "OK");
+            if (wrong_id) { ++g_fail;
+                for (int k = 0; k < K && k < 6; ++k)
+                    std::printf("        [%d] fast %d fallback %d\n", k, gi[k], base_id[k]);
+            }
+            ++g_case;
+            std::printf("  %-34s %d/%d differ  %s\n", "weights BIT-IDENTICAL", wrong_w, K,
+                        wrong_w ? "FAIL" : "OK");
+            if (wrong_w) ++g_fail;
+        }
+        CU(cudaFree(fw)); CU(cudaFree(fi));
+    }
+
     CU(cudaFree(dl)); CU(cudaFree(db)); CU(cudaFree(dw)); CU(cudaFree(di));
 }
 
@@ -893,6 +970,11 @@ int main() {
     // it: the eval scores on a short reference prompt while timing at 128k, so it
     // runs splits=1 and reports a byte-identical KLD however wrong this path is.
     test_mla_decode_attn(131072, 12);  std::printf("\n");
+    // REAL dims (kv_lora 512, rope 64, v_dim 128, qk_nope 128): rslots becomes 2 and
+    // this is the ONLY case that reaches the deep-unroll (12, 2, (8,6)) instantiation
+    // and, on an f16 cache with the shared budget proven, the staged cache walk. The
+    // shrunk-dims cases above run rslots 1 and can pass while that shape is broken.
+    test_mla_decode_attn(20000, 12, 512, 64, 128, 128);  std::printf("\n");
     test_moe_router_noaux_tc(); std::printf("\n");
 
     std::printf("%d cases, %d failure(s)\n", g_case, g_fail);

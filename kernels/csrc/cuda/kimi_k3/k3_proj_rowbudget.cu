@@ -12,7 +12,19 @@ namespace {
 // are covered by other CTAs rather than by nothing. Not a tuning constant pulled
 // from the air: it is the operating point of the two shapes in this exact kernel
 // that already reach bandwidth, used as the target for the four that do not.
-constexpr int kTargetWarps = 1792;
+// SPARKINFER_K3_WARP_TARGET overrides the 1792 default: it was the
+// best-OBSERVED operating point, never a measured optimum. Raising it lowers
+// ROWS (fewer loads/thread, more CTAs) — also the decisive H1-vs-H3 experiment.
+static int target_warps() {
+    static const int v = [] {
+        const char* e = std::getenv("SPARKINFER_K3_WARP_TARGET");
+        const int n = e ? atoi(e) : 0;
+        // MEASURED: 3584 (ROWS halved, more resident CTAs) beats the shipped
+        // 1792 at the scored shape; 7168 regresses (one shape crosses a wave).
+        return n > 0 ? n : 3584;
+    }();
+    return v;
+}
 
 bool rowbudget_on() {
     static const bool on = [] {
@@ -37,12 +49,20 @@ int k3_proj_rows_for_budget(int N, int block_threads, int legacy_rows) {
     for (int r : kLadder) {
         const long grid  = ((long)N + r - 1) / r;
         const long warps = grid * warps_per_cta;
-        if (warps >= (long)kTargetWarps) {
+        if (warps >= (long)target_warps()) {
             // Never widen a CTA's row block beyond what the shipped tier chose.
             // The budget can only ask for MORE parallelism here; a shape that the
             // old rule already ran narrow (ssm_f_b at 1536 rows cannot reach 1792
             // warps at any ROWS) must not be pushed the other way by a rule that
             // happens to be satisfied at a higher ROWS on some future geometry.
+            // WAVE FLOOR: a target that pushes the grid past ONE wave costs
+            // more than the warps it buys — ffn_down_shexp at target 7168 went
+            // to 7168 one-warp CTAs = 1.70 waves against the 32-CTA/SM cap and
+            // 100% activation re-read, and ate the gains the other shapes made.
+            // Also floor ROWS at 2: re-read is exactly 1/ROWS.
+            const long cap = 132L * (warps_per_cta >= 2 ? 32 / warps_per_cta : 32);
+            if (grid > cap && r < legacy_rows) continue;
+            if (r < 2 && legacy_rows >= 2) continue;
             return r < legacy_rows ? r : legacy_rows;
         }
     }

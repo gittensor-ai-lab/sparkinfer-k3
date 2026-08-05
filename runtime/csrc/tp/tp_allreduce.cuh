@@ -37,7 +37,14 @@ using FlagType = uint32_t;
 
 // vLLM uses 36 blocks for the all-reduce: "too many SMs cause contention on the
 // NVLink bus." We cap Signal storage to that and clamp the launch likewise.
-constexpr int kMaxBlocks = 36;
+//
+// STORAGE ceiling only. vLLM's 36 was a budget in THREADS -- 36 blocks of 512 is
+// 18432 -- and this kernel now launches 64-thread blocks, so 36 CTAs spends an
+// eighth of the contention that number was chosen to bound. Signal is the reason
+// the ceiling has to be a compile-time constant (it sizes four peer-visible flag
+// arrays, ~6.4 KB at 64); the ceiling that is actually applied is grid_for's
+// runtime cap, which still defaults to 36.
+constexpr int kMaxBlocks = 64;
 
 // Per-rank synchronization buffer, peer-accessible from every rank. Two counter
 // sets (start/end) are needed because a peer block can reach the second sync

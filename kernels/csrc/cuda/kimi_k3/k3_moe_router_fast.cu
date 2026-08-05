@@ -125,8 +125,19 @@ __global__ void moe_router_shared_kernel(float* __restrict__ out_w,
         if (warp == 0) {
             float mv = (lane < NWARP) ? s_bestv[lane] : -INFINITY;
             int   mi = (lane < NWARP) ? s_besti[lane] : -1;
+            // START AT NWARP/2, NOT 16. Only lanes [0, NWARP) carry a candidate; the
+            // rest hold (-INFINITY, -1), against which router_better is a PROVABLE
+            // no-op — `ov > bv` is false for -INFINITY, and the tie arm is gated by
+            // `oi >= 0`, which -1 fails. At NWARP=8 the old bound ran five rounds
+            // where three suffice, so two of every five dependent shuffle rounds were
+            // dead. This loop is the kernel's critical path (gridDim is 1 for decode,
+            // so nothing else is resident to hide it) and it runs top_k=16 times per
+            // call, 92 times per token. The comment above already claimed three steps;
+            // the code did five.
+            static_assert(NWARP > 0 && (NWARP & (NWARP - 1)) == 0,
+                          "butterfly fold needs a power-of-two warp count");
 #pragma unroll
-            for (int off = 16; off > 0; off >>= 1)
+            for (int off = NWARP / 2; off > 0; off >>= 1)
                 router_better(__shfl_xor_sync(0xffffffff, mv, off),
                               __shfl_xor_sync(0xffffffff, mi, off), mv, mi);
             if (lane == 0) {
@@ -158,6 +169,250 @@ __global__ void moe_router_shared_kernel(float* __restrict__ out_w,
     for (int k = threadIdx.x; k < top_k; k += BLOCK) { w[k] = s_w[k]; ids[k] = s_ids[k]; }
 }
 
+// ===========================================================================
+// THE DECODE SPECIALISATION
+// ===========================================================================
+// Same algorithm, same 16 sequential exact-argmax passes, same total order. Three
+// things are compile-time here that are runtime above, and one array moves:
+//
+//   NV   — the per-thread candidate count, so the biased scores live in REGISTERS
+//          instead of being re-read from shared on every one of the top_k passes.
+//          The general kernel re-reads s_sel[e] each pass: ceil(896/256)=4 loads x
+//          256 threads x 16 passes = 14,336 dependent shared loads per call, on a
+//          kernel whose runtime IS its dependence chain. s_sel then disappears from
+//          shared entirely (-3584 B).
+//   TOPK — so nvcc can unroll the two normalisation loops and the masking test.
+//          As a runtime argument it could unroll none of them.
+//   n_tokens == 1 — which is what makes __launch_bounds__(BLOCK, 1) correct rather
+//          than merely harmless: at gridDim 1 there is exactly one CTA on one SM,
+//          so occupancy is worth nothing and capping registers to buy it is pure
+//          loss. nvcc cannot know that on its own.
+//
+// BIT-IDENTICAL, by the same total-order argument as the general kernel:
+//   * the initial scan visits the same experts in the same ascending order;
+//   * masking a winner sets the SAME candidate to -INFINITY, just in the register
+//     that holds it instead of in shared — the owner of expert e is thread
+//     e % BLOCK at slot e / BLOCK, and the test is unrolled over compile-time
+//     slots so `v` never spills to local memory (a runtime index would);
+//   * the normalisation keeps the serial ascending FADD chain, the same
+//     6.103515625e-5f floor, and the same per-element divide. Unrolling a chain of
+//     dependent += does not reassociate it.
+template <int BLOCK, int NV, int TOPK>
+__global__ __launch_bounds__(BLOCK, 1)
+void moe_router_reg_kernel(float* __restrict__ out_w,
+                           int* __restrict__ out_ids,
+                           const float* __restrict__ logits,
+                           const float* __restrict__ bias,
+                           int n_expert, bool norm_w, float w_scale) {
+    k3_pdl_sync();
+    const float* lg = logits;            // n_tokens == 1, so tok is 0
+    extern __shared__ float smem_rr[];
+    float* s_p   = smem_rr;              // UNBIASED probs, never mutated
+    float* s_w   = s_p + n_expert;
+    int*   s_ids = (int*)(s_w + TOPK);
+    __shared__ float s_bestv[BLOCK / 32];
+    __shared__ int   s_besti[BLOCK / 32];
+
+    constexpr int NWARP = BLOCK / 32;
+    static_assert(NWARP > 0 && (NWARP & (NWARP - 1)) == 0,
+                  "butterfly fold needs a power-of-two warp count");
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+
+    // The biased scores, held for the whole kernel. THIS is the change.
+    float v[NV];
+#pragma unroll
+    for (int i = 0; i < NV; ++i) {
+        const int e = (int)threadIdx.x + i * BLOCK;
+        if (e < n_expert) {
+            const float p = 1.0f / (1.0f + __expf(-lg[e]));   // sigmoid
+            s_p[e] = p;
+            v[i] = bias ? (p + bias[e]) : p;                  // bias: selection only
+        } else {
+            v[i] = -INFINITY;
+        }
+    }
+    __syncthreads();
+
+    for (int k = 0; k < TOPK; ++k) {
+        float bv = -INFINITY; int bi = -1;
+#pragma unroll
+        for (int i = 0; i < NV; ++i) {
+            const int e = (int)threadIdx.x + i * BLOCK;
+            if (e < n_expert) router_better(v[i], e, bv, bi);
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)     // full warp: every lane is live
+            router_better(__shfl_xor_sync(0xffffffff, bv, off),
+                          __shfl_xor_sync(0xffffffff, bi, off), bv, bi);
+        if (lane == 0) { s_bestv[warp] = bv; s_besti[warp] = bi; }
+        __syncthreads();
+
+        if (warp == 0) {
+            float mv = (lane < NWARP) ? s_bestv[lane] : -INFINITY;
+            int   mi = (lane < NWARP) ? s_besti[lane] : -1;
+#pragma unroll
+            for (int off = NWARP / 2; off > 0; off >>= 1)   // see the general kernel
+                router_better(__shfl_xor_sync(0xffffffff, mv, off),
+                              __shfl_xor_sync(0xffffffff, mi, off), mv, mi);
+            if (lane == 0) { s_ids[k] = mi; s_w[k] = s_p[mi]; }
+        }
+        __syncthreads();
+
+        // Mask the winner out of the OWNER's register. Unrolled over compile-time
+        // slots: a runtime `v[slot]` would push the whole array to local memory and
+        // cost far more than the shared read it replaced.
+        const int won = s_ids[k];
+#pragma unroll
+        for (int i = 0; i < NV; ++i)
+            if (won == (int)threadIdx.x + i * BLOCK) v[i] = -INFINITY;
+    }
+
+    if (threadIdx.x == 0) {
+        if (norm_w) {
+            float sum = 0.0f;
+#pragma unroll
+            for (int k = 0; k < TOPK; ++k) sum += s_w[k];     // ascending, unchanged
+            sum = fmaxf(sum, 6.103515625e-5f);
+#pragma unroll
+            for (int k = 0; k < TOPK; ++k) s_w[k] /= sum;
+        }
+        if (w_scale != 0.0f && w_scale != 1.0f) {
+#pragma unroll
+            for (int k = 0; k < TOPK; ++k) s_w[k] *= w_scale;
+        }
+    }
+    __syncthreads();
+
+    for (int k = threadIdx.x; k < TOPK; k += BLOCK) { out_w[k] = s_w[k]; out_ids[k] = s_ids[k]; }
+}
+
+// ===========================================================================
+// THE TWO-PHASE DECODE SPECIALISATION
+// ===========================================================================
+// The register kernel above pays TWO block-wide barriers per selected expert —
+// 32 __syncthreads on a single-CTA kernel whose runtime is its dependence chain,
+// with seven of eight warps parked at every one of them. This form replaces the
+// per-pass cross-warp rendezvous with the standard top-k decomposition:
+//
+//   phase A — each warp extracts the top-TOPK of ITS OWN candidates using only
+//             warp shuffles: zero block barriers, warps run fully independent;
+//   phase B — warp 0 merges the NWARP x TOPK survivors, again shuffle-only.
+//
+// Three __syncthreads total (survivor publish, epilogue in, epilogue out).
+//
+// BIT-IDENTICAL, and the argument is the same total order as always:
+//   * (value desc, index asc) is a total order, so each warp's k-th extraction is
+//     exactly its rank-k candidate, and a warp whose candidate belongs to the
+//     global top-TOPK necessarily holds it in its own top-TOPK — the union of the
+//     per-warp lists contains the global list;
+//   * phase B extracts from that union in rank order, so its k-th winner IS the
+//     global rank-k expert — the same id sequence the 16 global passes produce;
+//   * s_w[k] = s_p[winner], the normalisation chain, the floor and the scale are
+//     copied unchanged from the kernel above.
+template <int BLOCK, int NV, int TOPK>
+__global__ __launch_bounds__(BLOCK, 1)
+void moe_router_2p_kernel(float* __restrict__ out_w,
+                          int* __restrict__ out_ids,
+                          const float* __restrict__ logits,
+                          const float* __restrict__ bias,
+                          int n_expert, bool norm_w, float w_scale) {
+    k3_pdl_sync();
+    const float* lg = logits;
+    extern __shared__ float smem_rr[];
+    float* s_p   = smem_rr;              // UNBIASED probs, never mutated
+    float* s_w   = s_p + n_expert;
+    int*   s_ids = (int*)(s_w + TOPK);
+
+    constexpr int NWARP = BLOCK / 32;
+    static_assert(NWARP > 0 && NWARP <= 32, "phase B is one warp over NWARP lists");
+    __shared__ float s_pv[NWARP][TOPK];
+    __shared__ int   s_pi[NWARP][TOPK];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+
+    float v[NV];
+#pragma unroll
+    for (int i = 0; i < NV; ++i) {
+        const int e = (int)threadIdx.x + i * BLOCK;
+        if (e < n_expert) {
+            const float p = 1.0f / (1.0f + __expf(-lg[e]));   // sigmoid
+            s_p[e] = p;
+            v[i] = bias ? (p + bias[e]) : p;                  // bias: selection only
+        } else {
+            v[i] = -INFINITY;
+        }
+    }
+
+    // Phase A: this warp's top-TOPK of its own NV*32 candidates. No barriers —
+    // every step is warp-synchronous.
+    for (int k = 0; k < TOPK; ++k) {
+        float bv = -INFINITY; int bi = -1;
+#pragma unroll
+        for (int i = 0; i < NV; ++i) {
+            const int e = (int)threadIdx.x + i * BLOCK;
+            if (e < n_expert) router_better(v[i], e, bv, bi);
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            router_better(__shfl_xor_sync(0xffffffff, bv, off),
+                          __shfl_xor_sync(0xffffffff, bi, off), bv, bi);
+        // Every lane already holds the warp winner after the butterfly; lane 0's
+        // copy is canonical. Publish, then the OWNER lane masks it.
+        if (lane == 0) { s_pv[warp][k] = bv; s_pi[warp][k] = bi; }
+        const int won = __shfl_sync(0xffffffff, bi, 0);
+#pragma unroll
+        for (int i = 0; i < NV; ++i)
+            if (won == (int)threadIdx.x + i * BLOCK) v[i] = -INFINITY;
+    }
+    __syncthreads();                     // survivors visible to warp 0
+
+    // Phase B: warp 0 merges NWARP lists of TOPK. Lane l holds survivors
+    // l, l+32, l+64, ... — survivor s is s_p{v,i}[s / TOPK][s % TOPK].
+    if (warp == 0) {
+        constexpr int NSURV = NWARP * TOPK;
+        constexpr int SLOTS = (NSURV + 31) / 32;
+        float mv[SLOTS]; int mi[SLOTS];
+#pragma unroll
+        for (int j = 0; j < SLOTS; ++j) {
+            const int s = lane + 32 * j;
+            if (s < NSURV) { mv[j] = s_pv[s / TOPK][s % TOPK]; mi[j] = s_pi[s / TOPK][s % TOPK]; }
+            else           { mv[j] = -INFINITY;                mi[j] = -1; }
+        }
+        for (int k = 0; k < TOPK; ++k) {
+            float bv = -INFINITY; int bi = -1;
+#pragma unroll
+            for (int j = 0; j < SLOTS; ++j) router_better(mv[j], mi[j], bv, bi);
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                router_better(__shfl_xor_sync(0xffffffff, bv, off),
+                              __shfl_xor_sync(0xffffffff, bi, off), bv, bi);
+            if (lane == 0) { s_ids[k] = bi; s_w[k] = s_p[bi]; }
+            const int won = __shfl_sync(0xffffffff, bi, 0);
+#pragma unroll
+            for (int j = 0; j < SLOTS; ++j)
+                if (mi[j] == won) mv[j] = -INFINITY;
+        }
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        if (norm_w) {
+            float sum = 0.0f;
+#pragma unroll
+            for (int k = 0; k < TOPK; ++k) sum += s_w[k];     // ascending, unchanged
+            sum = fmaxf(sum, 6.103515625e-5f);
+#pragma unroll
+            for (int k = 0; k < TOPK; ++k) s_w[k] /= sum;
+        }
+        if (w_scale != 0.0f && w_scale != 1.0f) {
+#pragma unroll
+            for (int k = 0; k < TOPK; ++k) s_w[k] *= w_scale;
+        }
+    }
+    __syncthreads();
+
+    for (int k = threadIdx.x; k < TOPK; k += BLOCK) { out_w[k] = s_w[k]; out_ids[k] = s_ids[k]; }
+}
+
 }  // namespace
 
 bool k3_moe_router_fast(float* out_w, int* out_ids, const float* logits,
@@ -173,6 +428,43 @@ bool k3_moe_router_fast(float* out_w, int* out_ids, const float* logits,
     if (top_k > kRouterMaxTopK) return false;
 
     constexpr int BLOCK = 256;   // the original's, and what the sweep picked
+
+    // The decode specialisation, taken only when every assumption it is built on
+    // holds. SPARKINFER_K3_ROUTER_REG=0 restores the general kernel on the SAME
+    // binary, so the A/B needs no second build.
+    //   n_tokens == 1     -> gridDim 1, which is what justifies __launch_bounds__(,1)
+    //   top_k   == kTopK  -> the unrolled normalisation
+    //   n_expert <= NV*BLOCK -> every candidate fits in registers
+    // K3 decode is n_expert 896, top_k 16, n_tokens 1, so it qualifies; anything
+    // else falls through to the general kernel unchanged.
+    constexpr int kNV = 4, kTopK = 16;
+    static const bool want_reg = [] {
+        const char* e = std::getenv("SPARKINFER_K3_ROUTER_REG");
+        return !(e && e[0] == '0');
+    }();
+    // The two-phase form drops the register kernel's 32 per-pass block barriers to
+    // three. Same guards, same shapes; =0 keeps the per-pass-rendezvous kernel.
+    static const bool want_2p = [] {
+        const char* e = std::getenv("SPARKINFER_K3_ROUTER_2P");
+        return e && e[0] == '1';
+    }();
+    if (want_reg && n_tokens == 1 && top_k == kTopK && n_expert <= kNV * BLOCK) {
+        // No s_sel: the biased scores live in registers.
+        const size_t shm = ((size_t)n_expert + kTopK) * sizeof(float) +
+                           (size_t)kTopK * sizeof(int);
+        if (shm <= 48u * 1024u) {
+            if (want_2p)
+                k3_pdl_launch(1u, BLOCK, shm, stream,
+                              moe_router_2p_kernel<BLOCK, kNV, kTopK>,
+                              out_w, out_ids, logits, bias, n_expert, norm_w, w_scale);
+            else
+                k3_pdl_launch(1u, BLOCK, shm, stream,
+                              moe_router_reg_kernel<BLOCK, kNV, kTopK>,
+                              out_w, out_ids, logits, bias, n_expert, norm_w, w_scale);
+            return true;
+        }
+    }
+
     // s_sel + s_p over the experts, plus the top_k winners and their indices.
     const size_t shm = ((size_t)2 * n_expert + kRouterMaxTopK) * sizeof(float) +
                        (size_t)kRouterMaxTopK * sizeof(int);
