@@ -184,8 +184,26 @@ KIMI_K3_H200X8_IQ1S_LLAMA_128K="${KIMI_K3_H200X8_IQ1S_LLAMA_128K:-18.4435}"
 # raise-only, so a slow box cannot deflate it and mint tiers for everyone behind it.
 # 1.00 tok/s (995.65 ms/token) measured on main @ 37d4219 via the committed --ctx/--seek
 # path, which reproduces the throwaway seek_patch.py measurement (1.01 / 991.75) to 0.4%.
-# frontier: measured by eval/k3_eval_bot.py on main @ de47bfe168d1 (h200x8, UD-IQ1_S). Do not hand-edit — the bot rewrites this each round.
-KIMI_K3_H200X8_IQ1S_SPARKINFER_128K="${KIMI_K3_H200X8_IQ1S_SPARKINFER_128K:-46.48}"
+#
+# SET TO 56.8 BY HAND ON 2026-08-05, deliberately, because this slot stopped being the tier
+# basis and became the DECODE REGRESSION GUARD's baseline (#131).
+#
+# It read 46.48 while main did ~56.8: #127 (+23.2%) merged outside a round, so no round had
+# re-measured. As the tier basis a stale-low pin only over-scores the next PR, which the
+# next round corrects. As a GUARD baseline it is worse than that -- the floor is 1% under
+# this number, so 46.48 would have admitted a decode collapse to 46.02, a 19% regression,
+# while reporting that the guard passed.
+#
+# 56.8 is from #127's sealed receipt 8641ae28 (56.82 measured against a 46.11 frontier),
+# rounded down. Main itself has NOT been measured with #127 in it. Precedent says that is
+# close: #114 measured 45.38 and main then measured 44.85; #115 measured 46.49 and main
+# measured 46.48.
+#
+# THE RISK OF SETTING IT HIGH. The slot is raise-only, so if main actually measures under
+# the 56.232 floor the bot will not lower it and every PR fails the decode guard until a
+# human intervenes. FRONTIER_ALARM (0.90 -> 51.1) would not catch that. This wants a main
+# measurement to confirm it.
+KIMI_K3_H200X8_IQ1S_SPARKINFER_128K="${KIMI_K3_H200X8_IQ1S_SPARKINFER_128K:-56.8}"
 
 # ---- PREFILL @ 32k — the SCORED metric from 2026-08-05 -----------------------------------
 #
@@ -204,7 +222,8 @@ KIMI_K3_H200X8_IQ1S_SPARKINFER_128K="${KIMI_K3_H200X8_IQ1S_SPARKINFER_128K:-46.4
 KIMI_K3_H200X8_IQ1S_LLAMA_32K_PP="${KIMI_K3_H200X8_IQ1S_LLAMA_32K_PP:-143.88}"
 # frontier: rewritten by eval/k3_eval_bot.py each round, raise-only. Do not hand-edit.
 # Seeded from the 812.2 s / 32,768-token measurement on main @ 3b6a3f4.
-KIMI_K3_H200X8_IQ1S_SPARKINFER_32K_PP="${KIMI_K3_H200X8_IQ1S_SPARKINFER_32K_PP:-40.35}"
+# frontier: measured by eval/k3_eval_bot.py on main @ c1a1642e250b (h200x8, UD-IQ1_S). Do not hand-edit — the bot rewrites this each round.
+KIMI_K3_H200X8_IQ1S_SPARKINFER_32K_PP="${KIMI_K3_H200X8_IQ1S_SPARKINFER_32K_PP:-53.02}"
 
 KIMI_K3_H200X8_LLAMA_128="${KIMI_K3_H200X8_LLAMA_128:-0}"
 KIMI_K3_H200X8_LLAMA_512="${KIMI_K3_H200X8_LLAMA_512:-0}"
