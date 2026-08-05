@@ -1518,6 +1518,40 @@ class CiWorkflowTest(unittest.TestCase):
                           "both sides must state the same reason, so a receipt and a "
                           "workflow log cannot disagree about why the tier moved")
 
+    def test_a_payload_scored_under_the_old_basis_is_superseded_not_refused(self):
+        """The label check is a tamper check, and a tamper check may only compare things that
+        SHOULD be equal. Turning the llama anchor off put every sealed prefill payload in the
+        log at odds with its own re-derivation; refusing them would mean spending ~25
+        GPU-minutes per PR to reprint numbers that are already sealed.
+
+        The claimed label still has to be what the TRUSTED numbers really produce under one of
+        the two rule versions, so a forger cannot name an arbitrary tier -- only one the same
+        inputs actually yield."""
+        wf = (ROOT / ".github/workflows/eval-label.yml").read_text()
+        self.assertIn("alt_label = score(alt)", wf)
+        self.assertIn("the payload was edited", wf,
+                      "a label matching NEITHER basis is still a hard refusal")
+        self.assertIn("superseded=", wf, "the supersession must reach the PR comment")
+
+        def label(tps, anchor=None):
+            env = {**os.environ, "SPARKINFER_DIFFICULTY_REF": "143.88"}
+            if anchor:
+                env["SPARKINFER_TIER_ANCHOR"] = anchor
+            return json.loads(subprocess.run(
+                [sys.executable, str(ROOT / "bench/scripts/label.py"),
+                 str(tps), "53.02", "0", "1.0", "0.006694998", "10b0c9a"],
+                capture_output=True, text=True, check=True, env=env,
+            ).stdout.split("RESULT_JSON", 1)[1])["label"]
+
+        # #133's sealed run: S under the anchor it was scored with, L under the current rule.
+        # Both are real derivations of 59.06 against 53.02, which is what makes the
+        # supersession safe to accept.
+        self.assertEqual(label(59.06), "S")
+        self.assertEqual(label(59.06, "off"), "L")
+        # ...and nothing makes those numbers an XL under either basis, so a payload claiming
+        # one is still caught.
+        self.assertNotIn("XL", {label(59.06), label(59.06, "off")})
+
     def test_decode_is_guarded_at_128k_even_though_prefill_is_scored(self):
         """Prefill and decode share kernels, so batching the prompt WILL move decode. The
         guard bounds how far, and it is a refusal rather than a tier: a prefill gain bought

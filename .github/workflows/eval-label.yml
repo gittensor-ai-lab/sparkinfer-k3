@@ -294,22 +294,50 @@ jobs:
                     f"path produces ({sorted(SPEED_SOURCES_OK)}). The speed was measured "
                     f"some other way — refusing to label it.", file=sys.stderr)
               sys.exit(1)
-          out = subprocess.run(
-              [sys.executable, "bench/scripts/label.py", str(d["tps"]), str(frontier),
-               "0", str(d["top1"]), str(d["kl"]), str(d["commit"])],
-              capture_output=True, text=True, env=env, check=True).stdout
-          re_d = json.loads(out.split("RESULT_JSON", 1)[1].strip())
+          def score(e):
+              out = subprocess.run(
+                  [sys.executable, "bench/scripts/label.py", str(d["tps"]), str(frontier),
+                   "0", str(d["top1"]), str(d["kl"]), str(d["commit"])],
+                  capture_output=True, text=True, env=e, check=True).stdout
+              return json.loads(out.split("RESULT_JSON", 1)[1].strip())
+
+          re_d = score(env)
           derived = re_d.get("label", "")
+          # A PAYLOAD SCORED UNDER THE OLD RULE IS NOT A FORGED PAYLOAD.
+          #
+          # This comparison is a tamper check, and a tamper check may only compare things
+          # that SHOULD be equal. When the scoring rule itself changes -- as it did when the
+          # llama anchor was turned off for prefill -- every sealed payload in the log
+          # disagrees with its own re-derivation, and refusing them all would mean re-running
+          # ~25 GPU-minutes per PR to reprint a number that is already sealed.
+          #
+          # So: recompute under the OTHER anchor setting too. The claimed label still has to
+          # be a deterministic function of the TRUSTED numbers (this checkout's lock, this
+          # checkout's label.py) under one of the two rule versions. That keeps the check
+          # tight -- a forger cannot name an arbitrary tier, only one the same inputs really
+          # produce -- while letting a rules change supersede instead of reject.
+          superseded = ""
           if claimed and claimed != derived:
-              print(f"::error::reported label {claimed!r} != re-derived {derived!r} from the same "
-                    f"numbers — payload edited or harness version mismatch", file=sys.stderr)
-              sys.exit(1)
+              alt = dict(env)
+              if alt.pop("SPARKINFER_TIER_ANCHOR", None) is None:
+                  alt["SPARKINFER_TIER_ANCHOR"] = "off"
+              alt_label = score(alt).get("label", "")
+              if claimed != alt_label:
+                  print(f"::error::reported label {claimed!r} is neither the re-derived "
+                        f"{derived!r} nor {alt_label!r} (the other tier basis) from the same "
+                        f"numbers — the payload was edited", file=sys.stderr)
+                  sys.exit(1)
+              superseded = (f"re-scored {claimed} -> {derived}: this run was sealed under the "
+                            f"{d.get('tier_basis', 'previous')} tier basis and the repo now "
+                            f"scores this metric {re_d.get('tier_basis', 'differently')}")
+              print(f"::notice::{superseded}", file=sys.stderr)
           print(f"label={derived}")
           print(f"tps={d['tps']}")
           print(f"top1={d['top1']}")
           print(f"kl={d['kl']}")
           print(f"pct={re_d.get('pct_over_frontier', '')}")
           print(f"reason={re_d.get('reason', '') or re_d.get('note', '')}")
+          print(f"superseded={superseded}")
           PY
 
       - name: Apply the tier
@@ -322,6 +350,7 @@ jobs:
           KL: ${{ steps.verdict.outputs.kl }}
           PCT: ${{ steps.verdict.outputs.pct }}
           REASON: ${{ steps.verdict.outputs.reason }}
+          SUPERSEDED: ${{ steps.verdict.outputs.superseded }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
@@ -343,12 +372,14 @@ jobs:
             echo
             echo "| metric | value |"
             echo "|---|--:|"
-            echo "| decode tok/s | $TPS |"
+            echo "| scored tok/s | $TPS |"
             echo "| % over frontier | $PCT |"
             echo "| top-1 vs llama.cpp | $TOP1 |"
             echo "| mean KLD vs llama.cpp | $KL |"
             [ -n "$REASON" ] && echo "| note | $REASON |"
             echo
+            [ -n "$SUPERSEDED" ] && { echo "> **$SUPERSEDED.** The measurements are unchanged"; \
+                                      echo "> — only the basis they are sized against moved."; echo; }
             echo "Re-derived from the posted measurements with \`bench/scripts/label.py\`;"
             echo "the tier is a deterministic function of them, not of the reported label."
           } > /tmp/body.md
