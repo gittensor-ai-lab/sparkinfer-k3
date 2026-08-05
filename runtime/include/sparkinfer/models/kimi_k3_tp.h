@@ -263,6 +263,12 @@ struct KimiK3TP {
     // undercount here would make the collectives-per-token line report a saving that
     // came from not counting rather than from not doing.
     long n_coll_per_chunk = 0;
+    // How much of a prefill went into building graphs rather than running them. The MLA
+    // split plan steps with context, and every step throws the chunk graph away, so a long
+    // ingestion re-captures several times over — invisible in a tok/s number, and the
+    // suspect for the 29 s that a 32k run lost between 2048 and 4096.
+    long   n_chunk_captures = 0;
+    double ms_chunk_capture = 0.0;
     bool chunk_graph_ready = false;
     bool chunk_graph_off   = false;
 };

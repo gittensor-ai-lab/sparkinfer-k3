@@ -1655,13 +1655,37 @@ bool k3_prefill_chunk(KimiK3TP& p, const int* ids, int base, int B,
 
     // ---- close the capture, then run it ------------------------------------
     if (capturing) {
+        // PRICE EVERY CAPTURE, because a per-band measurement cannot tell a slow band from
+        // a re-captured one. A 32k ingestion showed 33.4 ms/token across 2048->4096 against
+        // 18.9 either side — ~29 s of excess, seven times what one capture costs — and
+        // there is no way to attribute that from the outside. This says how many captures
+        // happened, when, and how the cost splits between recording the graph and
+        // instantiating it: if instantiate dominates, cudaGraphExecUpdate is the fix; if
+        // recording does, the graph has to get smaller.
+        const auto t_cap0 = std::chrono::steady_clock::now();
+        double ms_record = 0.0;
         bool ok_cap = true;
         for (auto& R : p.ranks) {
             if (cudaSetDevice(R.device) != cudaSuccess) { ok_cap = false; break; }
             if (cudaStreamEndCapture(R.stream, &R.chunk_graph) != cudaSuccess ||
                 R.chunk_graph == nullptr) { ok_cap = false; break; }
+            ms_record = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - t_cap0).count();
             if (cudaGraphInstantiate(&R.chunk_exec, R.chunk_graph, nullptr, nullptr, 0)
                 != cudaSuccess) { ok_cap = false; break; }
+        }
+        if (ok_cap) {
+            size_t n_nodes = 0;
+            cudaGraphGetNodes(p.ranks[0].chunk_graph, nullptr, &n_nodes);
+            const double ms_all = std::chrono::duration<double, std::milli>(
+                                      std::chrono::steady_clock::now() - t_cap0).count();
+            ++p.n_chunk_captures;
+            p.ms_chunk_capture += ms_all;
+            std::fprintf(stderr,
+                         "[k3-prefill] chunk graph capture #%ld at base=%d plan=%d B=%d: "
+                         "%.0f ms total (record %.0f, instantiate %.0f), %zu nodes/rank\n",
+                         p.n_chunk_captures, base, live_plan, B,
+                         ms_all, ms_record, ms_all - ms_record, n_nodes);
         }
         if (!ok_cap) {
             // A failed capture costs speed, never correctness — the same rule the decode
@@ -1859,6 +1883,17 @@ bool kimi_k3_tp_forward_prompt(KimiK3TP& p, const int* ids, int n_ids,
         }
         if (on_depth && !on_depth(target)) { restore(base0 + done); return false; }
     }
+
+    // What the ingestion spent BUILDING graphs, as a share of the tokens it ingested.
+    // Printed next to PREFILL_TOTAL so the two are read together: a tok/s number averages
+    // capture cost over the whole prompt and hides it, and this is the term that decides
+    // whether the chunk's steady-state parity is worth anything end to end.
+    if (p.n_chunk_captures > 0)
+        std::fprintf(stderr,
+                     "[k3-prefill] %ld chunk graph captures over %d tokens: %.0f ms total, "
+                     "%.3f ms/token of the ingestion\n",
+                     p.n_chunk_captures, n_ids, p.ms_chunk_capture,
+                     n_ids > 0 ? p.ms_chunk_capture / (double)n_ids : 0.0);
 
     // Leave every rank where a forward_token loop would have left it: position past the
     // prompt, host and device mirrors agreeing. A caller that ingests a prompt and then
