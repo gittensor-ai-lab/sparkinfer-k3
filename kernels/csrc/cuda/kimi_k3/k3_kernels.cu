@@ -3143,6 +3143,77 @@ __global__ void proj_q8_0_fused4_kernel(float* __restrict__ y0, float* __restric
         }
 }
 
+// Two projections sharing one activation. ROWS=4 matches the single-tensor multirow
+// kernel — with only two tensors the register budget that forced fused4 down to
+// ROWS=2 is free again, so activation reuse is 8x (2 tensors x 4 rows) rather than
+// the 4x a naive 2-tensor ROWS=2 would give.
+//
+// BIT-IDENTICAL to two separate proj_q8_0_multirow_kernel<BLOCK, 4> launches (and
+// therefore to two k3_proj_f32 calls at N >= 1024): same stride, same i order, same
+// block_sum.
+template <int BLOCK, int ROWS>
+__global__ void proj_q8_0_fused2_kernel(float* __restrict__ y0, float* __restrict__ y1,
+                                        const float* __restrict__ x,
+                                        const BlockQ8_0* __restrict__ W0,
+                                        const BlockQ8_0* __restrict__ W1,
+                                        int blocks_per_row, int n_rows) {
+    k3_pdl_sync();
+    const int n0 = blockIdx.x * ROWS;
+    __shared__ float shm[BLOCK / 32 + 1];
+
+    const BlockQ8_0* const Wt[2] = {W0, W1};
+    float* const Yt[2] = {y0, y1};
+
+    float acc[2][ROWS];
+#pragma unroll
+    for (int t = 0; t < 2; ++t)
+#pragma unroll
+        for (int r = 0; r < ROWS; ++r) acc[t][r] = 0.0f;
+
+    for (int b = threadIdx.x; b < blocks_per_row; b += BLOCK) {
+        const float* xb = x + (size_t)b * 32;
+        float s[2][ROWS];
+#pragma unroll
+        for (int t = 0; t < 2; ++t)
+#pragma unroll
+            for (int r = 0; r < ROWS; ++r) s[t][r] = 0.0f;
+
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const float x0 = xb[4 * i + 0], x1 = xb[4 * i + 1];
+            const float x2 = xb[4 * i + 2], x3 = xb[4 * i + 3];
+#pragma unroll
+            for (int t = 0; t < 2; ++t)
+#pragma unroll
+                for (int r = 0; r < ROWS; ++r) {
+                    if (n0 + r >= n_rows) continue;
+                    const BlockQ8_0* row = Wt[t] + (size_t)(n0 + r) * blocks_per_row;
+                    const int wq = get_int_b2(row[b].qs, i);
+                    s[t][r] += (float)(int8_t)(wq >>  0) * x0;
+                    s[t][r] += (float)(int8_t)(wq >>  8) * x1;
+                    s[t][r] += (float)(int8_t)(wq >> 16) * x2;
+                    s[t][r] += (float)(int8_t)(wq >> 24) * x3;
+                }
+        }
+#pragma unroll
+        for (int t = 0; t < 2; ++t)
+#pragma unroll
+            for (int r = 0; r < ROWS; ++r) {
+                if (n0 + r >= n_rows) continue;
+                const BlockQ8_0* row = Wt[t] + (size_t)(n0 + r) * blocks_per_row;
+                acc[t][r] += __half2float(__ushort_as_half(row[b].d)) * s[t][r];
+            }
+    }
+
+#pragma unroll
+    for (int t = 0; t < 2; ++t)
+#pragma unroll
+        for (int r = 0; r < ROWS; ++r) {
+            const float v = block_sum<BLOCK>(acc[t][r], shm);
+            if (threadIdx.x == 0 && n0 + r < n_rows) Yt[t][n0 + r] = v;
+        }
+}
+
 template <int BLOCK, bool WIDE = false>
 __global__ void proj_q8_0_q8_0_kernel(float* __restrict__ y,
                                       const BlockQ8_0* __restrict__ x,
@@ -3325,6 +3396,66 @@ __global__ void proj_q8_0_q8_0_fused4_kernel(float* __restrict__ y0,
     // only the store is guarded. Same contract as the multirow kernel.
 #pragma unroll
     for (int t = 0; t < 4; ++t) {
+#pragma unroll
+        for (int r = 0; r < ROWS; ++r) {
+            const float v = block_sum<BLOCK>(acc[t][r], shm);
+            if (threadIdx.x == 0 && n0 + r < n_rows) Yt[t][n0 + r] = v;
+        }
+    }
+}
+
+// Q8 activation x TWO Q8_0 weight matrices — the dense / shared-expert gate+up
+// twin of fused4. Same "quantize once, consume twice" story: under default qact
+// the f32-activation k3_proj_f32_x2 was silently skipped, and two separate
+// k3_proj_ggml_f32 calls re-quantised the identical normed2 each time.
+//
+// BIT-IDENTICAL to two separate k3_proj_ggml_f32 calls: one staged activation
+// block, same dp4a order over i, same block_sum tree per row. ROWS=4 matches
+// the f32 fused2 packing (register budget free with only two tensors).
+template <int BLOCK, int ROWS>
+__global__ void proj_q8_0_q8_0_fused2_kernel(float* __restrict__ y0,
+                                             float* __restrict__ y1,
+                                             const BlockQ8_0* __restrict__ x,
+                                             const BlockQ8_0* __restrict__ W0,
+                                             const BlockQ8_0* __restrict__ W1,
+                                             int blocks_per_row, int n_rows) {
+    k3_pdl_sync();
+    const int n0 = blockIdx.x * ROWS;
+    __shared__ float shm[BLOCK / 32 + 1];
+
+    const BlockQ8_0* const Wt[2] = {W0, W1};
+    float* const Yt[2] = {y0, y1};
+
+    float acc[2][ROWS];
+#pragma unroll
+    for (int t = 0; t < 2; ++t)
+#pragma unroll
+        for (int r = 0; r < ROWS; ++r) acc[t][r] = 0.0f;
+
+    for (int b = threadIdx.x; b < blocks_per_row; b += BLOCK) {
+        int xq[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) xq[i] = get_int_b2(x[b].qs, i);
+        const float dx = __half2float(__ushort_as_half(x[b].d));
+
+#pragma unroll
+        for (int t = 0; t < 2; ++t) {
+#pragma unroll
+            for (int r = 0; r < ROWS; ++r) {
+                if (n0 + r >= n_rows) continue;
+                const BlockQ8_0* row = Wt[t] + (size_t)(n0 + r) * blocks_per_row;
+                int sumi = 0;
+#pragma unroll
+                for (int i = 0; i < 8; ++i)
+                    sumi = __dp4a(get_int_b2(row[b].qs, i), xq[i], sumi);
+                const float dw = __half2float(__ushort_as_half(row[b].d));
+                acc[t][r] += (float)sumi * (dw * dx);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int t = 0; t < 2; ++t) {
 #pragma unroll
         for (int r = 0; r < ROWS; ++r) {
             const float v = block_sum<BLOCK>(acc[t][r], shm);
@@ -4826,6 +4957,40 @@ bool k3_proj_ggml_f32_x4(float* y0, float* y1, float* y2, float* y3, const float
     return true;
 }
 
+bool k3_proj_ggml_f32_x2(float* y0, float* y1, const float* x,
+                         const void* W0, const void* W1,
+                         int wtype, int N, int K, void* q8_scratch,
+                         cudaStream_t stream, bool x_pre_q8) {
+    // Twin of k3_proj_ggml_f32_x4 for the dense / shared-expert gate+up pair.
+    // Same narrow contract: Q8_0 weights, identical [N, K], false = slow path.
+    if (N <= 0 || K <= 0 || wtype != 8 || K % 32 != 0) return false;
+    if (!y0 || !y1 || !W0 || !W1 || !q8_scratch) return false;
+
+    // ROWS=4 matches the f32 fused2 packing. Floor is ROWS (not MULTIROW_MIN_N):
+    // shexp under tp=8 is N=768, which is exactly the scored path this exists for.
+    // Per-row b / i / block_sum order is unchanged vs two separate ggml projs.
+    constexpr int ROWS = 4;
+    if (N < ROWS) return false;
+    const int nb = K / 32;
+
+    if (!x_pre_q8) {
+        k3_quantize_q8_0(q8_scratch, x, nb, stream);
+    }
+
+    const unsigned grid = (unsigned)((N + ROWS - 1) / ROWS);
+    const BlockQ8_0* xq = (const BlockQ8_0*)q8_scratch;
+#define K3_QQ2_LAUNCH(BS)                                                        \
+    k3_pdl_launch(grid, BS, 0, stream, proj_q8_0_q8_0_fused2_kernel<BS, ROWS>,   \
+        y0, y1, xq, (const BlockQ8_0*)W0, (const BlockQ8_0*)W1, nb, N)
+    switch (proj_block_for(nb)) {
+        case 32:  K3_QQ2_LAUNCH(32);  break;
+        case 64:  K3_QQ2_LAUNCH(64);  break;
+        default:  K3_QQ2_LAUNCH(128); break;
+    }
+#undef K3_QQ2_LAUNCH
+    return true;
+}
+
 bool k3_proj_f32_x4(float* y0, float* y1, float* y2, float* y3, const float* x,
                     const void* W0, const void* W1, const void* W2, const void* W3,
                     int wtype, int N, int K, cudaStream_t stream) {
@@ -4858,6 +5023,35 @@ bool k3_proj_f32_x4(float* y0, float* y1, float* y2, float* y3, const float* x,
             k3_pdl_launch(grid, 128, 0, stream, proj_q8_0_fused4_kernel<128, ROWS>, 
                 y0, y1, y2, y3, x, (const BlockQ8_0*)W0, (const BlockQ8_0*)W1,
                 (const BlockQ8_0*)W2, (const BlockQ8_0*)W3, nb, N);
+            break;
+    }
+    return true;
+}
+
+bool k3_proj_f32_x2(float* y0, float* y1, const float* x,
+                    const void* W0, const void* W1,
+                    int wtype, int N, int K, cudaStream_t stream) {
+    if (N <= 0 || K <= 0 || wtype != 8 || K % 32 != 0) return false;
+    if (!y0 || !y1 || !W0 || !W1) return false;
+    // Floor is ROWS so shexp band N=768 (tp=8) can take the fusion. Per-row
+    // accumulation over b/i is unchanged vs two separate k3_proj_f32 calls.
+    // Launches go through k3_pdl_launch so this stays on the PDL path with x4.
+    constexpr int ROWS = 4;
+    if (N < ROWS) return false;
+    const int nb = K / 32;
+    const unsigned grid = (unsigned)((N + ROWS - 1) / ROWS);
+    switch (proj_block_for(nb)) {
+        case 32:
+            k3_pdl_launch(grid, 32, 0, stream, proj_q8_0_fused2_kernel<32, ROWS>,
+                y0, y1, x, (const BlockQ8_0*)W0, (const BlockQ8_0*)W1, nb, N);
+            break;
+        case 64:
+            k3_pdl_launch(grid, 64, 0, stream, proj_q8_0_fused2_kernel<64, ROWS>,
+                y0, y1, x, (const BlockQ8_0*)W0, (const BlockQ8_0*)W1, nb, N);
+            break;
+        default:
+            k3_pdl_launch(grid, 128, 0, stream, proj_q8_0_fused2_kernel<128, ROWS>,
+                y0, y1, x, (const BlockQ8_0*)W0, (const BlockQ8_0*)W1, nb, N);
             break;
     }
     return true;

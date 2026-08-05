@@ -343,6 +343,71 @@ int main() {
         for (int t = 0; t < 4; ++t) { cudaFree(dy[t]); cudaFree(dref[t]); }
     }
 
+    // ---- Q8 activation x TWO Q8_0 weights, fused (dense / shexp gate+up) ----
+    //
+    // N=768 is the tp=8 shared-expert band — the shape that used to refuse the
+    // f32 x2 floor and skip under default qact. N=4096 covers a larger multirow
+    // regime. Both must be bit-identical to two separate k3_proj_ggml_f32 calls.
+    for (int N : {768, 4096}) {
+        const int K = 7168;
+        const int bpr = K / 32;
+        std::vector<BlockQ8_0> W0((size_t)N * bpr), W1((size_t)N * bpr);
+        std::vector<float> x(K);
+        auto fillW = [&](std::vector<BlockQ8_0>& W) {
+            for (auto& b : W) {
+                b.d = __half_as_ushort(__float2half_rn(0.002f + 0.004f * U(rng)));
+                for (int j = 0; j < 32; ++j) b.qs[j] = (int8_t)(int)(127.0f * U(rng));
+            }
+        };
+        fillW(W0); fillW(W1);
+        for (auto& v : x) v = U(rng);
+
+        void *dW0, *dW1, *dx, *dq, *dy0, *dy1, *dref0, *dref1;
+        CU(cudaMalloc(&dW0, W0.size()*sizeof(BlockQ8_0)));
+        CU(cudaMalloc(&dW1, W1.size()*sizeof(BlockQ8_0)));
+        CU(cudaMalloc(&dx, K*sizeof(float)));
+        CU(cudaMalloc(&dq, k3_q8_0_bytes(K)));
+        CU(cudaMalloc(&dy0, N*sizeof(float)));
+        CU(cudaMalloc(&dy1, N*sizeof(float)));
+        CU(cudaMalloc(&dref0, N*sizeof(float)));
+        CU(cudaMalloc(&dref1, N*sizeof(float)));
+        CU(cudaMemcpy(dW0, W0.data(), W0.size()*sizeof(BlockQ8_0), cudaMemcpyHostToDevice));
+        CU(cudaMemcpy(dW1, W1.data(), W1.size()*sizeof(BlockQ8_0), cudaMemcpyHostToDevice));
+        CU(cudaMemcpy(dx, x.data(), K*sizeof(float), cudaMemcpyHostToDevice));
+
+        const bool refok =
+            k3_proj_ggml_f32((float*)dref0, (const float*)dx, dW0, 8, N, K, dq, 0) &&
+            k3_proj_ggml_f32((float*)dref1, (const float*)dx, dW1, 8, N, K, dq, 0);
+        CU(cudaDeviceSynchronize());
+
+        const bool ok = k3_proj_ggml_f32_x2((float*)dy0, (float*)dy1, (const float*)dx,
+                                            dW0, dW1, 8, N, K, dq, 0);
+        CU(cudaDeviceSynchronize());
+        CU(cudaGetLastError());
+
+        double worst = 0; int worst_t = -1; bool anynz = false;
+        void* dy[2] = {dy0, dy1}; void* dref[2] = {dref0, dref1};
+        for (int t = 0; t < 2; ++t) {
+            std::vector<float> a(N), b(N);
+            CU(cudaMemcpy(a.data(), dy[t],   N*sizeof(float), cudaMemcpyDeviceToHost));
+            CU(cudaMemcpy(b.data(), dref[t], N*sizeof(float), cudaMemcpyDeviceToHost));
+            double num = 0, den = 0;
+            for (int n = 0; n < N; ++n) {
+                const double d = a[n] - b[n];
+                num += d*d; den += (double)b[n]*b[n];
+            }
+            if (den > 0) anynz = true;
+            const double rl2 = std::sqrt(num / (den + 1e-30));
+            if (rl2 > worst) { worst = rl2; worst_t = t; }
+        }
+        std::printf("[Q8_0 x Q8_0 fused2] N=%d K=%d accepted=%s (ref=%s) "
+                    "worst relL2 vs 2 separate calls=%.3e (tensor %d)\n",
+                    N, K, ok ? "yes" : "NO", refok ? "yes" : "NO", worst, worst_t);
+        if (!ok || !refok || !anynz || worst != 0.0) ++fail;
+        cudaFree(dW0); cudaFree(dW1); cudaFree(dx); cudaFree(dq);
+        cudaFree(dy0); cudaFree(dy1); cudaFree(dref0); cudaFree(dref1);
+    }
+
     // ---- F32 dense case ----
     {
         const int N = 200, K = 384;
