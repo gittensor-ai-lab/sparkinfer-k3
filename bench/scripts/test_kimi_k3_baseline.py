@@ -1552,6 +1552,82 @@ class CiWorkflowTest(unittest.TestCase):
         # one is still caught.
         self.assertNotIn("XL", {label(59.06), label(59.06, "off")})
 
+    def test_a_self_declared_block_skips_instead_of_demanding_a_node_run(self):
+        """#144 measured prefill 63.28 vs 59.07 on one binary, held the decode guard, verified
+        parity bit-exact at 1k and 4k -- then found parity FAILS at 32k, pasted the failing
+        compare_logits output into the body, and said do not merge on the perf number. The
+        most careful submission in the queue.
+
+        The template had nowhere to put that, so the author restructured the body, which cost
+        the '## Node run' heading the attestation scan keys on, and the PR was labelled
+        needs-node-run. The loop told someone who had run more experiments than anyone that
+        they had not touched a GPU.
+
+        Both readers now take a ticked Blocked box from the WHOLE body, not from the node-run
+        section -- an author with something to disclose is the one most likely to have
+        reorganised around it."""
+        bot = self._bot()
+        # WITH the needs-node-run label already on it. That is the state the mechanism has to
+        # win from: #144 was labelled before it could adopt the box, and a blocked declaration
+        # that loses to a stale label reports the same wrong reason it was meant to replace.
+        blocked = {"number": 1, "isDraft": False, "labels": [{"name": "needs-node-run"}],
+                   "body": "## Summary\n- [x] **Blocked — do not evaluate yet.** parity @32k\n"}
+        ok, why = bot.eligibility(blocked)
+        self.assertFalse(ok)
+        self.assertIn("marked this blocked", why)
+        # ...and it is not reported as a missing node run, which is the whole point.
+        self.assertNotIn("needs-node-run", why)
+        self.assertNotIn("has not attested", why)
+
+        # Unticked is the normal state and must not skip anything: the box is a declaration,
+        # not a keyword. #144's own body carried an UNTICKED "parity @32k — FAILS ... Blocking."
+        # line, and reading that as a block would let any mention of the word stop a round.
+        unblocked = dict(blocked, body="## Summary\n- [ ] **Blocked** — no\nblocked blocked\n")
+        self.assertNotIn("marked this blocked", bot.eligibility(unblocked)[1])
+
+        wf = (ROOT / ".github/workflows/node-attestation.yml").read_text()
+        self.assertIn("author marked this blocked", wf,
+                      "the label must not be applied to a PR that already said 'not yet'")
+        tpl = (ROOT / ".github/PULL_REQUEST_TEMPLATE.md").read_text()
+        self.assertIn("Blocked — do not evaluate yet", tpl)
+        self.assertIn("Known problems", tpl,
+                      "there has to be somewhere to write the defect that is not a "
+                      "machine-read section")
+
+    def test_the_template_never_hardcodes_a_frontier_number(self):
+        """A frontier quoted in a doc is stale the next time anything merges, and a stale one
+        is not a cosmetic error: #135, #136 and #138 were all optimised against a pin that
+        understated main by 31%, all measured honestly, and all landed under the bar.
+
+        The template used to print 'main does 40.35' directly. It now sends people to
+        reference.lock on main, and tells them to measure main themselves in the same session
+        as their own arm -- which is what kept #133's self-measured before within 0.2% of what
+        the node independently found."""
+        tpl = (ROOT / ".github/PULL_REQUEST_TEMPLATE.md").read_text()
+        for stale in ("40.35", "53.02", "56.8", "59.06"):
+            self.assertNotIn(stale, tpl,
+                             f"{stale} is a measurement with a shelf life — link the lock "
+                             f"instead of copying the number into a template")
+        self.assertIn("reference.lock", tpl)
+        self.assertIn("measure `main` yourself", tpl)
+
+    def test_merging_a_winner_advances_the_pin_in_the_same_breath(self):
+        """reconcile_lock only runs when a round STARTS, so between a merge and the next round
+        the pin describes the main that existed before the winner landed. After #133 that gap
+        was 53.02 pinned against ~59.06 on main.
+
+        A stale-low pin does not merely mislead. The pin is what the claim gate compares
+        against, so it makes the gate too LENIENT: a PR claiming 55 clears a 53.02 bar while
+        being slower than the main it would merge into, and buys ~25 GPU-minutes to find that
+        out."""
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        merge_at = src.index("if merge_winner(args.repo, winner")
+        after = src[merge_at:merge_at + 1600]
+        self.assertIn("reconcile_lock(args.repo, NODE, quant, winner_tps", after,
+                      "the pin has to move with the merge, not with the next round")
+        self.assertIn("winner_tps > 0", after,
+                      "a missing measurement must not write a zero frontier")
+
     def test_decode_is_guarded_at_128k_even_though_prefill_is_scored(self):
         """Prefill and decode share kernels, so batching the prompt WILL move decode. The
         guard bounds how far, and it is a refusal rather than a tier: a prefill gain bought
@@ -3950,10 +4026,15 @@ class PrefillAttestationTest(unittest.TestCase):
         """The shipped template ships EMPTY measurement cells on purpose, so ticking every box
         without filling them is not enough -- see AttestationNeedsEvidenceTest. Fill them the
         way an author who actually ran it would."""
-        sec = (self._template_section().replace("- [ ]", "- [x]")
-               + "\n| | before (main) | after (this PR) |\n|---|--:|--:|\n"
-                 "| prefill @ 32k | 53.02 | 62.00 |\n"
-                 "| decode @ 128k | 56.82 | 56.79 |\n")
+        # Every box EXCEPT Blocked: that one is a declaration that something is wrong, so an
+        # author with three clean measurements leaves it alone. Ticking it is what #144 needed
+        # and is covered by its own test.
+        sec = "\n".join(
+            ln if "Blocked" in ln else ln.replace("- [ ]", "- [x]")
+            for ln in self._template_section().splitlines()
+        ) + ("\n| | before (main) | after (this PR) |\n|---|--:|--:|\n"
+             "| prefill @ 32k | 53.02 | 62.00 |\n"
+             "| decode @ 128k | 56.82 | 56.79 |\n")
         ok, why = self._bot().eligibility(self._pr(sec))
         self.assertTrue(ok, why)
 
