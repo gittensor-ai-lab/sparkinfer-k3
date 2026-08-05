@@ -693,7 +693,25 @@ fi
 # The bars pinned above. eval-label.yml pins the SAME pair when it re-derives; a bot and a
 # workflow disagreeing about REJECT is the same class of bug as disagreeing about the
 # frontier.
-RESULT="$(SPARKINFER_DIFFICULTY_REF="$LLAMA_REF" SPARKINFER_SCORED_CONTEXT="$SCORED_CTX" \
+# THE LLAMA ANCHOR IS OFF ON THE PREFILL METRIC, and eval-label.yml turns it off by the
+# same test (CTX_SUFFIX ending in _PP). These two must agree: eval-label.yml re-derives the
+# label from the same numbers and REFUSES the payload when its answer differs, so a harness
+# that anchored where the workflow does not would read as "payload edited" on every PR.
+#
+# Why off: the anchor sizes a gain against llama.cpp as a MATURITY level of the same
+# algorithm. llama.cpp batches the prompt; sparkinfer walks it token by token. delta/143.88
+# therefore measures the feature we have not built (#137), not the work in the PR -- and
+# since the buckets are fractions of the ref, it made a tier cost 2.7x more here (L = +27.1%
+# over the frontier) than on decode (L = +10.0%) purely because llama's two metrics are 7.8x
+# apart. LLAMA_REF stays pinned and keeps being reported as pct_of_llama.
+ANCHOR_ENV=()
+if [[ "$CTX_SUFFIX" == *_PP ]]; then
+    ANCHOR_ENV=(SPARKINFER_TIER_ANCHOR=off
+                SPARKINFER_TIER_ANCHOR_REASON="llama.cpp batches the prompt and sparkinfer does not, so its prefill is a different algorithm rather than a mature version of this one")
+    echo ">> tier anchor OFF — prefill is scored against the frontier, not llama's batched prefill" >&2
+fi
+RESULT="$(env "${ANCHOR_ENV[@]}" \
+    SPARKINFER_DIFFICULTY_REF="$LLAMA_REF" SPARKINFER_SCORED_CONTEXT="$SCORED_CTX" \
     SPARKINFER_KL_BAR="$KL_BAR" \
     SPARKINFER_KL_PREFER="$KL_PREFER" \
     python3 "$HERE/label.py" "$TPS" "$FRONTIER" 0 "$TOP1" "$KL" "$COMMIT" "$PROV")"

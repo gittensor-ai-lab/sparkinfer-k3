@@ -1441,8 +1441,10 @@ class CiWorkflowTest(unittest.TestCase):
         self.assertIn('SPARKINFER_SCORED_CONTEXT="$SCORED_CTX"', ev,
                       "the verdict must record which context earned it")
         wf = (ROOT / ".github/workflows/eval-label.yml").read_text()
-        self.assertIn('{kind}_32K_PP', wf,
+        self.assertIn('SUFFIX = "32K_PP"', wf,
                       "the trusted re-derivation must read the same slot the bot writes")
+        self.assertIn('{kind}_{SUFFIX}', wf,
+                      "the slot name must be built from that one suffix, not a second literal")
         # the suffix has to resolve to a context, or a pinned llama reference at it is
         # unverifiable by check_reference_lock.py
         import importlib.util as _u
@@ -1450,6 +1452,105 @@ class CiWorkflowTest(unittest.TestCase):
         crl = _u.module_from_spec(spec)
         spec.loader.exec_module(crl)
         self.assertEqual(crl.CTX_OF_SUFFIX.get("32K_PP"), 32768)
+
+    def test_the_llama_anchor_is_off_on_the_prefill_metric(self):
+        """A tier's COST scales with the reference, and llama's two metrics are 7.8x apart:
+        18.44 tok/s decode against 143.88 prefill. So the same rule that asks +10% over the
+        frontier for an L on decode asks +27.1% on prefill -- not because prefill work is
+        harder, but because llama.cpp batches the prompt and we do not, which makes 143.88 a
+        different ALGORITHM rather than a mature version of ours.
+
+        The anchor had been inert on K3 since the decode frontier passed 18.44 (ref < frontier
+        -> min() picks g), so every recent K3 tier was already frontier-relative. Moving the
+        scored metric to prefill silently reactivated a dormant rule at 2.7x its old strength
+        and cost #133 the L its +11.4% earned under the rule every prior PR was scored by.
+
+        Turn this back on the round after batched prefill (#137) lands."""
+        run = lambda **e: json.loads(subprocess.run(
+            [sys.executable, str(ROOT / "bench/scripts/label.py"),
+             "59.06", "53.02", "0", "1.0", "0.006694998", "10b0c9a"],
+            capture_output=True, text=True, check=True,
+            env={**os.environ, "SPARKINFER_DIFFICULTY_REF": "143.88", **e},
+        ).stdout.split("RESULT_JSON", 1)[1])
+
+        off = run(SPARKINFER_TIER_ANCHOR="off")
+        self.assertEqual(off["label"], "L", "+11.4% over the frontier is an L")
+        self.assertEqual(off["effective_pct"], 11.4)
+        self.assertEqual(off["tier_basis"], "frontier_relative")
+        # The ref is still pinned and still reported -- it stopped being the BASIS, it did
+        # not stop being true. pct_of_llama must remain delta/143.88, not delta/frontier,
+        # or every receipt written under the new basis silently redefines the field.
+        self.assertEqual(off["pct_of_llama"], 4.2)
+        self.assertEqual(off["tier_anchor_ref"], 143.88)
+        # Turning the anchor off always records WHY in the receipt, whether or not the
+        # caller supplied a specific reason. A tier basis that changed for reasons the log
+        # does not carry is not auditable a year later.
+        self.assertIn("does not measure the same algorithm", off["tier_anchor_off"])
+        why = run(SPARKINFER_TIER_ANCHOR="off",
+                  SPARKINFER_TIER_ANCHOR_REASON="llama.cpp batches the prompt")
+        self.assertEqual(why["tier_anchor_off"], "llama.cpp batches the prompt")
+
+        self.assertEqual(run()["label"], "S", "default stays anchored — this is opt-in")
+
+        # Decode is untouched: there the ref is BELOW the frontier, so the cap already
+        # picked the frontier-relative gain and the anchor never bound.
+        dec = json.loads(subprocess.run(
+            [sys.executable, str(ROOT / "bench/scripts/label.py"),
+             "62.48", "56.8", "0", "1.0", "0.0067", "abc1234"],
+            capture_output=True, text=True, check=True,
+            env={**os.environ, "SPARKINFER_DIFFICULTY_REF": "18.4435"},
+        ).stdout.split("RESULT_JSON", 1)[1])
+        self.assertEqual((dec["label"], dec["effective_pct"]), ("L", 10.0))
+
+    def test_the_harness_and_the_workflow_switch_the_anchor_on_the_same_test(self):
+        """eval-label.yml re-derives the label from the payload's own numbers and REFUSES it
+        when its answer differs from the reported one -- that is the forged-payload check. So
+        a harness that anchors where the workflow does not does not produce a wrong tier, it
+        produces 'payload edited or harness version mismatch' on every prefill PR. Both sides
+        must key off the same thing: a CTX_SUFFIX ending in _PP."""
+        ev = (ROOT / "bench/scripts/kimi_k3_eval.sh").read_text()
+        wf = (ROOT / ".github/workflows/eval-label.yml").read_text()
+        self.assertIn('[[ "$CTX_SUFFIX" == *_PP ]]', ev)
+        self.assertIn('anchor_off = SUFFIX.endswith("_PP")', wf)
+        for src in (ev, wf):
+            self.assertIn("SPARKINFER_TIER_ANCHOR", src)
+            self.assertIn("llama.cpp batches the prompt and sparkinfer does not", src,
+                          "both sides must state the same reason, so a receipt and a "
+                          "workflow log cannot disagree about why the tier moved")
+
+    def test_a_payload_scored_under_the_old_basis_is_superseded_not_refused(self):
+        """The label check is a tamper check, and a tamper check may only compare things that
+        SHOULD be equal. Turning the llama anchor off put every sealed prefill payload in the
+        log at odds with its own re-derivation; refusing them would mean spending ~25
+        GPU-minutes per PR to reprint numbers that are already sealed.
+
+        The claimed label still has to be what the TRUSTED numbers really produce under one of
+        the two rule versions, so a forger cannot name an arbitrary tier -- only one the same
+        inputs actually yield."""
+        wf = (ROOT / ".github/workflows/eval-label.yml").read_text()
+        self.assertIn("alt_label = score(alt)", wf)
+        self.assertIn("the payload was edited", wf,
+                      "a label matching NEITHER basis is still a hard refusal")
+        self.assertIn("superseded=", wf, "the supersession must reach the PR comment")
+
+        def label(tps, anchor=None):
+            env = {**os.environ, "SPARKINFER_DIFFICULTY_REF": "143.88"}
+            if anchor:
+                env["SPARKINFER_TIER_ANCHOR"] = anchor
+            return json.loads(subprocess.run(
+                [sys.executable, str(ROOT / "bench/scripts/label.py"),
+                 str(tps), "53.02", "0", "1.0", "0.006694998", "10b0c9a"],
+                capture_output=True, text=True, check=True, env=env,
+            ).stdout.split("RESULT_JSON", 1)[1])["label"]
+
+        # #133's sealed run: S under the anchor it was scored with, L under the current rule.
+        # Both are real derivations of 59.06 against 53.02, which is what makes the
+        # supersession safe to accept.
+        self.assertEqual(label(59.06), "S")
+        self.assertEqual(label(59.06, "off"), "L")
+        # ...and nothing makes those numbers an XL under either basis, so a payload claiming
+        # one is still caught.
+        self.assertNotIn("XL", {label(59.06), label(59.06, "off")})
 
     def test_decode_is_guarded_at_128k_even_though_prefill_is_scored(self):
         """Prefill and decode share kernels, so batching the prompt WILL move decode. The

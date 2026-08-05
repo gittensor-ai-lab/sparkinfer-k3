@@ -112,6 +112,40 @@ if _ref_raw is None:
 DIFF_REF   = float(_ref_raw)
 DIFF_MAX   = float(os.environ.get("SPARKINFER_DIFFICULTY_MAX", "1.5"))
 
+# Does the reference measure the SAME ALGORITHM as the frontier, one maturity level on?
+#
+# The anchor's whole premise is that llama.cpp is a mature version of what we do, so
+# delta/llama_ref reads as "fraction of a mature engine's throughput earned". That premise
+# holds for decode. It does NOT hold for prefill: llama.cpp batches the prompt and sparkinfer
+# ingests it token by token, so 143.88 vs 53.02 is two different algorithms, not two maturity
+# levels of one. Sizing an unbatched gain against a batched engine measures the missing
+# feature, not the work -- and the missing feature is #137, which no amount of tuning inside
+# the current path can close.
+#
+# The damage is not theoretical. The bucket thresholds are fractions of the ref, so what a
+# tier COSTS scales with the ref, and llama's two metrics are 7.8x apart:
+#
+#            llama_ref   frontier    L costs
+#   decode      18.44      56.80     +10.0% over frontier   (ref < frontier: cap picks g)
+#   prefill    143.88      53.02     +27.1% over frontier   (ref > frontier: anchor binds)
+#
+# Nobody chose that. The anchor had been inert on K3 since the decode frontier passed 18.44,
+# so every recent K3 tier was already frontier-relative; moving the scored metric to prefill
+# on 2026-08-05 silently reactivated a dormant rule at 2.7x its old strength. #133 measured a
+# real +11.4% over the frontier -- an L under the rule every prior K3 PR was scored by -- and
+# landed S.
+#
+# So: OFF for prefill until batched prefill exists, ON everywhere else. DIFF_REF stays pinned
+# and keeps being reported as pct_of_llama; it just is not the tier basis. Flip this back the
+# round after #137 lands and the two engines are doing the same thing again.
+TIER_ANCHOR = os.environ.get("SPARKINFER_TIER_ANCHOR", "auto").strip().lower()
+if TIER_ANCHOR not in ("auto", "off"):
+    sys.stderr.write(f"label.py: SPARKINFER_TIER_ANCHOR={TIER_ANCHOR!r} is not 'auto' or 'off'\n")
+    sys.exit(2)
+ANCHOR_OFF_REASON = os.environ.get(
+    "SPARKINFER_TIER_ANCHOR_REASON",
+    "the reference does not measure the same algorithm as the frontier")
+
 # ---- No-regression guards (opt-in; empty => inert) ----------------------------------------
 # The tier is earned at ONE context (SPARKINFER_SCORED_CONTEXT). Every other measured context is a
 # guard: a PR may not pay for its scored gain by giving back ground elsewhere. Shifting cost from
@@ -202,7 +236,7 @@ def _speed_tier_fields(tps, frontier, ceiling):
     # longer mint XLs from low-hanging fruit while a mature one (past llama) can't clear XS. Significance
     # still gates on raw %-over-frontier above (a gain must beat the current best); only the TIER is
     # llama-anchored. Past-llama difficulty boost (Option B) is unchanged. DIFF_REF<=0 -> legacy basis.
-    llama_anchored = DIFF_REF > 0
+    llama_anchored = DIFF_REF > 0 and TIER_ANCHOR != "off"
     ref = DIFF_REF if llama_anchored else frontier
     if LOWER_IS_BETTER:
         # Latency: fair gain = how much of llama's TTFT we cut vs llama (ref - value) / ref.
@@ -239,7 +273,10 @@ def _speed_tier_fields(tps, frontier, ceiling):
     label = next((l for thr, l in BUCKETS if g_eff >= thr), "XS")
     out.update(label=label, delta_tps=round(delta, 6 if LOWER_IS_BETTER else 2),
                pct_over_frontier=round(100 * g, 1),      # RAW measured speedup / TTFT reduction
-               pct_of_llama=round(100 * g_fair, 1),      # gain vs llama — the label basis
+               # Gain vs llama. The label basis only while the anchor is on; when it is off
+               # this stays the TRUE fraction of llama (delta/DIFF_REF), not delta/frontier,
+               # so the number keeps meaning the same thing in every receipt.
+               pct_of_llama=round(100 * (delta / DIFF_REF if DIFF_REF > 0 else g_fair), 1),
                pct_of_ceiling=round(100 * tps / ceiling, 1) if ceiling > 0 and not LOWER_IS_BETTER else None)
     out["effective_pct"] = round(100 * g_eff, 1)
     if D != 1.0:                                        # transparency: expose the boost in the verdict
@@ -293,7 +330,12 @@ if res.get("label") != "REJECT" and kl > KL_PREFER:
 res["pass"] = res.pop("pass_", True)
 # Make the basis explicit. A tier computed without a llama anchor is not comparable to one
 # that has it, and the difference was previously invisible in the output.
-res["tier_basis"] = "llama_anchored" if DIFF_REF > 0 else "frontier_relative"
+if DIFF_REF > 0 and TIER_ANCHOR == "off":
+    res["tier_basis"] = "frontier_relative"
+    res["tier_anchor_off"] = ANCHOR_OFF_REASON
+    res["tier_anchor_ref"] = round(DIFF_REF, 4)
+else:
+    res["tier_basis"] = "llama_anchored" if DIFF_REF > 0 else "frontier_relative"
 if SCORED_CTX:
     res["scored_context"] = int(SCORED_CTX)
 if _rows:
