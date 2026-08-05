@@ -238,6 +238,14 @@ if(BUILD_EXAMPLES)
     target_include_directories(kimi_k3_moe_ref_check PRIVATE ${PROJECT_SOURCE_DIR}/../kernels/include)
     set_target_properties(kimi_k3_moe_ref_check PROPERTIES CXX_STANDARD 17)
 
+    # Correctness check for the batched-prefill driver: runs a prompt through the
+    # naive per-token loop AND kimi_k3_prefill_tokens(), diffs the final logits.
+    # UNVERIFIED ON HARDWARE at the time this was added -- this is the first thing
+    # to run once a GPU is available, before trusting anything else in that PR.
+    add_executable(kimi_k3_prefill_check examples/kimi_k3_prefill_check.cpp)
+    target_link_libraries(kimi_k3_prefill_check PRIVATE sparkinfer_runtime CUDA::cudart)
+    set_target_properties(kimi_k3_prefill_check PROPERTIES CXX_STANDARD 17)
+
     add_executable(thermal_sweep examples/thermal_sweep.cpp)   # force each thermal mode, measure W/°C/tok/s
     target_include_directories(thermal_sweep PRIVATE include)
     target_link_libraries(thermal_sweep PRIVATE sparkinfer_runtime CUDA::cudart Threads::Threads)
