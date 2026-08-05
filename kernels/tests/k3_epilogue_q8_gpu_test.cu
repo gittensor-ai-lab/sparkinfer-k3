@@ -60,6 +60,22 @@ static void test_situ_q8() {
     std::printf("  %-46s %s\n", "Q8_0 bytes bit-identical", q_ok ? "OK" : "FAIL");
     if (!q_ok) ++g_fail;
 
+    // Hot path passes nullptr for the float mirror — Q8 must still match.
+    void* q8_nomirror = nullptr;
+    CU(cudaMalloc(&q8_nomirror, qb));
+    const bool took2 = k3_situ_q8(q8_nomirror, nullptr, dg, du, n, beta, lb, 0);
+    CU(cudaDeviceSynchronize());
+    ++g_case;
+    std::printf("  %-46s %s\n", "nullptr float mirror engages", took2 ? "OK" : "FAIL");
+    if (!took2) ++g_fail;
+    std::vector<char> hq2(qb);
+    CU(cudaMemcpy(hq2.data(), q8_nomirror, qb, cudaMemcpyDeviceToHost));
+    ++g_case;
+    const bool q2_ok = bytes_eq(hq2.data(), href.data(), qb);
+    std::printf("  %-46s %s\n", "Q8_0 identical without float mirror", q2_ok ? "OK" : "FAIL");
+    if (!q2_ok) ++g_fail;
+    CU(cudaFree(q8_nomirror));
+
     CU(cudaFree(dg)); CU(cudaFree(du));
     CU(cudaFree(dsitu)); CU(cudaFree(dsitu2));
     CU(cudaFree(q8_fused)); CU(cudaFree(q8_ref));

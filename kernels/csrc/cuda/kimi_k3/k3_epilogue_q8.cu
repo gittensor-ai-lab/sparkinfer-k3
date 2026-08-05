@@ -29,9 +29,9 @@
 //     kda_gate_out_kernel<128> uses; only the apply is then quantised. Idle lanes
 //     above head_dim are unreachable at K3's head_dim == 128.
 //
-// The float buffers (gate_out / dense_situ / mla_attn_out) are still written when
-// the caller passes them, so debug tags and any later reader see what the split
-// path wrote.
+// The float buffers (gate_out / dense_situ / mla_attn_out) are written only when
+// the caller passes them — the forward passes nullptr on the hot path and keeps
+// the mirror solely for debug tags. Q8 bytes stay bit-identical either way.
 //
 // ===========================================================================
 // WHAT IT DECLINES
