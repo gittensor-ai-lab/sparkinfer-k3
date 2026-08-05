@@ -1586,32 +1586,116 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
 
     // ---- phase 1: attention. Ends holding a FULL-WIDTH PARTIAL SUM,
     // because attn_output is ColShard. The driver reduces it before phase 2. ----
+    // ---- PREFILL TILE REUSE: take the fill's work instead of redoing it ----
+    //
+    // WHY THIS EXISTS, MEASURED. The tile fill already computes this token's mix, norm
+    // and quantised activation, and the consumer used to recompute all three and then
+    // COPY the four projections in — so a tile hit cost more launches than a tile miss.
+    // Counted per token per KDA layer: a miss is mix, push, norm, hoist, fused4 = 5
+    // nodes; the copying hit was 10 + 5/T. That is why the batched fill lost to its own
+    // control at every tile width (49.86 vs 51.00 at T=4, 42.21 vs 45.24 at T=16) while
+    // doing strictly less arithmetic.
+    //
+    // It matters because prefill under capture is bound by the SIZE of the recorded
+    // graph, not by arithmetic: capture is worth 1.93x on the per-token path's 3308-node
+    // graph and only 1.56x on a T=16 tile's 61258-node one. Nodes are the currency.
+    //
+    // Reusing instead of recomputing makes a hit 3 + 5/T — cheaper than a miss.
+    //
+    // WHAT IS NOT REUSED, AND MUST NOT BE. The bank PUSH stays here. The fill reads each
+    // token's checkpoint bank as it stands on ENTRY to the layer and never writes it, so
+    // the push is the consumer's job alone; skipping it would leave the bank one
+    // checkpoint short for every later layer, and skipping the n_ckpt increment would
+    // mix the wrong prefix. Both are fluent-wrong failures, not crashes.
+    //
+    // The pointers are ALIASED, not copied, and restored by the guard below on every
+    // exit path — the same discipline res_bank_orig and kimi_k3_swap_partial_buffer
+    // already use. Aliasing is safe because a tile row belongs to exactly one token and
+    // is dead once that token's layer is done: the fill overwrites it at the next layer.
+    // SPARKINFER_K3_PREFILL_REUSE=0 makes the consumer ignore the tile ENTIRELY — it
+    // recomputes the mix, the norm and the quantise and runs its own fused4, which is
+    // exactly what a tile miss does. So =0 is the fill-OFF control's consumer with the
+    // fill still running, which isolates the fill's cost from the reuse's saving, and =1
+    // is the change. One binary, both arms.
+    static const bool want_tile_reuse = [] {
+        const char* e = std::getenv("SPARKINFER_K3_PREFILL_REUSE");
+        return !(e && e[0] == '0');
+    }();
+    const K3PrefillTile* pt_hit = nullptr;
+    if (fwd.prefill_tile && want_tile_reuse && !fwd.debug) {
+        // The debug taps read these buffers straight after the launch that wrote them,
+        // and on a reuse there IS no such launch — the value was produced by the fill,
+        // one call earlier. Localising a mismatch is the taps' whole job, so they get
+        // the recomputing path.
+        const K3PrefillTile* pt = (const K3PrefillTile*)fwd.prefill_tile;
+        if (pt->layer == layer && pt->hidden == H &&
+            fwd.prefill_tok >= 0 && fwd.prefill_tok < pt->n_live)
+            pt_hit = pt;
+    }
+    // Holds the SLOTS rather than the scratch, so it never has to name
+    // KimiK3Forward::Scratch (a nested type this free function cannot spell).
+    struct K3TileAlias {
+        float** normed_p = nullptr; float* normed0 = nullptr;
+        void**  act_p    = nullptr; void*  act0    = nullptr;
+        float **qp = nullptr, **kp = nullptr, **vp = nullptr, **gp = nullptr;
+        float  *q0 = nullptr,  *k0 = nullptr,  *v0 = nullptr,  *g0 = nullptr;
+        ~K3TileAlias() {
+            if (!normed_p) return;
+            *normed_p = normed0; *act_p = act0;
+            *qp = q0; *kp = k0; *vp = v0; *gp = g0;
+        }
+    } tile_alias;
+    if (pt_hit) {
+        tile_alias.normed_p = &s.normed; tile_alias.normed0 = s.normed;
+        tile_alias.act_p    = &s.act_q8; tile_alias.act0    = s.act_q8;
+        tile_alias.qp = &s.qkv_q;      tile_alias.q0 = s.qkv_q;
+        tile_alias.kp = &s.qkv_k;      tile_alias.k0 = s.qkv_k;
+        tile_alias.vp = &s.qkv_v;      tile_alias.v0 = s.qkv_v;
+        tile_alias.gp = &s.g_proj_out; tile_alias.g0 = s.g_proj_out;
+    }
+
     if (do_attn) {
         // --- pre-attention mix, then bank push (raw pre-mix value) ---
         if (res_bs > 0) {
             if (!L.attn_res_score.ok()) return false;
-            k3k::attn_res_mix_f32(s.mixed, st.res_bank, hidden_in,
-                                  (const float*)L.attn_res_score.data, H, st.n_ckpt,
-                                  eps, stream, s.res_scores);
+            // The mix is skipped on a hit, the PUSH below is not — see the note above.
+            if (!pt_hit) {
+                k3k::attn_res_mix_f32(s.mixed, st.res_bank, hidden_in,
+                                      (const float*)L.attn_res_score.data, H, st.n_ckpt,
+                                      eps, stream, s.res_scores);
+            }
             if (banked) {
                 if (st.n_ckpt >= st.max_ckpt) return false;
                 cudaMemcpyAsync(st.res_bank + (size_t)st.n_ckpt * H, hidden_in,
                                 (size_t)H * sizeof(float), cudaMemcpyDeviceToDevice, stream);
                 ++st.n_ckpt;
             }
-        } else {
+        } else if (!pt_hit) {
             cudaMemcpyAsync(s.mixed, hidden_in, (size_t)H * sizeof(float),
                             cudaMemcpyDeviceToDevice, stream);
         }
         if (fwd.debug) fwd.debug("attn_res_mix", layer, s.mixed, H);
 
         if (!L.attn_norm.ok()) return false;
-        k3k::rms_norm_f32(s.normed, s.mixed, (const float*)L.attn_norm.data, H, eps, stream);
-        if (fwd.debug) fwd.debug("attn_norm", layer, s.normed, H);
-        // normed feeds ssm_f_a and ssm_beta on a KDA layer, and q_a/q_dense, kv_a and
-        // attn_gate on an MLA one. The fused qkvg group keeps its own quantisation --
-        // it is one launch that already amortises it across four tensors.
-        hoist_act(s.normed, H);
+        if (pt_hit) {
+            // The fill produced BOTH of these for this row, from the same inputs with the
+            // same kernels — bit-identical by construction, which the sweep's 0.0 KLD at
+            // every tile width is the end-to-end check on.
+            s.normed = pt_hit->normed + (size_t)fwd.prefill_tok * (size_t)H;
+            s.act_q8 = (char*)pt_hit->q8 +
+                       (size_t)fwd.prefill_tok * k3k::k3_q8_0_bytes(H);
+            // Tell proj_h_on that act_q8 already holds THIS activation, so ssm_f_a and
+            // ssm_beta skip their re-quantise too. Without this they would quantise
+            // s.normed again and the saving would stop at the qkvg group.
+            hoisted_src = s.normed;
+        } else {
+            k3k::rms_norm_f32(s.normed, s.mixed, (const float*)L.attn_norm.data, H, eps, stream);
+            if (fwd.debug) fwd.debug("attn_norm", layer, s.normed, H);
+            // normed feeds ssm_f_a and ssm_beta on a KDA layer, and q_a/q_dense, kv_a and
+            // attn_gate on an MLA one. The fused qkvg group keeps its own quantisation --
+            // it is one launch that already amortises it across four tensors.
+            hoist_act(s.normed, H);
+        }
 
         k3_profiler().start(L.is_kda ? "attn_kda" : "attn_mla", stream);
         if (L.is_kda) {
@@ -1717,19 +1801,27 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             // is the failure this file refuses to ship everywhere else. `pt->qkv == qkv`
             // catches a shard-width mismatch, which would corrupt silently by copying the
             // wrong number of floats.
+            // ALIASED, NOT COPIED. Four D2D memcpys per token per KDA layer is ~280 graph
+            // nodes per token — on a path whose cost IS its node count, that was most of
+            // the reason a tile hit lost to a tile miss. Pointing the scratch at the row
+            // costs nothing and the downstream attention reads the identical floats.
+            //
+            // Safe because a tile row belongs to exactly one token and dies with that
+            // token's layer: nothing re-reads row t after token t's attention, so even an
+            // in-place consumer could not corrupt a value anyone else will see. The
+            // restore is the guard declared at the top of this function, which runs on
+            // every exit path including the error returns below.
             bool qkvg_from_tile = false;
-            if (fwd.prefill_tile) {
-                const K3PrefillTile* pt = (const K3PrefillTile*)fwd.prefill_tile;
-                if (pt->layer == layer && pt->qkv == qkv &&
-                    fwd.prefill_tok >= 0 && fwd.prefill_tok < pt->n_live) {
-                    const size_t off = (size_t)fwd.prefill_tok * (size_t)qkv;
-                    const size_t nb  = (size_t)qkv * sizeof(float);
-                    cudaMemcpyAsync(s.qkv_q, pt->q + off, nb, cudaMemcpyDeviceToDevice, stream);
-                    cudaMemcpyAsync(s.qkv_k, pt->k + off, nb, cudaMemcpyDeviceToDevice, stream);
-                    cudaMemcpyAsync(s.qkv_v, pt->v + off, nb, cudaMemcpyDeviceToDevice, stream);
-                    cudaMemcpyAsync(s.g_proj_out, pt->g + off, nb, cudaMemcpyDeviceToDevice, stream);
-                    qkvg_from_tile = true;
-                }
+            if (pt_hit && pt_hit->qkv == qkv) {
+                // The qkv guard is the one check that could not be hoisted to pt_hit: it
+                // catches a shard-width mismatch, and a mismatch would hand attention the
+                // wrong number of floats rather than fail.
+                const size_t off = (size_t)fwd.prefill_tok * (size_t)qkv;
+                s.qkv_q      = pt_hit->q + off;
+                s.qkv_k      = pt_hit->k + off;
+                s.qkv_v      = pt_hit->v + off;
+                s.g_proj_out = pt_hit->g + off;
+                qkvg_from_tile = true;
             }
             // `||` SHORT-CIRCUITS, and that is load-bearing rather than stylistic: the
             // right-hand side CALLS the projections. On a tile hit it must not be evaluated
