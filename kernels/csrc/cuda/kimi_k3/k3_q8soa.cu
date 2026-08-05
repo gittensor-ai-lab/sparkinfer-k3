@@ -16,7 +16,7 @@
 // graph capture) and registers the SoA pair against the original device
 // pointer, so call sites need no plumbing: they ask "is there an SoA view of
 // this pointer" and fall through to the shipped path when there is not.
-// SPARKINFER_K3_Q8SOA=1 opts in; default OFF until measured.
+// SPARKINFER_K3_Q8SOA=0 restores the AoS path; default ON (bit-identical).
 
 #include "sparkinfer/kernels/kimi_k3.h"
 #include "sparkinfer/kernels/kimi_k3_fast.h"
@@ -71,8 +71,10 @@ std::unordered_map<const void*, SoaView> g_soa;
 
 bool q8soa_enabled() {
     static const bool on = [] {
+        // Default ON: load-time SoA repack cuts Q8_0 proj issue stalls (17→3 mem
+        // ops/block) with the same dp4a order. =0 restores AoS on one binary.
         const char* e = std::getenv("SPARKINFER_K3_Q8SOA");
-        return e && e[0] == '1';
+        return !(e && e[0] == '0');
     }();
     return on;
 }

@@ -114,6 +114,7 @@ bool k3_proj_q8_fused4_1bar(float* y0, float* y1, float* y2, float* y3, const fl
 // a top_k above 32, or a shared request past the 48 KiB budget.
 // Q8_0 structure-of-arrays weights (k3_q8soa.cu). Register at LOAD time;
 // the proj entries decline (return false) for any unregistered tensor.
+// Default ON (SPARKINFER_K3_Q8SOA=0 restores AoS); bit-identical by construction.
 bool k3_q8soa_register(const void* wdata, int wtype, const long ne[4]);
 bool k3_proj_q8soa(float* y, const void* q8_act, const void* wdata,
                    int N, int K, cudaStream_t stream);

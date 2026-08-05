@@ -1149,15 +1149,25 @@ __global__ void moe_gate_up_situ_kernel(float* __restrict__ scratch,
     const Blk* u_row = up_exps   + (size_t)(e * ffn + j) * blocks_per_row;
 
     float gacc = 0.0f, uacc = 0.0f;
-    // blocks_per_row arrives as a runtime argument, so nvcc cannot unroll this and each
-    // iteration's divergent iq1s_grid_c gather sits alone on a dependent chain. Unrolling
-    // puts four independent gathers and four weight loads in flight. Accumulation order
-    // is unchanged, so this is bit-identical.
+    // BPR14: scored K3 latent is 3584 → blocks_per_row is exactly 14, but it arrives
+    // as a RUNTIME bound — `#pragma unroll 4` on a 14-trip runtime loop only peels
+    // four at a time and leaves each divergent lattice gather alone on a dependent
+    // chain. A compile-time 14 issues all fourteen LDG→gather→FMA chains back to
+    // back (same pattern as BPR3 on down below). Ascending b preserved: bit-identical.
+    if (blocks_per_row == 14) {
+#pragma unroll
+        for (int b = 0; b < 14; ++b) {
+            const float* xb = x + b * 256;
+            gacc += block_dot<XVEC, GPACK, GSMEM>(g_row[b], xb, lane, 32);
+            uacc += block_dot<XVEC, GPACK, GSMEM>(u_row[b], xb, lane, 32);
+        }
+    } else {
 #pragma unroll 4
-    for (int b = 0; b < blocks_per_row; ++b) {
-        const float* xb = x + b * 256;
-        gacc += block_dot<XVEC, GPACK, GSMEM>(g_row[b], xb, lane, 32);
-        uacc += block_dot<XVEC, GPACK, GSMEM>(u_row[b], xb, lane, 32);
+        for (int b = 0; b < blocks_per_row; ++b) {
+            const float* xb = x + b * 256;
+            gacc += block_dot<XVEC, GPACK, GSMEM>(g_row[b], xb, lane, 32);
+            uacc += block_dot<XVEC, GPACK, GSMEM>(u_row[b], xb, lane, 32);
+        }
     }
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
@@ -5074,8 +5084,8 @@ bool k3_quantize_act_rows_f32(void* q8_out, const float* x, int K, int n_rows,
 // the caller's straight-line code instead of an invariant someone has to maintain.
 bool k3_proj_q8act_f32(float* y, const void* q8_scratch, const void* W, int wtype,
                        int N, int K, cudaStream_t stream) {
-    // SoA-first (k3_q8soa.cu): engages only for load-registered tensors under
-    // SPARKINFER_K3_Q8SOA=1; bit-identical to the dispatch below by construction.
+    // SoA-first (k3_q8soa.cu): load-registered tensors under SPARKINFER_K3_Q8SOA
+    // (default ON; =0 restores AoS). Bit-identical to the dispatch below.
     if (k3_proj_q8soa(y, q8_scratch, W, N, K, stream)) return true;
 
     if (N <= 0 || K <= 0) return false;
