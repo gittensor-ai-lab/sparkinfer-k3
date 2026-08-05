@@ -8,9 +8,11 @@
 #include "sparkinfer/tp/k3_coll_1bar.h"
 #include "sparkinfer/tp/shard.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
 #include <vector>
 #include <string>
 #include <thread>
@@ -1804,6 +1806,54 @@ static bool k3_tp_prefill_tile(KimiK3TP& p, const int* ids, int T) {
         std::fprintf(stderr, "[k3-prefill] captured tile: %zu nodes/rank, T=%d, "
                              "mla splits=%d, from position %d\n",
                      nnodes, T, plan_lo, base);
+        // SPARKINFER_K3_PREFILL_NODES=1 prints WHICH kernels those nodes are.
+        //
+        // The tile only beats the per-token path if a T-token tile records about what one
+        // token records today — capture is worth 1.93x on a 3308-node graph and 1.56x on a
+        // 61258-node one — so the batching order is decided by the node histogram and
+        // nothing else. Reading it off the layer body would be guessing, and nsys cannot
+        // run in this container (it dies enumerating /sys/devices/virtual/nvidia-pci-gpu),
+        // so the count is taken from the captured graph itself, which is the authority
+        // anyway: these ARE the nodes that get replayed.
+        //
+        // Diagnostic only, off by default, and it runs ONCE per capture rather than per
+        // replay, so it cannot perturb the measurement it exists to direct.
+        if (const char* e = std::getenv("SPARKINFER_K3_PREFILL_NODES")) if (e[0] == '1') {
+            std::vector<cudaGraphNode_t> nodes(nnodes);
+            if (cudaGraphGetNodes(pool.graph[0], nodes.data(), &nnodes) == cudaSuccess) {
+                std::map<std::string, long> hist;
+                long other = 0;
+                for (size_t i = 0; i < nnodes; ++i) {
+                    cudaGraphNodeType ty{};
+                    if (cudaGraphNodeGetType(nodes[i], &ty) != cudaSuccess) continue;
+                    if (ty == cudaGraphNodeTypeKernel) {
+                        cudaKernelNodeParams kp{};
+                        const char* nm = nullptr;
+                        if (cudaGraphKernelNodeGetParams(nodes[i], &kp) == cudaSuccess &&
+                            cudaFuncGetName(&nm, kp.func) == cudaSuccess && nm)
+                            ++hist[nm];
+                        else ++hist["<kernel:unnamed>"];
+                    } else if (ty == cudaGraphNodeTypeMemcpy) {
+                        ++hist["<memcpy>"];
+                    } else if (ty == cudaGraphNodeTypeMemset) {
+                        ++hist["<memset>"];
+                    } else {
+                        ++other;
+                    }
+                }
+                std::vector<std::pair<long, std::string>> rows;
+                rows.reserve(hist.size());
+                for (auto& kv : hist) rows.push_back({kv.second, kv.first});
+                std::sort(rows.begin(), rows.end(),
+                          [](const auto& a, const auto& b) { return a.first > b.first; });
+                std::fprintf(stderr, "[k3-nodes] T=%d, %zu nodes, %zu distinct, "
+                                     "%ld non-kernel-non-copy\n",
+                             T, nnodes, rows.size(), other);
+                for (auto& r : rows)
+                    std::fprintf(stderr, "[k3-nodes] %8ld  %7.2f/token  %s\n",
+                                 r.first, (double)r.first / (double)T, r.second.c_str());
+            }
+        }
     }
 
     if (graph_on) {
