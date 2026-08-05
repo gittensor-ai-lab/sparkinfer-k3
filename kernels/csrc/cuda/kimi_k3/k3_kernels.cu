@@ -2982,6 +2982,11 @@ __global__ void mla_kv_store_kernel(float* __restrict__ cache,
 // cannot change. k3_read_pos_f32 exists so a test can prove the two never drift.
 __global__ void bump_pos_kernel(int* __restrict__ p) { *p += 1; }
 
+// Original single-block norm. Kept as the bit-identical reference path: the sum of
+// squares is partitioned across exactly 128 threads with stride 128, and the apply
+// walk matches. Widening the sum changes that partition and moves KL vs main past the
+// ratchet (#115 measured 4.63x at one depth) — so the wide kernel below freezes this
+// reduction and only widens the elementwise apply.
 template <int BLOCK>
 __global__ void rms_norm_kernel(float* __restrict__ out, const float* __restrict__ x,
                                 const float* __restrict__ w, int n, float eps) {
@@ -2992,6 +2997,54 @@ __global__ void rms_norm_kernel(float* __restrict__ out, const float* __restrict
     const float ss = block_sum<BLOCK>(acc, shm);
     const float inv = rsqrtf(ss / (float)n + eps);
     for (int d = threadIdx.x; d < n; d += BLOCK) out[d] = x[d] * inv * w[d];
+}
+
+// Wide apply, frozen reduction.
+//
+// WHY THE SUM STAYS ON 128 THREADS. Changing how many threads contribute to ss changes
+// the float32 association of the sum of squares, which changes inv, which changes every
+// output element by ~1e-7 relative — enough to push KL vs main over the 2x ratchet while
+// still clearing the absolute KL bar. The measured +2.8% at 128k on #115 came with
+// accuracy-regression for exactly that reason. The apply is elementwise once inv is
+// fixed, so widening it (more threads, float4 loads) cannot change a bit of the output
+// if the reduction matches rms_norm_kernel<128>.
+//
+// Idle threads above 128 contribute 0 to block_sum; x+0 is an IEEE identity, so the
+// longer warp-tree sum is bit-identical to the 4-warp one.
+//
+// n4 is the float4 count when vec4!=0; n is always the element count (the mean divisor).
+template <int BLOCK>
+__global__ void rms_norm_wide_kernel(float* __restrict__ out, const float* __restrict__ x,
+                                     const float* __restrict__ w, int n, float eps,
+                                     int n4, int vec4) {
+    k3_pdl_sync();
+    __shared__ float shm[BLOCK / 32 + 1];
+
+    float acc = 0.0f;
+    if (threadIdx.x < 128) {
+        for (int d = (int)threadIdx.x; d < n; d += 128) acc += x[d] * x[d];
+    }
+    const float ss = block_sum<BLOCK>(acc, shm);
+    const float inv = rsqrtf(ss / (float)n + eps);
+
+    if (vec4) {
+        const float4* __restrict__ x4 = (const float4*)x;
+        const float4* __restrict__ w4 = (const float4*)w;
+        float4* __restrict__ o4 = (float4*)out;
+        for (int d = (int)threadIdx.x; d < n4; d += BLOCK) {
+            const float4 v = x4[d];
+            const float4 g = w4[d];
+            float4 r;
+            r.x = v.x * inv * g.x;
+            r.y = v.y * inv * g.y;
+            r.z = v.z * inv * g.z;
+            r.w = v.w * inv * g.w;
+            o4[d] = r;
+        }
+    } else {
+        for (int d = (int)threadIdx.x; d < n; d += BLOCK)
+            out[d] = x[d] * inv * w[d];
+    }
 }
 
 }  // namespace
@@ -4207,11 +4260,57 @@ size_t k3_moe_q8_k_bytes(int latent, int ffn, int top_k) {
            sizeof(BlockQ8K);
 }
 
+// Threads for the apply phase. The reduction is always 128 threads (see the kernel);
+// this only sizes how many threads walk the elementwise scale. Floored at 128 so the
+// narrow norms keep the shape they already had.
+static inline int rms_norm_block_for(int units) {
+    if (units >= 1024) return 1024;
+    if (units >= 512)  return 512;
+    if (units >= 256)  return 256;
+    return 128;
+}
+
+static inline bool rms_norm_aligned16(const void* p) {
+    return ((uintptr_t)p & 15u) == 0;
+}
+
 void rms_norm_f32(float* out, const float* x, const float* w, int n, float eps,
                   cudaStream_t stream) {
     if (n <= 0) return;
-    constexpr int BLOCK = 128;
-    k3_pdl_launch(1, BLOCK, 0, stream, rms_norm_kernel<BLOCK>, out, x, w, n, eps);
+
+    // At BLOCK==128 with no vec4 the wide kernel is the original kernel (same 128-thread
+    // sum, same 128-thread apply), so that path stays on rms_norm_kernel for a one-line
+    // reviewer check rather than trusting the specialization. Everything wider shares
+    // that reduction and only grows the apply.
+    const bool vec4 = (n % 4 == 0 && rms_norm_aligned16(out) && rms_norm_aligned16(x) &&
+                       rms_norm_aligned16(w));
+    const int units = vec4 ? n / 4 : n;
+    const int block = rms_norm_block_for(units);
+    const int n4 = vec4 ? n / 4 : 0;
+
+    if (block == 128 && !vec4) {
+        k3_pdl_launch(1, 128, 0, stream, rms_norm_kernel<128>, out, x, w, n, eps);
+        return;
+    }
+
+    switch (block) {
+        case 1024:
+            k3_pdl_launch(1, 1024, 0, stream, rms_norm_wide_kernel<1024>,
+                          out, x, w, n, eps, n4, vec4 ? 1 : 0);
+            return;
+        case 512:
+            k3_pdl_launch(1, 512, 0, stream, rms_norm_wide_kernel<512>,
+                          out, x, w, n, eps, n4, vec4 ? 1 : 0);
+            return;
+        case 256:
+            k3_pdl_launch(1, 256, 0, stream, rms_norm_wide_kernel<256>,
+                          out, x, w, n, eps, n4, vec4 ? 1 : 0);
+            return;
+        default:
+            k3_pdl_launch(1, 128, 0, stream, rms_norm_wide_kernel<128>,
+                          out, x, w, n, eps, n4, vec4 ? 1 : 0);
+            return;
+    }
 }
 
 void k3_add_f32(float* out, const float* a, const float* b, int64_t n,
