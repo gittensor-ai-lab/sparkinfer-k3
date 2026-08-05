@@ -44,9 +44,15 @@
 // 896 experts at top_k 16 means a T-token chunk sends only T*16/896 rows to each
 // expert: ~36 rows at T=2048, ~73 at T=4096. The expert GEMM is STRUCTURALLY SKINNY in
 // M and no chunk size available in a 32k prefill changes that — reaching M=128 would
-// need T=7168. So BM is 32, not prefill_gemm_i8.cu's 128: a 128-row tile would run
-// three quarters empty on the shape this kernel actually sees, and the M dimension is
-// the one that cannot be widened by asking for a bigger chunk.
+// need T=7168.
+//
+// The obvious conclusion from that — make BM small so the tile is not mostly empty —
+// is only half right, and this file shipped it as if it were the whole story. Two costs
+// pull BM in opposite directions: the IQ1_S DECODE is ~2/3 of the time and is repeated
+// per M-tile (wants BM large), while the mma work is the BM x BN output area and is paid
+// whether or not the rows are real (wants BM small). Measured, they cross near M=70. So
+// BM is a template parameter with both shapes instantiated, and the launcher picks on M.
+// The table and the ablation it comes from are at kMSwitch below.
 //
 // BN stays at 128 and BK at 64. BK=64 is two IQ1_S sub-blocks, and because k0 is a
 // multiple of 64 and 256 % 64 == 0 a tile can never straddle a 256-value block
@@ -74,6 +80,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <mutex>
+#include <type_traits>
 
 namespace sparkinfer {
 namespace kernels {
@@ -82,13 +89,47 @@ namespace {
 
 constexpr int kQK   = 256;    // values per IQ1_S block
 constexpr int kSub  = 32;     // values per sub-block == mma.m16n8k32's k-extent
-constexpr int kBM   = 32;     // see the shape note above
+// BM IS A TEMPLATE PARAMETER BECAUSE TWO COSTS PULL IT IN OPPOSITE DIRECTIONS.
+//
+// Ablation on one H200 at N=98304, K=3584, weights DRAM-resident, M=1, best of 50:
+//
+//     full kernel                        0.2380 ms
+//     minus the divergent lattice gather 0.2183 ms    ->  gather is  8% of it
+//     minus ALL global weight reads      0.1548 ms    ->  weight ld is 35% of it
+//
+// So roughly two thirds of the time is the IQ1_S DECODE, and the decode is a function
+// of the WEIGHT tile alone: it does not shrink when M shrinks, and it is repeated for
+// every M-tile. That argues for a large BM.
+//
+// But the mma work is the OUTPUT AREA, BM x BN, and it is paid whether or not the rows
+// are real. A 128x128 tile issues 4x the mma of a 32x128 one, so at small M a large BM
+// spends four times the tensor-core work to produce the same few rows. That argues for
+// a small BM. Measured, us/token:
+//
+//     M       1     16     32     36     64     73    128    256
+//     BM 32 235.2  15.47   8.75  11.39   6.66   8.98   6.61   6.44
+//     BM128 468.7  29.21  14.64  13.12   7.73   7.20   4.76   4.67
+//
+// The crossover is near M=70: below it the wasted mma dominates, above it the repeated
+// decode does. Neither constant is right on its own, and the first version of this file
+// shipped BM=32 with a rationale ("a 128-row tile would run three quarters empty") that
+// happened to land on the correct side for M<70 for a reason that was only half the
+// story. Both shapes are instantiated and the launcher picks on M.
+//
+// 896 experts at top_k 16 put the expected M at ~36 for a 2048-token chunk and ~73 for
+// 4096 — which straddles the crossover, so this dispatch is not academic.
 constexpr int kBN   = 128;
 constexpr int kBK   = 64;     // two sub-blocks
-constexpr int kWarps = 4;
-constexpr int kThreads = kWarps * 32;
-constexpr int kMFrag = kBM / 16;              // 2
-constexpr int kNFrag = (kBN / kWarps) / 8;    // 4
+constexpr int kMSwitch = 70;  // measured crossover; see the table above
+
+// WARPS moves WITH BM, because the accumulator depth is BM/16 and the register budget
+// is fixed. At BM=128, kMFrag=8, so 4 warps would need accf[8][4][4] = 128 registers
+// for the accumulator alone and spill; 8 warps halves NFrag and puts it back at 64.
+// The launch-bounds block count is derived from the same budget rather than written
+// twice: 65536 / (128 regs * threads).
+template <int BM> struct MmaCfg;
+template <> struct MmaCfg<32>  { static constexpr int warps = 4; };
+template <> struct MmaCfg<128> { static constexpr int warps = 8; };
 
 // 50 bytes, matching ggml block_iq1_s. Redeclared here rather than shared with
 // k3_kernels.cu because that struct is private to that TU; the static_assert is what
@@ -185,11 +226,20 @@ __global__ void quantize_rows_i8_f32_kernel(const float* __restrict__ x,
 // `rows` optionally gathers A's M rows out of a larger token buffer (the MoE dispatch's
 // per-expert row list). Null means identity, which is what the standalone test uses.
 //
+// 2, NOT 4. The bound is a REGISTER budget: 65536 / (blocks * kThreads), so at 256
+// threads 4 blocks would allow 64 registers and accf[8][2][4] is 64 floats on its own —
+// every fragment register and address would spill. 2 blocks gives 128, which is what
+// this shape actually needs, and 2 * 38 KB of shared is comfortable against the SM's
+// 228 KB. The first version's 4 was correct only for the 128-thread, BM=32 shape it was
+// written against, and the two constants have to move together.
+//
 // The launch_bounds second argument is load-bearing, not decorative: the accumulator
 // block is kMFrag*kNFrag*4 floats plus the fragment registers, and letting ptxas spend
 // freely here costs the second resident block on a kernel whose whole purpose is to
 // keep the tensor pipe fed.
-__global__ __launch_bounds__(kThreads, 4)
+template <int BM>
+__global__ __launch_bounds__(MmaCfg<BM>::warps * 32,
+                             65536 / (128 * MmaCfg<BM>::warps * 32))
 void moe_iq1s_mma_kernel(float* __restrict__ C,
                          const signed char* __restrict__ A,
                          const float* __restrict__ sa,
@@ -197,6 +247,11 @@ void moe_iq1s_mma_kernel(float* __restrict__ C,
                          const int* __restrict__ rows,
                          int M, int N, int K) {
     k3_pdl_sync();
+    constexpr int kBM     = BM;
+    constexpr int kWarps  = MmaCfg<BM>::warps;
+    constexpr int kThreads = kWarps * 32;
+    constexpr int kMFrag  = kBM / 16;
+    constexpr int kNFrag  = (kBN / kWarps) / 8;
     // __align__(16) is REQUIRED, not defensive: ldmatrix.sync.aligned takes a shared
     // address that must be 16 B aligned, and swz() only ever returns multiples of 16
     // WITHIN a row — which buys nothing unless the array base is aligned too. A char
@@ -206,8 +261,9 @@ void moe_iq1s_mma_kernel(float* __restrict__ C,
     __shared__ __align__(16) signed char Bs[2][kBN][kBK];
     __shared__ float       Bsc[2][2][kBN];        // [buf][sub-block][row] = dl/8
     __shared__ uint16_t    Sgrid[SPARKINFER_IQ1S_NGRID];
-    // 4 + 16 + 2 + 4 = 26 KB, inside the 48 KB static-shared ceiling, and 4 resident
-    // blocks fit the SM's 228 KB. Both halves of __launch_bounds__ depend on that.
+    // BM 32: 4 + 16 + 2 + 4 = 26 KB.  BM 128: 16 + 16 + 2 + 4 = 38 KB. Both inside the
+    // 48 KB static-shared ceiling, and the resident-block count __launch_bounds__ asks
+    // for fits the SM's 228 KB in either shape.
     static_assert(sizeof(As) + sizeof(Bs) + sizeof(Bsc) + sizeof(Sgrid) <= 48 * 1024,
                   "static shared exceeds the 48 KB per-block limit");
 
@@ -238,9 +294,12 @@ void moe_iq1s_mma_kernel(float* __restrict__ C,
 
     // Stage one BK=64 tile of A (gathered) and of W (decoded from IQ1_S).
     auto stage = [&](int buf, int k0) {
-        // A: kBM rows x 64 B = 128 chunks of 16 B over 128 threads, one each.
-        {
-            const int r = tid >> 2, c = (tid & 3) << 4;
+        // A: kBM rows x (kBK/16) chunks of 16 B, strided over the block. Written as a
+        // grid-stride loop rather than one-chunk-per-thread so kBM and kWarps can move
+        // independently — the first version hard-coded 128 threads against 32 rows and
+        // silently required them to stay in step.
+        for (int s = tid; s < kBM * (kBK / 16); s += kThreads) {
+            const int r = s / (kBK / 16), c = (s % (kBK / 16)) << 4;
             const int gk = k0 + c;
             signed char* dst = &As[buf][r][swz(c, r)];
             const int src_row = (m0 + r < M) ? (rows ? rows[m0 + r] : m0 + r) : -1;
@@ -250,12 +309,10 @@ void moe_iq1s_mma_kernel(float* __restrict__ C,
             else
                 *reinterpret_cast<uint4*>(dst) = make_uint4(0u, 0u, 0u, 0u);
         }
-        // W: 128 rows x 2 sub-blocks = 256 decode units over 128 threads, two each.
-        // One unit is one (row, 32 values) — one qh, four qs bytes, four lattice
-        // lookups — and it emits 32 int8 plus the single scale that covers them.
-#pragma unroll
-        for (int u = 0; u < 2; ++u) {
-            const int unit = tid + u * kThreads;
+        // W: kBN rows x 2 sub-blocks decode units, strided the same way. One unit is one
+        // (row, 32 values) — one qh, four qs bytes, four lattice lookups — and it emits
+        // 32 int8 plus the single scale that covers them.
+        for (int unit = tid; unit < kBN * (kBK / kSub); unit += kThreads) {
             const int r    = unit >> 1;                 // row within the BN tile
             const int half = unit & 1;                  // which sub-block of the BK tile
             const int kk   = k0 + half * kSub;
@@ -391,9 +448,18 @@ bool k3_moe_iq1s_mma_gemm(float* C, const signed char* A, const float* sa,
     // dims (3584, 3072, 7168) are all multiples of 256.
     if (M <= 0 || N <= 0 || K <= 0 || (K % kQK) != 0) return false;
     if (!ensure_grid_uploaded()) return false;
-    dim3 grid((unsigned)((N + kBN - 1) / kBN), (unsigned)((M + kBM - 1) / kBM));
-    k3_pdl_launch(grid, kThreads, 0, stream, moe_iq1s_mma_kernel,
-                  C, A, sa, reinterpret_cast<const BlockIQ1S*>(W), rows, M, N, K);
+    // Pick the tile on M. Below the crossover the wasted mma of a 128-row tile costs
+    // more than the extra decode a 32-row one pays; above it, the reverse. Measured on
+    // one H200 -- see kMSwitch. This is a launch-time choice, not a build-time one,
+    // because a MoE dispatch sees a different M for every expert in the same call.
+    const auto go = [&](auto tag) {
+        constexpr int BM = decltype(tag)::value;
+        dim3 grid((unsigned)((N + kBN - 1) / kBN), (unsigned)((M + BM - 1) / BM));
+        k3_pdl_launch(grid, MmaCfg<BM>::warps * 32, 0, stream, moe_iq1s_mma_kernel<BM>,
+                      C, A, sa, reinterpret_cast<const BlockIQ1S*>(W), rows, M, N, K);
+    };
+    if (M <= kMSwitch) go(std::integral_constant<int, 32>{});
+    else               go(std::integral_constant<int, 128>{});
     return true;
 }
 
