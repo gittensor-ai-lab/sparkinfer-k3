@@ -322,6 +322,99 @@ void moe_expert_ffn_iq1s_f32(float* out, float* scratch,
                              cudaStream_t stream,
                              int expert_begin = 0, int n_local_experts = 0);
 
+// ---------------------------------------------------------------------------
+// 4c. IQ1_S on the int8 tensor cores — the BATCHED expert GEMM
+// ---------------------------------------------------------------------------
+// The routed experts are ~531 of UD-IQ1_S's 553 GiB, so this is the only tensor-core
+// opportunity in K3 whose prize is the model rather than a corner of it.
+//
+// IQ1_S is an int8 format EXACTLY: w = dl*(g + delta) with g in {-1,0,+1} and
+// delta = +/-0.125 rearranges to w = (dl/8)*(8g + s) with 8g + s in {-9,-7,-1,1,7,9},
+// and dl/8 is constant across the 32-value sub-block. mma.sync.m16n8k32.s8 reduces
+// exactly 32 values of k, so the scale domain and the instruction's k-extent coincide
+// and the int32 accumulator is drained once per mma. The conversion is bit-for-bit
+// lossless — not "higher precision than what is stored", which is what the Q4_K/Q6_K
+// int8 path can claim; this is an equality. k3_moe_iq1s_mma_cpu_test proves it over a
+// million values with no GPU, and measures the resulting reduction as 5x MORE accurate
+// than the shipped f32 scalar path (112 rounded adds at K=3584 against 3584).
+//
+// THESE ARE NOT ON ANY LIVE PATH. At M=1 — every path K3 runs today, decode and
+// prefill alike, since prompt ingestion is a forward_token loop — an m16 tile is 1/16
+// occupied and the shipped GEMV wins. They become correct only once a batched prefill
+// supplies M>1, and they are landed first because whether IQ1_S can reach the tensor
+// cores losslessly is what decides the value of building that batching at all.
+//
+// Tiled on M at launch: a T-token chunk sends T*16/896 = T/56 rows to each expert on
+// average, so M is the caller's knob (T=8192 -> M=146). BM=32 and BM=128 are both
+// instantiated and picked on M; the measured crossover is near M=70.
+
+// PER-32 symmetric int8 quantization of f32 activations, one warp per row. The f32 twin
+// of launch_prefill_quantize_rows_i8 (which takes bf16).
+//
+// `scale` is [rows][cols/32], NOT [rows]. The granularity is not a free parameter: the
+// GEMM already drains its int32 accumulator every 32 k because that is the IQ1_S
+// sub-block, so a per-32 activation scale rides that existing boundary for one extra
+// multiply per drained element. A per-row scale (what this used to emit) is set by the
+// row's largest element and costs resolution everywhere else — measured as relL2 1.7e-2
+// against the shipped scalar op, with the T=1 case ruling out any gather defect.
+//
+// `cols` must be a multiple of 32. Returns false if the shape is unsupported.
+bool k3_moe_iq1s_mma_quantize_rows(signed char* q, float* scale, const float* x,
+                                   int rows, int cols, cudaStream_t stream = nullptr);
+
+// C[M,N] = A[M,K] @ W[N,K]^T, W the native GGUF IQ1_S [N,K] blocks, A int8 with the
+// per-32 scales `sa` above ([M][K/32]). C is f32 (K3 is f32 end to end) and COMPACT — row m of C
+// is the m'th row of this expert's group.
+//
+// `rows` optionally gathers A's M rows out of a larger token buffer (a MoE dispatch's
+// per-expert row list); null means identity. When it is given, `sa` is indexed by the
+// SOURCE token while C stays compact, so the caller scatters C itself.
+//
+// K must be a whole number of 256-value IQ1_S blocks — the tile derives the sub-block
+// index by shift and mask and has no partial-block form. K3's expert dims (3584, 3072,
+// 7168) all qualify. Returns false if the shape is unsupported or the lattice upload
+// failed; the caller must fall back rather than emit a wrong result.
+bool k3_moe_iq1s_mma_gemm(float* C, const signed char* A, const float* sa,
+                          const void* W, const int* rows,
+                          int M, int N, int K, cudaStream_t stream = nullptr);
+
+// BATCHED expert FFN — the consumer that gives the GEMM above an M.
+//
+// The shipped moe_expert_ffn_iq1s_f32 is ONE token against top_k experts, so every
+// expert sees M=1. This takes T tokens, buckets the (token, slot) pairs BY EXPERT with
+// a counting sort, and runs each expert once over all the rows routed to it — so the
+// expert's 6.45 MB of weights are read once for M rows instead of once per row.
+//
+// Masking instead of gathering does not work here: at 896 experts and top_k 16, running
+// every expert over every token computes 56x the work it keeps. The rows are physically
+// gathered, and the resulting index array is exactly the `rows` list the GEMM takes.
+//
+// x:    [T, latent]        out: [T, latent], WRITTEN (zeroed here, not accumulated)
+// ids:  [T, top_k]         GLOBAL expert indices; out-of-band ones contribute zero
+// w:    [T, top_k]         routing weights
+//
+// NOT bit-identical to the scalar path, for two structural reasons: the activation is
+// int8 with a per-ROW scale where the scalar path uses block_q8_K's per-256 scale, and
+// the top_k combine accumulates with atomicAdd because a token's contributions arrive
+// from different per-expert launches. The WEIGHTS are not re-rounded — that is what the
+// IQ1_S identity buys — so what moves is activation quantization and summation order.
+//
+// Allocates its own scratch with cudaMallocAsync and synchronizes once to read the
+// bucket counts, so it is NOT usable inside a graph capture. That is a prefill-shaped
+// constraint, not a decode one.
+//
+// Returns false on an unsupported shape or an allocation failure; the caller must fall
+// back rather than emit a wrong result. NOTHING CALLS THIS YET — the batched prefill
+// that would produce a [T, latent] activation block does not exist.
+bool k3_moe_expert_ffn_batched_iq1s(float* out, const float* x,
+                                    const int* ids, const float* w,
+                                    const void* gate_exps, const void* up_exps,
+                                    const void* down_exps,
+                                    int T, int latent, int ffn, int top_k,
+                                    float situ_beta, float situ_linear_beta,
+                                    int expert_begin, int n_local_experts,
+                                    cudaStream_t stream = nullptr);
+
 // Type-dispatched front doors. PREFER THESE over the per-type entry points.
 //
 // An unsloth dynamic quant mixes types per tensor, so the expert type is a property
