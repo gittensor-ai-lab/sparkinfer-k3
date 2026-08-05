@@ -135,7 +135,12 @@ def _row_cells(line):
 
 def measured_claims(section):
     """{'prefill','decode'} for rows whose 'after' cell holds a bare number."""
-    found, after_idx = set(), None
+    return set(measured_values(section))
+
+
+def measured_values(section):
+    """{'prefill': float, 'decode': float} from the 'after (this PR)' column."""
+    found, after_idx = {}, None
     for ln in section.splitlines():
         if ln.count("|") < 2:
             continue
@@ -148,11 +153,40 @@ def measured_claims(section):
             continue
         if not MEASURED_CELL.match(cells[after_idx]):
             continue
+        val = float(cells[after_idx].strip("* "))
         if "prefill" in low[0]:
-            found.add("prefill")
+            found.setdefault("prefill", val)
         if "decode" in low[0]:
-            found.add("decode")
+            found.setdefault("decode", val)
     return found
+
+
+# THE CLAIM HAS TO BE WORTH MEASURING.
+#
+# A round costs ~25 GPU-minutes per PR. If the number an author reports would not score even
+# if it were exact, the node has nothing to learn by re-deriving it -- and the author already
+# knows, because they measured it. #135 claimed 50.60 against a 53.02 frontier: honestly
+# measured, correctly reported, and 4.6% BELOW the thing it has to beat.
+#
+# Compared against the PIN rather than a fresh measurement, because the pin is the number
+# published to contributors -- it is what they were told to beat. The 2% is label.py's
+# significance gate: below it a gain scores `none` however real, so measuring cannot change
+# the outcome.
+CLAIM_SIG = float(os.environ.get("K3_CLAIM_SIG", "0.02"))
+
+
+def pinned_frontier(slot):
+    """The pinned frontier for `slot`, from this checkout's reference.lock. None if absent."""
+    try:
+        text = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                 "bench", "scripts", "reference.lock")).read()
+    except OSError:
+        return None
+    m = re.search(rf"^{re.escape(slot)}=\"\$\{{[^:]+:-([0-9.]+)\}}\"", text, re.M)
+    if not m:
+        return None
+    v = float(m.group(1))
+    return v if v > 0 else None
 
 
 PREFILL_CLAIM = re.compile(r"prefill", re.I)
@@ -277,13 +311,26 @@ def eligibility(pr):
                        "are required")
 
     # …and the ticked boxes must be backed by measured numbers, not placeholders.
-    have = measured_claims(section)
+    have = measured_values(section)
     unbacked = [n for n in ("prefill", "decode") if n not in have]
     if unbacked:
         return False, ("ticked but not measured: " + ", ".join(unbacked) +
                        " — put the measured tok/s in the 'after (this PR)' column. A ticked "
                        "box with '*awaits eval round*' or 'no change' in it is a request to "
                        "be measured, not an attestation that it was")
+
+    # …and the claim has to be worth ~25 GPU-minutes. A number that cannot score even if it
+    # is exact does not need re-deriving on the node: the author measured it, and the pin is
+    # the number they were told to beat.
+    slot = _frontier_slot(NODE, "UD-IQ1_S")
+    pinned = pinned_frontier(slot)
+    claim = have.get("prefill")
+    if pinned and claim is not None and claim <= pinned * (1 + CLAIM_SIG):
+        delta = 100 * (claim / pinned - 1)
+        return False, (f"claimed prefill {claim} does not beat the pinned {pinned} frontier "
+                       f"({delta:+.1f}%) by the {CLAIM_SIG:.0%} significance gate — it would "
+                       f"score `none` even if exact, so the node has nothing to learn. "
+                       f"Re-measure against the current frontier, or close it")
     return True, "eligible"
 
 
@@ -1114,6 +1161,17 @@ FRONTIER_TOL = 0.02
 # that needs a human: either something regressed on main or the box is degraded. Both are
 # reasons to stop, not to quietly re-baseline the thing that decides payouts.
 FRONTIER_ALARM = 0.90
+# A frontier that overshoots its pin by this much means the PIN WAS STALE, not that main got
+# faster this instant -- main does not gain 30% between rounds. It is worth saying out loud
+# because a stale-low pin is invisible while it does damage: the bot measures and passes the
+# frontier explicitly, so ROUNDS score correctly, but eval-label.yml derives from the lock and
+# contributors read it to decide what to beat.
+#
+# 2026-08-05: the prefill slot was hand-seeded at 40.35 from a measurement taken before #114,
+# #115 and #127 landed. Prefill shares the single-token path with decode, so those decode wins
+# lifted it to 53.02 -- a 31% understatement that three PRs optimised against, reporting gains
+# of +25.4%, +24.5% and +5.3% that were really -4.6%, -5.3% and -19.8%.
+FRONTIER_STALE_NOTICE = float(os.environ.get("K3_FRONTIER_STALE_NOTICE", "0.10"))
 
 
 # THE SCORED METRIC IS PREFILL AT 32k (2026-08-05), so the frontier lives in _32K_PP.
@@ -1190,6 +1248,14 @@ def reconcile_lock(repo, node, quant, measured, main_sha, dry_run):
         print(f">> frontier: main measures {measured}, below the pinned {pinned} but within "
               f"the alarm band — scoring against the pin (the conservative direction)")
         return pinned
+
+    if pinned > 0 and measured > pinned * (1 + FRONTIER_STALE_NOTICE):
+        print(f"!! {slot} pinned {pinned} but main measures {measured} — the pin was stale by "
+              f"{100 * (measured / pinned - 1):.1f}%.\n"
+              f"   Rounds were unaffected (the frontier is measured and passed explicitly), but "
+              f"eval-label.yml derives tiers from this pin and contributors read it to decide "
+              f"what to beat, so anything scored or written against {pinned} was priced wrong.",
+              file=sys.stderr)
 
     # Rewrite BY LINE, not by splicing the regex match out of the whole text. Splicing looked
     # fine and quietly ate the blank line after the slot, because the trailing-whitespace part

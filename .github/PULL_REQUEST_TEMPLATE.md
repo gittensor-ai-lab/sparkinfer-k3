@@ -37,6 +37,13 @@
 > `no change — no decode path is touched` all read as *not measured* and the PR is skipped.
 > A round costs ~25 GPU-minutes per PR, so it measures changes that are already known to do
 > something — it is not the place to find out whether yours does.
+>
+> **Your prefill number must beat the pinned frontier by more than 2%**, or the PR is
+> skipped: below that it scores `none` even if exact, so re-deriving it on the node changes
+> nothing. The frontier moves as PRs merge — read the current
+> `KIMI_K3_H200X8_IQ1S_SPARKINFER_32K_PP` in
+> [`bench/scripts/reference.lock`](../bench/scripts/reference.lock) rather than a number
+> quoted in an older PR, and prefer measuring `main` yourself over trusting the pin.
 
 **Prefill tok/s @ 32k** — the scored metric. `llama.cpp` does **143.88** here; `main` does
 **40.35**, because there is no batched prefill and every prompt token goes through the
