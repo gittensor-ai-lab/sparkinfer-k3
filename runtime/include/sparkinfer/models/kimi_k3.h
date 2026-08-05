@@ -390,6 +390,12 @@ struct KimiK3Forward {
     K3ProjBatch pb;
 };
 
+// Whether the routed up-projection may be row-sharded across ranks. Its own switch
+// (SPARKINFER_K3_ROUTED_UP_BAND), deliberately not the head band's, so the two can be
+// A/B'd separately on one binary. The driver checks it too: sharding is only correct when
+// the caller issues the reduce that sums the bands.
+bool k3_routed_up_band_enabled();
+
 // Size the per-token slots the batched projection needs. Idempotent, and a failure leaves
 // the batch machinery OFF (n_tok stays 0) rather than half-built, so the caller falls back
 // to the per-token path instead of reading a slot that was never allocated.

@@ -1176,10 +1176,52 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
         }
 
         // --- phase 3 on every rank ------------------------------------------
+        //
+        // SHARD THE ROUTED UP-PROJECTION, when there is a collective to stitch it with.
+        // ffn_routed_up is Replicate, so the plain FfnFinish below has all eight ranks
+        // computing the identical 7168x3584 result — 2.51 GB/token/rank over 92 layers,
+        // seven eighths of it redundant. FfnUp computes only this rank's band into a
+        // zeroed hidden-wide buffer; one all-reduce sums the bands; FfnTail then runs
+        // unchanged on the complete value.
+        //
+        // Costs one extra collective per MoE layer against ~7/8 of the projection. Falls
+        // back to FfnFinish for the leading dense layer (no routed_up to shard, so the
+        // partial buffer is null) and whenever the band declines.
         const IClock::time_point t_p3 = ip.on ? IClock::now() : IClock::time_point{};
+        int up_count = 0;
+        std::vector<void*> up_bufs;   // the collective takes void*
+        const bool shard_up = k3_routed_up_band_enabled() && tp_size > 1 &&
+                              layer >= cfg.leading_dense;
+        if (shard_up) {
+            up_bufs.resize((size_t)tp_size, nullptr);
+            for (int r = 0; r < tp_size; ++r) {
+                int c = 0;
+                up_bufs[(size_t)r] = (void*)kimi_k3_partial_buffer(
+                    p.ranks[(size_t)r].fwd, layer, K3LayerPhase::FfnUp, &c);
+                if (!up_bufs[(size_t)r] || c <= 0) { up_count = 0; break; }
+                if (up_count == 0) up_count = c;
+                else if (up_count != c) { up_count = 0; break; }
+            }
+        }
+        if (shard_up && up_count > 0) {
+            if (!issue_all([&](int r) {
+                    KimiK3TPRank& R = p.ranks[(size_t)r];
+                    return kimi_k3_forward_layer_phase(R.fwd, layer, K3LayerPhase::FfnUp,
+                                                       R.x, R.x_next);
+                })) return false;
+            if (!p.coll->allreduce_f32_group(up_bufs, (size_t)up_count, p.streams)) {
+                std::fprintf(stderr, "[k3-tp] routed_up all-reduce failed at layer %d\n",
+                             layer);
+                return false;
+            }
+            ++p.n_collectives;
+            ++coll_k;
+        }
+        const K3LayerPhase p3 = (shard_up && up_count > 0) ? K3LayerPhase::FfnTail
+                                                           : K3LayerPhase::FfnFinish;
         if (!issue_all([&](int r) {
                 KimiK3TPRank& R = p.ranks[(size_t)r];
-                if (!kimi_k3_forward_layer_phase(R.fwd, layer, K3LayerPhase::FfnFinish,
+                if (!kimi_k3_forward_layer_phase(R.fwd, layer, p3,
                                                  R.x, R.x_next)) return false;
                 // Each worker swaps only its OWN rank's pair; no rank reads
                 // another's x, so this needs no synchronisation beyond the
