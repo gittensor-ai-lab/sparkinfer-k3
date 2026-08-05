@@ -2095,6 +2095,8 @@ class CiWorkflowTest(unittest.TestCase):
             x
             ## Node run
             - [ ] Tested on **8× H200** (`sm_90`)
+            - [x] **Prefill measured at 32k** on 8× H200
+            - [x] **No 128k decode regression** on 8× H200
             ## Checklist
             - [x] `bench/scripts/kimi_k3_baseline.sh --node h200x8 --dry-run` resolves
         """)
@@ -3029,7 +3031,10 @@ class CiWorkflowTest(unittest.TestCase):
         because a wrong skip during a GitHub incident stops every round while a wrong include
         costs one eval the merge guards still refuse."""
         bot = self._bot()
-        body = "## Node run\n- [x] Tested on **8× H200** (`sm_90`)\n"
+        # the scored metric and its guard each need their own claim (2026-08-05)
+        body = ("## Node run\n- [x] Tested on **8× H200** (`sm_90`)\n"
+                "- [x] **Prefill measured at 32k** on 8× H200\n"
+                "- [x] **No 128k decode regression** on 8× H200\n")
         calls = []
 
         def fake_state(seq):
@@ -3243,6 +3248,8 @@ class CiWorkflowTest(unittest.TestCase):
         body = textwrap.dedent("""\
             ## Node run
             - [x] Tested on **8× H200** (`sm_90`)
+            - [x] **Prefill measured at 32k** on 8× H200
+            - [x] **No 128k decode regression** on 8× H200
         """)
         pr = lambda **kw: {"isDraft": False, "labels": [], "body": body, **kw}
 
@@ -3270,7 +3277,10 @@ class CiWorkflowTest(unittest.TestCase):
         bot = self._bot()
         self.assertIn("needs-node-run", bot.NEVER_MERGE_LABELS)
         self.assertIn("needs-rebase", bot.NEVER_MERGE_LABELS)
-        body = "## Node run\n- [x] Tested on **8× H200** (`sm_90`)\n"
+        # the scored metric and its guard each need their own claim (2026-08-05)
+        body = ("## Node run\n- [x] Tested on **8× H200** (`sm_90`)\n"
+                "- [x] **Prefill measured at 32k** on 8× H200\n"
+                "- [x] **No 128k decode regression** on 8× H200\n")
         ok, _ = bot.eligibility({"isDraft": False, "body": body,
                                  "labels": [{"name": "needs-rebase"}]})
         self.assertTrue(ok, "needs-rebase must stay evaluable — the bot clears it by rebasing")
@@ -3785,3 +3795,86 @@ class RatchetBlocksOnlyAtTheBarTest(unittest.TestCase):
         bot = self._bot()
         self.assertEqual(bot.KL_RATCHET_BLOCK_AT, 0.05,
                          "the ratchet must block at label.py's KL_BAR, not a separate number")
+
+
+class PrefillAttestationTest(unittest.TestCase):
+    """The scored metric and its guard each need their own claim.
+
+    The tier is earned on PREFILL at 32k and decode at 128k is a regression guard, so a node
+    tick no longer says what was run. "I touched a GPU" was enough when there was one number;
+    it is not enough now that a PR can move one metric and quietly cost the other.
+
+    Three places must agree, for the same reason the slot suffix must: the template that asks,
+    the workflow that labels, and the bot that skips. A PR the workflow labels but the bot
+    evaluates -- or the reverse -- is the failure this prevents."""
+
+    def _bot(self):
+        import importlib.util as u
+        s = u.spec_from_file_location("b", str(ROOT / "eval/k3_eval_bot.py"))
+        m = u.module_from_spec(s); s.loader.exec_module(m); return m
+
+    def _pr(self, section):
+        return {"body": "## Node run\n" + section + "\n## Checklist\n", "labels": [],
+                "isDraft": False, "mergeable": "MERGEABLE", "isCrossRepository": False,
+                "author": {"login": "x"}, "number": 1, "title": "perf(k3): x",
+                "headRefOid": "a" * 40}
+
+    def _template_section(self):
+        bot = self._bot()
+        return bot.node_run_section((ROOT / ".github/PULL_REQUEST_TEMPLATE.md").read_text())
+
+    def test_the_template_asks_for_both_claims(self):
+        sec = self._template_section()
+        self.assertTrue(sec, "the template has no '## Node run' section to scan")
+        self.assertRegex(sec, r"(?i)-\s*\[\s*\]\s*.*prefill")
+        self.assertRegex(sec, r"(?i)-\s*\[\s*\]\s*.*decode regression")
+
+    def test_all_three_ticked_is_eligible(self):
+        ok, why = self._bot().eligibility(self._pr(self._template_section().replace("- [ ]", "- [x]")))
+        self.assertTrue(ok, why)
+
+    def test_a_node_tick_alone_is_no_longer_enough(self):
+        sec = self._template_section().replace("- [ ] Tested on", "- [x] Tested on")
+        ok, why = self._bot().eligibility(self._pr(sec))
+        self.assertFalse(ok, "a bare node tick still admits a PR to the scoring loop")
+        self.assertIn("prefill", why)
+        self.assertIn("decode", why)
+
+    def test_a_partial_claim_names_what_is_missing(self):
+        sec = (self._template_section()
+               .replace("- [ ] Tested on", "- [x] Tested on")
+               .replace("- [ ] **Prefill", "- [x] **Prefill"))
+        ok, why = self._bot().eligibility(self._pr(sec))
+        self.assertFalse(ok)
+        self.assertIn("decode regression", why)
+        self.assertNotIn("prefill measured", why, "it should not report a claim that WAS made")
+
+    def test_the_workflow_and_the_bot_agree_on_what_counts(self):
+        """Two independent readings that must agree beat one trusted absolutely -- the same
+        argument that made the bot re-check the node tick after #74 and #71 slipped through."""
+        wf = (ROOT / ".github/workflows/node-attestation.yml").read_text()
+        self.assertIn("CLAIMS", wf, "the workflow does not check the metric claims at all")
+        self.assertIn("tickedClaims", wf)
+        self.assertIn("missingClaims.length === 0", wf,
+                      "the workflow clears the label without requiring the claims")
+        bot = self._bot()
+        self.assertTrue(bot.PREFILL_CLAIM.search("- [x] Prefill measured at 32k"))
+        self.assertTrue(bot.DECODE_CLAIM.search("- [x] No 128k decode regression"))
+
+    def test_a_ticked_claim_is_not_itself_a_node_attestation(self):
+        """The claim boxes name the node too ("Prefill measured at 32k on 8x H200"), so a
+        ticked claim satisfied the ticked+H200 scan on its own and the node box could stay
+        empty -- the exact #74/#71 shape this scan was narrowed to stop, reintroduced by the
+        very checkboxes added to make attestation MORE specific.
+
+        Caught by test_bot_eligibility_scan_is_scoped_to_the_node_run_section while this was
+        being written, which is the second time that test has earned its keep."""
+        sec = ("- [ ] Tested on **8x H200** (`sm_90`)\n"
+               "- [x] **Prefill measured at 32k** on 8x H200\n"
+               "- [x] **No 128k decode regression** on 8x H200\n")
+        ok, why = self._bot().eligibility(self._pr(sec))
+        self.assertFalse(ok, "ticked claims stood in for the unticked node box")
+        self.assertIn("not ticked", why)
+        wf = (ROOT / ".github/workflows/node-attestation.yml").read_text()
+        self.assertIn("if (/prefill|decode\\s+regression/i.test(ln)) continue;", wf,
+                      "the workflow still lets a claim line pass as a node attestation")

@@ -107,6 +107,14 @@ NODE_RUN_HEADING = re.compile(r"^##\s+node run\s*$", re.I)
 ANY_HEADING = re.compile(r"^##\s+")
 
 
+# The two claims a perf-bearing PR must make, beyond ticking the node. Kept in step with
+# CLAIMS in .github/workflows/node-attestation.yml -- both read the same '## Node run'
+# section of the same body, and disagreeing about what counts as attested is the same class
+# of bug as disagreeing about the frontier.
+PREFILL_CLAIM = re.compile(r"prefill", re.I)
+DECODE_CLAIM = re.compile(r"decode\s+regression|no\s+.*decode|decode.*no\s+regress", re.I)
+
+
 def node_run_section(body):
     """Only the text between '## Node run' and the next '##' heading.
 
@@ -193,9 +201,36 @@ def eligibility(pr):
                        "in '## Node run'")
 
     section = node_run_section(pr.get("body") or "")
-    ticked = any(TICKED.search(ln) and H200.search(ln) for ln in section.splitlines())
+    lines = section.splitlines()
+    # A CLAIM LINE IS NOT A NODE ATTESTATION.
+    #
+    # The claim boxes name the node too ("Prefill measured at 32k on 8x H200"), so a ticked
+    # claim satisfied the ticked+H200 scan on its own and the node box could stay empty --
+    # the exact shape of the #74/#71 bug this scan was narrowed to stop, reintroduced by the
+    # very checkboxes added to make attestation MORE specific. Excluded explicitly.
+    def _is_claim(ln):
+        return bool(PREFILL_CLAIM.search(ln) or DECODE_CLAIM.search(ln))
+    ticked = any(TICKED.search(ln) and H200.search(ln) and not _is_claim(ln) for ln in lines)
     if not ticked:
         return False, "the 8x H200 box is not ticked — the author has not attested a node run"
+
+    # THE SCORED METRIC AND ITS GUARD EACH NEED THEIR OWN CLAIM (2026-08-05).
+    #
+    # The tier is earned on PREFILL at 32k and decode at 128k is a regression guard, so a
+    # node tick no longer says what was run. "I touched a GPU" was enough when there was one
+    # number; it is not enough now that a PR can move one metric and quietly cost the other.
+    #
+    # Checked HERE as well as in node-attestation.yml for the reason the label check above
+    # exists: two independent readings that must agree beat one trusted absolutely. The
+    # label can also lag a body edit by a workflow run, and a round that starts in that
+    # window would otherwise book the node for a PR that has attested nothing.
+    missing = [name for name, rx in (("prefill measured at 32k", PREFILL_CLAIM),
+                                     ("no 128k decode regression", DECODE_CLAIM))
+               if not any(TICKED.search(ln) and rx.search(ln) for ln in lines)]
+    if missing:
+        return False, ("missing attestation in '## Node run': " + "; ".join(missing) +
+                       " — the tier is earned on prefill and decode is guarded, so both "
+                       "are required")
     return True, "eligible"
 
 
