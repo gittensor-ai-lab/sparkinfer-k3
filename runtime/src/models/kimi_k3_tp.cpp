@@ -457,13 +457,24 @@ bool kimi_k3_tp_init(const GGUF& g, const KimiK3Config& cfg, const K3PlanOptions
     // chunk's partials in ONE call. They are contiguous by construction (the batch
     // arena in kimi_k3.cpp lays slots out end to end), so the payload is exactly
     // B * the per-token width. At B=1 this is the value it has always been.
-    // NOT scaled by the prefill chunk size, and that was measured rather than
-    // assumed: sizing it B-fold made an 8-token chunk fail the WEIGHT load at
-    // layer 68 on an idle box. The owned buffers are peer-mapped and replicated
-    // per rank per slot, so the multiplier lands on the one allocation the model
-    // has no headroom for. kimi_k3_tp_forward_prompt reduces a chunk in slices
-    // that fit this capacity instead — see the reduce_chunk helper there.
-    const size_t max_count  = attn_count > moe_count ? attn_count : moe_count;
+    // Scaled by the prefill chunk size, because kimi_k3_tp_forward_prompt reduces
+    // a chunk's partials in one call and they are contiguous by construction.
+    //
+    // AN EARLIER ATTEMPT AT THIS WAS BACKED OUT ON A BAD DIAGNOSIS. Scaling it
+    // coincided with an 8-token chunk failing the WEIGHT load at layer 68, and that
+    // was recorded here as "the owned buffers are peer-mapped per rank per slot, so
+    // the multiplier lands on the allocation the model has no headroom for". The
+    // arithmetic does not support it: PeerOneShotAllreduce allocates
+    // count*4*(kSlotCount+2) bytes PER DEVICE, which at B=8 is ~1.7 MB against ~70
+    // GiB of headroom. The real cause was the driver still reclaiming the previous
+    // run's 1.1 TiB — nvidia-smi reads 0 MiB before reclamation completes, which is
+    // exactly the race kimi_k3_eval.sh's settle_gpus() exists for and which my
+    // launcher did not wait out.
+    //
+    // Capped so a mistyped SPARKINFER_K3_PREFILL_BATCH cannot ask for gigabytes.
+    const size_t per_tok    = attn_count > moe_count ? attn_count : moe_count;
+    const int    pb_cap     = prefill_batch_env() > 512 ? 512 : prefill_batch_env();
+    const size_t max_count  = per_tok * (size_t)pb_cap;
     out.coll = tp::make_collective(devices, requested, &err, max_count,
                                    /*need_f32=*/true);
     if (!out.coll) {
