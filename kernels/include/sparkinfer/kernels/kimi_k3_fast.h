@@ -121,6 +121,54 @@ bool k3_proj_q8soa(float* y, const void* q8_act, const void* wdata,
 bool k3_proj_q8soa_f32(float* y, const float* x, const void* wdata,
                        int N, int K, void* q8_scratch, cudaStream_t stream);
 
+// Fused-4 + software-pipelined SoA variants (k3_q8soa_xfuse.cu). Decline when
+// SoA is off or a weight was never registered. Bit-identical to four separate
+// SoA (and therefore AoS) launches.
+bool k3_q8soa_cache_view(const void* wdata, const void* d_scales,
+                         const void* d_quants, long nblocks_per_row);
+bool k3_q8soa_register_vec(const void* wdata, int wtype, const long ne[4]);
+bool k3_q8soa_register_batch(const void* const* wdata, const int* wtypes,
+                             const long (*ne)[4], int n);
+bool k3_proj_q8soa_pipe(float* y, const void* q8_act, const void* wdata,
+                        int N, int K, cudaStream_t stream);
+bool k3_proj_q8soa_fused4(float* y0, float* y1, float* y2, float* y3,
+                          const void* q8_act,
+                          const void* W0, const void* W1,
+                          const void* W2, const void* W3,
+                          int N, int K, cudaStream_t stream);
+bool k3_proj_q8soa_fused4_f32(float* y0, float* y1, float* y2, float* y3,
+                              const float* x,
+                              const void* W0, const void* W1,
+                              const void* W2, const void* W3,
+                              int N, int K, void* q8_scratch,
+                              cudaStream_t stream);
+
+// Fused-2 (gate/up-style pairs), soft-pipelined fused4, dual-stride single
+// tensor, and cache introspection. All decline when SoA is off / unregistered.
+bool k3_q8soa_lookup(const void* wdata, const void** d_scales,
+                     const void** d_quants, long* nblocks_per_row);
+bool k3_q8soa_clear_cache();
+int  k3_q8soa_cache_size();
+bool k3_proj_q8soa_fused2(float* y0, float* y1, const void* q8_act,
+                          const void* W0, const void* W1,
+                          int N, int K, cudaStream_t stream);
+bool k3_proj_q8soa_fused2_f32(float* y0, float* y1, const float* x,
+                              const void* W0, const void* W1,
+                              int N, int K, void* q8_scratch,
+                              cudaStream_t stream);
+bool k3_proj_q8soa_fused4_pipe(float* y0, float* y1, float* y2, float* y3,
+                               const void* q8_act,
+                               const void* W0, const void* W1,
+                               const void* W2, const void* W3,
+                               int N, int K, cudaStream_t stream);
+bool k3_proj_q8soa_dual(float* y, const void* q8_act, const void* wdata,
+                        int N, int K, cudaStream_t stream);
+bool k3_proj_q8soa_wpipe(float* y, const void* q8_act, const void* wdata,
+                         int N, int K, cudaStream_t stream);
+bool k3_proj_q8soa_fused2_wpipe(float* y0, float* y1, const void* q8_act,
+                                const void* W0, const void* W1,
+                                int N, int K, cudaStream_t stream);
+
 bool k3_moe_router_fast(float* out_w, int* out_ids, const float* logits,
                         const float* bias, int n_expert, int top_k, int n_tokens,
                         bool norm_w, float w_scale, cudaStream_t stream);
