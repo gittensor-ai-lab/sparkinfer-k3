@@ -363,6 +363,16 @@ int kimi_k3_mla_ordinal(const KimiK3Config& cfg, int layer);   // -1 if layer is
 // nothing when fwd.debug is unset.
 using KimiK3DebugFn = std::function<void(const char* tag, int layer, const float* dev_ptr, int64_t n)>;
 
+// Set on KimiK3Forward while a chunk is in flight. n_tok == 0 means "no batch": every
+// phase behaves exactly as it did before this existed.
+//
+// `slot` is which token AttnPre/Attn are currently working on and is re-pointed by the
+// driver per call, the same way it re-aims x/x_next.
+struct K3ProjBatch {
+    int n_tok = 0;
+    int slot  = 0;
+};
+
 struct KimiK3Forward {
     const KimiK3Config* cfg = nullptr;
     const KimiK3Weights* w = nullptr;
@@ -375,7 +385,15 @@ struct KimiK3Forward {
     // kimi_k3_forward_alloc_scratch(); forward_token() assumes they exist.
     struct Scratch;
     Scratch* s = nullptr;
+
+    // Zero unless a chunk is in flight — see K3ProjBatch.
+    K3ProjBatch pb;
 };
+
+// Size the per-token slots the batched projection needs. Idempotent, and a failure leaves
+// the batch machinery OFF (n_tok stays 0) rather than half-built, so the caller falls back
+// to the per-token path instead of reading a slot that was never allocated.
+bool kimi_k3_forward_alloc_proj_batch(const KimiK3Config& cfg, KimiK3Forward& fwd, int n_tok);
 
 bool kimi_k3_forward_alloc_scratch(const KimiK3Config& cfg, KimiK3Forward& fwd);
 void kimi_k3_forward_free_scratch(KimiK3Forward& fwd);
@@ -427,7 +445,25 @@ bool kimi_k3_forward_layer(KimiK3Forward& fwd, int layer, const float* hidden_in
 // `All` runs all three back to back and is what kimi_k3_forward_layer calls, so the
 // tp_size 1 path is unchanged. Running All must be bit-identical to running the
 // three phases in sequence — asserted by kimi_k3_tp_phase_check.
-enum class K3LayerPhase { All = 0, Attn = 1, FfnPartial = 2, FfnFinish = 3 };
+// AttnPre / AttnProj exist to get the qkvg group off the per-token path.
+//
+// The KDA q/k/v/g group is the largest weight stream in the token — 4 x 1536x7168 over 69
+// layers = 3.23 GB per token per rank — and prompt ingestion re-reads every byte of it for
+// every token, even though all of them multiply the SAME four matrices. Batching needs the
+// B activations to exist at once, so the phase splits at the projection:
+//
+//   AttnPre   per token, driver has aimed the state: residual mix -> norm -> quantise,
+//             into THIS token's slot. Owns the state mutation (n_ckpt, the bank push), so
+//             it runs exactly once per token.
+//   AttnProj  once per layer: one batched projection over every slot.
+//   Attn      per token again: everything from the conv1d on, reading its slot.
+//
+// Attn keeps doing the whole thing when no batch is set, so the single-token path is
+// untouched and is still the fallback.
+enum class K3LayerPhase {
+    All = 0, Attn = 1, FfnPartial = 2, FfnFinish = 3, AttnPre = 4, AttnProj = 5
+};
+
 
 bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase phase,
                                 const float* hidden_in, float* hidden_out);

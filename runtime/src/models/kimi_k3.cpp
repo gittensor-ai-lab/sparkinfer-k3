@@ -815,6 +815,23 @@ struct KimiK3Forward::Scratch {
     // another CTA is still reading it). 14 KB buys the spread on 92 launches.
     float* moe_normed = nullptr;
 
+    // ---- per-token slots for the batched qkvg projection ---------------------
+    //
+    // SEVEN buffers, not the four the projection obviously needs, and the extra three are
+    // the correctness point. `mixed` is read again by the residual add and `normed` by
+    // ssm_f_a / ssm_beta, both AFTER the projection — so leaving either as shared scratch
+    // hands every token the LAST token's value. Fluent, wrong, and invisible to a timing
+    // run: the same hazard the phase-3 deferral note describes for ffn_out.
+    //
+    // batch_cap is the number of slots actually allocated. Zero means the batched path is
+    // unavailable and every phase runs its single-token form.
+    int    batch_cap = 0;
+    float* b_mixed  = nullptr;     // [cap][H]
+    float* b_normed = nullptr;     // [cap][H]
+    void*  b_act_q8 = nullptr;     // [cap][H/32] Q8_0 blocks
+    float* b_qkv_q  = nullptr, *b_qkv_k = nullptr, *b_qkv_v = nullptr;  // [cap][qkv]
+    float* b_g_proj = nullptr;     // [cap][qkv]
+
     // KDA
     float* qkv_q = nullptr, *qkv_k = nullptr, *qkv_v = nullptr;   // [qkv]
     float* conv_q = nullptr, *conv_k = nullptr, *conv_v = nullptr; // [qkv]
@@ -908,6 +925,51 @@ int k3_moe_ffn_local(const KimiK3Forward& fwd, const KimiK3Config& cfg) {
     if (fwd.w && fwd.w->shard.moe_2d && fwd.w->shard.moe_ffn > 0)
         return fwd.w->shard.moe_ffn;
     return cfg.moe_ffn;
+}
+
+bool kimi_k3_forward_alloc_proj_batch(const KimiK3Config& cfg, KimiK3Forward& fwd,
+                                      int n_tok) {
+    if (!fwd.s || n_tok <= 1) return false;
+    auto& s = *fwd.s;
+    if (s.batch_cap >= n_tok) return true;      // already wide enough
+    if (s.batch_cap != 0) return false;         // never grow: the old slots are live
+
+    const int H   = cfg.hidden;
+    const int qkv = cfg.n_q_heads * cfg.kda_head_dim;
+    // Q8_0 is 32 values per 34-byte block, and the activation is H wide.
+    const size_t q8_bytes_per_tok = (size_t)(H / 32) * 34u;
+
+    auto alloc_f = [&](float*& ptr, size_t n) {
+        void* p = nullptr;
+        if (cudaMalloc(&p, n * sizeof(float)) != cudaSuccess) return false;
+        s.owned.push_back(p);
+        ptr = (float*)p;
+        return true;
+    };
+    bool ok = true;
+    ok &= alloc_f(s.b_mixed,  (size_t)n_tok * H);
+    ok &= alloc_f(s.b_normed, (size_t)n_tok * H);
+    ok &= alloc_f(s.b_qkv_q,  (size_t)n_tok * qkv);
+    ok &= alloc_f(s.b_qkv_k,  (size_t)n_tok * qkv);
+    ok &= alloc_f(s.b_qkv_v,  (size_t)n_tok * qkv);
+    ok &= alloc_f(s.b_g_proj, (size_t)n_tok * qkv);
+    if (ok) {
+        void* p = nullptr;
+        ok = cudaMalloc(&p, (size_t)n_tok * q8_bytes_per_tok) == cudaSuccess;
+        if (ok) { s.owned.push_back(p); s.b_act_q8 = p; }
+    }
+    if (!ok) {
+        // Leave the machinery OFF rather than half-built. Everything allocated above is on
+        // the owned list and frees with the rest of scratch; batch_cap staying 0 is what
+        // makes every phase keep running its single-token form.
+        s.b_mixed = s.b_normed = nullptr;
+        s.b_qkv_q = s.b_qkv_k = s.b_qkv_v = s.b_g_proj = nullptr;
+        s.b_act_q8 = nullptr;
+        s.batch_cap = 0;
+        return false;
+    }
+    s.batch_cap = n_tok;
+    return true;
 }
 
 bool kimi_k3_forward_alloc_scratch(const KimiK3Config& cfg, KimiK3Forward& fwd) {
