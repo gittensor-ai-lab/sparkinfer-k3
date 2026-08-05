@@ -182,6 +182,99 @@ void kda_conv_step_f32(float* out, float* state, const float* x, const float* w,
                        int d_conv, int d_inner, cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
+// 6b. KDA chunk-parallel prefill scan
+// ---------------------------------------------------------------------------
+// kda_decode_step_f32 above is one token; prompt ingestion currently calls it T
+// times in a sequential loop, so a KDA layer's cost at prefill is T dependent
+// launches of a kernel whose own body is one rank-1 update. This is the
+// chunk-parallel (WY / UT-transform) reformulation of the SAME recurrence —
+// mathematically the delta-rule family sparkinfer already carries for Qwen's
+// GDN (kernels/csrc/cuda/fused/prefill_gdn_chunk.cu), specialised to K3's own
+// gate (per-channel, A_log/dt_bias/lower_bound-sigmoid form — see op 7 below)
+// and scalar-per-head beta.
+//
+// THE ALGORITHM IS RE-DERIVED FROM kda_decode_step_f32's OWN PINNED FORMULA,
+// not assumed. Per chunk of CHUNK=16 local tokens t=0..15, contraction index i
+// (what q/k contract over — the SAME i that op 6's decay is indexed by) and
+// output index j, with S_in the state entering the chunk:
+//
+//   G_t[i]      = sum_{r=0}^{t} g_r[i]                (inclusive cumsum, per channel)
+//   k_decayed_t = k_t * exp(G_t)     q_decayed_t = q_t * exp(G_t)   (q already 1/sqrt(D)-scaled
+//   k_inv_t     = k_t * exp(-G_t)    k_restored_t = k_inv_t * exp(G_total)     by this point)
+//   L[t][s]     = beta_t * (k_decayed_t . k_inv_s)   s < t,  else 0   (strictly lower)
+//   Mqk[t][s]   =          (q_decayed_t . k_inv_s)   s <= t, else 0   (lower, incl. diag)
+//   INV         = (I + L)^{-1}                         [16,16], state-independent
+//   RHS_t       = beta_t * (v_t - k_decayed_t @ S_in)              state-dependent
+//   U           = INV @ RHS                             [16, head_dim]
+//   O           = Q_decayed @ S_in + Mqk @ U             [16, head_dim] <- chunk output
+//   S_out[i][j] = S_in[i][j] * exp(G_total[i]) + (K_restored^T @ U)[i][j]
+//
+// Everything through INV is a pure function of this chunk's own q/k/v/g/beta —
+// no dependence on S_in — so it is computed for EVERY chunk of EVERY head in
+// parallel (kernel 1, "prep"). Only the state-dependent tail (RHS onward) is
+// sequential, and only over CHUNKS, not tokens: T/16 dependent steps instead
+// of T, each a small dense matmul against a precomputed [16,16] inverse
+// instead of a fresh triangular solve (kernel 2, "scan"). Full derivation,
+// cross-checked against Moonshot's own FlashKDA (github.com/MoonshotAI/
+// FlashKDA — H=96/D=128 is K3's own shape, and lower_bound "-5.0 to 0" is
+// kda_gate_lower_bound), is proven against the token-by-token recurrence in
+// kernels/tests/k3_kda_chunk_prefill_cpu_test.cpp: multi-chunk, a ragged
+// final chunk (zero-padded exactly as FlashKDA's own reference pads it —
+// beta=0 on a padded row zeros that row of L entirely, so it cannot
+// contaminate the state or any real row's output), and the axis-of-decay
+// swap that op 6's own history already shipped once as a silent bug.
+//
+// NOT FlashKDA's kernel. That one is CUTLASS/CUTE, sm_90a-specific (TMA,
+// warpgroup MMA, register-file transposes), bf16/fp16 throughout for
+// tensor-core rate, and inverts (I+L) by a doubling Neumann series to stay in
+// bf16 range under CHUNK=16. This is f32 end to end — matching every other
+// kernel in this file's stated convention, correctness first — and inverts
+// by plain forward substitution: at CHUNK=16 the triangular solve is O(16^3)
+// against O(16*head_dim^2) for the two decayed projections, a rounding error
+// either way, so there is no precision pressure motivating the doubling trick
+// once nothing is fighting for tensor-core throughput.
+//
+// q, k arrive RAW (not yet L2-normalised) here, unlike kda_decode_step_f32's own
+// contract — the norm is elementwise-per-token exactly like the gate and beta
+// activations, so it is folded into kernel 1 for the same reason they are: one
+// launch per chunk-batch, not one per token. l2_eps is threaded through rather
+// than a baked-in constant because l2_norm_heads_f32's own signature takes it
+// as a parameter, not a fixed value — op 8 above. q ends up scaled by
+// 1/sqrt(head_dim) as part of the SAME norm call op 8 already fuses that into
+// (scale=1/sqrt(D) for Q, scale=1 for K).
+//
+// g_raw is ALREADY f_b(f_a(x)) + dt_bias — op 7's OWN contract, and op 7's kernel takes no
+// separate dt_bias for exactly that reason: the bias is folded in upstream,
+// by the GEMM that produces g_raw, not by the gate kernel. (FlashKDA's own
+// kernel takes A_log and dt_bias as two separate tensors and adds them
+// inside; that is FlashKDA's contract, not this one — this function takes
+// what op 7 takes, so it stays a drop-in for T calls to the elementwise gate
+// too, not a second gate convention living beside the first.) The
+// lb*sigmoid(A*g_raw) transform, and beta's sigmoid, run INSIDE kernel 1
+// (folded, not called out to op 7 and a separate sigmoid T times), because
+// folding is what keeps this to one launch per chunk-batch rather than one
+// per token for the elementwise stages too — the whole point of batching.
+//
+// q,k,v,g_raw: [T, n_head, head_dim].  beta_logit: [T, n_head].
+// A: [n_head], already -exp(A_log) as op 7 documents (ssm_a in the GGUF).
+// state: [n_head, head_dim, head_dim], the SAME j*head_dim+i layout op 6
+// reads and writes — updated in place.  out: [T, n_head, head_dim].
+//
+// NOT bit-identical to T sequential decode steps: the sum a state element
+// accumulates is reassociated by the chunk telescoping (a rounding-order
+// change, the same class op 6's own reassociated warp-per-column schedule
+// already makes), and G_t[i] underflowing exp() to exactly 0 for a deep
+// per-channel decay is the CORRECT physical answer (full forget), not an
+// error — f32's ~1e-38 floor is reached only when the real single-token
+// products would themselves have vanished into it.
+bool k3_kda_chunk_prefill(float* out, float* state,
+                          const float* q, const float* k, const float* v,
+                          const float* g_raw, const float* beta_logit,
+                          const float* A,
+                          int T, int head_dim, int n_head,
+                          float lower_bound, float l2_eps, cudaStream_t stream);
+
+// ---------------------------------------------------------------------------
 // 11. IQ2_XS dequantisation
 // ---------------------------------------------------------------------------
 // Reference: ggml dequantize_row_iq2_xs() + block_iq2_xs in ggml-common.h.
