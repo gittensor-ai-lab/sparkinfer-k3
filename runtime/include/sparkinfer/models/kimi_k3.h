@@ -363,10 +363,30 @@ int kimi_k3_mla_ordinal(const KimiK3Config& cfg, int layer);   // -1 if layer is
 // nothing when fwd.debug is unset.
 using KimiK3DebugFn = std::function<void(const char* tag, int layer, const float* dev_ptr, int64_t n)>;
 
+// Per-token state a chunked prefill needs B of, which does not live in Scratch.
+//
+// d_pos is a single device int with FOUR readers taking it three different ways: a KV row
+// index (*d_pos), an attention length (*d_pos + 1), a counter for k3_bump_pos, and the MoE
+// weight-epsilon skip threshold at position >= 16384. Sharing one across a chunk would put
+// every token at the same depth -- wrong KV row, wrong length, and an all-or-none skip near
+// the boundary. All four are silent, so the driver hands B positions and aiming selects one.
+//
+// n_ckpt by contrast is a function of the layer index only, so the whole chunk shares it:
+// one host counter, B bank slabs.
+struct K3BatchState {
+    int    n_tok = 0;
+    int*   d_pos_base = nullptr;      // [n_tok] device ints, base+0 .. base+n_tok-1
+    float* res_bank_base = nullptr;   // [n_tok][hidden * max_ckpt]
+    long   res_bank_stride = 0;       // elements between tokens
+};
+
 struct KimiK3Forward {
     const KimiK3Config* cfg = nullptr;
     const KimiK3Weights* w = nullptr;
     KimiK3RuntimeState* state = nullptr;
+    // Non-null only on the chunked prefill path. When set, kimi_k3_forward_aim_token
+    // also re-points state->d_pos and state->res_bank at the requested token.
+    const K3BatchState* batch = nullptr;
     K3PlanOptions opt;
     cudaStream_t stream = nullptr;   // null = the default stream
     KimiK3DebugFn debug;             // may be empty
@@ -379,6 +399,24 @@ struct KimiK3Forward {
 
 bool kimi_k3_forward_alloc_scratch(const KimiK3Config& cfg, KimiK3Forward& fwd);
 void kimi_k3_forward_free_scratch(KimiK3Forward& fwd);
+
+// Allocates every scratch buffer B times contiguously ([B][n] slabs) instead of once.
+// batch_n <= 1 is byte-for-byte the single-token allocator, so decode is unaffected.
+//
+// A slab rather than B separate Scratch objects, because slicing both preserves the
+// aliasing inside Scratch and hands a batched kernel [B][n] with no gather.
+bool kimi_k3_forward_alloc_scratch_n(const KimiK3Config& cfg, KimiK3Forward& fwd,
+                                     int batch_n);
+
+// Repoint every scratch field at slice `b`. Host pointer arithmetic only, so it is legal
+// inside a capture and deterministic per (layer, phase, b).
+//
+// Returns false for an out-of-range b, or b != 0 on a scratch not allocated batched.
+// Fatal for the caller: continuing runs token b's phases against token 0's buffers.
+bool kimi_k3_forward_aim_token(KimiK3Forward& fwd, int b);
+
+// How many slices this scratch was allocated for (1 when not batched).
+int  kimi_k3_forward_batch_n(const KimiK3Forward& fwd);
 
 // Run one decode step. `out_logits` is host-visible (a cudaMemcpy is done into it)
 // and must have room for cfg.vocab floats. Advances state->position. Every layer

@@ -211,6 +211,21 @@ bool kimi_k3_tp_init(const GGUF& g, const KimiK3Config& cfg, const K3PlanOptions
 // ~1 ulp, not bitwise. kimi_k3_tp_moe_check pins that bound.
 bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits);
 
+// Ingest `n_ids` prompt tokens, carrying SPARKINFER_K3_PREFILL_BATCH tokens through each
+// layer instead of walking all 93 layers per token. `on_depth(d)` fires once the prefix of
+// length d is complete (return false to abort); out_logits holds that prefix's distribution
+// when the head ran for it.
+//
+// Walking layer-major is what lets one weight read serve B tokens — the batched kernels
+// (k3_batch_proj.h, k3_batch_elem.h) need B activations resident at once.
+//
+// NOT ON THE DECODE PATH: decode is one token by definition and keeps forward_token.
+//
+// Falls back to a forward_token loop when the chunk machinery is unavailable, so a parity
+// comparison against main is unambiguous.
+bool kimi_k3_tp_forward_prompt(KimiK3TP& p, const int* ids, int n_ids, float* out_logits,
+                               const std::function<bool(int)>& on_depth);
+
 void kimi_k3_tp_free(KimiK3TP& p);
 
 }  // namespace sparkinfer
