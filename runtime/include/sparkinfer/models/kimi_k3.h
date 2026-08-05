@@ -453,6 +453,49 @@ float* kimi_k3_partial_buffer(KimiK3Forward& fwd, int layer, K3LayerPhase phase,
 float* kimi_k3_swap_partial_buffer(KimiK3Forward& fwd, K3LayerPhase phase,
                                   float* buf);
 
+// ---------------------------------------------------------------------------
+// Chunked prompt ingestion.
+//
+// Prompt ingestion is prefill, and prefill runs the DECODE step once per token:
+// every one of a 32k prompt's tokens pays 93 layers of launches, 185 collectives
+// and one output head. The work per token is fixed, but almost none of it is
+// per-token BOUND — the projections are GEMVs that want to be GEMMs, the
+// collectives are 185 rendezvous that could be 185/B, and the head is needed once.
+//
+// A chunked walk carries B tokens through layer L before starting layer L+1. What
+// makes that legal is that the only cross-token dependencies in this model run
+// along the RECURRENT axis, not the layer axis: the KDA conv/delta state and the
+// MLA KV cache are consumed in token order WITHIN a layer, and nothing in layer L
+// reads a later layer's output. So the per-token phases still run in token order
+// inside each layer, and the batching is in what surrounds them.
+//
+//   kimi_k3_forward_alloc_batch     allocate B slots (call after alloc_scratch,
+//                                   and after fwd.state is set — the residual
+//                                   bank is sized from state->max_ckpt).
+//   kimi_k3_forward_batch_begin     start a chunk: clear every slot's checkpoint
+//                                   count.
+//   kimi_k3_forward_select_slot     address slot t. Pointer arithmetic only; the
+//                                   whole of forward_layer_phase then runs on
+//                                   that token unmodified.
+//   kimi_k3_forward_batch_end       give the decode path its own residual bank
+//                                   back. MUST be called before the next
+//                                   forward_token.
+//   kimi_k3_batch_partial_buffer    the base and TOTAL element count of a phase's
+//                                   partial across n_slots, so the driver reduces
+//                                   B tokens in one collective instead of B.
+//
+// B == 1 takes the same path with a one-slot arena and is bit-identical to the
+// token loop — which is what makes it a usable control: any divergence at B=8 is
+// the batching, not the batched code.
+bool kimi_k3_forward_alloc_batch(const KimiK3Config& cfg, KimiK3Forward& fwd,
+                                 int batch);
+int  kimi_k3_forward_batch_capacity(const KimiK3Forward& fwd);
+void kimi_k3_forward_batch_begin(KimiK3Forward& fwd);
+void kimi_k3_forward_select_slot(KimiK3Forward& fwd, int slot);
+void kimi_k3_forward_batch_end(KimiK3Forward& fwd);
+float* kimi_k3_batch_partial_buffer(KimiK3Forward& fwd, int layer,
+                                    K3LayerPhase phase, int n_slots, int* count);
+
 // Print the SPARKINFER_K3_PROFILE=1 phase breakdown to stderr (no-op when unset).
 void kimi_k3_profile_report();
 
