@@ -103,13 +103,16 @@ void run_case(const char* what, int M, int N, int K, bool gather) {
     std::vector<BlockIQ1S> W((size_t)N * blk_per_row);
     for (auto& b : W) b = random_block(rng);
 
-    // int8 activations over the whole pool, with per-row scales.
+    // int8 activations over the whole pool, with PER-32 scales: sa is [pool][K/32], the
+    // granularity the GEMM drains at. Deliberately varied across blocks within a row —
+    // a constant-per-row sa would pass even if the kernel ignored the block index.
+    const int nb = K / kSub;
     std::vector<int8_t> A((size_t)pool * K);
-    std::vector<float>  sa(pool);
+    std::vector<float>  sa((size_t)pool * nb);
     std::uniform_int_distribution<int> q(-127, 127);
     std::uniform_real_distribution<float> sd(0.002f, 0.02f);
     for (int r = 0; r < pool; ++r) {
-        sa[r] = sd(rng);
+        for (int b = 0; b < nb; ++b) sa[(size_t)r * nb + b] = sd(rng);
         for (int k = 0; k < K; ++k) A[(size_t)r * K + k] = (int8_t)q(rng);
     }
     // A deliberately non-monotonic, non-identity row list: a gather bug that merely
@@ -117,7 +120,8 @@ void run_case(const char* what, int M, int N, int K, bool gather) {
     std::vector<int> rows(M);
     for (int i = 0; i < M; ++i) rows[i] = (i * 7 + 3) % pool;
 
-    // float64 reference over the reconstructed weights and the same int8 activations.
+    // float64 reference over the reconstructed weights and the same int8 activations,
+    // applying each 32-block's own activation scale — the schedule the kernel now runs.
     std::vector<double> ref((size_t)M * N);
     std::vector<float>  wrow(K);
     for (int n = 0; n < N; ++n) {
@@ -126,9 +130,15 @@ void run_case(const char* what, int M, int N, int K, bool gather) {
         for (int m = 0; m < M; ++m) {
             const int src = gather ? rows[m] : m;
             double acc = 0.0;
-            for (int k = 0; k < K; ++k)
-                acc += (double)wrow[k] * (double)A[(size_t)src * K + k];
-            ref[(size_t)m * N + n] = acc * (double)sa[src];
+            for (int b = 0; b < nb; ++b) {
+                double blk = 0.0;
+                for (int j = 0; j < kSub; ++j) {
+                    const int k = b * kSub + j;
+                    blk += (double)wrow[k] * (double)A[(size_t)src * K + k];
+                }
+                acc += blk * (double)sa[(size_t)src * nb + b];
+            }
+            ref[(size_t)m * N + n] = acc;
         }
     }
 

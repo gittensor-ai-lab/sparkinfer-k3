@@ -42,6 +42,8 @@
 //                      and the int32 accumulator provably cannot overflow
 //   [4] control        dropping delta (m = 8g, the plausible simplification) is measurably
 //                      wrong — without this, [1] and [3] only prove the tolerance was loose
+//   [5] scales         a per-32 activation scale beats a per-row one, and can never be
+//                      worse, on the quantity the kernel actually computes
 //
 // Random block bits are the right input: every bit pattern is a VALID IQ1_S block for
 // reconstruction purposes (the grid index is 11 bits so it cannot leave the 2048-entry
@@ -129,8 +131,8 @@ std::vector<uint16_t> build_packed_grid() {
     return p;
 }
 
-inline int unpack2(uint16_t pw, int j) {
-    return ((int)((uint32_t)pw << (30 - 2 * j))) >> 30;     // sign-extend field j
+inline int unpack2(uint32_t pw, int j) {
+    return ((int)(pw << (30 - 2 * j))) >> 30;               // sign-extend field j
 }
 
 // The reference: ggml's own reconstruction order, dl * (grid + delta) in f32.
@@ -446,6 +448,99 @@ void test_control_drop_delta() {
     check(mean_rel > 0.05, "dropping delta is a large, systematic error (control)");
 }
 
+
+// ---------------------------------------------------------------------------
+// [5] per-32 activation scales
+// ---------------------------------------------------------------------------
+// The claim is not "per-32 is finer" (that is arithmetic) but that it MEASURABLY beats
+// per-row on the quantity the kernel actually computes — a dot product against IQ1_S
+// weights — and by enough to matter against the 1.7e-2 the batched op was measured at.
+//
+// The input distribution is the whole point. A row with uniform magnitude cannot tell
+// the two apart, because one scale fits it. Real activations are not uniform: they have
+// a few large channels, and a per-row scale is set by those and spends its resolution
+// on them. So the row here is mostly small with a sparse set of outliers.
+void test_per32_scales() {
+    std::printf("[5] per-32 activation scales vs per-row, swept over outlier density\n");
+    const auto gp = build_packed_grid();
+
+    const int K = 3584, N = 32;
+    const int blk_per_row = K / kQK, nb = K / kSub;
+
+    // THE FACTOR IS A FUNCTION OF THE INPUT, SO REPORT THE CURVE, NOT ONE NUMBER.
+    // A row of uniform magnitude cannot distinguish the two schemes — one scale fits it.
+    // The gap opens with outliers and then CLOSES again once they are dense enough to
+    // land in most 32-blocks, because a block containing one is no better off than the
+    // row was. Asserting a single ratio would be fitting the test to whichever density
+    // happened to be picked.
+    std::printf("      outliers   per-row     per-32    ratio\n");
+    const int densities[] = {0, K / 512, K / 128, K / 32, K / 8};
+    bool all_better = true;
+    double best_ratio = 0.0;
+    for (int di = 0; di < 5; ++di) {
+        const int n_out = densities[di];
+        std::mt19937 rng(0xD07u + di);
+        std::vector<BlockIQ1S> W((size_t)N * blk_per_row);
+        for (auto& b2 : W) b2 = random_block(rng);
+
+        std::normal_distribution<float> g(0.0f, 0.05f);
+        std::uniform_real_distribution<float> big(2.0f, 6.0f);
+        std::uniform_int_distribution<int> where(0, K - 1);
+        std::vector<float> x((size_t)K);
+        for (int k = 0; k < K; ++k) x[k] = g(rng);
+        for (int i = 0; i < n_out; ++i) x[where(rng)] = big(rng);
+
+        float amax = 0.0f;
+        for (float v : x) amax = std::max(amax, std::fabs(v));
+        const float d_row = amax / 127.0f;
+        std::vector<int8_t> q_row(K);
+        for (int k = 0; k < K; ++k) q_row[k] = (int8_t)std::lrint(x[k] / d_row);
+
+        std::vector<float>  d_blk(nb);
+        std::vector<int8_t> q_blk(K);
+        for (int b2 = 0; b2 < nb; ++b2) {
+            float a2 = 0.0f;
+            for (int j = 0; j < kSub; ++j) a2 = std::max(a2, std::fabs(x[b2 * kSub + j]));
+            d_blk[b2] = a2 / 127.0f;
+            for (int j = 0; j < kSub; ++j)
+                q_blk[b2 * kSub + j] =
+                    (int8_t)(a2 == 0.0f ? 0 : std::lrint(x[b2 * kSub + j] / d_blk[b2]));
+        }
+
+        double err_row = 0.0, err_blk = 0.0, mag = 0.0;
+        for (int n = 0; n < N; ++n) {
+            double ref = 0.0, arow = 0.0, ablk = 0.0, amagn = 0.0;
+            for (int ib = 0; ib < blk_per_row; ++ib) {
+                for (int s32 = 0; s32 < kSubPerBlk; ++s32) {
+                    int8_t mw[kSub]; float sc;
+                    kernel_decode_sub(W[(size_t)n * blk_per_row + ib], s32, mw, &sc, gp);
+                    const int base = ib * kQK + s32 * kSub, kb = (ib * kQK + s32 * kSub) / kSub;
+                    int32_t dr = 0, db = 0;
+                    for (int j = 0; j < kSub; ++j) {
+                        const double t = (double)sc * mw[j] * (double)x[base + j];
+                        ref += t; amagn += std::fabs(t);
+                        dr += (int32_t)mw[j] * q_row[base + j];
+                        db += (int32_t)mw[j] * q_blk[base + j];
+                    }
+                    arow += (double)dr * sc * d_row;
+                    ablk += (double)db * sc * d_blk[kb];
+                }
+            }
+            err_row += std::fabs(arow - ref); err_blk += std::fabs(ablk - ref); mag += amagn;
+        }
+        const double rr = err_row / mag, rb = err_blk / mag;
+        std::printf("      %8d   %.3e  %.3e   %5.2fx\n", n_out, rr, rb, rr / rb);
+        if (rb > rr) all_better = false;
+        best_ratio = std::max(best_ratio, rr / rb);
+    }
+    // Per-32 can never be WORSE: its scale is the max over a subset of the row's, so it
+    // is bounded above by the row scale block by block. That is the invariant to assert.
+    check(all_better, "per-32 is never worse than per-row, at any density");
+    // And somewhere on a realistic curve it has to be worth the extra multiply.
+    std::printf("      best %.2fx\n", best_ratio);
+    check(best_ratio > 2.0, "per-32 is worth the multiply at some realistic density");
+}
+
 }  // namespace
 
 int main() {
@@ -453,7 +548,8 @@ int main() {
     test_exactness();      std::printf("\n");
     test_tile_schedule();  std::printf("\n");
     test_accumulation();   std::printf("\n");
-    test_control_drop_delta();
+    test_control_drop_delta();  std::printf("\n");
+    test_per32_scales();
     std::printf("\n%s\n", g_fail ? "FAIL"
                                  : "PASS: IQ1_S is exactly int8 x (dl/8); tile and "
                                    "accumulation schedules verified");

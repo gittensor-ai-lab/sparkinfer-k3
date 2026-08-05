@@ -154,12 +154,18 @@ template <> struct MmaCfg<128> { static constexpr int warps = 8; };
 struct BlockIQ1S { uint16_t d; uint8_t qs[32]; uint16_t qh[8]; };
 static_assert(sizeof(BlockIQ1S) == 50, "IQ1_S block must be 50 bytes");
 
+// The one definition of what a 2-bit lattice field means.
+__device__ __forceinline__ int unpack2(uint32_t pw, int j) {
+    return ((int)(pw << (30 - 2 * j))) >> 30;             // sign-extend 2-bit field j
+}
+
 // The packed 2-bit lattice: field j holds (grid[j] & 3), sign-extended on read. Packed
 // host-side from the SAME iq1s_grid_host every other consumer uses. This TU carries its
 // own copy because a __device__ symbol does not cross translation units; the packing
 // rule is duplicated from k3_kernels.cu's ensure_iq1s_tables and the CPU test rebuilds
 // it independently, so a divergence fails a test rather than biasing a tensor.
 __device__ static uint16_t g_iq1s_grid_p[SPARKINFER_IQ1S_NGRID];
+
 
 // Upload once per device. Must not run inside a stream capture — same constraint, and
 // the same reason, as ensure_iq1s_tables: cudaMemcpyToSymbol is illegal there.
@@ -202,39 +208,53 @@ __device__ __forceinline__ void ldm_x4(unsigned& r0, unsigned& r1, unsigned& r2,
                  : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(a));
 }
 
-__device__ __forceinline__ int unpack2(uint16_t pw, int j) {
-    return ((int)((uint32_t)pw << (30 - 2 * j))) >> 30;   // sign-extend 2-bit field j
-}
-
 // ---------------------------------------------------------------------------
-// Per-row symmetric int8 quantization of the f32 activations.
+// PER-32 symmetric int8 quantization of the f32 activations.
 // ---------------------------------------------------------------------------
-// K3 is f32 end to end, so this is the f32 twin of launch_prefill_quantize_rows_i8
-// (which takes bf16). Per-ROW scales: the scale is constant in k, which is exactly
-// what lets the GEMM hoist it out of the reduction and apply it once in the epilogue.
+// This used to carry ONE scale per row, chosen because a scale constant in k can be
+// hoisted out of the GEMM's reduction and applied once in the epilogue. That was free
+// and it was too coarse: measured against the shipped scalar op, the batched MoE landed
+// at relL2 1.7e-2, and the T=1 case pinned the cause on quantization rather than on any
+// gather (see k3_moe_batched_iq1s_gpu_test). A single scale over 3584 values is set by
+// the row's largest element, so every value below it loses resolution in proportion.
 //
-// Quantizing the activation to int8 is not a new approximation being introduced here:
-// llama.cpp's own vec_dot contract for IQ1_S converts the activation to block_q8_K
-// first, and k3_kernels.cu already carries that path (block_dot_q8k) as the pinned
-// reference. This is the same int8 activation, with a per-row rather than per-256
-// scale.
+// THE GRANULARITY IS NOT A FREE PARAMETER — IT IS THE ONE THE GEMM ALREADY PAYS FOR.
+// The int32 accumulator is drained every 32 k because that is the IQ1_S sub-block, and
+// the weight scale dl/8 is applied at exactly that boundary. An activation scale on the
+// same boundary therefore costs ONE extra multiply per drained element and no new
+// synchronisation, no new pass, and no change to the tile shape. Anything finer would
+// need a drain the mma does not already do; anything coarser leaves resolution on the
+// floor for nothing.
+//
+// It also lands closer to what the reference does. llama.cpp's vec_dot contract for
+// IQ1_S converts the activation to block_q8_K — int8 with a per-256 scale — so the
+// scalar path this is graded against is itself block-scaled, and per-32 is finer than
+// the thing it must agree with rather than coarser.
+//
+// `scale` is [rows][cols/32], row-major. `cols` must be a multiple of 32.
 __global__ void quantize_rows_i8_f32_kernel(const float* __restrict__ x,
                                             signed char* __restrict__ q,
                                             float* __restrict__ scale,
                                             int rows, int cols) {
     k3_pdl_sync();
-    const int r = blockIdx.x, lane = threadIdx.x;
+    const int r = blockIdx.x;
     if (r >= rows) return;
-    const float* xr = x + (size_t)r * cols;
-    float amax = 0.0f;
-    for (int c = lane; c < cols; c += 32) amax = fmaxf(amax, fabsf(xr[c]));
+    const int nb = cols / kSub;
+    const float*  xr = x + (size_t)r * cols;
+    signed char*  qr = q + (size_t)r * cols;
+    float*        sr = scale + (size_t)r * nb;
+    // One warp per row, one 32-value sub-block per lane-sweep: lane L owns element L of
+    // the block, so the amax is a full warp reduction and every block is independent.
+    const int lane = threadIdx.x;
+    for (int b = 0; b < nb; ++b) {
+        const float v = xr[b * kSub + lane];
+        float amax = fabsf(v);
 #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
-    const float d = amax / 127.0f;
-    if (lane == 0) scale[r] = d;
-    signed char* qr = q + (size_t)r * cols;
-    for (int c = lane; c < cols; c += 32)
-        qr[c] = (signed char)((amax == 0.0f) ? 0 : (int)rintf(xr[c] / d));
+        for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+        const float d = amax / 127.0f;
+        if (lane == 0) sr[b] = d;
+        qr[b * kSub + lane] = (signed char)((amax == 0.0f) ? 0 : (int)rintf(v / d));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -277,11 +297,13 @@ void moe_iq1s_mma_kernel(float* __restrict__ C,
     __shared__ __align__(16) signed char As[2][kBM][kBK];
     __shared__ __align__(16) signed char Bs[2][kBN][kBK];
     __shared__ float       Bsc[2][2][kBN];        // [buf][sub-block][row] = dl/8
+    __shared__ float       Asc[2][2][kBM];        // [buf][sub-block][row] = activation scale
     __shared__ uint16_t    Sgrid[SPARKINFER_IQ1S_NGRID];
     // BM 32: 4 + 16 + 2 + 4 = 26 KB.  BM 128: 16 + 16 + 2 + 4 = 38 KB. Both inside the
     // 48 KB static-shared ceiling, and the resident-block count __launch_bounds__ asks
     // for fits the SM's 228 KB in either shape.
-    static_assert(sizeof(As) + sizeof(Bs) + sizeof(Bsc) + sizeof(Sgrid) <= 48 * 1024,
+    static_assert(sizeof(As) + sizeof(Bs) + sizeof(Bsc) + sizeof(Asc) +
+                  sizeof(Sgrid) <= 48 * 1024,
                   "static shared exceeds the 48 KB per-block limit");
 
     const int tid  = threadIdx.x;
@@ -326,6 +348,15 @@ void moe_iq1s_mma_kernel(float* __restrict__ C,
             else
                 *reinterpret_cast<uint4*>(dst) = make_uint4(0u, 0u, 0u, 0u);
         }
+        // The two activation scales this BK tile needs, one per sub-block. Indexed by
+        // the SOURCE row, like A itself; a padding row gets 0 so its (already zeroed)
+        // operand contributes nothing rather than a stale scale.
+        for (int u = tid; u < kBM * (kBK / kSub); u += kThreads) {
+            const int r = u >> 1, half = u & 1;
+            const int src_row = (m0 + r < M) ? (rows ? rows[m0 + r] : m0 + r) : -1;
+            const int kb = (k0 + half * kSub) / kSub;
+            Asc[buf][half][r] = (src_row >= 0) ? sa[(size_t)src_row * (K / kSub) + kb] : 0.0f;
+        }
         // W: kBN rows x 2 sub-blocks decode units, strided the same way. One unit is one
         // (row, 32 values) — one qh, four qs bytes, four lattice lookups — and it emits
         // 32 int8 plus the single scale that covers them.
@@ -354,6 +385,20 @@ void moe_iq1s_mma_kernel(float* __restrict__ C,
             // 16 B alignment is required by the two uint4 stores below and is NOT
             // implied for a local array of char.
             __align__(16) signed char m8[kSub];
+            // A TABLE-DRIVEN DECODE WAS TRIED HERE AND IS 24% SLOWER. A byte of the
+            // packed word holds four 2-bit fields, so a 256-entry table maps it to four
+            // finished int8 codes and this eight-step loop disappears — twelve shared
+            // loads per unit against four loads plus ~150 ALU ops. Measured at M=1 on
+            // one H200, N=98304 K=3584 DRAM-resident: 315.3 us/token against this
+            // form's 253.98.
+            //
+            // The premise was wrong. The earlier ablation showed that removing the
+            // divergent Sgrid gather saved only 8%, and I read that as "the ALU is the
+            // cost". It is not: the table lookup is ALSO a divergent shared gather —
+            // TWO per lattice entry, eight per unit — and divergent shared loads
+            // serialize on bank conflicts where the ALU runs in parallel. Trading
+            // parallel arithmetic for serialized lookups is the wrong direction, and 8%
+            // was the cost of ONE gather, not the ceiling on all of them.
 #pragma unroll
             for (int l = 0; l < 4; ++l) {
                 const uint32_t idx =
@@ -397,6 +442,15 @@ void moe_iq1s_mma_kernel(float* __restrict__ C,
                 ldm_x4(bf[jp][0], bf[jp][1], bf[jp + 1][0], bf[jp + 1][1],
                        &Bs[buf][col][swz(kk + (sub & 1) * 16, col)]);
             }
+            // The activation scales depend on i and the sub-block, NOT on j — so they
+            // are read once per half here rather than re-read inside the j loop, where
+            // the first version had them and paid kNFrag times over for the same value.
+            float saA[kMFrag], saB[kMFrag];
+#pragma unroll
+            for (int i = 0; i < kMFrag; ++i) {
+                saA[i] = Asc[buf][half][i * 16 + grp];
+                saB[i] = Asc[buf][half][i * 16 + grp + 8];
+            }
 #pragma unroll
             for (int j = 0; j < kNFrag; ++j) {
                 // dl depends on (n, sub-block) and NOT on m, so the two column scales
@@ -414,24 +468,28 @@ void moe_iq1s_mma_kernel(float* __restrict__ C,
                         : "r"(af[i][0]), "r"(af[i][1]), "r"(af[i][2]), "r"(af[i][3]),
                           "r"(bf[j][0]), "r"(bf[j][1]));
                     // Elements 0,1 are row grp; 2,3 are row grp+8. Columns alternate.
-                    accf[i][j][0] += (float)a0 * sc0;
-                    accf[i][j][1] += (float)a1 * sc1;
-                    accf[i][j][2] += (float)a2 * sc0;
-                    accf[i][j][3] += (float)a3 * sc1;
+                    // BOTH scales now vary with the sub-block, so both are applied here
+                    // and neither survives to the epilogue. sa depends on the row only,
+                    // sc on the column only, so the four products are two of each.
+                    accf[i][j][0] += (float)a0 * sc0 * saA[i];
+                    accf[i][j][1] += (float)a1 * sc1 * saA[i];
+                    accf[i][j][2] += (float)a2 * sc0 * saB[i];
+                    accf[i][j][3] += (float)a3 * sc1 * saB[i];
                 }
             }
         }
         buf ^= 1;
     }
 
-    // The per-token activation scale is constant in k, so it never entered the loop and
-    // is applied exactly once, here.
+    // NOTHING IS APPLIED HERE ANY MORE. Both scales vary with the sub-block, so both are
+    // consumed at the drain inside the k loop; the accumulator already holds the finished
+    // value. The per-row form this replaced could defer the activation scale to exactly
+    // this point, which is what made it cheap and also what made it coarse.
     //
-    // `sa` is indexed by the SOURCE token, not by the compact output row: when `rows`
-    // gathers this expert's tokens out of a larger buffer, row gm of C came from token
-    // rows[gm] and carries that token's scale. C itself stays compact — the caller
-    // scatters it — so the two indices are deliberately different and must not be
-    // collapsed into one.
+    // `sa` is still indexed by the SOURCE token rather than the compact output row —
+    // when `rows` gathers this expert's tokens out of a larger buffer, row gm of C came
+    // from token rows[gm] — but that indirection now lives in stage(), where the scales
+    // are read, not here.
 #pragma unroll
     for (int i = 0; i < kMFrag; ++i) {
 #pragma unroll
@@ -440,8 +498,7 @@ void moe_iq1s_mma_kernel(float* __restrict__ C,
             for (int e = 0; e < 4; ++e) {
                 const int gm = m0 + i * 16 + grp + (e >> 1) * 8;
                 const int gn = n0 + warp * (kBN / kWarps) + j * 8 + tig * 2 + (e & 1);
-                if (gm < M && gn < N)
-                    C[(size_t)gm * N + gn] = accf[i][j][e] * sa[rows ? rows[gm] : gm];
+                if (gm < M && gn < N) C[(size_t)gm * N + gn] = accf[i][j][e];
             }
         }
     }

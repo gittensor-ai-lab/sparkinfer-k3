@@ -32,10 +32,12 @@
 // ---------------------------------------------------------------------------
 // Two reasons, both structural rather than sloppy:
 //
-//   1. The activation is quantized to int8 with a per-ROW scale. The scalar path uses
+//   1. The activation is quantized to int8 with a per-32 scale. The scalar path uses
 //      block_q8_K — int8 with a per-256 scale — so both quantize, but not identically.
 //      (llama.cpp's own vec_dot contract for IQ1_S also quantizes the activation, so
-//      this is a different int8, not a new approximation.)
+//      this is a different int8, not a new approximation. Per-32 is FINER than the
+//      per-256 it is graded against, which is why this term shrank when the scale
+//      granularity moved off per-row.)
 //   2. The top_k combine accumulates with atomicAdd, because experts are processed in
 //      bucket order and a token's top_k contributions land from different launches.
 //      The scalar path sums k ascending. Same terms, different order.
@@ -181,8 +183,11 @@ bool k3_moe_expert_ffn_batched_iq1s(float* out, const float* x,
 
     // 1. Quantize the activation once for the whole chunk. Per-ROW scales, which is
     //    what lets the GEMM hoist the scale out of its k loop entirely.
+    // sx is [T][latent/32] now, not [T]: the quantizer carries a scale per 32 values so
+    // the GEMM can apply it at the same drain boundary it already applies the weight
+    // scale at. See the granularity note in k3_moe_iq1s_mma.cu.
     signed char* xq = sc.take<signed char>((size_t)T * latent);
-    float*       sx = sc.take<float>((size_t)T);
+    float*       sx = sc.take<float>((size_t)T * (latent / 32));
     if (!sc.ok) { sc.free_all(); return false; }
     if (!k3_moe_iq1s_mma_quantize_rows(xq, sx, x, T, latent, stream)) { sc.free_all(); return false; }
 
@@ -228,7 +233,7 @@ bool k3_moe_expert_ffn_batched_iq1s(float* out, const float* x,
     float*       up   = sc.take<float>((size_t)maxM * ffn);
     float*       h    = sc.take<float>((size_t)maxM * ffn);
     signed char* hq   = sc.take<signed char>((size_t)maxM * ffn);
-    float*       sh   = sc.take<float>((size_t)maxM);
+    float*       sh   = sc.take<float>((size_t)maxM * (ffn / 32));
     float*       down = sc.take<float>((size_t)maxM * latent);
     if (!sc.ok) { sc.free_all(); return false; }
 

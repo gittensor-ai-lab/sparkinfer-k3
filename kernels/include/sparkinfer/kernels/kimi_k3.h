@@ -348,15 +348,22 @@ void moe_expert_ffn_iq1s_f32(float* out, float* scratch,
 // average, so M is the caller's knob (T=8192 -> M=146). BM=32 and BM=128 are both
 // instantiated and picked on M; the measured crossover is near M=70.
 
-// Per-row symmetric int8 quantization of f32 activations, one warp per row. The f32
-// twin of launch_prefill_quantize_rows_i8 (which takes bf16). Per-ROW scales, because
-// a scale constant in k is what lets the GEMM hoist it out of the reduction entirely.
+// PER-32 symmetric int8 quantization of f32 activations, one warp per row. The f32 twin
+// of launch_prefill_quantize_rows_i8 (which takes bf16).
+//
+// `scale` is [rows][cols/32], NOT [rows]. The granularity is not a free parameter: the
+// GEMM already drains its int32 accumulator every 32 k because that is the IQ1_S
+// sub-block, so a per-32 activation scale rides that existing boundary for one extra
+// multiply per drained element. A per-row scale (what this used to emit) is set by the
+// row's largest element and costs resolution everywhere else — measured as relL2 1.7e-2
+// against the shipped scalar op, with the T=1 case ruling out any gather defect.
+//
 // `cols` must be a multiple of 32. Returns false if the shape is unsupported.
 bool k3_moe_iq1s_mma_quantize_rows(signed char* q, float* scale, const float* x,
                                    int rows, int cols, cudaStream_t stream = nullptr);
 
 // C[M,N] = A[M,K] @ W[N,K]^T, W the native GGUF IQ1_S [N,K] blocks, A int8 with the
-// per-row scales `sa` above. C is f32 (K3 is f32 end to end) and COMPACT — row m of C
+// per-32 scales `sa` above ([M][K/32]). C is f32 (K3 is f32 end to end) and COMPACT — row m of C
 // is the m'th row of this expert's group.
 //
 // `rows` optionally gathers A's M rows out of a larger token buffer (a MoE dispatch's
