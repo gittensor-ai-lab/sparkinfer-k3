@@ -1843,8 +1843,25 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
 
         k3_profiler().start(layer < cfg.leading_dense ? "ffn_dense" : "ffn_moe", stream);
         if (layer < cfg.leading_dense) {
-            if (!proj_h(s.dense_gate, s.normed2, L.ffn_gate, cfg.dense_ffn, H)) return false;
-            if (!proj_h(s.dense_up, s.normed2, L.ffn_up, cfg.dense_ffn, H)) return false;
+            // gate + up share normed2. Under qact+#81 hoist, reuse act_q8
+            // (x_pre_q8) so we do not re-quantise; fuse the two GEMVs either way.
+            const bool gu_pre = (hoisted_src == s.normed2);
+            const bool fused_gu =
+                L.ffn_gate.ok() && L.ffn_up.ok() &&
+                L.ffn_gate.type == 8 && L.ffn_up.type == 8 &&
+                (ggml_qact_proj
+                     ? k3k::k3_proj_ggml_f32_x2(s.dense_gate, s.dense_up, s.normed2,
+                                                L.ffn_gate.data, L.ffn_up.data,
+                                                L.ffn_gate.type, cfg.dense_ffn, H,
+                                                gu_pre ? s.act_q8 : s.proj_q8,
+                                                stream, gu_pre)
+                     : k3k::k3_proj_f32_x2(s.dense_gate, s.dense_up, s.normed2,
+                                           L.ffn_gate.data, L.ffn_up.data,
+                                           L.ffn_gate.type, cfg.dense_ffn, H, stream));
+            if (!fused_gu) {
+                if (!proj_h(s.dense_gate, s.normed2, L.ffn_gate, cfg.dense_ffn, H)) return false;
+                if (!proj_h(s.dense_up, s.normed2, L.ffn_up, cfg.dense_ffn, H)) return false;
+            }
             if (fwd.debug) fwd.debug("dbg_dense_gate", layer, s.dense_gate, cfg.dense_ffn);
             if (fwd.debug) fwd.debug("dbg_dense_up", layer, s.dense_up, cfg.dense_ffn);
             k3k::situ_f32(s.dense_situ, s.dense_gate, s.dense_up, cfg.dense_ffn,
@@ -1973,12 +1990,29 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
                                  cfg.moe_ffn * cfg.n_shared, tp_size);
                     return false;
                 }
-                if (!proj_h_on(l_shx, s.dense_gate, s.normed2, L.ffn_gate_shexp,
-                               shexp_band, H))
-                    return false;
-                if (!proj_h_on(l_shx, s.dense_up, s.normed2, L.ffn_up_shexp,
-                               shexp_band, H))
-                    return false;
+                // gate + up share normed2 (rank band). Reuse hoist via x_pre_q8.
+                // Issue on l_shx.st — same stream as the rest of the shared expert.
+                const bool shexp_pre = (hoisted_src == s.normed2);
+                const bool fused_shexp_gu =
+                    L.ffn_gate_shexp.type == 8 && L.ffn_up_shexp.type == 8 &&
+                    (ggml_qact_proj
+                         ? k3k::k3_proj_ggml_f32_x2(s.dense_gate, s.dense_up, s.normed2,
+                                                    L.ffn_gate_shexp.data, L.ffn_up_shexp.data,
+                                                    L.ffn_gate_shexp.type, shexp_band, H,
+                                                    shexp_pre ? s.act_q8 : s.proj_q8,
+                                                    l_shx.st, shexp_pre)
+                         : k3k::k3_proj_f32_x2(s.dense_gate, s.dense_up, s.normed2,
+                                               L.ffn_gate_shexp.data, L.ffn_up_shexp.data,
+                                               L.ffn_gate_shexp.type, shexp_band, H,
+                                               l_shx.st));
+                if (!fused_shexp_gu) {
+                    if (!proj_h_on(l_shx, s.dense_gate, s.normed2, L.ffn_gate_shexp,
+                                   shexp_band, H))
+                        return false;
+                    if (!proj_h_on(l_shx, s.dense_up, s.normed2, L.ffn_up_shexp,
+                                   shexp_band, H))
+                        return false;
+                }
                 k3k::situ_f32(s.dense_situ, s.dense_gate, s.dense_up, shexp_band,
                              cfg.situ_beta, cfg.situ_linear_beta, l_shx.st);
                 if (!proj_on(l_shx, s.shexp_out, s.dense_situ, L.ffn_down_shexp, H,

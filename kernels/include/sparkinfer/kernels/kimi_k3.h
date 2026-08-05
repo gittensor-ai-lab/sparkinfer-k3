@@ -653,6 +653,18 @@ bool k3_proj_f32_x4(float* y0, float* y1, float* y2, float* y3, const float* x,
                     const void* W0, const void* W1, const void* W2, const void* W3,
                     int wtype, int N, int K, cudaStream_t stream);
 
+// Twin of x4 for the dense / shared-expert gate+up pair: quantise once, fuse both
+// GEMVs. Floor N>=4 so shexp band N=768 (tp=8) is accepted — the scored path.
+// Bit-identical to two separate k3_proj_ggml_f32 / k3_proj_f32 calls.
+bool k3_proj_ggml_f32_x2(float* y0, float* y1, const float* x,
+                         const void* W0, const void* W1,
+                         int wtype, int N, int K, void* q8_scratch,
+                         cudaStream_t stream, bool x_pre_q8 = false);
+
+bool k3_proj_f32_x2(float* y0, float* y1, const float* x,
+                    const void* W0, const void* W1,
+                    int wtype, int N, int K, cudaStream_t stream);
+
 // llama.cpp's CPU mul_mat does not multiply quantised weights by the original f32
 // activation. It first converts the activation to the weight type's vec_dot_type:
 // Q8_0 weights use block_q8_0 activations, while IQ1_S/IQ2_XS use block_q8_K.
