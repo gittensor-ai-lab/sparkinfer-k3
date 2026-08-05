@@ -24,8 +24,29 @@
 > `bench/results/*.json` the sweep emitted, and the `lock` CI job enforces that.
 
 - [ ] Tested on **8× H200** (`sm_90`)
+- [ ] **Prefill measured at 32k** on 8× H200 — this is the scored metric
+- [ ] **No 128k decode regression** on 8× H200 — within 1% of the frontier
 
-**Decode tok/s** — from `bench/scripts/kimi_k3_baseline.sh --node h200x8`, **UD-IQ1_S**:
+> **All three are required for a perf-bearing PR, and the evaluation loop skips a PR that is
+> missing any of them.** The tier is earned on prefill; decode is a guard. A prefill gain
+> bought by giving decode back has not moved the engine forward, it has moved work around,
+> so the round refuses to score it.
+
+**Prefill tok/s @ 32k** — the scored metric. `llama.cpp` does **143.88** here; `main` does
+**40.35**, because there is no batched prefill and every prompt token goes through the
+single-token decode step.
+
+| | before (main) | after (this PR) |
+|---|--:|--:|
+| prefill @ 32k | | |
+
+**Decode tok/s @ 128k** — the guard, not the tier. Must stay within **1%** of the frontier.
+
+| | before (main) | after (this PR) |
+|---|--:|--:|
+| decode @ 128k | | |
+
+**Decode at other contexts** — optional, useful evidence, never scored:
 
 | context | before (main) | after (this PR) |
 |---|--:|--:|
@@ -33,12 +54,10 @@
 | 512 | | |
 | 4k | | |
 | 32k | | |
-| 128k | | |
 
-<!-- 128k is in the scored sweep, not deferred to a capability probe. UD-IQ1_S at 128k is
-     the configuration this repo actually runs, so a PR that only moves 128-token decode
-     has not shown it moves the case anyone uses. Reference for context: llama.cpp does
-     18.32 tok/s at ctx 128 on this node; sparkinfer does 3.55. -->
+<!-- Prefill at 32k became the scored metric on 2026-08-05. Decode at 128k was the right
+     thing to score while sparkinfer was 18x behind llama.cpp there; it is now 3.08x ahead
+     (56.82 vs 18.44) and the untouched gap is ingestion, where we are 3.57x BEHIND. -->
 
 <!-- Paste the sweep output backing the numbers above. Isolated-kernel microbenchmarks are
      welcome as extra evidence but do NOT substitute for an end-to-end before/after. -->
