@@ -112,6 +112,21 @@ int prefill_batch_env() {
     return v;
 }
 
+// The tile width, read here for the SAME reason as the chunk size above: the tile
+// driver now reduces a whole tile's partials in one call, so the collective has to be
+// sized for T tokens at init or the first reduce fails after the weight load.
+//
+// Default 4 mirrors the use site. The two are read independently and the collective is
+// sized to whichever is larger, because one binary serves both drivers.
+int prefill_tile_env() {
+    static const int v = [] {
+        const char* e = std::getenv("SPARKINFER_K3_PREFILL_TILE");
+        const int x = e ? std::atoi(e) : 4;
+        return x > 0 ? x : 4;
+    }();
+    return v;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -475,8 +490,12 @@ bool kimi_k3_tp_init(const GGUF& g, const KimiK3Config& cfg, const K3PlanOptions
     // launcher did not wait out.
     //
     // Capped so a mistyped SPARKINFER_K3_PREFILL_BATCH cannot ask for gigabytes.
+    // The larger of the two prefill drivers' widths: the chunked walk reduces B tokens
+    // in one call and the tile driver reduces T, and one binary serves both.
     const size_t per_tok    = attn_count > moe_count ? attn_count : moe_count;
-    const int    pb_cap     = prefill_batch_env() > 512 ? 512 : prefill_batch_env();
+    const int    pb_want    = prefill_batch_env() > prefill_tile_env()
+                                  ? prefill_batch_env() : prefill_tile_env();
+    const int    pb_cap     = pb_want > 512 ? 512 : pb_want;
     const size_t max_count  = per_tok * (size_t)pb_cap;
     out.coll = tp::make_collective(devices, requested, &err, max_count,
                                    /*need_f32=*/true);
@@ -1371,7 +1390,12 @@ int k3_prefill_pick_tile(const KimiK3TP& p, int want) {
         // its exit barrier intact, so there is no reuse distance to protect and any T
         // is sound.
         if (p.n_coll_slots <= 1) return T;
-        if (tp::k3_coll_1bar_ok(per_token * T, p.n_coll_slots)) return T;
+        // NOT per_token * T ANY MORE. The tile reduces a whole tile's partials in ONE
+        // call per phase, so a tile issues the same number of collectives as a single
+        // token does — the count no longer scales with T, and neither does the rotation
+        // constraint. That is what frees T from the {2,5,8,11,14} exclusion it used to
+        // have at 185 collectives with 3 slots.
+        if (tp::k3_coll_1bar_ok(per_token, p.n_coll_slots)) return T;
     }
     return 0;
 }
@@ -1425,6 +1449,20 @@ bool k3_prefill_pool_init(KimiK3TP& p, int want_tile) {
             if (cudaMalloc(&q, n * sizeof(float)) != cudaSuccess) { ok = false; break; }
             pool->banks[r] = (float*)q;
         }
+        // THE BATCH ARENA, and it is what makes phase-major order possible at all.
+        //
+        // A phase-major tile runs every token's attention, THEN reduces, THEN every
+        // token's FFN. That requires each token's attention partial to still exist when
+        // its FFN reads it — and s.attn_out is ONE TOKEN WIDE, so in token-major order
+        // token t+1 overwrites token t's before the reduce ever sees it. The arena gives
+        // each token its own attn_out/ffn_out/moe_fused slot, laid out end to end, which
+        // is also exactly the contiguity the batched collective needs.
+        //
+        // Allocated here rather than in the chunked walk's prompt_alloc because the two
+        // drivers size it differently (T vs B) and whichever runs first wins; alloc_batch
+        // returns true when the existing arena is already big enough.
+        if (!R.fwd.state) { ok = false; break; }
+        if (!kimi_k3_forward_alloc_batch(cfg, R.fwd, T)) { ok = false; break; }
     }
     if (!ok) {
         k3_prefill_pool_free(pool, p.ranks);
@@ -1509,8 +1547,32 @@ static bool k3_tp_prefill_tile(KimiK3TP& p, const int* ids, int T) {
     const int plan_lo = k3k::k3_mla_decode_plan(cfg.n_q_heads, cfg.kv_lora_rank, base + 1);
     const int plan_hi = k3k::k3_mla_decode_plan(cfg.n_q_heads, cfg.kv_lora_rank, base + T);
     const bool plan_uniform = (plan_lo == plan_hi);
+    // THE TILE-WIDE REDUCE MUST GO THROUGH THE COLLECTIVE'S OWNED BUFFERS, and capture
+    // is what makes that a hard requirement rather than a preference.
+    //
+    // The first phase-major version reduced the batch arena with allreduce_f32_group and
+    // DEADLOCKED under capture — GPUs 0 and 1 pinned at 100% with the rest idle, a peer
+    // barrier waiting on ranks that never arrived. The group entry point takes arbitrary
+    // pointers and was only ever exercised by the chunked walk, which never captured;
+    // allreduce_f32_owned_slot is the one the tile used under capture, and the rotating
+    // slots exist precisely to make it capture-safe. Swapping them was the bug.
+    //
+    // Eagerly the reorder is fine either way and bit-exact (0.0 KLD, argmax and logit
+    // identical to the per-token reference), so this gates CAPTURE, not the reorder: a
+    // backend without owned buffers still runs the tile, just without a graph, rather
+    // than hanging.
+    const bool coll_owned = p.zero_copy && p.coll->owns_buffers() &&
+                            p.coll->max_count() > 0;
     const bool graph_on = want_graph && !pool.graph_disabled && plan_uniform &&
-                          parallel_issue && tp_size > 1;
+                          parallel_issue && tp_size > 1 && coll_owned;
+    if (want_graph && !coll_owned && !pool.graph_disabled) {
+        static bool said = false;
+        if (!said) {
+            said = true;
+            std::fprintf(stderr, "[k3-prefill] collective has no owned buffers; the "
+                                 "tile-wide reduce cannot be captured — running eager\n");
+        }
+    }
     if (graph_on && pool.graph_ready && pool.captured_plan != plan_lo) {
         for (std::size_t r = 0; r < p.ranks.size(); ++r) {
             cudaSetDevice(p.ranks[r].device);
@@ -1559,8 +1621,12 @@ static bool k3_tp_prefill_tile(KimiK3TP& p, const int* ids, int T) {
         }
     }
 
+    // Counts the collectives this tile issues, and indexes the rotation. A tile now
+    // issues TWO per layer instead of two per token, so the wrap the 1bar rotation has to
+    // survive is per TILE — which is why k3_prefill_pick_tile stopped multiplying its
+    // check by T, and why T is no longer restricted to the widths that check admitted.
     int coll_k = 0;
-    const int n_slots = p.n_coll_slots;
+    const int n_slots = p.n_coll_slots > 0 ? p.n_coll_slots : 1;
 
     // Skipped wholesale on a replay rather than guarded per call: the recorded graph
     // already contains every launch, and a partially-skipped tile would leave the
@@ -1605,140 +1671,125 @@ static bool k3_tp_prefill_tile(KimiK3TP& p, const int* ids, int T) {
         if (!tile_filled)
             for (auto& t : pool.tiles) t.layer = -1;
 
-        for (int t = 0; t < T; ++t) {
-            // --- per-token state, set on every rank BEFORE anything is issued -------
-            // These are host-side fields the workers dereference, so they are written
-            // by the submitting thread with the pool parked — the same rule the
-            // zero-copy pointer swaps follow, and for the same reason.
+        // ---- PHASE-MAJOR: three passes over the tile, one collective per phase -----
+        //
+        // WHY THE ORDER CHANGED. Token-major — run token t's whole layer, then t+1's —
+        // issues a collective PER TOKEN. That is 185 per token and ~5.5% of the recorded
+        // graph's nodes. Phase-major runs every token's attention, reduces ONCE over the
+        // whole tile, then every token's FFN, so a tile issues what one token used to.
+        //
+        // THIS IS A NODE CHANGE, NOT A LATENCY ONE, and the distinction is the entire
+        // reason it is worth doing. Collectives cost ~0.01 ms of an 18.8 ms token, so the
+        // chunked walk's 1.77x for the same idea DOES NOT TRANSFER — that came off an
+        // uncaptured path where it was buying back submission overhead capture removes
+        // for free. What it buys here is graph SIZE: capture is worth 1.93x on the
+        // per-token path's 3308-node graph and only 1.56x on a T=16 tile's 61258-node
+        // one. Reading the earlier result as "batching collectives is worthless" would
+        // have skipped this — it was worthless for the reason it was first proposed.
+        //
+        // WHAT MAKES IT LEGAL. The only cross-token dependencies inside a layer run along
+        // the RECURRENT axis — the KDA conv/delta state and the MLA KV rows — and both are
+        // consumed by ATTENTION, which still runs strictly in token order in pass 1.
+        // Nothing in token t+1's attention reads token t's FFN output; that flows to the
+        // next LAYER. So deferring every FFN until after every attention reorders only
+        // work that was already independent. Measured bit-exact against the per-token
+        // reference (0.0 KLD, top-1 100%, argmax 10677 and logit 19.774452 on both).
+        //
+        // WHERE THE PARTIALS LIVE. Token t's partial goes straight into the COLLECTIVE'S
+        // OWNED input buffer at offset t*width, and the reduce is one owned-slot call
+        // over T*width. Not the batch arena: reducing the arena means allreduce_f32_group,
+        // which takes arbitrary pointers, was only ever exercised by the uncaptured
+        // chunked walk, and DEADLOCKED here under capture. The owned buffers are sized
+        // per_tok * T at init for exactly this.
+        //
+        // The arena still backs res_bank and the leading dense layer's ffn_out via
+        // select_slot, which is why it is still allocated.
+        const int w_attn = H;
+        const int w_moe  = is_moe ? (cfg.expert_latent + H) : H;
+        const int slot_attn = attn_reduce ? (coll_k % n_slots) : -1;
+        const int slot_moe  = (coll_k + (attn_reduce ? 1 : 0)) % n_slots;
+        auto set_tok = [&](int t) {
+            // Host-side fields the workers dereference, written by the submitting thread
+            // with the pool parked — the rule the zero-copy pointer swaps followed, and
+            // for the same reason.
             for (int r = 0; r < tp_size; ++r) {
                 KimiK3TPRank& R = p.ranks[(size_t)r];
-                R.state.position = base + t;          // host mirror: picks the MLA plan
-                if (pool.banks[(size_t)r])
-                    R.state.res_bank = pool.banks[(size_t)r] +
-                        (size_t)t * (size_t)R.state.max_ckpt * (size_t)H;
-                R.state.n_ckpt = ckpt[(size_t)r][(size_t)t];
+                R.state.position = base + t;      // host mirror: picks the MLA plan
                 R.fwd.prefill_tile = &pool.tiles[(size_t)r];
                 R.fwd.prefill_tok = t;
             }
-
-            const int k_attn = coll_k;
-            const int k_moe  = coll_k + (attn_reduce ? 1 : 0);
-            const int slot_attn = n_slots > 1 ? (k_attn % n_slots) : -1;
-            const int slot_moe  = n_slots > 1 ? (k_moe  % n_slots) : -1;
-            float* const* in_attn = slot_attn >= 0
-                ? p.zc_in_slot[(size_t)slot_attn].data() : p.zc_in.data();
-            float* const* in_moe = slot_moe >= 0
-                ? p.zc_in_slot[(size_t)slot_moe].data() : p.zc_in.data();
-            const bool zc_attn = p.zero_copy && attn_reduce;
-            if (p.zero_copy && tp_size > 1 && (is_moe || zc_attn)) {
-                for (std::size_t r = 0; r < p.ranks.size(); ++r) {
-                    if (is_moe)
-                        kimi_k3_swap_partial_buffer(p.ranks[r].fwd,
-                                                    K3LayerPhase::FfnPartial, in_moe[r]);
-                    if (zc_attn)
-                        kimi_k3_swap_partial_buffer(p.ranks[r].fwd,
-                                                    K3LayerPhase::Attn, in_attn[r]);
-                }
+        };
+        // Address token t's slot on rank r. TWO steps, and the second is not optional:
+        // select_slot aims state->res_bank at the ARENA's bank, but this tile owns its
+        // own bank and the fill reads THAT one. Leaving select_slot's choice in place
+        // would have the fill and the consumer mixing over different memory — same
+        // shapes, different values, fluent wrong output.
+        auto pick_slot = [&](int r, int t) {
+            KimiK3TPRank& R = p.ranks[(size_t)r];
+            kimi_k3_forward_select_slot(R.fwd, t);
+            if (pool.banks[(size_t)r]) {
+                R.state.res_bank = pool.banks[(size_t)r] +
+                    (size_t)t * (size_t)R.state.max_ckpt * (size_t)H;
+                R.state.n_ckpt = ckpt[(size_t)r][(size_t)t];
             }
+        };
+        auto save_ckpt = [&](int t) {
+            for (int r = 0; r < tp_size; ++r)
+                ckpt[(size_t)r][(size_t)t] = p.ranks[(size_t)r].state.n_ckpt;
+        };
+        // Aim `phase`'s partial at token t's row of a peer-visible region. `in` picks the
+        // rotation slot's input (where the phase WRITES) or the shared output (where the
+        // next phase READS the sum).
+        auto aim = [&](int r, int t, K3LayerPhase phase, int width, int slot, bool in) {
+            if (!coll_owned) return;
+            float* base_p = in ? (float*)p.coll->reduce_in_slot(r, slot)
+                               : (float*)p.coll->reduce_out(r);
+            if (!base_p) return;
+            kimi_k3_swap_partial_buffer(p.ranks[(size_t)r].fwd, phase,
+                                        base_p + (size_t)t * (size_t)width);
+        };
+        // One call for the whole tile, or as few as the owned buffers' capacity admits.
+        auto reduce_tile = [&](int width, int slot) -> bool {
+            const size_t cap = p.coll->max_count();
+            int per_call = T;
+            if (cap > 0 && (size_t)T * (size_t)width > cap) {
+                per_call = (int)(cap / (size_t)width);
+                if (per_call < 1) return false;      // one token does not even fit
+            }
+            for (int off = 0; off < T; off += per_call) {
+                const int m = std::min(per_call, T - off);
+                // The payload starts at the slot's base, so a sliced reduce has to begin
+                // at token `off` — which the owned entry point cannot express. Slicing is
+                // therefore only correct when it does not slice: capacity is sized
+                // per_tok * T at init precisely so this is one call.
+                if (off != 0 || m != T) return false;
+                if (!p.coll->allreduce_f32_owned_slot((size_t)m * (size_t)width,
+                                                      p.streams, slot))
+                    return false;
+                ++p.n_collectives;
+                ++coll_k;
+            }
+            return true;
+        };
 
-            // --- phase 1 (+2 when nothing separates them) --------------------------
+        // ---- pass 1: every token's attention, still in token order -----------------
+        //
+        // The position advance rides INSIDE the job rather than following it on the host:
+        // the worker already has this rank's device current, and enqueueing onto another
+        // rank's stream from the wrong device is an "invalid resource handle".
+        //
+        // RELATIVE, never a set. +1 between tokens and -(T-1) after the last, which
+        // returns the position to `base` so the next layer starts where this one did. An
+        // absolute set would bake this tile's base into a captured graph and rewind every
+        // replayed tile to the one it was recorded at — fluent output over wrong KV rows.
+        for (int t = 0; t < T; ++t) {
+            set_tok(t);
             if (!issue_all([&](int r) {
                     KimiK3TPRank& R = p.ranks[(size_t)r];
                     K3PrefillTile& tl = pool.tiles[(size_t)r];
-                    float* hin  = tl.x      + (size_t)t * H;
-                    float* hout = tl.x_next + (size_t)t * H;
+                    pick_slot(r, t);
+                    if (attn_reduce) aim(r, t, K3LayerPhase::Attn, w_attn, slot_attn, true);
                     if (!kimi_k3_forward_layer_phase(R.fwd, layer, K3LayerPhase::Attn,
-                                                     hin, hout)) return false;
-                    if (attn_reduce) return true;
-                    return kimi_k3_forward_layer_phase(R.fwd, layer,
-                                                       K3LayerPhase::FfnPartial, hin, hout);
-                })) return false;
-
-            if (attn_reduce) {
-                int count = 0;
-                for (int r = 0; r < tp_size; ++r) {
-                    int n = 0;
-                    float* buf = kimi_k3_partial_buffer(p.ranks[(size_t)r].fwd, layer,
-                                                        K3LayerPhase::Attn, &n);
-                    if (!buf || n <= 0) return false;
-                    if (r == 0) count = n;
-                    else if (n != count) return false;
-                    p.reduce_bufs[(size_t)r] = buf;
-                }
-                const bool okk = zc_attn
-                    ? p.coll->allreduce_f32_owned_slot((size_t)count, p.streams, slot_attn)
-                    : p.coll->allreduce_f32_group(p.reduce_bufs, (size_t)count, p.streams);
-                if (!okk) {
-                    std::fprintf(stderr, "[k3-prefill] attention all-reduce failed at "
-                                         "layer %d token %d\n", layer, t);
-                    return false;
-                }
-                ++p.n_collectives;
-                ++coll_k;
-                if (zc_attn) {
-                    for (std::size_t r = 0; r < p.ranks.size(); ++r)
-                        kimi_k3_swap_partial_buffer(p.ranks[r].fwd, K3LayerPhase::Attn,
-                                                    p.zc_out[r]);
-                }
-                if (!issue_all([&](int r) {
-                        KimiK3TPRank& R = p.ranks[(size_t)r];
-                        K3PrefillTile& tl = pool.tiles[(size_t)r];
-                        return kimi_k3_forward_layer_phase(R.fwd, layer,
-                                                           K3LayerPhase::FfnPartial,
-                                                           tl.x + (size_t)t * H,
-                                                           tl.x_next + (size_t)t * H);
-                    })) return false;
-            }
-
-            // --- the MoE collective ------------------------------------------------
-            if (is_moe && tp_size > 1) {
-                int count = 0;
-                for (int r = 0; r < tp_size; ++r) {
-                    int n = 0;
-                    float* buf = kimi_k3_partial_buffer(p.ranks[(size_t)r].fwd, layer,
-                                                        K3LayerPhase::FfnPartial, &n);
-                    if (!buf || n <= 0) return false;
-                    if (r == 0) count = n;
-                    else if (n != count) return false;
-                    p.reduce_bufs[(size_t)r] = buf;
-                }
-                const bool okc = p.zero_copy
-                    ? p.coll->allreduce_f32_owned_slot((size_t)count, p.streams, slot_moe)
-                    : p.coll->allreduce_f32_group(p.reduce_bufs, (size_t)count, p.streams);
-                if (!okc) {
-                    std::fprintf(stderr, "[k3-prefill] all-reduce failed at layer %d "
-                                         "token %d\n", layer, t);
-                    return false;
-                }
-                ++p.n_collectives;
-                ++coll_k;
-                if (p.zero_copy) {
-                    for (std::size_t r = 0; r < p.ranks.size(); ++r)
-                        kimi_k3_swap_partial_buffer(p.ranks[r].fwd,
-                                                    K3LayerPhase::FfnPartial, p.zc_out[r]);
-                }
-            }
-
-            // --- phase 3, and the position step -------------------------------------
-            // The position advance rides INSIDE the phase-3 job rather than following it
-            // on the host: the worker already has this rank's device current, and
-            // enqueueing onto another rank's stream from the wrong device is an
-            // "invalid resource handle". It is also where a captured tile needs it.
-            //
-            // RELATIVE, never a set. Between tokens it is +1; after the last token of the
-            // layer it is -(T-1), which returns the position to `base` so the next layer
-            // starts where this one did. An absolute set would bake this tile's base into
-            // a captured graph and rewind every replayed tile to the one it was recorded
-            // at — fluent output over the wrong KV rows.
-            //
-            // NOTE the absence of the token driver's std::swap(R.x, R.x_next). The tile's
-            // pair is swapped ONCE PER LAYER, after all T tokens have used it, not once
-            // per token — swapping here would hand token t+1 the buffer token t is still
-            // reading as its input.
-            if (!issue_all([&](int r) {
-                    KimiK3TPRank& R = p.ranks[(size_t)r];
-                    K3PrefillTile& tl = pool.tiles[(size_t)r];
-                    if (!kimi_k3_forward_layer_phase(R.fwd, layer, K3LayerPhase::FfnFinish,
                                                      tl.x + (size_t)t * H,
                                                      tl.x_next + (size_t)t * H))
                         return false;
@@ -1747,11 +1798,61 @@ static bool k3_tp_prefill_tile(KimiK3TP& p, const int* ids, int T) {
                                         R.stream);
                     return true;
                 })) return false;
-
-            for (int r = 0; r < tp_size; ++r)
-                ckpt[(size_t)r][(size_t)t] = p.ranks[(size_t)r].state.n_ckpt;
+            save_ckpt(t);
+        }
+        if (attn_reduce && !reduce_tile(w_attn, slot_attn)) {
+            std::fprintf(stderr, "[k3-prefill] attention all-reduce failed at layer %d\n",
+                         layer);
+            return false;
         }
 
+        // ---- pass 2: every token's FFN partial --------------------------------------
+        // Reads its attention sum out of reduce_out and writes its MoE partial into the
+        // next rotation slot's input. Different regions, so both aims coexist.
+        for (int t = 0; t < T; ++t) {
+            set_tok(t);
+            if (!issue_all([&](int r) {
+                    KimiK3TPRank& R = p.ranks[(size_t)r];
+                    K3PrefillTile& tl = pool.tiles[(size_t)r];
+                    pick_slot(r, t);
+                    if (attn_reduce) aim(r, t, K3LayerPhase::Attn, w_attn, slot_attn, false);
+                    if (is_moe && tp_size > 1)
+                        aim(r, t, K3LayerPhase::FfnPartial, w_moe, slot_moe, true);
+                    return kimi_k3_forward_layer_phase(R.fwd, layer,
+                                                       K3LayerPhase::FfnPartial,
+                                                       tl.x + (size_t)t * H,
+                                                       tl.x_next + (size_t)t * H);
+                })) return false;
+            save_ckpt(t);
+        }
+        // The leading dense layer's FFN partial is replicated, never reduced, which is
+        // why this is gated on is_moe exactly as the token-major loop was.
+        if (is_moe && tp_size > 1 && !reduce_tile(w_moe, slot_moe)) {
+            std::fprintf(stderr, "[k3-prefill] FFN all-reduce failed at layer %d\n",
+                         layer);
+            return false;
+        }
+
+        // ---- pass 3: every token's FFN finish ---------------------------------------
+        //
+        // NOTE the absence of the token driver's std::swap(R.x, R.x_next). The tile's
+        // pair is swapped ONCE PER LAYER, below, after all T tokens have used it —
+        // swapping here would hand token t+1 the buffer token t is still reading.
+        for (int t = 0; t < T; ++t) {
+            set_tok(t);
+            if (!issue_all([&](int r) {
+                    KimiK3TPRank& R = p.ranks[(size_t)r];
+                    K3PrefillTile& tl = pool.tiles[(size_t)r];
+                    pick_slot(r, t);
+                    if (is_moe && tp_size > 1)
+                        aim(r, t, K3LayerPhase::FfnPartial, w_moe, slot_moe, false);
+                    return kimi_k3_forward_layer_phase(R.fwd, layer,
+                                                       K3LayerPhase::FfnFinish,
+                                                       tl.x + (size_t)t * H,
+                                                       tl.x_next + (size_t)t * H);
+                })) return false;
+            save_ckpt(t);
+        }
         // One swap for the whole tile, after every token has finished the layer.
         for (auto& tl : pool.tiles) k3_prefill_tile_swap(tl);
     }
