@@ -83,6 +83,24 @@ namespace {
 
 constexpr int CHUNK = 16;
 
+// Stream-ordered scratch arena. Declared HERE, at namespace scope, not inside the
+// launcher: a function-local struct may not have a member function template, so
+// `take<E>()` does not compile as a local. k3_moe_batched_iq1s.cu's equivalent is
+// at namespace scope for the same reason.
+struct Arena {
+    std::vector<void*> bufs;
+    cudaStream_t s;
+    bool ok = true;
+    template <class E> E* take(size_t count) {
+        if (!ok) return nullptr;
+        void* p = nullptr;
+        if (cudaMallocAsync(&p, count * sizeof(E), s) != cudaSuccess) { ok = false; return nullptr; }
+        bufs.push_back(p);
+        return static_cast<E*>(p);
+    }
+    void free_all() { for (void* b : bufs) cudaFreeAsync(b, s); bufs.clear(); }
+};
+
 __device__ __forceinline__ float k3c_sigmoid(float x) {
     return 1.0f / (1.0f + __expf(-x));
 }
@@ -270,15 +288,47 @@ void k3_kda_chunk_prep_kernel(float* __restrict__ ws_kd, float* __restrict__ ws_
 }
 
 // ---------------------------------------------------------------------------
-// Kernel 2: scan. grid = n_head, block = 128 threads = head_dim. One block per
-// head, sequential over its chunks — the one real dependency, T/16 steps.
+// Kernel 2: scan. grid = (n_head, head_dim/JC), block = 128 = 4 warps.
+// Sequential over CHUNKS only — the one real dependency, T/16 steps.
 // ---------------------------------------------------------------------------
-// Thread j owns state row j (S[i][j] at state[j*head_dim+i]) for the whole
-// kernel, reading and writing all head_dim elements of it straight from global —
-// the access pattern kda_decode_step_kernel already uses, deliberately NOT staged
-// through shared here. The staged variant (kda_decode_step_smem_kernel's IC=32
-// column-chunk trick) is the natural next step once this is validated on
-// hardware, not before: this file's job is the algorithm, correct first.
+// THE COLUMN SPLIT IS THE WHOLE PERFORMANCE STORY, and it was measured rather
+// than assumed. A first version ran grid = n_head with one thread per state
+// column: 12 blocks on a 132-SM part under the sharded policy, 1536 threads of
+// the ~270k the device offers — 0.6% of the machine, and ~0.07% of fp32 peak.
+// Measured against the T sequential decode steps it replaces (H200, head_dim
+// 128, n_head 12): only 1.24x, with the per-token cost FLAT at ~24 us, i.e. the
+// chunk form was buying nothing. Isolating the two kernels showed why — K1 alone
+// was 0.071 us/token against the pair's 24.27, so K2 was 99.7% of the time and
+// its occupancy was the entire problem.
+//
+// The state columns are INDEPENDENT, which is what makes the split legal:
+// RHS[t][j], U[t][j] and S[:,j] all depend only on column j of S_in. So the
+// column axis can be spread across blocks, exactly as this repo's sibling
+// chunk-scan for Qwen's GDN already does (prefill_gdn_chunk.cu launches its scan
+// as `dim3 gscan(v_heads, HD/JC)`).
+//
+// ONE WARP PER COLUMN, i SPLIT ACROSS LANES — and that mapping is not new here
+// either: it is exactly what k3_kda_step_cpu_test.cpp already models and proves
+// for the single-token step ("warp per column, i split across lanes", lane l
+// owning i = 4l..4l+3 as one float4). Reusing a proven ownership is worth more
+// than inventing a second one, for an operator whose own header documents an
+// axis bug shipping once undetected.
+//
+//   grid   (n_head, head_dim/JC), JC = 4 columns per block  ->  12 x 32 = 384 blocks
+//   block  128 threads = 4 warps; warp w owns column j = cb*JC + w
+//   lane   l owns contraction indices i = 4l .. 4l+3
+//
+// 384 blocks x 128 threads = 49,152 threads, 32x the first version. The 32 blocks
+// of a given head each load that head's full [16,128] workspace tile, so the tile
+// read is 32x redundant — but it is an L2 hit after the first block and the
+// alternative is leaving 97% of the device idle, which is what the measurement
+// above says that costs.
+//
+// The two projections reduce over i, so they need a cross-lane sum; the state
+// update is elementwise in i and needs none. The reduction is a BUTTERFLY
+// (__shfl_xor), not a __shfl_down tree, so every lane ends holding the total and
+// U can be formed redundantly in all 32 lanes with no broadcast — the same
+// association order the CPU model uses.
 __global__ __launch_bounds__(kD, 4)
 void k3_kda_chunk_scan_kernel(float* __restrict__ out, float* __restrict__ state,
                               const float* __restrict__ v,
@@ -288,8 +338,15 @@ void k3_kda_chunk_scan_kernel(float* __restrict__ out, float* __restrict__ state
                               const float* __restrict__ ws_inv,
                               int T, int n_head, int n_chunks) {
     k3_pdl_sync();
-    const int h = blockIdx.x;
-    const int j = threadIdx.x;
+    constexpr int JC = 4;              // columns per block
+    constexpr int IPL = kD / 32;       // contraction indices per lane = 4
+
+    const int h    = blockIdx.x;
+    const int cb   = blockIdx.y;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int j    = cb * JC + warp;   // this warp's state column
+    const int i0   = lane * IPL;       // this lane's contraction strip
 
     __shared__ float s_kd[CHUNK * kD];
     __shared__ float s_qd[CHUNK * kD];
@@ -303,14 +360,22 @@ void k3_kda_chunk_scan_kernel(float* __restrict__ out, float* __restrict__ state
                   "K2 static shared exceeds the 48 KB default per-block limit");
 
     float* S = state + (size_t)h * kD * kD;
+    float* Sj = S + (size_t)j * kD;    // this warp's column, i fastest — op 6's layout
+
+    // This lane's slice of its column, held in registers across the WHOLE scan:
+    // nothing else ever touches these elements, so the state never round-trips
+    // through global between chunks. That is the other half of the win — the
+    // first version re-read and re-wrote all 128 elements of the column from
+    // global on every chunk.
+    float Sreg[IPL];
+#pragma unroll
+    for (int e = 0; e < IPL; ++e) Sreg[e] = Sj[i0 + e];
 
     for (int c = 0; c < n_chunks; ++c) {
         const int t0 = c * CHUNK;
         const int actual_len = min(CHUNK, T - t0);
         const size_t tile = (size_t)h * n_chunks + c;
 
-        // Cooperative load of this chunk's workspace tile — every thread needs all
-        // of it (broadcast), so one coalesced stride-128 pass per array.
         const float* in_kd   = ws_kd   + tile * WsLayout::kKD;
         const float* in_qd   = ws_qd   + tile * WsLayout::kQD;
         const float* in_kr   = ws_kr   + tile * WsLayout::kKR;
@@ -318,32 +383,35 @@ void k3_kda_chunk_scan_kernel(float* __restrict__ out, float* __restrict__ state
         const float* in_beta = ws_beta + tile * WsLayout::kBeta;
         const float* in_mqk  = ws_mqk  + tile * WsLayout::kMqk;
         const float* in_inv  = ws_inv  + tile * WsLayout::kInv;
-        for (int i = j; i < CHUNK * kD; i += kD) {
+        for (int i = threadIdx.x; i < CHUNK * kD; i += kD) {
             s_kd[i] = in_kd[i]; s_qd[i] = in_qd[i]; s_kr[i] = in_kr[i];
         }
-        s_gt[j] = in_gt[j];
-        if (j < CHUNK) s_beta[j] = in_beta[j];
-        for (int i = j; i < CHUNK * CHUNK; i += kD) {
+        s_gt[threadIdx.x] = in_gt[threadIdx.x];
+        if (threadIdx.x < CHUNK) s_beta[threadIdx.x] = in_beta[threadIdx.x];
+        for (int i = threadIdx.x; i < CHUNK * CHUNK; i += kD) {
             s_mqk[i] = in_mqk[i]; s_inv[i] = in_inv[i];
         }
         __syncthreads();
 
-        // RHS_t = beta_t * (v_t - k_decayed_t @ S_in). All 16 read the SAME S_in
-        // (the state is only written at the end of the chunk), so they are computed
-        // together. Both t-loops are unrolled so RHS/U index with compile-time
-        // constants and stay in registers.
+        // RHS_t = beta_t * (v_t - k_decayed_t . S_in[:,j]). Butterfly-reduced so
+        // every lane holds the total; all 16 read the SAME S_in, which is only
+        // written at the end of the chunk.
         float RHS[CHUNK];
 #pragma unroll
         for (int t = 0; t < CHUNK; ++t) {
-            float proj = 0.0f;
-            for (int i = 0; i < kD; ++i) proj += s_kd[t * kD + i] * S[(size_t)j * kD + i];
+            float acc = 0.0f;
+#pragma unroll
+            for (int e = 0; e < IPL; ++e) acc += s_kd[t * kD + i0 + e] * Sreg[e];
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                acc += __shfl_xor_sync(0xffffffffu, acc, off);
             const float v_val = (t < actual_len)
                 ? v[((size_t)(t0 + t) * n_head + h) * kD + j] : 0.0f;
-            RHS[t] = s_beta[t] * (v_val - proj);
+            RHS[t] = s_beta[t] * (v_val - acc);
         }
 
-        // U = INV @ RHS. INV is lower triangular by construction (K1's substitution
-        // never writes above the diagonal), so s <= t covers every nonzero entry.
+        // U = INV @ RHS, computed redundantly in every lane (no broadcast needed).
+        // INV is lower triangular by construction, so s <= t covers every nonzero.
         float U[CHUNK];
 #pragma unroll
         for (int t = 0; t < CHUNK; ++t) {
@@ -353,33 +421,41 @@ void k3_kda_chunk_scan_kernel(float* __restrict__ out, float* __restrict__ state
             U[t] = acc;
         }
 
-        // O = Q_decayed @ S_in + Mqk @ U. The loop runs the full unrolled CHUNK with
-        // the STORE guarded, rather than a runtime-bounded loop, so U/Mqk keep their
-        // compile-time indexing; a store past actual_len would write past [T,...].
+        // O = q_decayed_t . S_in[:,j] + Mqk_t . U. Same butterfly; lane 0 stores.
 #pragma unroll
         for (int t = 0; t < CHUNK; ++t) {
             if (t < actual_len) {
-                float proj = 0.0f;
-                for (int i = 0; i < kD; ++i) proj += s_qd[t * kD + i] * S[(size_t)j * kD + i];
-                float mu = 0.0f;
+                float acc = 0.0f;
 #pragma unroll
-                for (int s = 0; s <= t; ++s) mu += s_mqk[t * CHUNK + s] * U[s];
-                out[((size_t)(t0 + t) * n_head + h) * kD + j] = proj + mu;
+                for (int e = 0; e < IPL; ++e) acc += s_qd[t * kD + i0 + e] * Sreg[e];
+#pragma unroll
+                for (int off = 16; off > 0; off >>= 1)
+                    acc += __shfl_xor_sync(0xffffffffu, acc, off);
+                if (lane == 0) {
+                    float mu = 0.0f;
+#pragma unroll
+                    for (int s = 0; s <= t; ++s) mu += s_mqk[t * CHUNK + s] * U[s];
+                    out[((size_t)(t0 + t) * n_head + h) * kD + j] = acc + mu;
+                }
             }
         }
 
-        // S_out[i][j] = S_in[i][j]*exp(g_total[i]) + sum_t k_restored_t[i]*U[t].
-        // Thread j owns the whole physical row j — the same exclusive ownership
-        // kda_decode_step_kernel uses — so the read-modify-write needs no barrier
-        // against other threads; nothing else ever touches this row.
-        for (int i = 0; i < kD; ++i) {
-            float acc = S[(size_t)j * kD + i] * __expf(s_gt[i]);
+        // S[i][j] = S[i][j]*exp(g_total[i]) + sum_t k_restored_t[i]*U[t].
+        // Elementwise in i — no reduction, and it stays in registers.
+#pragma unroll
+        for (int e = 0; e < IPL; ++e) {
+            const int i = i0 + e;
+            float acc = Sreg[e] * __expf(s_gt[i]);
 #pragma unroll
             for (int t = 0; t < CHUNK; ++t) acc += s_kr[t * kD + i] * U[t];
-            S[(size_t)j * kD + i] = acc;
+            Sreg[e] = acc;
         }
-        __syncthreads();   // the shared tile must be fully consumed before the next load
+        __syncthreads();   // the shared tile must be consumed before the next load
     }
+
+    // The state lives in registers for the whole scan; write it back once.
+#pragma unroll
+    for (int e = 0; e < IPL; ++e) Sj[i0 + e] = Sreg[e];
 }
 
 }  // namespace
@@ -397,21 +473,9 @@ bool k3_kda_chunk_prefill(float* out, float* state,
     const size_t n_tiles = (size_t)n_head * n_chunks;
 
     // Stream-ordered workspace: freed on the same stream after K2, so the frees
-    // execute only once the scan has consumed it. ~412 KB per (chunk,head) pair
-    // per 1e3 tiles — at T=2048, n_head=12 that is 1536 tiles = ~13 MB, transient.
-    struct Arena {
-        std::vector<void*> bufs;
-        cudaStream_t s;
-        bool ok = true;
-        template <class E> E* take(size_t count) {
-            if (!ok) return nullptr;
-            void* p = nullptr;
-            if (cudaMallocAsync(&p, count * sizeof(E), s) != cudaSuccess) { ok = false; return nullptr; }
-            bufs.push_back(p);
-            return static_cast<E*>(p);
-        }
-        void free_all() { for (void* b : bufs) cudaFreeAsync(b, s); bufs.clear(); }
-    } arena{{}, stream};
+    // execute only once the scan has consumed it. At T=2048, n_head=12 that is
+    // 1536 tiles x ~26 KB = ~40 MB, transient.
+    Arena arena{{}, stream};
 
     float* ws_kd   = arena.take<float>(n_tiles * WsLayout::kKD);
     float* ws_qd   = arena.take<float>(n_tiles * WsLayout::kQD);
@@ -427,7 +491,11 @@ bool k3_kda_chunk_prefill(float* out, float* state,
                   ws_kd, ws_qd, ws_kr, ws_gt, ws_beta, ws_mqk, ws_inv,
                   q, k, g_raw, beta_logit, A, T, n_head, lower_bound, l2_eps);
 
-    k3_pdl_launch((unsigned)n_head, kD, 0, stream, k3_kda_chunk_scan_kernel,
+    // (n_head, head_dim/JC): the column split that takes K2 off 12 blocks. JC = 4
+    // is the warp-per-column mapping — see the kernel's own note and the measured
+    // occupancy it comes from.
+    dim3 g2((unsigned)n_head, (unsigned)(kD / 4));
+    k3_pdl_launch(g2, kD, 0, stream, k3_kda_chunk_scan_kernel,
                   out, state, v, ws_kd, ws_qd, ws_kr, ws_gt, ws_beta, ws_mqk, ws_inv,
                   T, n_head, n_chunks);
 
