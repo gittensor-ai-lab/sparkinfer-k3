@@ -468,6 +468,34 @@ bool k3_moe_iq1s_mma_gemm(float* C, const signed char* A, const float* sa,
                           const void* W, const int* rows,
                           int M, int N, int K, cudaStream_t stream = nullptr);
 
+// BATCHED Q8_0 PROJECTION: C[M,N] = A[M,K] @ W[N,K]^T, W in Q8_0.
+//
+// The dense counterpart to the expert GEMM above, and the larger half of the
+// problem. k3_proj_f32 takes ONE activation vector, so every dense projection in
+// K3 (attn_q/k/v, ssm_g, attn_output, ffn_routed_down/up, the router, the shared
+// expert, all of MLA's) is a GEMV: it reads a multi-megabyte weight matrix to
+// produce one 7168-float row, at ~2 FLOP per weight byte. Per-token weight traffic
+// splits ~70/30 dense-to-expert — the 896 routed experts are 531 of UD-IQ1_S's
+// 553 GiB but top_k 16 makes them sparse (9.5 GiB/token), while the remaining
+// 22 GiB is read by EVERY token. Unlike the expert side, the dense side amortises
+// at any batch size: M rows share one weight read because every token multiplies
+// the identical matrix.
+//
+// A is int8 with a per-32 scale in `sa` ([M][K/32]) — the SAME format
+// k3_moe_iq1s_mma_quantize_rows emits, and that quantiser is reused rather than
+// duplicated, so the two GEMMs cannot drift on activation handling.
+//
+// No dequantisation happens anywhere: a Q8_0 block is one f16 scale and 32 int8
+// codes (w = d*q), which is exactly mma.m16n8k32.s8's operand with the scale
+// applied at the k=32 drain the instruction already forces. The int8 the tensor
+// core multiplies IS the stored weight.
+//
+// K must be a multiple of 64 (the BK tile); returns false otherwise, and the
+// caller must fall back rather than emit a wrong-shaped result.
+bool k3_proj_q8_mma_gemm(float* C, const signed char* A, const float* sa,
+                         const void* W, int M, int N, int K,
+                         cudaStream_t stream = nullptr);
+
 // BATCHED expert FFN — the consumer that gives the GEMM above an M.
 //
 // The shipped moe_expert_ffn_iq1s_f32 is ONE token against top_k experts, so every
