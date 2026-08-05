@@ -196,6 +196,15 @@ struct KimiK3TP {
     int n_coll_slots = 1;
     std::vector<float*> orig_moe;        // scratch pointer, restored at free
     std::vector<float*> orig_attn;       // same, for the attention partial
+
+    // Prefill tile scratch: the per-rank tile buffers and the per-token residual
+    // banks kimi_k3_tp_prefill needs. Allocated on the first prefill call and
+    // released by kimi_k3_tp_free, so a decode-only run never pays for it.
+    //
+    // Opaque here on purpose. Naming the type would pull the prefill kernels'
+    // header into every translation unit that drives a decode step, and nothing
+    // outside the prefill driver has any business reaching into it.
+    struct K3PrefillPool* prefill = nullptr;
 };
 
 // Load the model once per rank, banding the routed experts. `devices` gives tp_size.
@@ -210,6 +219,25 @@ bool kimi_k3_tp_init(const GGUF& g, const KimiK3Config& cfg, const K3PlanOptions
 // order — the expert partials are reassociated by the reduce, so agreement is to
 // ~1 ulp, not bitwise. kimi_k3_tp_moe_check pins that bound.
 bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits);
+
+// Ingest a prompt, running the LAYER loop outside the TOKEN loop.
+//
+// WHAT THIS CHANGES, AND WHAT IT DOES NOT. Every token still computes exactly what
+// kimi_k3_tp_forward_token would compute for it, in the same order, against the same
+// KV cache and the same KDA recurrence — the inner loop walks tokens in sequence, which
+// is the order those recurrences require. What changes is that T tokens are resident at
+// one layer at a time, so a weight block can be read once and multiplied into T
+// activations instead of being re-streamed from HBM for every token. At ~22 GB of active
+// weights per token per rank that stream IS prefill's cost, which is why prefill tok/s
+// and decode tok/s are the same number today.
+//
+// `out_logits` (cfg.vocab floats) receives the LAST token's logits, so the caller can
+// sample from it exactly as it would after the final forward_token of a per-token loop.
+//
+// Falls back to the per-token path — never fails — for any prompt or geometry outside
+// the tile path's contract, so a caller gets a correct result either way and the only
+// observable difference is how long it took.
+bool kimi_k3_tp_prefill(KimiK3TP& p, const int* ids, int n_ids, float* out_logits);
 
 void kimi_k3_tp_free(KimiK3TP& p);
 

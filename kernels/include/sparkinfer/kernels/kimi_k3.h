@@ -577,6 +577,12 @@ void k3_mla_kv_store_f32(float* cache, const float* kv_cmpr_normed,
 // Advance the device's position, inside the captured region.
 void k3_bump_pos(int* d_pos, cudaStream_t stream);
 
+// The same advance by a signed step, for a driver whose layer loop is outside its
+// token loop: the position walks base..base+T-1 within a layer and has to return to
+// base for the next one. Relative rather than absolute so a captured tile replays at
+// the tile it is running, not the tile it was recorded at.
+void k3_add_pos(int* d_pos, int delta, cudaStream_t stream);
+
 // Same computation over an F16 latent cache — k_cache holds IEEE half rows in
 // the identical [key_length, n_ctx] layout (void* because half is a CUDA type
 // this header keeps out of the runtime's face). Arithmetic is f32; only the

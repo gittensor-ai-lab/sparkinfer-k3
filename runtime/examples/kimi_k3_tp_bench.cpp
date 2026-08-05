@@ -133,6 +133,7 @@ int main(int argc, char** argv) {
     // the accuracy pass WITHOUT these flags.
     int  max_ctx = 64;
     bool do_seek = false;
+    bool do_prefill = false;   // --prefill: ingest via the batched tile driver
     std::vector<int> ids;
     // --checkpoints: dump logits at several DEPTHS of one prompt in a single pass.
     //
@@ -151,6 +152,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--checkpoints") && i + 1 < argc) checkpoints = parse_ids(argv[++i]);
         else if (!std::strcmp(argv[i], "--ctx") && i + 1 < argc) max_ctx = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--seek")) do_seek = true;
+        else if (!std::strcmp(argv[i], "--prefill")) do_prefill = true;
     }
     if (!checkpoints.empty() && !logits_prefix) {
         std::printf("--checkpoints needs --logits-prefix\n");
@@ -259,6 +261,46 @@ int main(int argc, char** argv) {
             return std::chrono::duration<double, std::milli>(
                        std::chrono::steady_clock::now() - t0).count();
         };
+        // --prefill routes ingestion through the batched tile driver instead of the
+        // per-token loop. It is a separate flag rather than the default because the two
+        // must stay comparable on ONE binary: the same build, the same prompt, the same
+        // reference logits, and only the loop order different.
+        //
+        // CHECKPOINTS ARE NOT AVAILABLE ON THIS PATH and that is deliberate rather than
+        // an omission. A checkpoint asks for the logits at depth L, which means running
+        // the head at a token in the middle of a tile; the tile driver runs the head only
+        // for the last token it ingests. Reporting a checkpoint here would either mean a
+        // second head (measuring something the optimisation does not do) or silently
+        // reporting the wrong depth's logits. The final-token logits below ARE produced,
+        // so end-to-end parity against the per-token path is still checkable.
+        if (do_prefill) {
+            if (!checkpoints.empty()) {
+                std::printf("--prefill cannot serve --checkpoints (see the comment)\n");
+                return 1;
+            }
+            const auto t_b0 = std::chrono::steady_clock::now();
+            if (!kimi_k3_tp_prefill(p, ids.data(), (int)ids.size(), logits.data())) {
+                std::printf("prefill failed\n"); return 1;
+            }
+            const double el = std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - t_b0).count();
+            const size_t n = ids.size();
+            std::printf("PREFILL_TOTAL tokens=%zu ms=%.1f tok_s=%.2f ms_per_token=%.3f\n",
+                        n, el, n * 1000.0 / el, el / (double)n);
+            std::fflush(stdout);
+            int best = 0;
+            for (int i = 1; i < cfg.vocab; ++i)
+                if (logits[(size_t)i] > logits[(size_t)best]) best = i;
+            std::printf("argmax next-token id: %d  logit: %.6f\n", best, logits[(size_t)best]);
+            if (logits_path)
+                std::printf("%s %s\n",
+                            write_spkl(logits_path, logits, cfg.vocab) ? "wrote"
+                                                                       : "FAILED to write",
+                            logits_path);
+            kimi_k3_tp_free(p);
+            return 0;
+        }
+
         for (size_t i = 0; i < ids.size(); ++i) {
             if (!kimi_k3_tp_forward_token(p, ids[i], logits.data())) {
                 std::printf("prompt token %zu (id %d) failed\n", i, ids[i]); return 1;

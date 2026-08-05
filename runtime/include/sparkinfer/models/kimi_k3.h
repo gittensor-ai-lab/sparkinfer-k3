@@ -375,6 +375,21 @@ struct KimiK3Forward {
     // kimi_k3_forward_alloc_scratch(); forward_token() assumes they exist.
     struct Scratch;
     Scratch* s = nullptr;
+
+    // PREFILL TILE, or null for decode. When set and its `layer` matches the layer being
+    // run, the KDA q/k/v/g projections have ALREADY been computed for a tile of tokens and
+    // this call takes row `prefill_tok` instead of projecting again.
+    //
+    // Null for every decode call, which is what keeps the decode guard safe by
+    // construction rather than by care: decode never reads these fields, so a bug here
+    // cannot move the 128k number that #132 makes fatal to the whole round.
+    //
+    // The copy this enables is 4 x qkv floats (24 KB at K3's per-rank qkv=1536) against a
+    // projection that streams 1536 x 7168 Q8_0 = ~11.7 MB. Two thousandths of the cost it
+    // replaces, so pointing the layer at the tile row would save nothing worth the aliasing
+    // risk of handing `s.qkv_*` a buffer it does not own.
+    const void* prefill_tile = nullptr;   // K3PrefillTile*, opaque here to avoid the include
+    int prefill_tok = 0;                  // which row of the tile this call is
 };
 
 bool kimi_k3_forward_alloc_scratch(const KimiK3Config& cfg, KimiK3Forward& fwd);

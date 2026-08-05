@@ -1,4 +1,5 @@
 #include "sparkinfer/models/kimi_k3.h"
+#include "sparkinfer/models/kimi_k3_prefill.h"
 
 #include "sparkinfer/kernels/kimi_k3.h"
 #include "sparkinfer/kernels/kimi_k3_fast.h"
@@ -10,6 +11,9 @@
 #include <cstring>
 #include <algorithm>
 #include <cstdlib>
+#include <set>
+#include <mutex>
+#include <utility>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -1272,9 +1276,32 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
         return dag ? Lane{s.lane[i], s.proj_q8_lane[i]} : main_lane;
     };
 
-    auto proj_on = [&](Lane ln, float* y, const float* x, const KimiK3Tensor& W,
-                       int N, int K) {
-        if (!W.ok()) return false;
+    // MEASUREMENT ONLY, and it never ships enabled. SPARKINFER_K3_PROJ_REPEAT=N runs every
+    // Q8_0 projection N times instead of once.
+    //
+    // WHY REPEAT RATHER THAN SKIP. The obvious instrument is to ablate the projections and
+    // take the delta, and it lies: the projections feed the router, so skipping them hands
+    // the MoE dispatch garbage expert ids, which changes how many experts are LOCAL and
+    // therefore how much work the dispatch does. The measurement would move two things and
+    // attribute both to one. Repeating instead recomputes the SAME values into the SAME
+    // buffer -- idempotent, so nothing downstream can tell, routing is untouched, accuracy
+    // is untouched, and the graph still captures because only the launch count changes.
+    //
+    // (N-1) x the delta is the marginal cost of one projection pass, which is exactly the
+    // quantity a batched prefill path would be amortising. It is the number that decides
+    // whether the driver is worth building.
+    static const bool k3_proj_dump = [] {
+        const char* e = std::getenv("SPARKINFER_K3_PROJ_DUMP");
+        return e && e[0] == '1';
+    }();
+    static const int k3_proj_repeat = [] {
+        const char* e = std::getenv("SPARKINFER_K3_PROJ_REPEAT");
+        const int v = e ? std::atoi(e) : 1;
+        return (v >= 1 && v <= 8) ? v : 1;
+    }();
+
+    auto proj_once = [&](Lane ln, float* y, const float* x, const KimiK3Tensor& W,
+                         int N, int K) {
         if (ggml_qact_proj) {
             // SoA-FIRST, restored deliberately: the SoA kernel now carries the
             // one-barrier stash/fold verbatim (P2), so the epilogue confound that
@@ -1293,6 +1320,24 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
                                          ln.q8, ln.st);
         }
         return k3k::k3_proj_f32(y, x, W.data, W.type, N, K, ln.st);
+    };
+    auto proj_on = [&](Lane ln, float* y, const float* x, const KimiK3Tensor& W,
+                       int N, int K) {
+        if (!W.ok()) return false;
+        // MEASUREMENT ONLY. Dump each distinct (N,K) once so the projection microbenchmark
+        // can be run at the shapes the ENGINE actually issues per rank, not at the full
+        // tensor. Getting this wrong once already produced a flattering number.
+        if (k3_proj_dump) {
+            static std::set<std::pair<int,int>> seen;
+            static std::mutex m;
+            std::lock_guard<std::mutex> g(m);
+            if (seen.insert({N, K}).second)
+                std::fprintf(stderr, "[projshape] N=%d K=%d type=%d\n", N, K, W.type);
+        }
+        bool ok = false;
+        for (int rep = 0; rep < k3_proj_repeat; ++rep)
+            ok = proj_once(ln, y, x, W, N, K);
+        return ok;
     };
     auto proj = [&](float* y, const float* x, const KimiK3Tensor& W, int N, int K) {
         return proj_on(main_lane, y, x, W, N, K);
@@ -1472,7 +1517,50 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             // and never quantised in the first place. Measured -233 launches/token/rank
             // against the -462 the arithmetic predicted; this is the missing 69.
             const bool qkvg_pre = (hoisted_src == s.normed);
-            const bool fused_qkvg = fusable &&
+            if (k3_proj_dump) {
+                static bool once = false;
+                if (!once) { once = true;
+                    std::fprintf(stderr, "[projshape] FUSED4 qkvg N=%d K=%d\n", qkv, H); }
+            }
+            // The KDA q/k/v/g group is the largest projection in the model and does NOT go
+            // through proj_on, so the repeat instrument has to reach it here too or it
+            // would price everything except the biggest thing. Same idempotence argument:
+            // the extra passes recompute the same four outputs from the same activation.
+            for (int rep = 1; rep < k3_proj_repeat && fusable && ggml_qact_proj; ++rep)
+                k3k::k3_proj_q8_fused4_1bar(s.qkv_q, s.qkv_k, s.qkv_v, s.g_proj_out,
+                                            s.normed, L.attn_q.data, L.attn_k.data,
+                                            L.attn_v.data, L.ssm_g.data, L.attn_q.type,
+                                            qkv, H, qkvg_pre ? s.act_q8 : s.proj_q8,
+                                            stream, qkvg_pre);
+            // PREFILL TILE HIT. The batched pass already projected this token's q/k/v/g
+            // for this layer, so take the row instead of streaming ~11.7 MB of Q8_0 weights
+            // to recompute it. This is the whole point of the batched path: the weight was
+            // read once for the tile rather than once per token.
+            //
+            // The guards are not paranoia. `pt->layer == layer` catches a tile filled for a
+            // different layer and `prefill_tok < pt->n_live` catches a ragged final tile
+            // read as though it were full; either would produce FLUENT WRONG OUTPUT, which
+            // is the failure this file refuses to ship everywhere else. `pt->qkv == qkv`
+            // catches a shard-width mismatch, which would corrupt silently by copying the
+            // wrong number of floats.
+            bool qkvg_from_tile = false;
+            if (fwd.prefill_tile) {
+                const K3PrefillTile* pt = (const K3PrefillTile*)fwd.prefill_tile;
+                if (pt->layer == layer && pt->qkv == qkv &&
+                    fwd.prefill_tok >= 0 && fwd.prefill_tok < pt->n_live) {
+                    const size_t off = (size_t)fwd.prefill_tok * (size_t)qkv;
+                    const size_t nb  = (size_t)qkv * sizeof(float);
+                    cudaMemcpyAsync(s.qkv_q, pt->q + off, nb, cudaMemcpyDeviceToDevice, stream);
+                    cudaMemcpyAsync(s.qkv_k, pt->k + off, nb, cudaMemcpyDeviceToDevice, stream);
+                    cudaMemcpyAsync(s.qkv_v, pt->v + off, nb, cudaMemcpyDeviceToDevice, stream);
+                    cudaMemcpyAsync(s.g_proj_out, pt->g + off, nb, cudaMemcpyDeviceToDevice, stream);
+                    qkvg_from_tile = true;
+                }
+            }
+            // `||` SHORT-CIRCUITS, and that is load-bearing rather than stylistic: the
+            // right-hand side CALLS the projections. On a tile hit it must not be evaluated
+            // at all, or the work this exists to remove would still be issued.
+            const bool fused_qkvg = qkvg_from_tile || (fusable &&
                 (ggml_qact_proj
                      ? (k3k::k3_proj_q8_fused4_1bar(s.qkv_q, s.qkv_k, s.qkv_v,
                                                     s.g_proj_out, s.normed,
@@ -1490,7 +1578,7 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
                      : k3k::k3_proj_f32_x4(s.qkv_q, s.qkv_k, s.qkv_v, s.g_proj_out,
                                            s.normed, L.attn_q.data, L.attn_k.data,
                                            L.attn_v.data, L.ssm_g.data,
-                                           L.attn_q.type, qkv, H, stream));
+                                           L.attn_q.type, qkv, H, stream)));
             if (!fused_qkvg) {
                 if (!proj_h(s.qkv_q, s.normed, L.attn_q, qkv, H)) return false;
                 if (!proj_h(s.qkv_k, s.normed, L.attn_k, qkv, H)) return false;

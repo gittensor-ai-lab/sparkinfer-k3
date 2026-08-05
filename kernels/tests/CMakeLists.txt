@@ -33,6 +33,15 @@ target_link_libraries(kimi_k3_iq1s_gpu_test PRIVATE si_k3)
 target_include_directories(kimi_k3_iq1s_gpu_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
 add_test(NAME kimi_k3_iq1s_gpu_test COMMAND kimi_k3_iq1s_gpu_test)
 
+# The batched prefill projection against the single-token path it replaces, on device.
+# The CPU order test proves the two loop nests are the same float program; this proves the
+# two IMPLEMENTATIONS agree on hardware -- dp4a, the real block_for tier, the launch
+# geometry and the epilogue, none of which a host simulation reaches.
+add_executable(k3_prefill_proj_gpu_test k3_prefill_proj_gpu_test.cu)
+target_link_libraries(k3_prefill_proj_gpu_test PRIVATE si_k3)
+target_include_directories(k3_prefill_proj_gpu_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
+add_test(NAME k3_prefill_proj_gpu_test COMMAND k3_prefill_proj_gpu_test)
+
 # Row dequant (F32 passthrough + Q8_0), extending dequant_f32_by_type: what
 # token_embd.weight / output.weight lookups need (dequantise one contiguous row,
 # not a reduction). Bit-exact vs a float64 reference for both types.
@@ -71,6 +80,14 @@ add_executable(k3_moe_iq1s_mma_cpu_test k3_moe_iq1s_mma_cpu_test.cpp)
 set_target_properties(k3_moe_iq1s_mma_cpu_test PROPERTIES CXX_STANDARD 17)
 target_include_directories(k3_moe_iq1s_mma_cpu_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
 add_test(NAME k3_moe_iq1s_mma_cpu_test COMMAND k3_moe_iq1s_mma_cpu_test)
+
+# Prefill batching must not perturb the float program: the batched projection's
+# (row, token) cell has to equal what the single-token kernel produces for that token
+# alone. Host-only and exact -- it rebuilds both loop nests rather than calling CUDA,
+# which is what lets it pin block_for against the decode tier without a GPU.
+add_executable(k3_prefill_order_cpu_test k3_prefill_order_cpu_test.cpp)
+set_target_properties(k3_prefill_order_cpu_test PROPERTIES CXX_STANDARD 17)
+add_test(NAME k3_prefill_order_cpu_test COMMAND k3_prefill_order_cpu_test)
 
 foreach(k3t k3_kda_step_gpu_test k3_mla_absorb_gpu_test
             k3_proj_1bar_gpu_test k3_moe_iq1s_mma_gpu_test

@@ -3431,6 +3431,16 @@ __global__ void mla_kv_store_kernel(float* __restrict__ cache,
 // cannot change. k3_read_pos_f32 exists so a test can prove the two never drift.
 __global__ void bump_pos_kernel(int* __restrict__ p) { *p += 1; }
 
+// The same advance by an arbitrary signed step. A tile driver runs the layer loop
+// OUTSIDE the token loop, so within one layer the position walks base..base+T-1 and
+// then has to come back to base for the next layer — which is a -(T-1), not a bump.
+//
+// RELATIVE, and that is the whole reason this is not a `set`. A set would bake the
+// absolute position into the launch, and a captured graph replayed on the next tile
+// would rewind every token to the tile it was recorded at: fluent output, wrong KV
+// rows, invisible to timing. An add is the same instruction on every tile.
+__global__ void add_pos_kernel(int* __restrict__ p, int d) { *p += d; }
+
 // Original single-block norm. Kept as the bit-identical reference path: the sum of
 // squares is partitioned across exactly 128 threads with stride 128, and the apply
 // walk matches. Widening the sum changes that partition and moves KL vs main past the
@@ -4187,6 +4197,11 @@ void k3_mla_kv_store_f32(float* cache, const float* kv_cmpr_normed,
 void k3_bump_pos(int* d_pos, cudaStream_t stream) {
     if (!d_pos) return;
     k3_pdl_launch(1, 1, 0, stream, bump_pos_kernel, d_pos);
+}
+
+void k3_add_pos(int* d_pos, int delta, cudaStream_t stream) {
+    if (!d_pos || delta == 0) return;
+    k3_pdl_launch(1, 1, 0, stream, add_pos_kernel, d_pos, delta);
 }
 
 // TWO LENGTHS, AND THE SPLIT BETWEEN THEM IS THE WHOLE POINT.
