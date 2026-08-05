@@ -140,9 +140,36 @@ per-subsystem budget**. **Two different denominators, and mixing them up is expe
   which was invisible until the frontier passed 2× llama.cpp and then became the whole rule —
   `XL` was costing 9%. The K3 ladder was re-scored from the sealed receipts; see #122.
 
-### The scored context is 128k
+### The scored metric is PREFILL at 32k (from 2026-08-05)
 
-Everything above is measured at **ctx 131,072**, not at short context. Until 2026-08-01 it
+**The tier is earned on prompt ingestion of 32,768 tokens.** Decode at 131,072 is still
+measured every round, but as a **regression guard**, not the tier basis: if your PR drops
+decode more than **1%** below the pinned frontier, the round refuses to score it.
+
+Decode was the right thing to score while sparkinfer was 18× behind llama.cpp there. It is
+now 3.08× ahead, and the untouched gap is ingestion:
+
+| @ 32k | tok/s | |
+|---|--:|---|
+| llama.cpp | **143.88** | batches the prompt |
+| sparkinfer | **40.35** | **3.57× behind** |
+
+There is no batched prefill: every prompt token goes through the single-token decode step,
+so a prompt costs what generating it costs. A 32,768-token prompt takes ~13.5 minutes to
+ingest before the first token appears. That is the work now being paid for.
+
+Two consequences worth knowing before you start:
+
+- **The llama anchor binds here.** The prefill frontier (40.35) is *below* the reference
+  (143.88), so the tier is `delta / 143.88` — you do not get `XL` for improving a weak
+  baseline. Reaching ~66 tok/s earns `XL`; 40.35 → 50 earns `M`.
+- **Decode and prefill share kernels.** Batching the prompt will move decode. The 1% guard
+  bounds how far, and it is a refusal rather than a tier — a prefill gain bought by giving
+  decode back has not moved the engine forward, it has moved work around.
+
+### The decode guard is measured at 128k
+
+Everything about decode is measured at **ctx 131,072**, not at short context. Until 2026-08-01 it
 was not: `kimi_k3_tp_bench` hardcoded `max_ctx=64`, so the `reference.lock` slot said 128,
 this guide said 128k, and the hardware saw 64. Every tier awarded before that came from the
 last of those three.

@@ -1028,10 +1028,22 @@ FRONTIER_TOL = 0.02
 FRONTIER_ALARM = 0.90
 
 
-# The scored context is 131,072, so the frontier lives in the _128K slot. Keep this in step
-# with kimi_k3_eval.sh's CTX_SUFFIX and eval-label.yml's slot(): all three read the same
-# pin, and a mismatch means the bot writes one slot while CI scores from another.
-CTX_SUFFIX = "128K"
+# THE SCORED METRIC IS PREFILL AT 32k (2026-08-05), so the frontier lives in _32K_PP.
+#
+# Decode at 128k is now a REGRESSION GUARD rather than the tier basis. It was the right
+# thing to score while sparkinfer was 18x behind llama.cpp there; at 3.08x ahead the
+# remaining headroom is small, and the untouched gap is prompt ingestion -- 40.35 tok/s
+# against llama.cpp's 143.88, because there is no batched prefill and every prompt token
+# goes through the single-token decode step.
+#
+# KEEP ALL THREE IN STEP: this constant, kimi_k3_eval.sh's CTX_SUFFIX, and eval-label.yml's
+# slot(). A mismatch means the bot writes one slot while CI scores from another, and nothing
+# fails loudly -- the tier is just computed over unrelated numbers. A test asserts they
+# agree, which is how this change was caught mid-flight.
+CTX_SUFFIX = os.environ.get("K3_CTX_SUFFIX", "32K_PP")
+# The guard's slot. Never scored, always measured; the harness refuses a round whose decode
+# fell more than KIMI_K3_DECODE_GUARD_PCT under this.
+DECODE_SUFFIX = os.environ.get("K3_DECODE_SUFFIX", "128K")
 
 
 def _frontier_slot(node, quant):

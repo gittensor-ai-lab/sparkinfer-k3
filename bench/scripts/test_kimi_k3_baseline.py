@@ -1421,8 +1421,9 @@ class CiWorkflowTest(unittest.TestCase):
             self.assertIn(p, bot.NEVER_MERGE_PATHS,
                           f"{p} decides payouts and must block an unreviewed merge")
 
-    def test_scored_context_is_128k_everywhere(self):
-        """The scored context is 131,072, and THREE places have to agree on the slot suffix:
+    def test_scored_slot_agrees_everywhere(self):
+        """The scored metric is PREFILL at 32k (2026-08-05), and THREE places have to agree on
+        the slot suffix:
         the harness that measures, the workflow that re-derives the tier, and the bot that
         writes the frontier back. A mismatch means the bot updates one slot while CI scores
         from another, and nothing fails loudly -- the tier is just computed over unrelated
@@ -1433,24 +1434,43 @@ class CiWorkflowTest(unittest.TestCase):
         context were three different things, and 128k -- the configuration CONTRIBUTING says
         this repo runs -- was never scored at all."""
         bot = self._bot()
-        self.assertEqual(bot.CTX_SUFFIX, "128K")
-        self.assertTrue(bot._frontier_slot("h200x8", "UD-IQ1_S").endswith("_128K"))
+        self.assertEqual(bot.CTX_SUFFIX, "32K_PP")
+        self.assertTrue(bot._frontier_slot("h200x8", "UD-IQ1_S").endswith("_32K_PP"))
         ev = (ROOT / "bench/scripts/kimi_k3_eval.sh").read_text()
-        self.assertIn('SCORED_CTX="${KIMI_K3_SCORED_CTX:-131072}"', ev)
-        self.assertIn('CTX_SUFFIX="${KIMI_K3_CTX_SUFFIX:-128K}"', ev)
-        self.assertIn('--ctx "$SCORED_CTX" --seek', ev,
-                      "the speed pass must run at the scored context")
+        self.assertIn('CTX_SUFFIX="${KIMI_K3_CTX_SUFFIX:-32K_PP}"', ev)
         self.assertIn('SPARKINFER_SCORED_CONTEXT="$SCORED_CTX"', ev,
                       "the verdict must record which context earned it")
         wf = (ROOT / ".github/workflows/eval-label.yml").read_text()
-        self.assertIn('{kind}_128K', wf,
+        self.assertIn('{kind}_32K_PP', wf,
                       "the trusted re-derivation must read the same slot the bot writes")
-        # 128K has to resolve to a context, or a pinned llama reference at it is unverifiable
+        # the suffix has to resolve to a context, or a pinned llama reference at it is
+        # unverifiable by check_reference_lock.py
         import importlib.util as _u
         spec = _u.spec_from_file_location("crl", ROOT / "bench/scripts/check_reference_lock.py")
         crl = _u.module_from_spec(spec)
         spec.loader.exec_module(crl)
-        self.assertEqual(crl.CTX_OF_SUFFIX.get("128K"), 131072)
+        self.assertEqual(crl.CTX_OF_SUFFIX.get("32K_PP"), 32768)
+
+    def test_decode_is_guarded_at_128k_even_though_prefill_is_scored(self):
+        """Prefill and decode share kernels, so batching the prompt WILL move decode. The
+        guard bounds how far, and it is a refusal rather than a tier: a prefill gain bought
+        by giving decode back has not moved the engine forward, it has moved work around.
+
+        1% sits above the worst same-code spread observed between rounds (0.80%: main
+        measured 46.48 then 46.11), so it separates a real regression from box scatter."""
+        ev = (ROOT / "bench/scripts/kimi_k3_eval.sh").read_text()
+        self.assertIn('DECODE_GUARD_PCT="${KIMI_K3_DECODE_GUARD_PCT:-1.0}"', ev)
+        self.assertIn('DECODE_CTX="${KIMI_K3_DECODE_CTX:-131072}"', ev,
+                      "the guard must be applied at 128k, whatever is scored")
+        self.assertIn('--ctx "$DECODE_CTX" --seek', ev,
+                      "the decode pass must run at 128k even when prefill is scored")
+        self.assertIn("decode regressed to", ev, "the guard never refuses")
+        # and the receipt must record that the guard ran, else an inactive guard and a
+        # passing one look identical afterwards
+        self.assertIn('"decode_tps"', ev)
+        self.assertIn('"scored_metric"', ev)
+        bot = self._bot()
+        self.assertEqual(bot.DECODE_SUFFIX, "128K")
 
     def test_accuracy_is_not_measured_at_the_scored_context(self):
         """--seek attends over a ZEROED cache. That is faithful for TIMING (the MLA reduction
@@ -1831,8 +1851,10 @@ class CiWorkflowTest(unittest.TestCase):
                            "without a tolerance the lock is rewritten on pure noise, and "
                            "every commit to main costs every open PR a rebase")
         # only the one node+quant frontier slot is ever addressed
+        # the scored slot moved to prefill @32k on 2026-08-05; decode's _128K slot is still
+        # written, but as the regression guard's baseline rather than the tier basis
         self.assertEqual(bot._frontier_slot("h200x8", "UD-IQ1_S"),
-                         "KIMI_K3_H200X8_IQ1S_SPARKINFER_128K")
+                         "KIMI_K3_H200X8_IQ1S_SPARKINFER_32K_PP")
         self.assertNotIn("LLAMA", bot._frontier_slot("h200x8", "UD-IQ1_S"),
                          "the llama reference is a real external constant — never rewritten")
         rec = src[src.index("def reconcile_lock("):src.index("def evaluate(")]

@@ -187,6 +187,25 @@ KIMI_K3_H200X8_IQ1S_LLAMA_128K="${KIMI_K3_H200X8_IQ1S_LLAMA_128K:-18.4435}"
 # frontier: measured by eval/k3_eval_bot.py on main @ de47bfe168d1 (h200x8, UD-IQ1_S). Do not hand-edit — the bot rewrites this each round.
 KIMI_K3_H200X8_IQ1S_SPARKINFER_128K="${KIMI_K3_H200X8_IQ1S_SPARKINFER_128K:-46.48}"
 
+# ---- PREFILL @ 32k — the SCORED metric from 2026-08-05 -----------------------------------
+#
+# Decode at 128k is now a REGRESSION GUARD, not the tier basis. It was the right thing to
+# score while sparkinfer was 18x behind llama.cpp there; at 3.08x ahead the remaining
+# headroom is small, and the untouched gap is prompt ingestion.
+#
+# THERE IS NO BATCHED PREFILL. Every prompt token goes through the single-token decode step,
+# so a prompt costs what generating it costs: 32,768 tokens took 812.2 s wall clock on
+# main @ 3b6a3f4 (40.35 tok/s), against decode's ~56.8 tok/s. Ingesting is not faster than
+# generating, which is the whole opportunity.
+#
+# llama.cpp reference: llama-bench -p 32768 -n 0 -r 3 -ngl 999 on this node and this GGUF,
+# 143.88 +/- 0.23 tok/s (+/-0.16%). It batches the prompt and we do not, so it is 3.57x
+# faster here while being 3.08x slower at decode.
+KIMI_K3_H200X8_IQ1S_LLAMA_32K_PP="${KIMI_K3_H200X8_IQ1S_LLAMA_32K_PP:-143.88}"
+# frontier: rewritten by eval/k3_eval_bot.py each round, raise-only. Do not hand-edit.
+# Seeded from the 812.2 s / 32,768-token measurement on main @ 3b6a3f4.
+KIMI_K3_H200X8_IQ1S_SPARKINFER_32K_PP="${KIMI_K3_H200X8_IQ1S_SPARKINFER_32K_PP:-40.35}"
+
 KIMI_K3_H200X8_LLAMA_128="${KIMI_K3_H200X8_LLAMA_128:-0}"
 KIMI_K3_H200X8_LLAMA_512="${KIMI_K3_H200X8_LLAMA_512:-0}"
 KIMI_K3_H200X8_LLAMA_4K="${KIMI_K3_H200X8_LLAMA_4K:-0}"
