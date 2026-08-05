@@ -80,7 +80,7 @@ void bench(const char* name, int census_count, F&& launch) {
     const double us = (double)ms * 1000.0 / iters;
 
     results.push_back({name, census_count, us});
-    std::printf("  %-42s %7.2f us x %4d = %8.1f us/token\n",
+    std::printf("  %-52s %7.2f us x %4d = %8.1f us/token\n",
                 name, us, census_count, us * census_count);
     cudaEventDestroy(a);
     cudaEventDestroy(b);
@@ -299,6 +299,91 @@ int main() {
                                                1.0f, 1.0f, 19, s, 0, NLOCAL, q8k);
                 });
             }
+        }
+    }
+
+    // THE Q8_0 PROJECTIONS — ~675 on-path launches and, until now, the largest block of
+    // the token never measured. Everything else benched here sums to ~8.2 ms against a
+    // 21.4 ms token, so most of the decode is hiding in this family.
+    //
+    // Shapes are read off the census rather than guessed: proj_q8_multirow_1bar's grid is
+    // N/ROWS, so <128,16> at 448..2112 blocks is N = 7168..33792, <32,1> at 1536 blocks is
+    // N = 1536 (this rank's KDA qkv), <128,8> at 448 blocks is N = 3584 (expert latent).
+    // K is 7168 (hidden) for all of them.
+    {
+        // SHAPES FROM THE CALL SITES, not from the census grid alone.
+        //
+        // The census gives N (grid = N/ROWS) but says nothing about K, and assuming
+        // K = 7168 for all of them timed a weight matrix 2-4x larger than the real one.
+        // kimi_k3.cpp is the authority:
+        //   proj(attn_out, gate_out, attn_output,   H, qkv)            N=7168 K=1536
+        //   proj(ffn_out,  moe_out,  ffn_routed_up, H, expert_latent)  N=7168 K=3584
+        //   proj_h(qkv_q,  normed,   attn_q,        qkv, H)            N=1536 K=7168
+        //   proj_h(router_logits, normed2, ffn_gate_inp, n_experts, H) N=896  K=7168
+        struct Shape { int n; int k; int count; const char* what; };
+        const Shape shapes[] = {
+            {1536, 7168,  69, "KDA qkv        (attn_q/k/v/ssm_g)"},
+            {7168, 1536,  69, "KDA attn_output"},
+            {7168, 3584,  92, "ffn_routed_up  (MoE -> hidden)"},
+            {3584, 7168,  92, "expert latent  (hidden -> MoE)"},
+            { 896, 7168,  92, "router logits"},
+        };
+        std::printf("\n[Q8_0 projections] shapes read off the CALL SITES\n");
+        for (const auto& sh : shapes) {
+            void* q8act = nullptr;
+            CU(cudaMalloc(&q8act, k3_q8_0_bytes(sh.k) + 64));
+            CU(cudaMemset(q8act, 0x11, k3_q8_0_bytes(sh.k)));
+            const size_t wbytes = (size_t)sh.n * k3_q8_0_bytes(sh.k);
+            void* W = nullptr;
+            if (cudaMalloc(&W, wbytes) != cudaSuccess) {
+                std::printf("  %-34s SKIPPED (%.2f GiB)\n", sh.what,
+                            (double)wbytes / (1 << 30));
+                cudaFree(q8act);
+                continue;
+            }
+            CU(cudaMemset(W, 0x22, wbytes));
+            float* yv = dev_rand((size_t)sh.n, 40 + (unsigned)sh.n % 97);
+            char label[110];
+            // Print the ROOFLINE beside the measurement: these are pure streaming reads of
+            // Q8_0 weights, so bytes/4.8 TB/s is a hard floor and the ratio to it is the
+            // only thing that says whether a shape is worth attacking.
+            const double roof_us = (double)wbytes / 4.8e12 * 1e6;
+            // Print CTAs alongside, because that is the variable that turned out to
+            // track achieved bandwidth. The row budget picks ROWS to hit 1792 warps,
+            // which at 4 warps/CTA is only 448 CTAs for N=7168 -- against ~1188 that
+            // registers would allow (56 regs, zero spills) and the 4096 a standalone
+            // read of this same layout needed to reach 4.05 TB/s.
+            const int rows_guess = sh.n >= 4096 ? 16 : sh.n >= 2048 ? 8 : 4;
+            std::snprintf(label, sizeof label, "%s N=%d K=%d [roof %.1fus ~%dCTA]",
+                          sh.what, sh.n, sh.k, roof_us, sh.n / rows_guess);
+            // CALL WHAT THE DECODE CALLS. proj_on() in kimi_k3.cpp tries
+            // k3_proj_q8_multirow_1bar FIRST and only falls back to the q8act path when
+            // that declines (N < 1024). Benching k3_proj_q8act_f32 for every shape timed
+            // proj_q8_0_q8_0_kernel instead of proj_q8_multirow_1bar for three of the five
+            // -- a different kernel with a different tier ladder, which is why a sweep of
+            // SPARKINFER_K3_PROJ_TB moved nothing: the override governs a kernel the bench
+            // was not running.
+            float* xf = dev_rand((size_t)sh.k, 700 + (unsigned)sh.k % 91);
+            const bool multirow =
+                k3_proj_q8_multirow_1bar(yv, xf, W, 8, sh.n, sh.k, q8act, 0);
+            CU(cudaDeviceSynchronize());
+            if (multirow) {
+                bench(label, sh.count, [&](cudaStream_t s2){
+                    k3_proj_q8_multirow_1bar(yv, xf, W, 8, sh.n, sh.k, q8act, s2);
+                });
+            } else {
+                char lab2[128];
+                std::snprintf(lab2, sizeof lab2, "%s [q8act fallback]", label);
+                bench(lab2, sh.count, [&](cudaStream_t s2){
+                    k3_proj_q8act_f32(yv, q8act, W, 8, sh.n, sh.k, s2);
+                });
+            }
+            std::printf("      -> %.2f TB/s achieved (layout reads 4.05 TB/s standalone)\n",
+                        (double)wbytes / (results.back().us * 1e-6) / 1e12);
+            cudaFree(xf);
+            cudaFree(W);
+            cudaFree(yv);
+            cudaFree(q8act);
         }
     }
 

@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>   // uintptr_t — the float4-alignment test in the MoE dispatch
+#include <type_traits>  // is_same — the MLA latent arm is __half-only
 
 namespace sparkinfer {
 namespace kernels {
@@ -2130,7 +2131,7 @@ __global__ void mla_decode_attn_split_kernel(float* __restrict__ part_acc,
 // Unrolling changes issue order, never arithmetic order, so this is bit-identical by
 // construction rather than by tolerance — and the bench asserts it word-for-word.
 template <int BLOCK, int HPB, int RSLOTS, typename KV, int TPW = kMlaTokensPerWarp,
-          int UT = 4, int UD = 2>
+          int UT = 4, int UD = 2, int PT = 0>
 __global__ void mla_decode_attn_hbatch_kernel(float* __restrict__ part_acc,
                                               float* __restrict__ part_ml,
                                               const float* __restrict__ q,
@@ -2138,6 +2139,11 @@ __global__ void mla_decode_attn_hbatch_kernel(float* __restrict__ part_acc,
                                               int key_length, int kv_lora,
                                               const int* __restrict__ d_pos,
                                               float scale, int splits) {
+    // The PT arm walks the latent row as __half2 with r = 2*tid, so it is only
+    // instantiable where two halves per thread cover kv_lora exactly. The launcher
+    // checks the runtime half of that (kv_lora == 2 * BLOCK) before selecting it.
+    static_assert(PT == 0 || (RSLOTS == 2 && std::is_same<KV, __half>::value),
+                  "the PT latent arm needs a __half cache and kv_lora == 2 * BLOCK");
     k3_pdl_sync();
     // Device-read length; see mla_decode_attn_kernel.
     const int n_ctx = *d_pos + 1;   // d_pos is the ROW INDEX; the length is one more
@@ -2272,6 +2278,70 @@ __global__ void mla_decode_attn_hbatch_kernel(float* __restrict__ part_acc,
 #pragma unroll
             for (int hh = 0; hh < HPB; ++hh) acc[u][hh] *= s_c[hh];
 
+        if constexpr (PT > 0) {
+            // STAGE PT TOKENS OF s_p AT ONCE.
+            //
+            // `t` is warp-uniform, so `s_p[hh * kMlaCtxTile + t]` is a BROADCAST: it
+            // returns 4 useful bytes and still occupies the shared unit for a full
+            // cycle. At HPB 12 that is twelve of them per token, issued by all eight
+            // warps, and the whole latent phase only has 24 FFMA per token to hide them
+            // behind. Reading PT consecutive t per head instead lets the compiler fold
+            // them into LDS.128s — the values are contiguous in t and kMlaCtxTile keeps
+            // the base 16-byte aligned — which is a quarter of the instructions for the
+            // same bytes. Measured on one H200 at the scored shape, kernel alone, mean
+            // of 20 interleaved passes, every arm verified bit-identical to PT 0:
+            //
+            //   PT     ms      vs PT 0
+            //    0    0.197    1.000x   <- shipped
+            //    1    0.202    0.977x   <- half2 cache load ALONE, without the staging
+            //    2    0.214    0.922x
+            //    4    0.189    1.045x
+            //    8    0.177    1.116x
+            //   16    0.172    1.150x
+            //   32    0.170    1.159x   <- taken
+            //   64    0.170    1.159x   <- saturated
+            //
+            // PT 1 isolates the other half of this arm — the half2 cache load — and it
+            // is a small LOSS on its own, so the staging is the whole of the win and
+            // the wider load is along for the ride. p[HPB][PT] does not survive as
+            // registers at PT 32 and is not meant to; ptxas still reports 128, the same
+            // count and the same two blocks per SM as the shipped kernel.
+            const int r2 = threadIdx.x;
+            int t = 0;
+            for (; t + PT <= tn; t += PT) {
+                float p[HPB][PT];
+#pragma unroll
+                for (int hh = 0; hh < HPB; ++hh) {
+                    const float* srcp = s_p + hh * kMlaCtxTile + t;
+#pragma unroll
+                    for (int tt = 0; tt < PT; ++tt) p[hh][tt] = srcp[tt];
+                }
+#pragma unroll
+                for (int tt = 0; tt < PT; ++tt) {
+                    const __half2* kt2 = reinterpret_cast<const __half2*>(
+                        k_cache + (size_t)(t0 + t + tt) * key_length);
+                    const float2 kv = __half22float2(kt2[r2]);
+#pragma unroll
+                    for (int hh = 0; hh < HPB; ++hh) {
+                        acc[0][hh] += p[hh][tt] * kv.x;
+                        acc[1][hh] += p[hh][tt] * kv.y;
+                    }
+                }
+            }
+            for (; t < tn; ++t) {
+                float p[HPB];
+#pragma unroll
+                for (int hh = 0; hh < HPB; ++hh) p[hh] = s_p[hh * kMlaCtxTile + t];
+                const __half2* kt2 = reinterpret_cast<const __half2*>(
+                    k_cache + (size_t)(t0 + t) * key_length);
+                const float2 kv = __half22float2(kt2[r2]);
+#pragma unroll
+                for (int hh = 0; hh < HPB; ++hh) {
+                    acc[0][hh] += p[hh] * kv.x;
+                    acc[1][hh] += p[hh] * kv.y;
+                }
+            }
+        } else {
 #pragma unroll UT
         for (int t = 0; t < tn; ++t) {
             const KV* kt = k_cache + (size_t)(t0 + t) * key_length;
@@ -2288,10 +2358,21 @@ __global__ void mla_decode_attn_hbatch_kernel(float* __restrict__ part_acc,
                 }
             }
         }
+        }
         __syncthreads();
     }
 
     // UNNORMALISED partials, one (head, slice) row each — the combine applies 1/l.
+    // The PT arm holds r = 2*tid and 2*tid+1 rather than tid and tid+BLOCK, so it
+    // writes the pair as one float2. Which THREAD owns an r moved; which VALUE lands
+    // at an r did not, and the epilogue moves with the loop.
+    if constexpr (PT > 0) {
+#pragma unroll
+        for (int hh = 0; hh < HPB; ++hh) {
+            float* row = part_acc + ((size_t)(h0 + hh) * splits + sp) * kv_lora;
+            reinterpret_cast<float2*>(row)[threadIdx.x] = make_float2(acc[0][hh], acc[1][hh]);
+        }
+    } else {
 #pragma unroll
     for (int u = 0; u < RSLOTS; ++u) {
         const int r = threadIdx.x + u * BLOCK;
@@ -2299,6 +2380,7 @@ __global__ void mla_decode_attn_hbatch_kernel(float* __restrict__ part_acc,
 #pragma unroll
             for (int hh = 0; hh < HPB; ++hh)
                 part_acc[((size_t)(h0 + hh) * splits + sp) * kv_lora + r] = acc[u][hh];
+    }
     }
     if (threadIdx.x < HPB) {
         // An empty slice (n_ctx < splits) must contribute nothing: l = 0 and a very
@@ -3102,6 +3184,7 @@ void kda_decode_step_f32(float* out, float* state,
         const char* e = std::getenv("SPARKINFER_K3_KDA_VT");
         return !(e && e[0] == '0');
     }();
+
     if (want_vt && head_dim == SMEM_BLOCK && head_dim % IC == 0 && head_dim % BV == 0) {
         const size_t shm_vt =
             ((size_t)3 * head_dim + (size_t)BV * (IC + 1)) * sizeof(float);
@@ -3803,6 +3886,35 @@ static void mla_decode_attn_launch(float* out, const float* q, const KV* k_cache
             const char* e = std::getenv("SPARKINFER_K3_MLA_UNROLL");
             return !(e && e[0] == '0');
         }();
+        // THE LATENT PHASE'S SHARED READS ARE BROADCASTS AND THERE ARE HPB PER TOKEN.
+        //
+        // Staging PT of them at a time lets the compiler issue LDS.128 instead — the
+        // table on the kernel prices it at 1.159x. It rides the same instantiation as
+        // the deep unroll because it needs the same two facts to hold, plus one the
+        // runtime alone knows: the half2 walk assumes two halves per thread cover
+        // kv_lora exactly, so 2 * BLOCK must equal it, and the cache must be __half.
+        // Anything else falls through to PT 0, which is the shipped loop unchanged —
+        // an unspecialised shape is slower and never wrong.
+        //
+        // SPARKINFER_K3_MLA_PT=0 restores the shipped latent loop on the SAME binary,
+        // so the ablation does not need a second build. Default ON: the harness scores
+        // a default build.
+        static const bool latent_stage = [] {
+            const char* e = std::getenv("SPARKINFER_K3_MLA_PT");
+            return !(e && e[0] == '0');
+        }();
+        if constexpr (std::is_same<KV, __half>::value) {
+            if (deep_unroll && latent_stage && hpb == 12 && rslots == 2 &&
+                kv_lora == 2 * BLOCK) {
+                k3_pdl_launch(hgrid, BLOCK, hshm, stream,
+                              mla_decode_attn_hbatch_kernel<BLOCK, 12, 2, KV, kMlaTokensPerWarp, 8, 6, 32>,
+                              g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length,
+                              kv_lora, d_pos, scale, splits);
+                k3_mla_launch_combine<BLOCK>(out, dev, wv_b, n_head, kv_lora, v_dim,
+                                             splits, stream);
+                return;
+            }
+        }
         if (deep_unroll && hpb == 12 && rslots == 2) {
             k3_pdl_launch(hgrid, BLOCK, hshm, stream,
                           mla_decode_attn_hbatch_kernel<BLOCK, 12, 2, KV, kMlaTokensPerWarp, 8, 6>,
