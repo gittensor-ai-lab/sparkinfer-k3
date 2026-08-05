@@ -895,6 +895,25 @@ struct KimiK3Forward::Scratch {
     // main + 2. They are created ONCE per rank, on the rank's device, because a
     // stream created inside a capture is not capturable and one created per token
     // would be a per-token cudaStreamCreate on the critical path.
+    // ---- token slices -------------------------------------------------------
+    //
+    // A chunk needs B of every per-token buffer, and hand-picking which ones is how the
+    // first attempt at this went wrong: `mixed` and `normed` are read again AFTER the
+    // projection, so a batching that only sliced the obvious four handed every token the
+    // last token's residual. Slicing the WHOLE scratch removes the judgement call — there
+    // is no buffer left to forget.
+    //
+    // Each entry is (the field, its base, one token's stride). aim_token walks the table
+    // and repoints every field at slice b: host pointer arithmetic only, so it is legal
+    // inside a graph capture and deterministic per (layer, phase, b).
+    //
+    // A slab per field rather than B whole Scratch objects, because slicing in place keeps
+    // the aliasing inside Scratch intact (moe_fused/moe_out/shexp_out are one allocation)
+    // and hands a batched kernel a contiguous [B][n] with no gather.
+    struct Slice { void** field; void* base; size_t stride; };
+    std::vector<Slice> slices;
+    int batch_n = 1;
+
     static constexpr int kLanes = 2;
     cudaStream_t lane[kLanes] = {nullptr, nullptr};
     cudaEvent_t  ev_fork = nullptr;              // main -> lanes
@@ -998,31 +1017,42 @@ bool kimi_k3_forward_alloc_proj_batch(const KimiK3Config& cfg, KimiK3Forward& fw
     return true;
 }
 
-bool kimi_k3_forward_alloc_scratch(const KimiK3Config& cfg, KimiK3Forward& fwd) {
+bool kimi_k3_forward_alloc_scratch_n(const KimiK3Config& cfg, KimiK3Forward& fwd,
+                                    int batch_n) {
+    if (batch_n < 1) batch_n = 1;
     fwd.s = new KimiK3Forward::Scratch();
     auto& s = *fwd.s;
+    s.batch_n = batch_n;
     const int H = cfg.hidden;
     const int qkv = cfg.n_q_heads * cfg.kda_head_dim;
     const int qh = cfg.n_q_heads;
     const int qk_nope = cfg.key_length_mla - cfg.rope_dim;
 
+    // batch_n == 1 takes the same branch with a stride nothing ever uses, so decode
+    // allocates byte-for-byte what it always did.
+    auto rec = [&](void** field, void* base, size_t stride) {
+        if (batch_n > 1) s.slices.push_back({field, base, stride});
+    };
     auto alloc_f = [&](float*& ptr, size_t n) {
         void* p = nullptr;
-        if (cudaMalloc(&p, n * sizeof(float)) != cudaSuccess) return false;
+        if (cudaMalloc(&p, n * (size_t)batch_n * sizeof(float)) != cudaSuccess) return false;
         s.owned.push_back(p);
         ptr = (float*)p;
+        rec((void**)&ptr, p, n * sizeof(float));
         return true;
     };
     auto alloc_i = [&](int*& ptr, size_t n) {
         void* p = nullptr;
-        if (cudaMalloc(&p, n * sizeof(int)) != cudaSuccess) return false;
+        if (cudaMalloc(&p, n * (size_t)batch_n * sizeof(int)) != cudaSuccess) return false;
         s.owned.push_back(p);
         ptr = (int*)p;
+        rec((void**)&ptr, p, n * sizeof(int));
         return true;
     };
     auto alloc_bytes = [&](void*& ptr, size_t n) {
-        if (n == 0 || cudaMalloc(&ptr, n) != cudaSuccess) return false;
+        if (n == 0 || cudaMalloc(&ptr, n * (size_t)batch_n) != cudaSuccess) return false;
         s.owned.push_back(ptr);
+        rec(&ptr, ptr, n);
         return true;
     };
 
@@ -1134,6 +1164,37 @@ bool kimi_k3_forward_alloc_scratch(const KimiK3Config& cfg, KimiK3Forward& fwd) 
     }
     lok &= cudaEventCreateWithFlags(&s.ev_fork, cudaEventDisableTiming) == cudaSuccess;
     s.lanes_ok = lok;
+    return true;
+}
+
+// The single-token allocator every existing caller uses. batch_n 1 records no slices and
+// allocates exactly what it always did, so decode is untouched by construction.
+bool kimi_k3_forward_alloc_scratch(const KimiK3Config& cfg, KimiK3Forward& fwd) {
+    return kimi_k3_forward_alloc_scratch_n(cfg, fwd, 1);
+}
+
+int kimi_k3_forward_batch_n(const KimiK3Forward& fwd) {
+    return fwd.s ? fwd.s->batch_n : 1;
+}
+
+// Repoint every sliced field at token b. Host pointer arithmetic only — no launch, no
+// allocation, no stream work — so it is legal inside a graph capture and gives the same
+// pointers for the same (layer, phase, b) on every replay.
+//
+// Refuses out of range rather than clamping: continuing would run token b's phases against
+// token 0's buffers, which is fluent and wrong rather than loud.
+bool kimi_k3_forward_aim_token(KimiK3Forward& fwd, int b) {
+    if (!fwd.s) return false;
+    auto& s = *fwd.s;
+    if (b < 0 || b >= s.batch_n) return false;
+    if (s.batch_n == 1) return b == 0;
+    for (const auto& sl : s.slices)
+        *sl.field = (void*)((char*)sl.base + (size_t)b * sl.stride);
+    // The MoE trio is ONE allocation read three ways, so it is re-derived rather than
+    // sliced: moe_out is the base and shexp_out sits expert_latent floats into it. Slicing
+    // them independently would break that aliasing.
+    s.moe_out   = s.moe_fused;
+    s.shexp_out = s.moe_fused + fwd.cfg->expert_latent;
     return true;
 }
 

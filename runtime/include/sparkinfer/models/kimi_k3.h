@@ -402,6 +402,22 @@ bool k3_routed_up_band_enabled();
 bool kimi_k3_forward_alloc_proj_batch(const KimiK3Config& cfg, KimiK3Forward& fwd, int n_tok);
 
 bool kimi_k3_forward_alloc_scratch(const KimiK3Config& cfg, KimiK3Forward& fwd);
+
+// Allocate every scratch buffer batch_n times as contiguous [batch_n][n] slabs, so a chunk
+// has one slice per token. batch_n <= 1 is byte-for-byte the single-token allocator.
+//
+// Slicing ALL of scratch rather than a chosen few is the point: `mixed` and `normed` are
+// read again after the projection, so a partial slicing silently hands every token the last
+// token's residual. There is no buffer left to forget.
+bool kimi_k3_forward_alloc_scratch_n(const KimiK3Config& cfg, KimiK3Forward& fwd,
+                                     int batch_n);
+
+// Repoint every sliced field at token b. Host pointer arithmetic only, so it is legal
+// inside a graph capture and deterministic per (layer, phase, b). False for b out of range.
+bool kimi_k3_forward_aim_token(KimiK3Forward& fwd, int b);
+
+// How many slices this scratch was allocated for (1 when not batched).
+int  kimi_k3_forward_batch_n(const KimiK3Forward& fwd);
 void kimi_k3_forward_free_scratch(KimiK3Forward& fwd);
 
 // Run one decode step. `out_logits` is host-visible (a cudaMemcpy is done into it)
