@@ -2100,7 +2100,7 @@ class CiWorkflowTest(unittest.TestCase):
             
             | | before (main) | after (this PR) |
             |---|--:|--:|
-            | prefill @ 32k | 40.35 | 50.60 |
+            | prefill @ 32k | 53.02 | 62.00 |
             | decode @ 128k | 56.82 | 56.79 |
             ## Checklist
             - [x] `bench/scripts/kimi_k3_baseline.sh --node h200x8 --dry-run` resolves
@@ -3041,7 +3041,7 @@ class CiWorkflowTest(unittest.TestCase):
                 "- [x] **Prefill measured at 32k** on 8× H200\n"
                 "- [x] **No 128k decode regression** on 8× H200\n"
                 "\n| | before (main) | after (this PR) |\n|---|--:|--:|\n"
-                "| prefill @ 32k | 40.35 | 50.60 |\n"
+                "| prefill @ 32k | 53.02 | 62.00 |\n"
                 "| decode @ 128k | 56.82 | 56.79 |\n")
         calls = []
 
@@ -3261,7 +3261,7 @@ class CiWorkflowTest(unittest.TestCase):
             
             | | before (main) | after (this PR) |
             |---|--:|--:|
-            | prefill @ 32k | 40.35 | 50.60 |
+            | prefill @ 32k | 53.02 | 62.00 |
             | decode @ 128k | 56.82 | 56.79 |
         """)
         pr = lambda **kw: {"isDraft": False, "labels": [], "body": body, **kw}
@@ -3295,7 +3295,7 @@ class CiWorkflowTest(unittest.TestCase):
                 "- [x] **Prefill measured at 32k** on 8× H200\n"
                 "- [x] **No 128k decode regression** on 8× H200\n"
                 "\n| | before (main) | after (this PR) |\n|---|--:|--:|\n"
-                "| prefill @ 32k | 40.35 | 50.60 |\n"
+                "| prefill @ 32k | 53.02 | 62.00 |\n"
                 "| decode @ 128k | 56.82 | 56.79 |\n")
         ok, _ = bot.eligibility({"isDraft": False, "body": body,
                                  "labels": [{"name": "needs-rebase"}]})
@@ -3851,7 +3851,7 @@ class PrefillAttestationTest(unittest.TestCase):
         way an author who actually ran it would."""
         sec = (self._template_section().replace("- [ ]", "- [x]")
                + "\n| | before (main) | after (this PR) |\n|---|--:|--:|\n"
-                 "| prefill @ 32k | 40.35 | 50.60 |\n"
+                 "| prefill @ 32k | 53.02 | 62.00 |\n"
                  "| decode @ 128k | 56.82 | 56.79 |\n")
         ok, why = self._bot().eligibility(self._pr(sec))
         self.assertTrue(ok, why)
@@ -3930,7 +3930,7 @@ class AttestationNeedsEvidenceTest(unittest.TestCase):
 
     def test_measured_numbers_are_eligible(self):
         t = ("\n| | before (main) | after (this PR) |\n|---|--:|--:|\n"
-             "| prefill @ 32k | 40.35 | **50.60** |\n"
+             "| prefill @ 32k | 53.02 | **62.00** |\n"
              "| decode @ 128k | 56.82 | 56.79 |\n")
         ok, why = self._bot().eligibility(self._pr(t))
         self.assertTrue(ok, why)
@@ -3950,7 +3950,7 @@ class AttestationNeedsEvidenceTest(unittest.TestCase):
         the box says the regression was checked on 8x H200, and the guard exists precisely
         because prefill and decode share kernels."""
         t = ("\n| | before (main) | after (this PR) |\n|---|--:|--:|\n"
-             "| prefill @ 32k | 40.35 | 50.60 |\n"
+             "| prefill @ 32k | 53.02 | 62.00 |\n"
              "| decode @ 128k | 56.82 | **no change — no decode path is touched** |\n")
         ok, why = self._bot().eligibility(self._pr(t))
         self.assertFalse(ok)
@@ -3960,7 +3960,7 @@ class AttestationNeedsEvidenceTest(unittest.TestCase):
     def test_the_after_column_is_found_by_header_not_position(self):
         """#133 adds a delta column, so the measured value is not the last cell."""
         t = ("\n| | before (main) | after (this PR) | delta |\n|---|--:|--:|--:|\n"
-             "| prefill @ 32k | **53.14** | **53.20** | +0.11% |\n"
+             "| prefill @ 32k | **53.02** | **62.00** | +16.9% |\n"
              "| decode @ 128k | **56.81** | **56.80** | -0.02% |\n")
         ok, why = self._bot().eligibility(self._pr(t))
         self.assertTrue(ok, why)
@@ -4004,3 +4004,66 @@ class StaleFrontierNoticeTest(unittest.TestCase):
         lock = (ROOT / "bench/scripts/reference.lock").read_text()
         self.assertIn("a169ff4", lock, "the real measurement commit is not recorded")
         self.assertIn("53.02", lock)
+
+
+class ClaimMustBeatTheFrontierTest(unittest.TestCase):
+    """A round costs ~25 GPU-minutes per PR. If the number an author reports would not score
+    even if it were exact, the node has nothing to learn by re-deriving it -- and the author
+    already knows, because they measured it.
+
+    #135 is the case: 50.60 honestly measured, correctly reported, and 4.6% BELOW the 53.02
+    frontier it has to beat. Measuring it can only confirm what its own table says."""
+
+    def _bot(self):
+        import importlib.util as u
+        s = u.spec_from_file_location("b", str(ROOT / "eval/k3_eval_bot.py"))
+        m = u.module_from_spec(s); s.loader.exec_module(m); return m
+
+    TICKS = ("- [x] Tested on **8x H200** (`sm_90`)\n"
+             "- [x] **Prefill measured at 32k** on 8x H200\n"
+             "- [x] **No 128k decode regression** on 8x H200\n")
+
+    def _pr(self, prefill, decode=56.79):
+        tbl = ("\n| | before (main) | after (this PR) |\n|---|--:|--:|\n"
+               f"| prefill @ 32k | 53.02 | {prefill} |\n"
+               f"| decode @ 128k | 56.82 | {decode} |\n")
+        return {"body": "## Node run\n" + self.TICKS + tbl + "\n## Checklist\n",
+                "labels": [], "isDraft": False, "mergeable": "MERGEABLE",
+                "isCrossRepository": False, "author": {"login": "x"}, "number": 1,
+                "title": "perf(k3): x", "headRefOid": "a" * 40}
+
+    def test_the_pin_is_read_from_the_lock(self):
+        bot = self._bot()
+        slot = bot._frontier_slot("h200x8", "UD-IQ1_S")
+        self.assertTrue(slot.endswith("_32K_PP"))
+        self.assertGreater(bot.pinned_frontier(slot), 0)
+
+    def test_a_claim_that_clears_the_gate_is_evaluated(self):
+        bot = self._bot()
+        pin = bot.pinned_frontier(bot._frontier_slot("h200x8", "UD-IQ1_S"))
+        ok, why = bot.eligibility(self._pr(round(pin * 1.10, 2)))
+        self.assertTrue(ok, why)
+
+    def test_a_claim_below_the_frontier_is_not_worth_the_node(self):
+        """#135's shape."""
+        bot = self._bot()
+        pin = bot.pinned_frontier(bot._frontier_slot("h200x8", "UD-IQ1_S"))
+        ok, why = bot.eligibility(self._pr(round(pin * 0.95, 2)))
+        self.assertFalse(ok)
+        self.assertIn("does not beat", why)
+        self.assertIn("-5.0%", why)
+
+    def test_a_claim_inside_the_significance_gate_is_not_worth_the_node(self):
+        """#133's shape: honestly flat, and flat cannot score."""
+        bot = self._bot()
+        pin = bot.pinned_frontier(bot._frontier_slot("h200x8", "UD-IQ1_S"))
+        ok, why = bot.eligibility(self._pr(round(pin * 1.002, 2)))
+        self.assertFalse(ok, "a flat claim still booked the node")
+        self.assertIn("significance gate", why)
+
+    def test_the_gate_matches_label_pys_significance_threshold(self):
+        """Skipping on anything label.py would still score would silently narrow the loop."""
+        bot = self._bot()
+        lab = (ROOT / "bench/scripts/label.py").read_text()
+        self.assertIn("SIG = 0.02", lab)
+        self.assertEqual(bot.CLAIM_SIG, 0.02)
