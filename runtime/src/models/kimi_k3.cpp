@@ -1196,6 +1196,12 @@ float* kimi_k3_swap_partial_buffer(KimiK3Forward& fwd, K3LayerPhase phase,
     if (phase == K3LayerPhase::Attn) {
         old = s.attn_out;
         s.attn_out = buf;
+    } else if (phase == K3LayerPhase::FfnUp) {
+        // The banded up-projection writes s.ffn_out, and the reduce that sums the bands
+        // has to run over a buffer the COLLECTIVE owns — passing this scratch straight to
+        // the collective reduces nothing and leaves every rank holding just its own band.
+        old = s.ffn_out;
+        s.ffn_out = buf;
     } else if (phase == K3LayerPhase::FfnPartial) {
         // The FUSED buffer moves, and both views move with it — they are offsets into
         // one reduced payload, so repointing the base alone would leave the shared

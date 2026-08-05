@@ -267,6 +267,14 @@ struct KimiK3TP {
     // split plan steps with context, and every step throws the chunk graph away, so a long
     // ingestion re-captures several times over — invisible in a tok/s number, and the
     // suspect for the 29 s that a 32k run lost between 2048 and 4096.
+    // The context the chunk graph's MLA split plan is PINNED to for a whole ingestion.
+    // The plan is min(max_splits, ceil(n_ctx/4096)), so it steps at every 4096 boundary and
+    // each step throws the graph away: a 32k prompt paid EIGHT captures, 21.0 s, 3.24% of
+    // the run, 87% of it re-recording 50,809 nodes. Pinning to the end of the prompt makes
+    // it one. Over-large splits are explicitly supported -- mla_decode_attn_split_kernel
+    // writes m=-1e30, l=0 for an empty slice -- and n_ctx itself is read from the device at
+    // replay, so only the grid is frozen, never the length attended over.
+    int    prefill_plan_ctx = 0;
     long   n_chunk_captures = 0;
     double ms_chunk_capture = 0.0;
     bool chunk_graph_ready = false;

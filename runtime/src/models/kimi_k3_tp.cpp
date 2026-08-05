@@ -1188,34 +1188,52 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
         // back to FfnFinish for the leading dense layer (no routed_up to shard, so the
         // partial buffer is null) and whenever the band declines.
         const IClock::time_point t_p3 = ip.on ? IClock::now() : IClock::time_point{};
+        // The reduce must run over a buffer the COLLECTIVE owns. Aiming s.ffn_out at
+        // zc_in, reducing, then aiming it at zc_out is the same dance FfnPartial already
+        // does — and skipping it is why the first version of this reduced nothing and left
+        // every rank holding only its own band: a wrong model that still returned success.
         int up_count = 0;
-        std::vector<void*> up_bufs;   // the collective takes void*
-        const bool shard_up = k3_routed_up_band_enabled() && tp_size > 1 &&
+        const bool shard_up = k3_routed_up_band_enabled() && tp_size > 1 && p.zero_copy &&
                               layer >= cfg.leading_dense;
         if (shard_up) {
-            up_bufs.resize((size_t)tp_size, nullptr);
-            for (int r = 0; r < tp_size; ++r) {
-                int c = 0;
-                up_bufs[(size_t)r] = (void*)kimi_k3_partial_buffer(
-                    p.ranks[(size_t)r].fwd, layer, K3LayerPhase::FfnUp, &c);
-                if (!up_bufs[(size_t)r] || c <= 0) { up_count = 0; break; }
-                if (up_count == 0) up_count = c;
-                else if (up_count != c) { up_count = 0; break; }
-            }
+            kimi_k3_partial_buffer(p.ranks[0].fwd, layer, K3LayerPhase::FfnUp, &up_count);
+            if (up_count > 0 && (size_t)up_count > p.coll->max_count()) up_count = 0;
         }
         if (shard_up && up_count > 0) {
+            // GET THE MoE PAYLOAD OUT OF zc_out FIRST. Slots vary only the reduce INPUT;
+            // every reduce writes the same zc_out, and swap_partial_buffer(FfnPartial)
+            // left s.shexp_out pointing at zc_out + expert_latent. So the routed_up reduce
+            // would land on top of the shared expert that FfnTail is about to fold in —
+            // which is exactly what the first two attempts at this did, silently.
+            const int moe_w = cfg.expert_latent + cfg.hidden;
+            for (int r = 0; r < tp_size; ++r) {
+                KimiK3TPRank& R = p.ranks[(size_t)r];
+                if (cudaSetDevice(R.device) != cudaSuccess) return false;
+                if (cudaMemcpyAsync(p.orig_moe[(size_t)r], p.zc_out[(size_t)r],
+                                    (size_t)moe_w * sizeof(float),
+                                    cudaMemcpyDeviceToDevice, R.stream) != cudaSuccess)
+                    return false;
+                kimi_k3_swap_partial_buffer(R.fwd, K3LayerPhase::FfnPartial,
+                                            p.orig_moe[(size_t)r]);
+            }
+            for (int r = 0; r < tp_size; ++r)
+                kimi_k3_swap_partial_buffer(p.ranks[(size_t)r].fwd, K3LayerPhase::FfnUp,
+                                            p.zc_in[(size_t)r]);
             if (!issue_all([&](int r) {
                     KimiK3TPRank& R = p.ranks[(size_t)r];
                     return kimi_k3_forward_layer_phase(R.fwd, layer, K3LayerPhase::FfnUp,
                                                        R.x, R.x_next);
                 })) return false;
-            if (!p.coll->allreduce_f32_group(up_bufs, (size_t)up_count, p.streams)) {
+            if (!p.coll->allreduce_f32_owned_slot((size_t)up_count, p.streams, slot_moe)) {
                 std::fprintf(stderr, "[k3-tp] routed_up all-reduce failed at layer %d\n",
                              layer);
                 return false;
             }
             ++p.n_collectives;
             ++coll_k;
+            for (int r = 0; r < tp_size; ++r)
+                kimi_k3_swap_partial_buffer(p.ranks[(size_t)r].fwd, K3LayerPhase::FfnUp,
+                                            p.zc_out[(size_t)r]);
         }
         const K3LayerPhase p3 = (shard_up && up_count > 0) ? K3LayerPhase::FfnTail
                                                            : K3LayerPhase::FfnFinish;
@@ -1491,8 +1509,11 @@ bool k3_prefill_chunk(KimiK3TP& p, const int* ids, int base, int B,
     // The graph's identity is (B, mla_plan). The tail chunk of a prompt has a smaller B
     // and runs eager; a context that crosses a kMlaSplitMinCtx boundary invalidates, the
     // same rule the decode step applies to itself.
+    // Pin to the whole prompt's final context when the caller set it, so the graph is
+    // captured once instead of once per 4096-token step.
+    const int plan_ctx = p.prefill_plan_ctx > 0 ? p.prefill_plan_ctx : (base + B);
     const int live_plan = k3k::k3_mla_decode_plan(cfg.n_q_heads, cfg.kv_lora_rank,
-                                                  base + B);
+                                                  plan_ctx);
     static const bool want_graph = [] {
         const char* e = std::getenv("SPARKINFER_K3_PREFILL_GRAPH");
         return !(e && e[0] == '0');
@@ -1906,6 +1927,12 @@ bool kimi_k3_tp_forward_prompt(KimiK3TP& p, const int* ids, int n_ids,
         return ok;
     };
 
+    // Pin the chunk graph's MLA split plan to where this prompt ENDS, so the graph is
+    // captured once for the whole ingestion instead of being thrown away at every 4096
+    // boundary. Restored below so a later decode is unaffected.
+    const int plan_ctx_saved = p.prefill_plan_ctx;
+    p.prefill_plan_ctx = base0 + n_ids;
+
     int done = 0;
     for (size_t si = 0; si < stops.size(); ++si) {
         const int target = stops[si];
@@ -1930,6 +1957,8 @@ bool kimi_k3_tp_forward_prompt(KimiK3TP& p, const int* ids, int n_ids,
     // Printed next to PREFILL_TOTAL so the two are read together: a tok/s number averages
     // capture cost over the whole prompt and hides it, and this is the term that decides
     // whether the chunk's steady-state parity is worth anything end to end.
+    p.prefill_plan_ctx = plan_ctx_saved;
+
     if (p.n_chunk_captures > 0)
         std::fprintf(stderr,
                      "[k3-prefill] %ld chunk graph captures over %d tokens: %.0f ms total, "
