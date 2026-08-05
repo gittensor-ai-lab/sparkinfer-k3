@@ -103,7 +103,7 @@ add_test(NAME k3_prefill_order_cpu_test COMMAND k3_prefill_order_cpu_test)
 foreach(k3t k3_kda_step_gpu_test k3_mla_absorb_gpu_test
             k3_proj_1bar_gpu_test k3_moe_iq1s_mma_gpu_test
             k3_moe_batched_iq1s_gpu_test k3_kda_chunk_prefill_gpu_test
-            k3_proj_q8_mma_gpu_test)
+            k3_proj_q8_mma_gpu_test k3_epilogue_q8_gpu_test)
     add_executable(${k3t} ${k3t}.cu)
     target_link_libraries(${k3t} PRIVATE si_k3)
     target_include_directories(${k3t} PRIVATE ${PROJECT_SOURCE_DIR}/include)

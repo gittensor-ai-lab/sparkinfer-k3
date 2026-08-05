@@ -2574,6 +2574,9 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
                 }
                 kda_pre = true;
             }
+            // Set inside the a_tok==1 iteration when the gate→Q8 fold takes; consumed
+            // after the scan loop to skip the re-quantise on attn_output.
+            bool gated_q8 = false;
             for (int b = 0; b < a_tok; ++b) {
             const float* const nrm     = s.normed     + (int64_t)b * H;
             // decay_g carries a row axis only when the pre-scan batch filled it; without
@@ -2754,8 +2757,17 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             // and `gproj_b` is s.g_proj_out with b == 0.
             if (!fused_qkvg && !proj_h(gproj_b, nrm, L.ssm_g, qkv, H)) return false;
             if (!L.ssm_norm.ok()) return false;
-            k3k::kda_gate_out_f32(gate_b, s.delta_out, (const float*)L.ssm_norm.data,
-                                  gproj_b, head_dim, n_head, eps, stream);
+            // Single-token only: fold gate_out into the Q8_0 attn_output needs. The
+            // chunk path (a_tok > 1) keeps the split — gate per token, proj_b once.
+            if (a_tok == 1 && ggml_qact_proj && L.attn_output.type == 8 && s.proj_q8) {
+                gated_q8 = k3k::k3_kda_gate_q8(
+                    s.proj_q8, gate_b, s.delta_out, (const float*)L.ssm_norm.data,
+                    gproj_b, head_dim, n_head, eps, stream);
+            }
+            if (!gated_q8) {
+                k3k::kda_gate_out_f32(gate_b, s.delta_out, (const float*)L.ssm_norm.data,
+                                      gproj_b, head_dim, n_head, eps, stream);
+            }
             if (fwd.debug) fwd.debug("dbg_gate_out", layer, gate_b, qkv);
             }   // ---- end of the per-token scan loop ----
 
@@ -2778,9 +2790,17 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             // collective slot, so a marker hit means s.attn_out is already written for
             // this token and re-projecting would overwrite it from an aliased gate_out.
             // A marker miss retains the exact path above.
-            if (!(pt_hit && pt_hit->kda_out_layer == layer) &&
-                !proj_b(s.attn_out, H, s.gate_out, qkv, L.attn_output, H, qkv))
+            //
+            // gated_q8 (a_tok == 1 only) already wrote proj_q8 — skip the re-quantise.
+            if (gated_q8) {
+                if (!(pt_hit && pt_hit->kda_out_layer == layer) &&
+                    !k3k::k3_proj_q8act_f32(s.attn_out, s.proj_q8, L.attn_output.data,
+                                            L.attn_output.type, H, qkv, stream))
+                    return false;
+            } else if (!(pt_hit && pt_hit->kda_out_layer == layer) &&
+                       !proj_b(s.attn_out, H, s.gate_out, qkv, L.attn_output, H, qkv)) {
                 return false;
+            }
             if (fwd.debug) fwd.debug("kda_out", layer, s.attn_out, H);
         } else {
             const int mla_ord = kimi_k3_mla_ordinal(cfg, layer);
@@ -2958,6 +2978,7 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             }
             if (fwd.debug) fwd.debug("dbg_preattn", layer, s.mla_attn_out, qh * cfg.value_length_mla);
 
+            bool mla_gated_q8 = false;
             if (L.has_attn_gate) {
                 // Issued on its own lane so it runs UNDER the attention rather than
                 // after it. Host issue order is irrelevant here -- every launch is
@@ -2969,9 +2990,16 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
                     return false;
                 if (fwd.debug) fwd.debug("dbg_gateproj", layer, s.gate_proj_out, qh * cfg.value_length_mla);
                 if (mla_fork) dag_join(1);
-                k3k::mla_gate_out_f32(s.mla_attn_out, s.mla_attn_out, s.gate_proj_out,
-                                      (int64_t)qh * cfg.value_length_mla, stream,
-                                      a_tok, mlaout_row);
+                const int64_t gate_n = (int64_t)qh * cfg.value_length_mla;
+                // Single-token fold into Q8; chunk path keeps the batched gate + proj_b.
+                if (a_tok == 1 && ggml_qact_proj && L.attn_output.type == 8 && s.proj_q8) {
+                    mla_gated_q8 = k3k::k3_mla_gate_q8(
+                        s.proj_q8, s.mla_attn_out, s.mla_attn_out, s.gate_proj_out,
+                        gate_n, stream);
+                }
+                if (!mla_gated_q8)
+                    k3k::mla_gate_out_f32(s.mla_attn_out, s.mla_attn_out, s.gate_proj_out,
+                                          gate_n, stream, a_tok, mlaout_row);
                 if (fwd.debug) fwd.debug("dbg_postgate", layer, s.mla_attn_out, qh * cfg.value_length_mla);
             }
 
@@ -2979,9 +3007,15 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             // the cap, and repointed at the collective's buffer by the driver), and its
             // per-token pitch is H — the same layout the batched FfnPartial then READS
             // it at, and the same one nb*hidden reduces.
-            if (!proj_b(s.attn_out, H, s.mla_attn_out, mlaout_row, L.attn_output, H,
-                        qh * cfg.value_length_mla))
+            if (mla_gated_q8) {
+                if (!k3k::k3_proj_q8act_f32(s.attn_out, s.proj_q8, L.attn_output.data,
+                                            L.attn_output.type, H,
+                                            qh * cfg.value_length_mla, stream))
+                    return false;
+            } else if (!proj_b(s.attn_out, H, s.mla_attn_out, mlaout_row, L.attn_output, H,
+                               qh * cfg.value_length_mla)) {
                 return false;
+            }
             if (fwd.debug) fwd.debug("mla_out", layer, s.attn_out, H);
         }
 
@@ -3128,18 +3162,34 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
                          cfg.dense_ffn, H)) return false;
             if (fwd.debug) fwd.debug("dbg_dense_gate", layer, s.dense_gate, cfg.dense_ffn);
             if (fwd.debug) fwd.debug("dbg_dense_up", layer, s.dense_up, cfg.dense_ffn);
-            // Elementwise, so the row is purely a grid .y and there is no reduction to
-            // re-partition.
-            k3k::situ_f32(s.dense_situ, s.dense_gate, s.dense_up, cfg.dense_ffn,
-                         cfg.situ_beta, cfg.situ_linear_beta, stream,
-                         n_tok, cfg.dense_ffn);
+            // situ exists only to feed ffn_down's quantise — fold on the single-token
+            // path when the weight is Q8_0; the chunk path keeps situ + proj_b.
+            bool dense_situ_q8 = false;
+            if (n_tok == 1 && ggml_qact_proj && L.ffn_down.type == 8 && s.proj_q8) {
+                dense_situ_q8 = k3k::k3_situ_q8(
+                    s.proj_q8, s.dense_situ, s.dense_gate, s.dense_up, cfg.dense_ffn,
+                    cfg.situ_beta, cfg.situ_linear_beta, stream);
+            }
+            if (!dense_situ_q8) {
+                // Elementwise, so the row is purely a grid .y and there is no reduction to
+                // re-partition.
+                k3k::situ_f32(s.dense_situ, s.dense_gate, s.dense_up, cfg.dense_ffn,
+                             cfg.situ_beta, cfg.situ_linear_beta, stream,
+                             n_tok, cfg.dense_ffn);
+            }
             if (fwd.debug) fwd.debug("dbg_dense_situ", layer, s.dense_situ, cfg.dense_ffn);
             // s.ffn_out is read back in FfnFinish, one phase and (in the chunk driver)
             // one collective later, so it MUST be per-token. It was not, and the leading
             // dense layer's FFN output was therefore the LAST token of the chunk's for
             // every token of it -- see the note on this in the FfnFinish residual add.
-            if (!proj_b(s.ffn_out, H, s.dense_situ, cfg.dense_ffn, L.ffn_down, H,
-                        cfg.dense_ffn)) return false;
+            if (dense_situ_q8) {
+                if (!k3k::k3_proj_q8act_f32(s.ffn_out, s.proj_q8, L.ffn_down.data,
+                                            L.ffn_down.type, H, cfg.dense_ffn, stream))
+                    return false;
+            } else if (!proj_b(s.ffn_out, H, s.dense_situ, cfg.dense_ffn, L.ffn_down, H,
+                               cfg.dense_ffn)) {
+                return false;
+            }
         } else {
             // --- FORK: routed_down and the whole shared expert ----------------
             //
@@ -3389,6 +3439,11 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
                                      L.ffn_gate_shexp, shexp_band, H)) return false;
                         if (!proj_hb(s.dense_up, cfg.dense_ffn, normed2_src, H,
                                      L.ffn_up_shexp, shexp_band, H)) return false;
+                        k3k::situ_f32(s.dense_situ, s.dense_gate, s.dense_up, shexp_band,
+                                     cfg.situ_beta, cfg.situ_linear_beta, l_shx.st,
+                                     n_tok, cfg.dense_ffn);
+                        if (!proj_b(s.shexp_out, moe_row, s.dense_situ, cfg.dense_ffn,
+                                    L.ffn_down_shexp, H, shexp_band)) return false;
                     } else {
                         if (!proj_h_on(l_shx, s.dense_gate, normed2_src, L.ffn_gate_shexp,
                                        shexp_band, H))
@@ -3396,16 +3451,29 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
                         if (!proj_h_on(l_shx, s.dense_up, normed2_src, L.ffn_up_shexp,
                                        shexp_band, H))
                             return false;
-                    }
-                    k3k::situ_f32(s.dense_situ, s.dense_gate, s.dense_up, shexp_band,
-                                 cfg.situ_beta, cfg.situ_linear_beta, l_shx.st,
-                                 n_tok, cfg.dense_ffn);
-                    if (n_tok > 1) {
-                        if (!proj_b(s.shexp_out, moe_row, s.dense_situ, cfg.dense_ffn,
-                                    L.ffn_down_shexp, H, shexp_band)) return false;
-                    } else if (!proj_on(l_shx, s.shexp_out, s.dense_situ,
-                                        L.ffn_down_shexp, H, shexp_band)) {
-                        return false;
+                        // Same situ+Q8 fold as the leading dense path; the lane's q8
+                        // scratch is sized for dense_ffn, which covers every shexp band.
+                        bool shexp_situ_q8 = false;
+                        if (ggml_qact_proj && L.ffn_down_shexp.type == 8 && l_shx.q8) {
+                            shexp_situ_q8 = k3k::k3_situ_q8(
+                                l_shx.q8, s.dense_situ, s.dense_gate, s.dense_up,
+                                shexp_band, cfg.situ_beta, cfg.situ_linear_beta,
+                                l_shx.st);
+                        }
+                        if (!shexp_situ_q8)
+                            k3k::situ_f32(s.dense_situ, s.dense_gate, s.dense_up,
+                                          shexp_band, cfg.situ_beta, cfg.situ_linear_beta,
+                                          l_shx.st);
+                        if (shexp_situ_q8) {
+                            if (!k3k::k3_proj_q8act_f32(s.shexp_out, l_shx.q8,
+                                                        L.ffn_down_shexp.data,
+                                                        L.ffn_down_shexp.type, H,
+                                                        shexp_band, l_shx.st))
+                                return false;
+                        } else if (!proj_on(l_shx, s.shexp_out, s.dense_situ,
+                                            L.ffn_down_shexp, H, shexp_band)) {
+                            return false;
+                        }
                     }
                 }
                 if (fwd.debug) fwd.debug("dbg_shexp_partial", layer, s.shexp_out, H);

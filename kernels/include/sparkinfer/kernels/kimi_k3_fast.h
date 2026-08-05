@@ -179,6 +179,26 @@ bool k3_add3_rows_f32(float* out, float* out_ab, const float* a,
                       const float* b, int64_t b_row_stride, const float* c,
                       int rows, int cols, cudaStream_t stream);
 
+// ---------------------------------------------------------------------------
+// Factor — producer + Q8_0 quantise, in one launch
+// ---------------------------------------------------------------------------
+// Three call sites where an elementwise (or per-head RMS) producer exists only to
+// feed a single Q8_0 projection a few microseconds later. Each fold removes the
+// producer launch and the standalone quantise; the caller then runs
+// k3_proj_q8act_f32 on the emitted scratch.
+//
+// Bit-identical to the split path (see k3_epilogue_q8.cu). Declines on
+// SPARKINFER_K3_EPILOGUE_Q8=0 or a shape the warp quantiser cannot cover.
+// Optional float outs (situ_out / gated_out / gate_out) mirror what the standalone
+// producer wrote; pass nullptr to skip the store.
+bool k3_situ_q8(void* q8_out, float* situ_out, const float* gate, const float* up,
+                int64_t n, float beta, float linear_beta, cudaStream_t stream);
+bool k3_mla_gate_q8(void* q8_out, float* gated_out, const float* attn_out,
+                    const float* gate_proj, int64_t n, cudaStream_t stream);
+bool k3_kda_gate_q8(void* q8_out, float* gate_out, const float* o,
+                    const float* norm_w, const float* g2, int head_dim, int n_head,
+                    float eps, cudaStream_t stream);
+
 }  // namespace k3
 }  // namespace kernels
 }  // namespace sparkinfer
