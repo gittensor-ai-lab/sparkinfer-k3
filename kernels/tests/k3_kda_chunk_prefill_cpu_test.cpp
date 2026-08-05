@@ -1,23 +1,20 @@
 // Chunk-parallel KDA prefill — the algorithm, checked against the verified token-by-token
 // recurrence before any CUDA is written.
 //
-// WHERE THE ALGORITHM COMES FROM. Moonshot's own FlashKDA (github.com/MoonshotAI/FlashKDA,
-// "high-performance Kimi Delta Attention kernels") is the chunk-parallel WY/UT-transform form
-// of this exact operator: `lower_bound` in its README is documented as "-5.0 to 0", matching
-// K3's kda_gate_lower_bound = -5.0f, and its benchmark shape is literally H=96, D=128 — K3's
-// own dims. This file does NOT vendor FlashKDA's kernel (CUTLASS/CUTE, sm_90a TMA + GMMA,
-// bf16/fp16 tensor-core throughout — a different idiom than anything else in this tree).
-// It re-derives the SAME algorithm from K3's own pinned single-step formula
-// (kda_decode_step_kernel in k3_kernels.cu, the one k3_kda_step_cpu_test.cpp already proves
-// against float64) and cross-checks the result against FlashKDA's published structure.
-// Both derivations converge on the same matrices; see the file-header comment in
-// k3_kda_chunk_prefill.cu for the full derivation. Two things differ from FlashKDA on
-// purpose, not by omission:
+// WHERE THE ALGORITHM COMES FROM. This is the chunk-parallel WY/UT-transform form of the
+// gated delta rule — the standard way to turn a rank-1-update recurrence into a sequence of
+// dense matmuls over fixed-size chunks. It is derived here from K3's OWN pinned single-step
+// formula (kda_decode_step_kernel in k3_kernels.cu, the one k3_kda_step_cpu_test.cpp already
+// proves against float64), so the thing being verified is a reformulation of the operator
+// this tree actually ships, not a transcription of anything external. See the file-header
+// comment in k3_kda_chunk_prefill.cu for the full derivation.
+//
+// Two choices below are deliberate rather than omissions:
 //   - no `* scale` folded into q_decayed here. K3's own contract (kimi_k3.h, kda_decode_step_f32)
 //     already requires the CALLER to pre-scale q by 1/sqrt(head_dim) before it reaches the
 //     recurrence — this kernel is a drop-in replacement for N calls to that step, so it keeps
 //     the same input contract rather than inventing a second one.
-//   - the inverse is computed by forward substitution, not FlashKDA's doubling-Neumann-series
+//   - the inverse is computed by forward substitution, not the doubling-Neumann-series
 //     trick. Doubling exists to keep the series in fp16/bf16 range under tensor-core throughput
 //     pressure; this file (and the kernel it verifies) is f32 throughout, matching every other
 //     K3 kernel's stated convention, so there is no precision pressure motivating it. At
@@ -47,7 +44,7 @@
 //      MULTI-chunk, NON-zero-starting-state sequence — a single chunk cannot exercise the
 //      cross-chunk state carry, and a zero start state cannot exercise decay at all.
 //   2. a RAGGED final chunk (fewer than 16 real tokens) matches too, using the same
-//      zero-pad-the-tail scheme FlashKDA's own reference uses (q=k=v=g=beta=0 past the real
+//      standard zero-pad-the-tail scheme (q=k=v=g=beta=0 past the real
 //      length) — proven self-consistent below: beta=0 on a padded row zeros its ENTIRE row of
 //      L, so U is 0 there regardless of q/k content, so it contributes nothing to the state or
 //      to any later row's output.
@@ -166,7 +163,7 @@ SeqIO kda_chunk_parallel(const std::vector<double>& S0, const std::vector<double
             const int t0 = c * CHUNK;
             const int actual_len = std::min(CHUNK, T - t0);
 
-            // Zero-pad the tail exactly as FlashKDA's own reference does: q/k/v/g/beta all
+            // Zero-pad the tail: q/k/v/g/beta all
             // read as zero past actual_len. Proven self-consistent in the header comment.
             auto qt = [&](int t, int i) { return t < actual_len ? q[((size_t)(t0 + t) * H + h) * D + i] : 0.0; };
             auto kt = [&](int t, int i) { return t < actual_len ? k[((size_t)(t0 + t) * H + h) * D + i] : 0.0; };
@@ -225,7 +222,7 @@ SeqIO kda_chunk_parallel(const std::vector<double>& S0, const std::vector<double
             // forward substitution against the identity, once per chunk, so K2 (the part
             // that is sequential over chunks because S_in depends on the previous chunk's
             // S_out) only ever does a plain [16,16]@[16,128] matmul, never another solve.
-            // This is FlashKDA's K1/K2 split; only HOW the inverse is built differs
+            // This is the K1/K2 split the kernel uses; only HOW the inverse is built differs
             // (forward-substitution here, doubling-Neumann-series there) -- see the file
             // header for why that substitution is the right one for an f32, non-tensor-core
             // kernel. Building INV this way and then multiplying is mathematically the same

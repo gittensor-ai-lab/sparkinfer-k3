@@ -214,20 +214,17 @@ void kda_conv_step_f32(float* out, float* state, const float* x, const float* w,
 // parallel (kernel 1, "prep"). Only the state-dependent tail (RHS onward) is
 // sequential, and only over CHUNKS, not tokens: T/16 dependent steps instead
 // of T, each a small dense matmul against a precomputed [16,16] inverse
-// instead of a fresh triangular solve (kernel 2, "scan"). Full derivation,
-// cross-checked against Moonshot's own FlashKDA (github.com/MoonshotAI/
-// FlashKDA — H=96/D=128 is K3's own shape, and lower_bound "-5.0 to 0" is
-// kda_gate_lower_bound), is proven against the token-by-token recurrence in
+// instead of a fresh triangular solve (kernel 2, "scan"). The full derivation
+// is proven against the token-by-token recurrence in
 // kernels/tests/k3_kda_chunk_prefill_cpu_test.cpp: multi-chunk, a ragged
-// final chunk (zero-padded exactly as FlashKDA's own reference pads it —
-// beta=0 on a padded row zeros that row of L entirely, so it cannot
-// contaminate the state or any real row's output), and the axis-of-decay
-// swap that op 6's own history already shipped once as a silent bug.
+// final chunk (zero-padded — beta=0 on a padded row zeros that row of L
+// entirely, so it cannot contaminate the state or any real row's output),
+// and the axis-of-decay swap that op 6's own history already shipped once as
+// a silent bug.
 //
-// NOT FlashKDA's kernel. That one is CUTLASS/CUTE, sm_90a-specific (TMA,
-// warpgroup MMA, register-file transposes), bf16/fp16 throughout for
-// tensor-core rate, and inverts (I+L) by a doubling Neumann series to stay in
-// bf16 range under CHUNK=16. This is f32 end to end — matching every other
+// F32, NOT TENSOR CORES. A tensor-core implementation of this shape would be
+// bf16/fp16 throughout for rate, and would invert (I+L) by a doubling Neumann
+// series to stay in range under CHUNK=16. This is f32 end to end — matching every other
 // kernel in this file's stated convention, correctness first — and inverts
 // by plain forward substitution: at CHUNK=16 the triangular solve is O(16^3)
 // against O(16*head_dim^2) for the two decayed projections, a rounding error
@@ -245,11 +242,11 @@ void kda_conv_step_f32(float* out, float* state, const float* x, const float* w,
 //
 // g_raw is ALREADY f_b(f_a(x)) + dt_bias — op 7's OWN contract, and op 7's kernel takes no
 // separate dt_bias for exactly that reason: the bias is folded in upstream,
-// by the GEMM that produces g_raw, not by the gate kernel. (FlashKDA's own
-// kernel takes A_log and dt_bias as two separate tensors and adds them
-// inside; that is FlashKDA's contract, not this one — this function takes
-// what op 7 takes, so it stays a drop-in for T calls to the elementwise gate
-// too, not a second gate convention living beside the first.) The
+// by the GEMM that produces g_raw, not by the gate kernel. (An implementation
+// that took A_log and dt_bias as two separate tensors and added them inside
+// would be a second gate convention living beside the first; this function
+// takes what op 7 takes, so it stays a drop-in for T calls to the elementwise
+// gate too.) The
 // lb*sigmoid(A*g_raw) transform, and beta's sigmoid, run INSIDE kernel 1
 // (folded, not called out to op 7 and a separate sigmoid T times), because
 // folding is what keeps this to one launch per chunk-batch rather than one
