@@ -4311,16 +4311,41 @@ static void mla_decode_attn_launch(float* out, const float* q, const KV* k_cache
                 const char* e = std::getenv("SPARKINFER_K3_MLA_FILL");
                 return !(e && e[0] == '0');
             }();
-            // Strictly a no-op unless the target is actually ATTAINABLE. If shortening
-            // the slice all the way to one tile still cannot reach `fill`, the context
-            // genuinely is too short to feed the machine — which is the case the
-            // shipped comment above already reasons about correctly — so the original
-            // floor stands and nothing changes. Only a context that CAN fill the
-            // machine, and is merely being kept from it by tile rounding, is touched.
+            // TAKE THE PARALLELISM YOU CAN REACH, NOT ONLY THE PARALLELISM THAT REACHES
+            // THE TARGET.
+            //
+            // This used to apply the shortened slice ONLY when it got all the way to
+            // `fill`, on the reasoning that a context too short to feed the machine is a
+            // case the floor already handles. That reasoning holds at decode, where the
+            // context is long and the guard passes. It is exactly backwards for PREFILL.
+            //
+            // The guard clears only when n_ctx / kMlaCtxTile >= fill, i.e. at K3's
+            // sharded shape (groups 1, fill 264) when n_ctx >= 33,792. The scored prefill
+            // walks 0 -> 32,768 and is therefore ENTIRELY below it: for every token of
+            // the scored metric the shortening was computed and then thrown away, and
+            // the MLA attention ran on the long slice at a grid of 8..64 blocks against
+            // 132 SMs. Reaching only 128 of 264 is not "cannot fill the machine", it is
+            // four times the parallelism of not trying.
+            //
+            // The loop already stops at the first ms that reaches `fill`, so removing the
+            // guard cannot overshoot: a context that DOES clear the threshold gets the
+            // identical ms it got before, and the 128k decode guard is bit-for-bit
+            // untouched. Only the below-threshold case changes, and only upward.
+            //
+            // What it spends is slice length, and the tax is the partial-write term
+            // tax(slice) = 2*hpb*kv_lora/(key_length*slice) -- 4.17% at 512, 16.7% at one
+            // tile. That is traffic, and the kernel it is buying parallelism for is
+            // LATENCY-bound at these grid sizes, not traffic-bound, which is the trade.
+            // SPARKINFER_K3_MLA_FILL_PARTIAL=0 restores the all-or-nothing form on one
+            // binary so the two can be measured against each other.
+            static const bool partial_fill = [] {
+                const char* e = std::getenv("SPARKINFER_K3_MLA_FILL_PARTIAL");
+                return !(e && e[0] == '0');
+            }();
             if (reach_fill) {
                 int ms = min_slice;
                 while (ms > kMlaCtxTile && n_ctx / ms < fill) ms -= kMlaCtxTile;
-                if (n_ctx / ms >= fill) {
+                if (partial_fill || n_ctx / ms >= fill) {
                     min_slice = ms;
                     by_len    = std::max(1, n_ctx / ms);
                 }
