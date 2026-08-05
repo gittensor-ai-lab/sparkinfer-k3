@@ -31,6 +31,12 @@
 > missing any of them.** The tier is earned on prefill; decode is a guard. A prefill gain
 > bought by giving decode back has not moved the engine forward, it has moved work around,
 > so the round refuses to score it.
+>
+> **Tick a box only once you have the number, and put the number in the table.** The loop
+> checks the `after (this PR)` cell, not the tick: `*awaits eval round*`, a blank, or
+> `no change — no decode path is touched` all read as *not measured* and the PR is skipped.
+> A round costs ~25 GPU-minutes per PR, so it measures changes that are already known to do
+> something — it is not the place to find out whether yours does.
 
 **Prefill tok/s @ 32k** — the scored metric. `llama.cpp` does **143.88** here; `main` does
 **40.35**, because there is no batched prefill and every prompt token goes through the

@@ -2097,6 +2097,11 @@ class CiWorkflowTest(unittest.TestCase):
             - [ ] Tested on **8× H200** (`sm_90`)
             - [x] **Prefill measured at 32k** on 8× H200
             - [x] **No 128k decode regression** on 8× H200
+            
+            | | before (main) | after (this PR) |
+            |---|--:|--:|
+            | prefill @ 32k | 40.35 | 50.60 |
+            | decode @ 128k | 56.82 | 56.79 |
             ## Checklist
             - [x] `bench/scripts/kimi_k3_baseline.sh --node h200x8 --dry-run` resolves
         """)
@@ -3034,7 +3039,10 @@ class CiWorkflowTest(unittest.TestCase):
         # the scored metric and its guard each need their own claim (2026-08-05)
         body = ("## Node run\n- [x] Tested on **8× H200** (`sm_90`)\n"
                 "- [x] **Prefill measured at 32k** on 8× H200\n"
-                "- [x] **No 128k decode regression** on 8× H200\n")
+                "- [x] **No 128k decode regression** on 8× H200\n"
+                "\n| | before (main) | after (this PR) |\n|---|--:|--:|\n"
+                "| prefill @ 32k | 40.35 | 50.60 |\n"
+                "| decode @ 128k | 56.82 | 56.79 |\n")
         calls = []
 
         def fake_state(seq):
@@ -3250,6 +3258,11 @@ class CiWorkflowTest(unittest.TestCase):
             - [x] Tested on **8× H200** (`sm_90`)
             - [x] **Prefill measured at 32k** on 8× H200
             - [x] **No 128k decode regression** on 8× H200
+            
+            | | before (main) | after (this PR) |
+            |---|--:|--:|
+            | prefill @ 32k | 40.35 | 50.60 |
+            | decode @ 128k | 56.82 | 56.79 |
         """)
         pr = lambda **kw: {"isDraft": False, "labels": [], "body": body, **kw}
 
@@ -3280,7 +3293,10 @@ class CiWorkflowTest(unittest.TestCase):
         # the scored metric and its guard each need their own claim (2026-08-05)
         body = ("## Node run\n- [x] Tested on **8× H200** (`sm_90`)\n"
                 "- [x] **Prefill measured at 32k** on 8× H200\n"
-                "- [x] **No 128k decode regression** on 8× H200\n")
+                "- [x] **No 128k decode regression** on 8× H200\n"
+                "\n| | before (main) | after (this PR) |\n|---|--:|--:|\n"
+                "| prefill @ 32k | 40.35 | 50.60 |\n"
+                "| decode @ 128k | 56.82 | 56.79 |\n")
         ok, _ = bot.eligibility({"isDraft": False, "body": body,
                                  "labels": [{"name": "needs-rebase"}]})
         self.assertTrue(ok, "needs-rebase must stay evaluable — the bot clears it by rebasing")
@@ -3830,7 +3846,14 @@ class PrefillAttestationTest(unittest.TestCase):
         self.assertRegex(sec, r"(?i)-\s*\[\s*\]\s*.*decode regression")
 
     def test_all_three_ticked_is_eligible(self):
-        ok, why = self._bot().eligibility(self._pr(self._template_section().replace("- [ ]", "- [x]")))
+        """The shipped template ships EMPTY measurement cells on purpose, so ticking every box
+        without filling them is not enough -- see AttestationNeedsEvidenceTest. Fill them the
+        way an author who actually ran it would."""
+        sec = (self._template_section().replace("- [ ]", "- [x]")
+               + "\n| | before (main) | after (this PR) |\n|---|--:|--:|\n"
+                 "| prefill @ 32k | 40.35 | 50.60 |\n"
+                 "| decode @ 128k | 56.82 | 56.79 |\n")
+        ok, why = self._bot().eligibility(self._pr(sec))
         self.assertTrue(ok, why)
 
     def test_a_node_tick_alone_is_no_longer_enough(self):
@@ -3878,3 +3901,66 @@ class PrefillAttestationTest(unittest.TestCase):
         wf = (ROOT / ".github/workflows/node-attestation.yml").read_text()
         self.assertIn("if (/prefill|decode\\s+regression/i.test(ln)) continue;", wf,
                       "the workflow still lets a claim line pass as a node attestation")
+
+
+class AttestationNeedsEvidenceTest(unittest.TestCase):
+    """A ticked box is not a measurement.
+
+    #128 ticked all three boxes and wrote "Tables left for the round to write -- I am not
+    inventing numbers", with "*awaits eval round*" where the measured value goes. That is the
+    checkbox being used to REQUEST evaluation rather than attest one, and the gate could not
+    tell the difference: it checked that a box was ticked, never that anything stood behind
+    it. A round then books ~25 GPU-minutes per PR to measure what the author could have
+    measured, for someone who has not shown the change does anything."""
+
+    def _bot(self):
+        import importlib.util as u
+        s = u.spec_from_file_location("b", str(ROOT / "eval/k3_eval_bot.py"))
+        m = u.module_from_spec(s); s.loader.exec_module(m); return m
+
+    TICKS = ("- [x] Tested on **8x H200** (`sm_90`)\n"
+             "- [x] **Prefill measured at 32k** on 8x H200\n"
+             "- [x] **No 128k decode regression** on 8x H200\n")
+
+    def _pr(self, tables):
+        return {"body": "## Node run\n" + self.TICKS + tables + "\n## Checklist\n",
+                "labels": [], "isDraft": False, "mergeable": "MERGEABLE",
+                "isCrossRepository": False, "author": {"login": "x"}, "number": 1,
+                "title": "perf(k3): x", "headRefOid": "a" * 40}
+
+    def test_measured_numbers_are_eligible(self):
+        t = ("\n| | before (main) | after (this PR) |\n|---|--:|--:|\n"
+             "| prefill @ 32k | 40.35 | **50.60** |\n"
+             "| decode @ 128k | 56.82 | 56.79 |\n")
+        ok, why = self._bot().eligibility(self._pr(t))
+        self.assertTrue(ok, why)
+
+    def test_a_placeholder_is_not_a_measurement(self):
+        """#128's exact shape."""
+        t = ("\n| | before (main) | after (this PR) |\n|---|--:|--:|\n"
+             "| prefill @ 32k | 40.35 | *awaits eval round* |\n"
+             "| decode @ 128k | 56.8 | *awaits eval round* |\n")
+        ok, why = self._bot().eligibility(self._pr(t))
+        self.assertFalse(ok, "a PR that measured nothing was admitted to the scoring loop")
+        self.assertIn("prefill", why)
+        self.assertIn("decode", why)
+
+    def test_an_assertion_is_not_a_measurement(self):
+        """#136's shape: 'no change -- no decode path is touched'. It may well be right, but
+        the box says the regression was checked on 8x H200, and the guard exists precisely
+        because prefill and decode share kernels."""
+        t = ("\n| | before (main) | after (this PR) |\n|---|--:|--:|\n"
+             "| prefill @ 32k | 40.35 | 50.60 |\n"
+             "| decode @ 128k | 56.82 | **no change — no decode path is touched** |\n")
+        ok, why = self._bot().eligibility(self._pr(t))
+        self.assertFalse(ok)
+        self.assertIn("decode", why)
+        self.assertNotIn("prefill,", why, "prefill WAS measured and should not be reported")
+
+    def test_the_after_column_is_found_by_header_not_position(self):
+        """#133 adds a delta column, so the measured value is not the last cell."""
+        t = ("\n| | before (main) | after (this PR) | delta |\n|---|--:|--:|--:|\n"
+             "| prefill @ 32k | **53.14** | **53.20** | +0.11% |\n"
+             "| decode @ 128k | **56.81** | **56.80** | -0.02% |\n")
+        ok, why = self._bot().eligibility(self._pr(t))
+        self.assertTrue(ok, why)
