@@ -931,10 +931,24 @@ int k3_moe_ffn_local(const KimiK3Forward& fwd, const KimiK3Config& cfg) {
 // Its OWN switch, deliberately not SPARKINFER_K3_HEAD_BAND. The two reuse the same band
 // arithmetic but are different optimisations on different tensors, and sharing one env var
 // would make it impossible to A/B either of them alone.
+// DEFAULT OFF, and it has to stay off until the projection it bands goes through the same
+// kernel the unsharded path uses.
+//
+// Measured at ctx 1024: correct (same argmax at every depth, logits within ~1%) but 50.50
+// against 53.19 tok/s — a 5% LOSS, not the ~13% win the weight arithmetic predicts. The
+// cause is not the sharding. The unsharded call goes through the `proj` lambda, which
+// dispatches to the Q8-ACTIVATION kernels (k3_proj_q8soa_f32 / k3_proj_q8_multirow_1bar);
+// the banded call below goes straight to k3_proj_f32, the F32-activation kernel, which
+// reads unquantised activations and does considerably more work per row. So it cuts the row
+// count eightfold and hands the rows to a kernel expensive enough to more than eat the
+// saving — which is also why the result is not bit-identical.
+//
+// Turning this on by default before that is fixed would ship a measured regression. The fix
+// is to route the banded call through the same dispatch with N = the band's rows.
 bool k3_routed_up_band_enabled() {
     static const bool on = [] {
         const char* e = std::getenv("SPARKINFER_K3_ROUTED_UP_BAND");
-        return !(e && e[0] == '0');
+        return e && e[0] == '1';
     }();
     return on;
 }
