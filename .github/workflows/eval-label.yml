@@ -212,10 +212,12 @@ jobs:
               if m: lock[m.group(1)] = m.group(2).strip()
           # 128K, not 128: the scored context is 131,072. Both denominators must come from
           # the same context as the measurement, or the tier is arithmetic over unrelated
-          # numbers. Keep this suffix in step with kimi_k3_eval.sh's CTX_SUFFIX.
+          # numbers. Keep this suffix in step with kimi_k3_eval.sh's CTX_SUFFIX and
+          # k3_eval_bot.py's CTX_SUFFIX. Scored metric moved to prefill @32k on 2026-08-05;
+          # decode at 128k is now a regression guard in the harness, not the tier basis.
           def slot(kind):
               pfx = f"KIMI_K3_{node}"
-              for key in (f"{pfx}_{quant}_{kind}_128K", f"{pfx}_{kind}_128K"):
+              for key in (f"{pfx}_{quant}_{kind}_32K_PP", f"{pfx}_{kind}_32K_PP"):
                   v = lock.get(key, "")
                   try:
                       if v and float(v) > 0: return float(v)

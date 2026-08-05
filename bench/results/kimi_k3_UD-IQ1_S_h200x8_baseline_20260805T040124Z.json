@@ -1,0 +1,33 @@
+{
+  "engine": "llama.cpp (unsloth fork)",
+  "engine_repo": "https://github.com/unslothai/llama.cpp",
+  "engine_ref": "refs/pull/48/head",
+  "engine_commit": "efc8bc38f0a9950cbb10ccef2cf48b951c39d3b2",
+  "model": "Kimi K3",
+  "quant": "UD-IQ1_S",
+  "gguf": "Kimi-K3-UD-IQ1_S-00001-of-00014.gguf",
+  "node_profile": "h200x8",
+  "node_label": "8x H200 SXM (sm_90, Hopper)",
+  "node_expects_arch": "sm_90",
+  "arch": "sm_90",
+  "gpus": 8,
+  "gpu_name": "NVIDIA H200",
+  "hbm_gib_total": 1123,
+  "pinned_graphics_clock_mhz": "",
+  "max_ctx_budgeted": 32784,
+  "kv_gib_at_max_ctx": 1,
+  "decode_tokens": 0,
+  "reps": 3,
+  "llama_flags": "-ngl 999 -p 32768 -n 0 -r 3",
+  "reference_lock_prefix": "KIMI_K3_H200X8_IQ1S_LLAMA_",
+  "contexts": {
+    "32768": {
+      "prefill_pp": 143.88,
+      "decode_tps": 0.0,
+      "kind": "scored",
+      "reps": 3
+    }
+  },
+  "sparkinfer": null,
+  "note": "PREFILL (prompt-processing) reference for the 32k scored metric introduced 2026-08-05. llama-bench reported 143.88 +/- 0.23 tok/s at pp32768 (+/-0.16% over 3 reps), model line 'kimi-k3 2.8T.A50B IQ1_S - 1.5625 bpw, 553.20 GiB, 2779.48 B params, CUDA, ngl 999'. Measured on the same node and GGUF that measures every frontier. Decode is not measured here -- -n 0 -- because this file exists to anchor the prefill tier; the decode reference at ctx 131072 remains 18.4435 from kimi_k3_UD-IQ1_S_h200x8_baseline_20260803T084547Z.json. For contrast, sparkinfer ingests the same 32,768 tokens at 40.35 tok/s (812.2 s, main @ 3b6a3f4): llama.cpp batches the prompt and sparkinfer has no batched prefill, so it is 3.57x faster here while being 3.08x slower at decode."
+}

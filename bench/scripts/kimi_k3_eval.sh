@@ -146,8 +146,39 @@ QUANT="$(printf '%s' "${PRIMARY_QUANT:-UD-IQ1_S}" | sed 's/^UD-//' | tr -cd 'A-Z
 # its rate essentially flat from depth 0 to 131,072 (18.32 -> 18.44 tok/s, 3 reps) while
 # sparkinfer gave up 90% (10.34 -> 1.01). Scoring at 64 hid that entirely. The -8% falloff
 # once recorded for llama.cpp here was a single-rep artefact from a different box.
-SCORED_CTX="${KIMI_K3_SCORED_CTX:-131072}"
-CTX_SUFFIX="${KIMI_K3_CTX_SUFFIX:-128K}"
+# ---- WHAT THIS ROUND SCORES ------------------------------------------------------------
+#
+# From 2026-08-05 the tier is earned on PREFILL at 32k, and decode at 128k becomes a
+# regression guard. Decode was the right thing to score while sparkinfer was 18x behind
+# llama.cpp there; at 3.08x ahead the remaining headroom is small, and the untouched gap is
+# prompt ingestion:
+#
+#     decode  @128k   56.82 tok/s   3.08x llama.cpp   <- now a guard
+#     prefill @ 32k   40.35 tok/s   0.28x llama.cpp   <- now the tier basis
+#
+# There is no batched prefill: every prompt token goes through the single-token decode step,
+# so a prompt costs what generating it costs. llama.cpp batches and we do not, which is why
+# it is 3.57x faster at ingestion while being 3.08x slower at decode.
+SCORED_METRIC="${KIMI_K3_SCORED_METRIC:-prefill}"
+# Real tokens, from the committed parity corpus — the same ids the accuracy gate feeds, so a
+# prefill number and a parity number describe the same work.
+PREFILL_TOKENS="${KIMI_K3_PREFILL_TOKENS:-32768}"
+# DECODE MUST NOT REGRESS. Prefill and decode share kernels, so batching the prompt will move
+# decode; this bounds how far. 1% sits above the worst same-code spread observed between
+# rounds (0.80%: main measured 46.48 then 46.11) and well under anything that would matter,
+# so it separates a real regression from box scatter rather than policing noise.
+DECODE_GUARD_PCT="${KIMI_K3_DECODE_GUARD_PCT:-1.0}"
+
+if [[ "$SCORED_METRIC" == "prefill" ]]; then
+    SCORED_CTX="${KIMI_K3_SCORED_CTX:-$PREFILL_TOKENS}"
+    CTX_SUFFIX="${KIMI_K3_CTX_SUFFIX:-32K_PP}"
+else
+    SCORED_CTX="${KIMI_K3_SCORED_CTX:-131072}"
+    CTX_SUFFIX="${KIMI_K3_CTX_SUFFIX:-128K}"
+fi
+# The decode guard always reads the 128k slot, whatever is being scored.
+DECODE_CTX="${KIMI_K3_DECODE_CTX:-131072}"
+DECODE_SUFFIX="128K"
 lookup() {  # $1 = LLAMA | SPARKINFER
     local v
     v="$(eval "printf '%s' \"\${${PFX}_${QUANT}_$1_${CTX_SUFFIX}:-}\"")"
@@ -266,7 +297,7 @@ run_bench() {  # $1 = n_tokens ; echoes elapsed ns on stdout, bench output on fd
     local t0 t1 out rc=0
     t0="$(date +%s%N)"
     out="$(env -u POLARIS_API_KEY "$BENCH" "$MODEL" "$NDEV" "$LAYERS" "$1" \
-             --ctx "$SCORED_CTX" --seek 2>&1)" || rc=$?
+             --ctx "$DECODE_CTX" --seek 2>&1)" || rc=$?
     t1="$(date +%s%N)"
     [[ "$rc" == 0 ]] || { printf '%s\n' "$out" | tail -20 >&2; return 1; }
     printf '%s\n' "$out" >&3
@@ -490,6 +521,58 @@ if [[ -z "$TPS" || -z "$MSTOK" ]]; then
 fi
 echo ">> sparkinfer: $TPS tok/s ($MSTOK ms/token)  [self-timed, within the wall-clock bound]"
 
+# ---- decode regression guard, and the prefill measurement that is actually scored --------
+DECODE_TPS="$TPS"
+DECODE_MSTOK="$MSTOK"
+if [[ "$SCORED_METRIC" == "prefill" ]]; then
+    # THE GUARD. Prefill and decode share kernels, so batching the prompt will move decode.
+    # This bounds how far. It reads the 128k frontier slot directly rather than the scored
+    # one, and it is a REFUSAL, not a tier: a prefill win bought by giving decode back has
+    # not moved the engine forward, it has moved work around.
+    DECODE_FRONTIER="${KIMI_K3_DECODE_FRONTIER:-$(eval "printf '%s' \"\${${PFX}_${QUANT}_SPARKINFER_${DECODE_SUFFIX}:-0}\"")}"
+    if [[ -n "$DECODE_FRONTIER" && "$DECODE_FRONTIER" != "0" ]]; then
+        FLOOR="$(python3 -c "print(f'{float('$DECODE_FRONTIER') * (1 - float('$DECODE_GUARD_PCT')/100):.4f}')")"
+        echo ">> decode guard: $DECODE_TPS tok/s vs floor $FLOOR ($DECODE_GUARD_PCT% under the $DECODE_FRONTIER frontier)"
+        if python3 -c "import sys; sys.exit(0 if float('$DECODE_TPS') < float('$FLOOR') else 1)"; then
+            echo "kimi_k3_eval: decode regressed to $DECODE_TPS tok/s, under the $FLOOR floor" >&2
+            echo "  refusing to score: the tier is earned on prefill, but decode at $DECODE_CTX is" >&2
+            echo "  guarded. A prefill gain bought by giving decode back has not moved the engine" >&2
+            echo "  forward. Raise KIMI_K3_DECODE_GUARD_PCT deliberately if the trade is intended." >&2
+            exit 1
+        fi
+    else
+        echo ">> WARN: no decode frontier pinned for $PFX/$QUANT — the regression guard is INACTIVE" >&2
+    fi
+
+    # THE SCORED NUMBER. Real tokens from the committed parity corpus -- the same ids the
+    # accuracy gate feeds, so the prefill number and the parity number describe one run's
+    # work. --seek is deliberately NOT used: it leaves the cache zeroed, which is faithful
+    # for decode timing and meaningless for ingestion, because ingestion IS the cache fill.
+    PREFILL_IDS="$ROOT/bench/refdata/longctx.ctx${PREFILL_TOKENS}.ids"
+    if [[ ! -s "$PREFILL_IDS" ]]; then
+        echo "kimi_k3_eval: no prefill ids at $PREFILL_IDS — cannot measure the scored metric" >&2
+        exit 1
+    fi
+    echo ">> measuring prefill: ingesting $PREFILL_TOKENS real tokens ..."
+    PF_OUT="$(mktemp)"; trap 'rm -f "$PF_OUT"' EXIT
+    if ! env -u POLARIS_API_KEY "$BENCH" "$MODEL" "$NDEV" "$LAYERS" 1 \
+            --ids @"$PREFILL_IDS" --ctx "$(( PREFILL_TOKENS + 16 ))" > "$PF_OUT" 2>&1; then
+        tail -20 "$PF_OUT" >&2
+        echo "kimi_k3_eval: the prefill pass failed — nothing to score" >&2
+        exit 1
+    fi
+    # PREFILL_TOTAL tokens=32768 ms=812169.5 tok_s=40.35 ms_per_token=24.785
+    TPS="$(sed -n 's/.*PREFILL_TOTAL .*tok_s=\([0-9.]*\).*/\1/p' "$PF_OUT" | tail -1)"
+    MSTOK="$(sed -n 's/.*PREFILL_TOTAL .*ms_per_token=\([0-9.]*\).*/\1/p' "$PF_OUT" | tail -1)"
+    if [[ -z "$TPS" ]]; then
+        tail -20 "$PF_OUT" >&2
+        echo "kimi_k3_eval: the bench reported no PREFILL_TOTAL line — nothing to score" >&2
+        echo "  the binary predates the prefill instrumentation, so it cannot be scored on it." >&2
+        exit 1
+    fi
+    echo ">> prefill: $TPS tok/s ($MSTOK ms/token) over $PREFILL_TOKENS tokens"
+fi
+
 # ---- 2. correctness -------------------------------------------------------
 # THE ANSWER KEY MUST NOT BE ON THE SAME MACHINE AS THE BINARY BEING GRADED.
 #
@@ -556,13 +639,23 @@ KL_BAR="${KIMI_K3_KL_BAR:-0.05}"
 KL_PREFER="${KIMI_K3_KL_PREFER:-0.02}"
 
 PROV="$(python3 - "$NODE" "$DEVICES" "$LAYERS" "$MODEL" "$MSTOK" "$FINGERPRINT" \
-        "${EXT_TOP1:+controller}" "$SCORED_CTX" "$KL_BAR" "$KL_PREFER" <<'PY'
+        "${EXT_TOP1:+controller}" "$SCORED_CTX" "$KL_BAR" "$KL_PREFER" \
+        "$SCORED_METRIC" "$DECODE_TPS" "$DECODE_CTX" "$DECODE_GUARD_PCT" <<'PY'
 import json, sys, os
 node, devs, layers, model, mstok, fp, acc_src, ctx, kl_bar, kl_prefer = sys.argv[1:11]
+metric, decode_tps, decode_ctx, guard_pct = (sys.argv[11:15] + ["", "", "", ""])[:4]
 print(json.dumps({
     "node": node, "devices": devs, "layers": int(layers),
     "quant": os.path.basename(os.path.dirname(model)),
     "ms_per_token": float(mstok) if mstok else None,
+    # WHICH METRIC EARNED THE TIER, and the decode number the guard was applied to. Without
+    # these a reader cannot tell a prefill receipt from a decode one, and the guard leaves no
+    # trace of having run -- so a round where it was inactive looks identical to one where it
+    # passed.
+    "scored_metric": metric or "decode",
+    "decode_tps": float(decode_tps) if decode_tps else None,
+    "decode_ctx": int(decode_ctx) if decode_ctx else None,
+    "decode_guard_pct": float(guard_pct) if guard_pct else None,
     "engine": "sparkinfer/kimi_k3_tp_bench",
     "llama_commit": os.environ.get("KIMI_K3_LLAMACPP_COMMIT", ""),
     # How the two numbers that decide the tier were obtained. Both used to come from the
