@@ -1224,7 +1224,13 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
                     return kimi_k3_forward_layer_phase(R.fwd, layer, K3LayerPhase::FfnUp,
                                                        R.x, R.x_next);
                 })) return false;
-            if (!p.coll->allreduce_f32_owned_slot((size_t)up_count, p.streams, slot_moe)) {
+            // SLOT -1, NOT slot_moe, and the pairing is the whole bug. There is a
+            // reduce_in_slot() but NO reduce_out_slot(): a slotted reduce reads
+            // reduce_in_slot(r, slot) and always writes reduce_out(r). FfnUp above wrote
+            // zc_in[r] == reduce_in(r), the DEFAULT buffer, so passing slot_moe made the
+            // reduce sum a different allocation entirely and return success over stale
+            // memory. -1 selects the default pair, which is the one that was written.
+            if (!p.coll->allreduce_f32_owned_slot((size_t)up_count, p.streams, -1)) {
                 std::fprintf(stderr, "[k3-tp] routed_up all-reduce failed at layer %d\n",
                              layer);
                 return false;
