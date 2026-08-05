@@ -255,8 +255,11 @@ int main(int argc, char** argv) {
                 if (!check(cudaMemcpyAsync(dst, host.data(), count * sizeof(float),
                                            cudaMemcpyHostToDevice, streams[r]), "H2D")) return 1;
             }
-            if (!coll->allreduce_f32_group(bufs, count, streams)) {
-                std::printf("  FAIL: allreduce_f32_group returned false (count %zu)\n", count);
+            const bool launched = owned
+                ? coll->allreduce_f32_owned(count, streams)
+                : coll->allreduce_f32_group(bufs, count, streams);
+            if (!launched) {
+                std::printf("  FAIL: f32 all-reduce returned false (count %zu)\n", count);
                 return 1;
             }
             for (int r = 0; r < tp_size; ++r) {
@@ -301,7 +304,10 @@ int main(int argc, char** argv) {
         };
         double us_attn = 0, us_moe = 0;
         for (const auto& p : k3) {
-            auto issue = [&]() { coll->allreduce_f32_group(bufs, p.n, streams); };
+            auto issue = [&]() {
+                if (owned) coll->allreduce_f32_owned(p.n, streams);
+                else coll->allreduce_f32_group(bufs, p.n, streams);
+            };
             for (int warm = 0; warm < 20; ++warm) issue();
             for (int r = 0; r < tp_size; ++r) { cudaSetDevice(devices[r]); cudaStreamSynchronize(streams[r]); }
             const auto t0 = std::chrono::steady_clock::now();

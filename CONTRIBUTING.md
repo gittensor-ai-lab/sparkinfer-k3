@@ -130,6 +130,10 @@ per-subsystem budget**. **Two different denominators, and mixing them up is expe
   128k context**): `XS` <3.5%, `S` 3.5–6%, `M` 6–10%, `L` 10–18%, `XL` >18%. Any verified
   gain that clears the gate floors at `XS`.
 
+  **On the current scored metric (prefill @32k) the llama term is disabled** and the tier is
+  `delta / frontier` — see [The scored metric is PREFILL at 32k](#the-scored-metric-is-prefill-at-32k-from-2026-08-05)
+  for why. Everything below describes the anchor as it applies to decode.
+
   Both halves matter. While the frontier is **below** llama.cpp the llama term is smaller, so
   an un-optimized baseline cannot mint `XL`s from low-hanging fruit. Once the frontier is
   **past** llama.cpp — which K3 now is, at 2.2× — the frontier term is smaller, so a tier
@@ -152,7 +156,7 @@ now 3.08× ahead, and the untouched gap is ingestion:
 | @ 32k | tok/s | |
 |---|--:|---|
 | llama.cpp | **143.88** | batches the prompt |
-| sparkinfer | **40.35** | **3.57× behind** |
+| sparkinfer | **53.02** | **2.71× behind** |
 
 There is no batched prefill: every prompt token goes through the single-token decode step,
 so a prompt costs what generating it costs. A 32,768-token prompt takes ~13.5 minutes to
@@ -160,9 +164,22 @@ ingest before the first token appears. That is the work now being paid for.
 
 Two consequences worth knowing before you start:
 
-- **The llama anchor binds here.** The prefill frontier (40.35) is *below* the reference
-  (143.88), so the tier is `delta / 143.88` — you do not get `XL` for improving a weak
-  baseline. Reaching ~66 tok/s earns `XL`; 40.35 → 50 earns `M`.
+- **The llama anchor is OFF here, so the tier is `delta / frontier`.** The bands are the
+  same percentages you would read off decode: `S` +3.5%, `M` +6%, `L` +10%, `XL` +18% over
+  the current prefill frontier.
+
+  The anchor is off because 143.88 is not a mature version of what we do — llama.cpp
+  **batches** the prompt and sparkinfer walks it token by token, so `delta / 143.88` sizes a
+  gain against the feature we have not built rather than against the work in the PR. And
+  because the buckets are fractions of the reference, leaving it on made a tier cost **2.7×
+  more on prefill than on decode** (`L` = +27.1% over the frontier vs +10.0%) purely because
+  llama's two metrics are 7.8× apart — 18.44 decode against 143.88 prefill. Nothing about
+  prefill work is 2.7× harder; that number came from llama.cpp's shape, not from ours.
+
+  `pct_of_llama` is still recorded on every run, and `reference.lock` still pins 143.88 — it
+  stopped being the tier basis, not the target. **This flips back the round after batched
+  prefill (#137) lands**, because at that point the two engines are doing the same thing and
+  the anchor means what it says again.
 - **Decode and prefill share kernels.** Batching the prompt will move decode. The 1% guard
   bounds how far, and it is a refusal rather than a tier — a prefill gain bought by giving
   decode back has not moved the engine forward, it has moved work around.

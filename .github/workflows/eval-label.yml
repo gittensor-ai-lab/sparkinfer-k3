@@ -215,9 +215,10 @@ jobs:
           # numbers. Keep this suffix in step with kimi_k3_eval.sh's CTX_SUFFIX and
           # k3_eval_bot.py's CTX_SUFFIX. Scored metric moved to prefill @32k on 2026-08-05;
           # decode at 128k is now a regression guard in the harness, not the tier basis.
+          SUFFIX = "32K_PP"
           def slot(kind):
               pfx = f"KIMI_K3_{node}"
-              for key in (f"{pfx}_{quant}_{kind}_32K_PP", f"{pfx}_{kind}_32K_PP"):
+              for key in (f"{pfx}_{quant}_{kind}_{SUFFIX}", f"{pfx}_{kind}_{SUFFIX}"):
                   v = lock.get(key, "")
                   try:
                       if v and float(v) > 0: return float(v)
@@ -235,11 +236,27 @@ jobs:
                     f"{frontier}; using the pinned value", file=sys.stderr)
           # stdout of this heredoc IS $GITHUB_OUTPUT, so anything that is not key=value
           # goes to stderr or it corrupts the step outputs.
+          # The llama anchor sizes a gain against llama.cpp as a MATURITY level of the same
+          # algorithm. On the prefill metric it is not one: llama.cpp batches the prompt and
+          # sparkinfer walks it token by token, so delta/143.88 measures the feature we have
+          # not built (#137) rather than the work in the PR. Because the buckets are fractions
+          # of the ref, that also made a tier cost 2.7x more on prefill (L = +27.1% over the
+          # frontier) than on decode (L = +10.0%), purely because llama's two metrics are 7.8x
+          # apart. Turn the anchor back on the round after batched prefill lands.
+          anchor_off = SUFFIX.endswith("_PP")
           print(f"::notice::tier basis from reference.lock — frontier={frontier} "
-                f"llama_ref={ref}", file=sys.stderr)
+                f"llama_ref={ref}"
+                + ("  [anchor OFF: prefill is not the same algorithm as llama's batched "
+                   "prefill; tier is frontier-relative]" if anchor_off else ""),
+                file=sys.stderr)
 
           env = dict(os.environ)
           env["SPARKINFER_DIFFICULTY_REF"] = str(ref)
+          if anchor_off:
+              env["SPARKINFER_TIER_ANCHOR"] = "off"
+              env["SPARKINFER_TIER_ANCHOR_REASON"] = (
+                  "llama.cpp batches the prompt and sparkinfer does not, so its prefill is a "
+                  "different algorithm rather than a mature version of this one")
           # Same bars the harness used. label.py's defaults are the Qwen track's (0.20)
           # and must stay loose for it; K3 pins 0.05. If these two ever disagree the
           # workflow re-derives a different verdict from the same numbers.
