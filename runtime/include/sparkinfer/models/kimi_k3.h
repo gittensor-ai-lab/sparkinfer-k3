@@ -460,8 +460,25 @@ bool kimi_k3_forward_layer(KimiK3Forward& fwd, int layer, const float* hidden_in
 //
 // Attn keeps doing the whole thing when no batch is set, so the single-token path is
 // untouched and is still the fallback.
+// FfnUp / FfnTail split FfnFinish so the routed up-projection can be SHARDED.
+//
+// ffn_routed_up is Replicate, so every rank computes the identical 7168x3584 projection on
+// all 92 MoE layers — 2.51 GB per token per rank, eight times over. Row-sharding it gives
+// each rank 1/tp of the rows, but the result feeds the residual and the next layer's norm
+// needs the full hidden vector, so the bands have to be summed before the layer ends. That
+// is one all-reduce, and a phase boundary is the only place to put it.
+//
+//   FfnUp    routed_norm, then THIS RANK's band of the up-projection into a zeroed
+//            hidden-wide buffer. The zero matters: the reduce sums every rank's whole
+//            buffer, so anything outside the band must be exactly 0.
+//   FfnTail  the shared-expert fold and the residual add, unchanged.
+//
+// FfnFinish still runs both, so the unsharded path — and every existing caller — is
+// untouched. Sharding happens only when a driver asks for FfnUp explicitly, which is also
+// the only way the reduce between them gets issued.
 enum class K3LayerPhase {
-    All = 0, Attn = 1, FfnPartial = 2, FfnFinish = 3, AttnPre = 4, AttnProj = 5
+    All = 0, Attn = 1, FfnPartial = 2, FfnFinish = 3, AttnPre = 4, AttnProj = 5,
+    FfnUp = 6, FfnTail = 7
 };
 
 
