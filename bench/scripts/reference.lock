@@ -184,7 +184,6 @@ KIMI_K3_H200X8_IQ1S_LLAMA_128K="${KIMI_K3_H200X8_IQ1S_LLAMA_128K:-18.4435}"
 # raise-only, so a slow box cannot deflate it and mint tiers for everyone behind it.
 # 1.00 tok/s (995.65 ms/token) measured on main @ 37d4219 via the committed --ctx/--seek
 # path, which reproduces the throwaway seek_patch.py measurement (1.01 / 991.75) to 0.4%.
-# frontier: measured by eval/k3_eval_bot.py on main @ de47bfe168d1 (h200x8, UD-IQ1_S). Do not hand-edit — the bot rewrites this each round.
 #
 # SET TO 56.8 BY HAND ON 2026-08-05, deliberately, because this slot stopped being the tier
 # basis and became the DECODE REGRESSION GUARD's baseline (#131).
@@ -223,7 +222,8 @@ KIMI_K3_H200X8_IQ1S_SPARKINFER_128K="${KIMI_K3_H200X8_IQ1S_SPARKINFER_128K:-56.8
 KIMI_K3_H200X8_IQ1S_LLAMA_32K_PP="${KIMI_K3_H200X8_IQ1S_LLAMA_32K_PP:-143.88}"
 # frontier: rewritten by eval/k3_eval_bot.py each round, raise-only. Do not hand-edit.
 # Seeded from the 812.2 s / 32,768-token measurement on main @ 3b6a3f4.
-KIMI_K3_H200X8_IQ1S_SPARKINFER_32K_PP="${KIMI_K3_H200X8_IQ1S_SPARKINFER_32K_PP:-40.35}"
+# frontier: measured by eval/k3_eval_bot.py on main @ c1a1642e250b (h200x8, UD-IQ1_S). Do not hand-edit — the bot rewrites this each round.
+KIMI_K3_H200X8_IQ1S_SPARKINFER_32K_PP="${KIMI_K3_H200X8_IQ1S_SPARKINFER_32K_PP:-53.02}"
 
 KIMI_K3_H200X8_LLAMA_128="${KIMI_K3_H200X8_LLAMA_128:-0}"
 KIMI_K3_H200X8_LLAMA_512="${KIMI_K3_H200X8_LLAMA_512:-0}"
