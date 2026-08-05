@@ -301,6 +301,35 @@ void k3_kda_chunk_prep_kernel(float* __restrict__ ws_kd, float* __restrict__ ws_
 // was 0.071 us/token against the pair's 24.27, so K2 was 99.7% of the time and
 // its occupancy was the entire problem.
 //
+// ---------------------------------------------------------------------------
+// WHICH SEQUENTIAL KERNEL THIS IS ACTUALLY FASTER THAN, because the first
+// answer recorded here was against the wrong one.
+// ---------------------------------------------------------------------------
+// There are TWO per-token scans in this repo, and kimi_k3.cpp:1638 picks between
+// them at runtime:
+//
+//   k3_kda_decode_step_ip   warp-per-column, grid (n_head, head_dim/4) = 384
+//                           blocks. TRIED FIRST, and declines only on
+//                           head_dim != 128, a misaligned base, or
+//                           SPARKINFER_K3_KDA_IP=0 — none of which hold at K3's
+//                           shape. So this is what the scored path runs.
+//   kda_decode_step_f32     the tiled fallback, grid (n_head, head_dim/BV).
+//                           Unreachable at K3's shape.
+//
+// This file's first benchmark timed the FALLBACK and reported 38.26x. That is a
+// speedup over code the runtime never executes. Re-measured against both, same
+// binary, same session (8x H200, D=128 H=12, T=4096, us/token):
+//
+//     chunk 0.596   |   decode_step_ip 2.921  (4.90x)  |  tiled 30.258 (50.7x)
+//
+// 4.90x is the real figure. What it is worth end to end is the part that
+// decides whether a batched caller is worth building: the scan runs on ~70 of
+// K3's 93 layers, so batching it saves 70 * (2.921 - 0.596) = 0.163 ms of a
+// 16.93 ms/token prefill — 0.96%, or 59.07 -> 59.64 tok/s. The kernel is a real
+// 4.9x on its own axis and the axis is 1% of the problem; prefill is
+// overhead-bound across ~4,376 launches per token, and only batching ALL of
+// them moves it.
+//
 // The state columns are INDEPENDENT, which is what makes the split legal:
 // RHS[t][j], U[t][j] and S[:,j] all depend only on column j of S_in. So the
 // column axis can be spread across blocks, exactly as this repo's sibling
