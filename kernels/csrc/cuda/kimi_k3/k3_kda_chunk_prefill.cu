@@ -10,9 +10,7 @@
 // (per-channel, A_log/lower_bound-sigmoid) and scalar-per-head beta.
 //
 // See kernels/include/sparkinfer/kernels/kimi_k3.h, op 6b, for the full derivation
-// (re-derived from kda_decode_step_kernel's own pinned formula, cross-checked
-// against Moonshot's own FlashKDA — github.com/MoonshotAI/FlashKDA, whose
-// H=96/D=128 benchmark shape and lower_bound range are K3's own) and for exactly
+// (re-derived from kda_decode_step_kernel's own pinned formula) and for exactly
 // what is and is not the same contract as the per-token step. The algorithm was
 // proven against the token-by-token recurrence, in float64, BEFORE this file was
 // written: kernels/tests/k3_kda_chunk_prefill_cpu_test.cpp.
@@ -29,26 +27,24 @@
 //              dependent steps instead of T, each a handful of small dense matmuls
 //              against K1's precomputed workspace, not a fresh triangular solve.
 //
-// This is FlashKDA's own two-kernel split, kept for FlashKDA's own measured reason
-// (their deep-dive: fusing the two lost >=15% because the token-parallel work was
-// bottlenecked by the recurrence's low parallelism). K2 at grid = n_head is 12
+// The split is along the recurrence itself, and fusing the two would drag the
+// token-parallel work down to the sequential part's parallelism. K2 at grid = n_head is 12
 // blocks per rank under the sharded policy — poor occupancy, and structurally so;
 // the split exists precisely so that K1, which is (T/16) x n_head blocks, is where
 // the bulk of the arithmetic lands.
 //
 // F32 THROUGHOUT, PLAIN CUDA, NO TENSOR CORES — matching this file family's stated
 // convention (k3_kernels.cu: "correctness-first... fused variants come after the
-// math is pinned, not before") and NOT FlashKDA's own implementation, which is
-// CUTLASS/CUTE, sm_90a-specific (TMA, warpgroup MMA), bf16/fp16 throughout, and
-// inverts (I+L) by a doubling Neumann series to stay in bf16 range at CHUNK=16.
-// This inverts by plain forward substitution instead: at CHUNK=16 the triangular
+// math is pinned, not before"). A tensor-core implementation of this shape would be
+// bf16/fp16 throughout and would invert (I+L) by a doubling Neumann series to stay
+// in range at CHUNK=16; this inverts by plain forward substitution: at CHUNK=16 the triangular
 // solve is O(16^3) against O(16*head_dim^2) for the two decayed projections, a
 // rounding error either way once nothing is fighting for tensor-core throughput.
 //
 // CHUNK=16 IS LOAD-BEARING, NOT A TUNING KNOB. G_t is a cumsum of per-channel
 // log-gates bounded below by lower_bound = -5, so |G| <= 16*5 = 80 within a chunk,
 // and exp(+-G) spans [1.8e-35, 5.5e34] — inside f32's normal range (ln(f32 max) is
-// ~88.7) with the margin FlashKDA's own chunk-size analysis picked it for. A
+// ~88.7), with margin. A
 // CHUNK of 32 would put exp(-G) past f32 infinity on exactly the deep-decay
 // channels that carry the recency structure.
 //
