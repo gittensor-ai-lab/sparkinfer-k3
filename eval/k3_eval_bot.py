@@ -1114,6 +1114,17 @@ FRONTIER_TOL = 0.02
 # that needs a human: either something regressed on main or the box is degraded. Both are
 # reasons to stop, not to quietly re-baseline the thing that decides payouts.
 FRONTIER_ALARM = 0.90
+# A frontier that overshoots its pin by this much means the PIN WAS STALE, not that main got
+# faster this instant -- main does not gain 30% between rounds. It is worth saying out loud
+# because a stale-low pin is invisible while it does damage: the bot measures and passes the
+# frontier explicitly, so ROUNDS score correctly, but eval-label.yml derives from the lock and
+# contributors read it to decide what to beat.
+#
+# 2026-08-05: the prefill slot was hand-seeded at 40.35 from a measurement taken before #114,
+# #115 and #127 landed. Prefill shares the single-token path with decode, so those decode wins
+# lifted it to 53.02 -- a 31% understatement that three PRs optimised against, reporting gains
+# of +25.4%, +24.5% and +5.3% that were really -4.6%, -5.3% and -19.8%.
+FRONTIER_STALE_NOTICE = float(os.environ.get("K3_FRONTIER_STALE_NOTICE", "0.10"))
 
 
 # THE SCORED METRIC IS PREFILL AT 32k (2026-08-05), so the frontier lives in _32K_PP.
@@ -1190,6 +1201,14 @@ def reconcile_lock(repo, node, quant, measured, main_sha, dry_run):
         print(f">> frontier: main measures {measured}, below the pinned {pinned} but within "
               f"the alarm band — scoring against the pin (the conservative direction)")
         return pinned
+
+    if pinned > 0 and measured > pinned * (1 + FRONTIER_STALE_NOTICE):
+        print(f"!! {slot} pinned {pinned} but main measures {measured} — the pin was stale by "
+              f"{100 * (measured / pinned - 1):.1f}%.\n"
+              f"   Rounds were unaffected (the frontier is measured and passed explicitly), but "
+              f"eval-label.yml derives tiers from this pin and contributors read it to decide "
+              f"what to beat, so anything scored or written against {pinned} was priced wrong.",
+              file=sys.stderr)
 
     # Rewrite BY LINE, not by splicing the regex match out of the whole text. Splicing looked
     # fine and quietly ate the blank line after the slot, because the trailing-whitespace part
