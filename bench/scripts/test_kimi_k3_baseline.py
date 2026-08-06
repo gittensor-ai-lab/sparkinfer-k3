@@ -1628,6 +1628,64 @@ class CiWorkflowTest(unittest.TestCase):
         self.assertIn("winner_tps > 0", after,
                       "a missing measurement must not write a zero frontier")
 
+    def test_the_top1_bar_is_095_everywhere_that_can_disagree(self):
+        """Three readers apply this bar -- label.py's default, the harness, and the workflow's
+        re-derivation -- and eval-label.yml REFUSES a payload whose label it cannot reproduce.
+        A bar that differs between them does not produce a wrong verdict, it produces
+        'payload edited' on every PR, so they are pinned together."""
+        # label.py's DEFAULT stays 0.90 -- that is the Qwen track's bar, and accuracy.sh
+        # grades top-1 there over many rows at 0.875/0.80, so raising the shared default to
+        # tighten K3 would silently tighten a gate whose numbers we have never measured.
+        # K3 pins its own, exactly as it pins KL 0.05 against label.py's Qwen default 0.20.
+        lp = (ROOT / "bench/scripts/label.py").read_text()
+        self.assertIn('SPARKINFER_TOP1_BAR",  "0.90"', lp)
+        ev = (ROOT / "bench/scripts/kimi_k3_eval.sh").read_text()
+        self.assertIn('TOP1_BAR="${KIMI_K3_TOP1_BAR:-0.95}"', ev)
+        self.assertIn('SPARKINFER_TOP1_BAR="$TOP1_BAR"', ev)
+        self.assertIn('"top1_bar": float(top1_bar)', ev,
+                      "the bar the box ran must be in the payload, or a disagreement is "
+                      "guesswork")
+        wf = (ROOT / ".github/workflows/eval-label.yml").read_text()
+        self.assertIn('TOP1_BAR = "0.05", "0.02", "0.95"', wf)
+        self.assertIn('env["SPARKINFER_TOP1_BAR"] = TOP1_BAR', wf)
+
+    def test_top1_is_a_boolean_because_every_probe_dumps_one_row(self):
+        """THE BAR IS NOT A 5% TOLERANCE AND THE DOCS MUST NOT IMPLY ONE.
+
+        compare_logits computes (argmax_ref == argmax_test).mean() over the rows in the .spkl,
+        and every reference file carries n_tok=1. The mean of one boolean is 0.0 or 1.0;
+        k3_eval_bot then takes min() across depths. So every bar in (0, 1] behaves identically
+        -- 'the argmax must match exactly at every depth' -- and all 48 top-1 values in the
+        sealed log are exactly 1.0.
+
+        This test fails the day a probe dumps more than one row, which is the point: at that
+        moment 0.95 starts to mean something and the prose below it has to be revisited."""
+        import struct
+        refs = sorted((ROOT / "bench/refdata").glob("*.spkl"))
+        self.assertTrue(refs, "no reference logits to check")
+        for f in refs:
+            with open(f, "rb") as fh:
+                self.assertEqual(fh.read(4), b"SPKL", f.name)
+                _, n_tok, _ = struct.unpack("<III", fh.read(12))
+            self.assertEqual(n_tok, 1,
+                             f"{f.name} now carries {n_tok} rows -- top-1 is no longer a "
+                             f"boolean, so revisit the 0.95 bar and the docs that call it "
+                             f"pass/fail")
+        for doc, needle in ((("CONTRIBUTING.md"), "top-1 is pass/fail"),
+                            (("README.md"), "effectively pass/fail")):
+            self.assertIn(needle, (ROOT / doc).read_text(),
+                          f"{doc} must not present the bar as a graded tolerance")
+
+    def test_the_docs_quote_k3s_own_kl_bar_not_the_qwen_default(self):
+        """README said 'KL <= 0.20' in two places. That is label.py's shared default, which is
+        the Qwen track's; K3 pins 0.05 in the harness and in eval-label.yml. Quoting 0.20
+        tells a K3 contributor their PR has 4x the parity headroom it really has."""
+        readme = (ROOT / "README.md").read_text()
+        self.assertNotIn("KL <= 0.20", readme)
+        self.assertNotIn("KL ≤ 0.20", readme)
+        self.assertIn("KL ≤ 0.05", readme)
+        self.assertIn("KL <= 0.05", readme)
+
     def test_decode_is_guarded_at_128k_even_though_prefill_is_scored(self):
         """Prefill and decode share kernels, so batching the prompt WILL move decode. The
         guard bounds how far, and it is a refusal rather than a tier: a prefill gain bought
@@ -2178,8 +2236,8 @@ class CiWorkflowTest(unittest.TestCase):
                       "the bar label.py is given must be the one recorded in provenance")
         self.assertIn('SPARKINFER_KL_PREFER="$KL_PREFER"', ev)
         wf = (ROOT / ".github/workflows/eval-label.yml").read_text()
-        self.assertIn('KL_BAR, KL_PREFER = "0.05", "0.02"', wf,
-                      "the trusted re-derivation would use the Qwen default and disagree")
+        self.assertIn('KL_BAR, KL_PREFER, TOP1_BAR = "0.05", "0.02", "0.95"', wf,
+                      "the trusted re-derivation would use the Qwen defaults and disagree")
 
     def test_a_moved_kl_knob_names_itself(self):
         """The harness bar is env-overridable and the workflow's is pinned, so a box running

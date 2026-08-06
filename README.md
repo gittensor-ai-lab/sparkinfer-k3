@@ -287,8 +287,10 @@ bench/scripts/kimi_k3_eval.sh --node h200x8 --frontier <merged best>
 It emits the `RESULT_JSON` contract [`bench/scripts/label.py`](bench/scripts/label.py)
 already scores for the other models, so K3 needs no second scoring path:
 
-- **Correctness gate first.** top-1 ≥ 0.90 and KL ≤ 0.20 against the captured reference,
+- **Correctness gate first.** top-1 ≥ 0.95 and KL ≤ 0.05 against the captured reference,
   else `REJECT` — regardless of speed. A speedup that erodes parity is not a speedup.
+  Top-1 is effectively pass/fail (one logit row per probe, so it is a boolean); KL is the
+  graded gate.
 - **Significance gate.** The gain must beat 2% of the frontier, else `none`.
 - **Tier is the worse of two bases** — `min(delta/llama_ref, delta/frontier)` — so it can
   never exceed the speedup actually measured. Below llama.cpp the anchor binds, so an
@@ -336,7 +338,7 @@ Contributors submit PRs; the eval verifies correctness and speed **on an 8x H200
 1. Pick a narrow bottleneck in the Hopper decode path.
 2. Submit a PR with source changes and benchmark evidence.
 3. The eval builds `main` and the PR on the same 8x H200 node.
-4. Correctness vs llama.cpp (top-1 >= 0.90, KL <= 0.20) gates before any speed tier.
+4. Correctness vs llama.cpp (top-1 >= 0.95, KL <= 0.05) gates before any speed tier.
 5. Strongest context improvement scores; regressions get `regression-*` labels.
 6. Frontier merges; the [dashboard](https://gittensor-ai-lab.github.io/sparkinfer/dashboard/) updates.
 

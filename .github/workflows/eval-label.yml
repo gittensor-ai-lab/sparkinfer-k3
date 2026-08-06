@@ -265,8 +265,9 @@ jobs:
           # so a box can run with a looser bar and produce a verdict this job cannot
           # reproduce. It records what it used, so check that FIRST -- otherwise the only
           # symptom is a label mismatch blamed on an edited payload.
-          KL_BAR, KL_PREFER = "0.05", "0.02"
-          for key, pinned in (("kl_bar", KL_BAR), ("kl_prefer", KL_PREFER)):
+          KL_BAR, KL_PREFER, TOP1_BAR = "0.05", "0.02", "0.95"
+          for key, pinned in (("kl_bar", KL_BAR), ("kl_prefer", KL_PREFER),
+                              ("top1_bar", TOP1_BAR)):
               used = d.get(key)
               if used is None:
                   print(f"::warning::payload does not record {key}; it predates the pin or "
@@ -279,6 +280,12 @@ jobs:
                   sys.exit(1)
           env["SPARKINFER_KL_BAR"] = KL_BAR
           env["SPARKINFER_KL_PREFER"] = KL_PREFER
+          # Pinned here for the same reason as the KL pair: label.py's default is the Qwen
+          # track's and the harness's is env-overridable, so a box running a looser bar would
+          # produce a verdict this job cannot reproduce. Note the bar is currently
+          # unfalsifiable either way -- the probes dump one logit row per depth, so top1 is a
+          # boolean and every bar in (0, 1] behaves the same.
+          env["SPARKINFER_TOP1_BAR"] = TOP1_BAR
           # speed_source is only a record if a wrong value is refused. The harness writes
           # the truthful name for its one measured path; "wall_clock_differential" is the
           # same bounded path under its old (misleading) name, kept so pre-rename payloads
