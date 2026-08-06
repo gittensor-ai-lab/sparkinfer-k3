@@ -1332,9 +1332,10 @@ float* kimi_k3_swap_partial_buffer(KimiK3Forward& fwd, K3LayerPhase phase,
 static bool k3_check_launch(int layer, K3LayerPhase phase) {
     const cudaError_t e = cudaGetLastError();
     if (e == cudaSuccess) return true;
-    const char* pn = phase == K3LayerPhase::All        ? "All"
-                   : phase == K3LayerPhase::Attn       ? "Attn"
-                   : phase == K3LayerPhase::FfnPartial ? "FfnPartial" : "FfnFinish";
+    const char* pn = phase == K3LayerPhase::All          ? "All"
+                   : phase == K3LayerPhase::Attn         ? "Attn"
+                   : phase == K3LayerPhase::FfnPrepare   ? "FfnPrepare"
+                   : phase == K3LayerPhase::FfnPartial   ? "FfnPartial" : "FfnFinish";
     std::fprintf(stderr,
                  "[k3] LAUNCH FAILED at layer %d, phase %s: %s\n"
                  "     A kernel did not launch. Its output buffer still holds the "
@@ -1355,6 +1356,9 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
     const float eps = cfg.rms_eps;
 
     const bool do_attn   = (phase == K3LayerPhase::All || phase == K3LayerPhase::Attn);
+    const bool do_ffn_prepare = (phase == K3LayerPhase::All ||
+                                 phase == K3LayerPhase::FfnPrepare ||
+                                 phase == K3LayerPhase::FfnPartial);
     const bool do_ffn_p  = (phase == K3LayerPhase::All || phase == K3LayerPhase::FfnPartial);
     const bool do_ffn_f  = (phase == K3LayerPhase::All || phase == K3LayerPhase::FfnFinish);
 
@@ -1638,11 +1642,14 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
         float** normed_p = nullptr; float* normed0 = nullptr;
         void**  act_p    = nullptr; void*  act0    = nullptr;
         float **qp = nullptr, **kp = nullptr, **vp = nullptr, **gp = nullptr;
+        float **gop = nullptr;
         float  *q0 = nullptr,  *k0 = nullptr,  *v0 = nullptr,  *g0 = nullptr;
+        float  *go0 = nullptr;
         ~K3TileAlias() {
             if (!normed_p) return;
             *normed_p = normed0; *act_p = act0;
             *qp = q0; *kp = k0; *vp = v0; *gp = g0;
+            if (gop) *gop = go0;
         }
     } tile_alias;
     if (pt_hit) {
@@ -1652,6 +1659,10 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
         tile_alias.kp = &s.qkv_k;      tile_alias.k0 = s.qkv_k;
         tile_alias.vp = &s.qkv_v;      tile_alias.v0 = s.qkv_v;
         tile_alias.gp = &s.g_proj_out; tile_alias.g0 = s.g_proj_out;
+        if (pt_hit->kda_out_layer == layer && pt_hit->kda_gate_out) {
+            tile_alias.gop = &s.gate_out; tile_alias.go0 = s.gate_out;
+            s.gate_out = pt_hit->kda_gate_out + (size_t)fwd.prefill_tok * pt_hit->qkv;
+        }
     }
 
     if (do_attn) {
@@ -2010,7 +2021,10 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
                                   s.g_proj_out, head_dim, n_head, eps, stream);
             if (fwd.debug) fwd.debug("dbg_gate_out", layer, s.gate_out, qkv);
 
-            if (!proj(s.attn_out, s.gate_out, L.attn_output, H, qkv)) return false;
+            // The tile driver projects all rows together directly into the collective
+            // slot. A marker miss retains the exact scalar path.
+            if (!(pt_hit && pt_hit->kda_out_layer == layer) &&
+                !proj(s.attn_out, s.gate_out, L.attn_output, H, qkv)) return false;
             if (fwd.debug) fwd.debug("kda_out", layer, s.attn_out, H);
         } else {
             const int mla_ord = kimi_k3_mla_ordinal(cfg, layer);
@@ -2148,8 +2162,31 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
         k3_profiler().stop(L.is_kda ? "attn_kda" : "attn_mla", stream);
     }
 
-    // ---- phase 2: attention residual, FFN norm, and the FFN's PARTIAL. ----
-    if (do_ffn_p) {
+    // ---- phase 2a: attention residual and FFN norm. -------------------------
+    // A prefill tile may run this for all tokens before phase 2b, making the common
+    // normalized rows available to one batched routed-down projection.
+    const K3PrefillTile* ffn_pt = (const K3PrefillTile*)fwd.prefill_tile;
+    const bool ffn_tile_row = ffn_pt && fwd.prefill_tok >= 0 &&
+                              fwd.prefill_tok < ffn_pt->n_live;
+    const bool ffn_norm_prepared = ffn_tile_row &&
+                                   ffn_pt->ffn_norm_layer == layer;
+    const bool ffn_prepared = ffn_tile_row && ffn_pt->ffn_layer == layer;
+    const bool experts_prepared = ffn_tile_row && ffn_pt->expert_layer == layer;
+    const float* attn_src = (ffn_tile_row && ffn_pt->attn_layer == layer)
+        ? ffn_pt->attn_out + (size_t)fwd.prefill_tok * H : s.attn_out;
+    float* normed2_dst = (phase == K3LayerPhase::FfnPrepare && ffn_tile_row)
+        ? ffn_pt->normed2 + (size_t)fwd.prefill_tok * H : s.normed2;
+    const float* normed2_src = ffn_norm_prepared
+        ? ffn_pt->normed2 + (size_t)fwd.prefill_tok * H : normed2_dst;
+    const float* router_logits_src = ffn_prepared
+        ? ffn_pt->router_logits + (size_t)fwd.prefill_tok * cfg.n_experts
+        : s.router_logits;
+    const float* router_w_src = ffn_prepared
+        ? ffn_pt->router_w + (size_t)fwd.prefill_tok * cfg.top_k : s.router_w;
+    const int* router_ids_src = ffn_prepared
+        ? ffn_pt->router_ids + (size_t)fwd.prefill_tok * cfg.top_k : s.router_ids;
+
+    if (do_ffn_prepare && !ffn_norm_prepared) {
         // --- combine: replace on a checkpoint layer, add otherwise. Uses hidden_in
         // (the RAW pre-mix value), not s.mixed — the reference's residual add is
         // against the unmixed prefix_sum, only the norm/attention input was mixed. ---
@@ -2165,16 +2202,16 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
         if (res_fuse && res_bs > 0 && st.n_ckpt > 0) {
             if (!L.ffn_res_score.ok()) return false;
             k3k::attn_res_mix_f32(s.mixed2, st.res_bank,
-                                  banked ? s.attn_out : hidden_in,
+                                  banked ? attn_src : hidden_in,
                                   (const float*)L.ffn_res_score.data, H, st.n_ckpt, eps,
                                   stream, s.res_scores,
-                                  banked ? nullptr : s.attn_out, hidden_out);
+                                  banked ? nullptr : attn_src, hidden_out);
         } else {
             if (banked) {
-                cudaMemcpyAsync(hidden_out, s.attn_out, (size_t)H * sizeof(float),
+                cudaMemcpyAsync(hidden_out, attn_src, (size_t)H * sizeof(float),
                                 cudaMemcpyDeviceToDevice, stream);
             } else {
-                k3k::k3_add_f32(hidden_out, hidden_in, s.attn_out, H, stream);
+                k3k::k3_add_f32(hidden_out, hidden_in, attn_src, H, stream);
             }
 
             // --- pre-FFN mix, no bank push ---
@@ -2189,16 +2226,24 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             }
         }
         if (!L.ffn_norm.ok()) return false;
-        k3k::rms_norm_f32(s.normed2, s.mixed2, (const float*)L.ffn_norm.data, H, eps, stream);
-        if (fwd.debug) fwd.debug("ffn_norm", layer, s.normed2, H);
+        k3k::rms_norm_f32(normed2_dst, s.mixed2, (const float*)L.ffn_norm.data, H, eps, stream);
+        if (fwd.debug) fwd.debug("ffn_norm", layer, normed2_dst, H);
+    }
+
+    // ---- phase 2b: FFN partial. -------------------------------------------
+    if (do_ffn_p) {
         // normed2 has up to four consumers below -- the router, routed_down, and both
         // shared-expert projections -- and every one of them used to re-quantise it.
-        hoist_act(s.normed2, H);
+        if (!ffn_prepared) {
+            hoist_act(normed2_src, H);
+        } else {
+            hoisted_src = nullptr;
+        }
 
         k3_profiler().start(layer < cfg.leading_dense ? "ffn_dense" : "ffn_moe", stream);
         if (layer < cfg.leading_dense) {
-            if (!proj_h(s.dense_gate, s.normed2, L.ffn_gate, cfg.dense_ffn, H)) return false;
-            if (!proj_h(s.dense_up, s.normed2, L.ffn_up, cfg.dense_ffn, H)) return false;
+            if (!proj_h(s.dense_gate, normed2_src, L.ffn_gate, cfg.dense_ffn, H)) return false;
+            if (!proj_h(s.dense_up, normed2_src, L.ffn_up, cfg.dense_ffn, H)) return false;
             if (fwd.debug) fwd.debug("dbg_dense_gate", layer, s.dense_gate, cfg.dense_ffn);
             if (fwd.debug) fwd.debug("dbg_dense_up", layer, s.dense_up, cfg.dense_ffn);
             k3k::situ_f32(s.dense_situ, s.dense_gate, s.dense_up, cfg.dense_ffn,
@@ -2233,21 +2278,25 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             const Lane l_rd  = moe_fork ? lane_of(0) : main_lane;   // routed_down
             const Lane l_shx = moe_fork ? lane_of(1) : main_lane;   // shared expert
 
-            if (!proj_h(s.router_logits, s.normed2, L.ffn_gate_inp, cfg.n_experts, H))
+            if (!ffn_prepared &&
+                !proj_h(s.router_logits, normed2_src, L.ffn_gate_inp, cfg.n_experts, H))
                 return false;
-            if (fwd.debug) fwd.debug("dbg_router_logits", layer, s.router_logits, cfg.n_experts);
+            if (fwd.debug) fwd.debug("dbg_router_logits", layer, router_logits_src,
+                                     cfg.n_experts);
             if (!L.exp_probs_b.ok()) return false;
             // Shared-memory selection first; it declines to the original below on any
             // shape it does not handle, and is bit-identical where it does.
-            if (!k3k::k3_moe_router_fast(s.router_w, s.router_ids, s.router_logits,
-                                         (const float*)L.exp_probs_b.data, cfg.n_experts,
-                                         cfg.top_k, /*n_tokens=*/1, /*norm_w=*/true,
-                                         /*w_scale=*/1.0f, stream))
-                k3k::moe_router_noaux_tc_f32(s.router_w, s.router_ids, s.router_logits,
-                                             (const float*)L.exp_probs_b.data, cfg.n_experts,
-                                             cfg.top_k, /*n_tokens=*/1, /*norm_w=*/true,
-                                             /*w_scale=*/1.0f, stream);
-            if (fwd.debug) fwd.debug("dbg_router_w", layer, s.router_w, cfg.top_k);
+            if (!ffn_prepared) {
+                if (!k3k::k3_moe_router_fast(s.router_w, s.router_ids, s.router_logits,
+                                             (const float*)L.exp_probs_b.data,
+                                             cfg.n_experts, cfg.top_k, 1, true, 1.0f,
+                                             stream))
+                    k3k::moe_router_noaux_tc_f32(
+                        s.router_w, s.router_ids, s.router_logits,
+                        (const float*)L.exp_probs_b.data, cfg.n_experts,
+                        cfg.top_k, 1, true, 1.0f, stream);
+            }
+            if (fwd.debug) fwd.debug("dbg_router_w", layer, router_w_src, cfg.top_k);
 
             // routed_down feeds the dispatch UNNORMALISED — routed_norm (if present)
             // normalises the dispatch's OUTPUT, not this. See build_latent_moe in the
@@ -2255,9 +2304,14 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             // moe_out = build_norm(moe_out, ...)", and only after that does
             // ffn_routed_up run. Getting this backwards (norm between routed_down and
             // the dispatch) was an earlier version's bug, same class as the ssm_norm fix.
-            if (!proj_h_on(l_rd, s.routed_down_out, s.normed2, L.ffn_routed_down,
-                           cfg.expert_latent, H))
+            const float* routed_down_src = s.routed_down_out;
+            if (ffn_prepared) {
+                routed_down_src = ffn_pt->routed_down +
+                    (size_t)fwd.prefill_tok * cfg.expert_latent;
+            } else if (!proj_h_on(l_rd, s.routed_down_out, normed2_src,
+                                  L.ffn_routed_down, cfg.expert_latent, H)) {
                 return false;
+            }
 
             if (!L.ffn_gate_exps.ok() || !L.ffn_up_exps.ok() || !L.ffn_down_exps.ok())
                 return false;
@@ -2279,13 +2333,15 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             // likewise unchanged — the group is still a CONTIGUOUS id range, just a
             // longer one. What changes is only which bytes the loader packed.
             const int moe_ffn_rank = k3_moe_ffn_local(fwd, cfg);
-            const bool moe_ok = k3k::moe_expert_ffn_f32_by_type(
-                s.moe_out, s.moe_scratch, s.routed_down_out, s.router_ids, s.router_w,
-                L.ffn_gate_exps.data, L.ffn_up_exps.data, L.ffn_down_exps.data,
-                cfg.expert_latent, moe_ffn_rank, cfg.top_k, cfg.situ_beta,
-                cfg.situ_linear_beta, L.ffn_gate_exps.type, stream,
-                expert_begin, n_local_exp, ggml_qact_moe ? s.moe_q8 : nullptr);
-            if (!moe_ok) return false;
+            if (!experts_prepared) {
+                const bool moe_ok = k3k::moe_expert_ffn_f32_by_type(
+                    s.moe_out, s.moe_scratch, routed_down_src, router_ids_src, router_w_src,
+                    L.ffn_gate_exps.data, L.ffn_up_exps.data, L.ffn_down_exps.data,
+                    cfg.expert_latent, moe_ffn_rank, cfg.top_k, cfg.situ_beta,
+                    cfg.situ_linear_beta, L.ffn_gate_exps.type, stream,
+                    expert_begin, n_local_exp, ggml_qact_moe ? s.moe_q8 : nullptr);
+                if (!moe_ok) return false;
+            }
             // This rank's PARTIAL expert sum: it legitimately differs per rank and
             // from the tp=1 value. dbg_moe_reduced below is the one that must match.
             if (fwd.debug) fwd.debug("dbg_moe_partial", layer, s.moe_out, cfg.expert_latent);
@@ -2327,22 +2383,26 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
                                  cfg.moe_ffn * cfg.n_shared, tp_size);
                     return false;
                 }
-                if (!proj_h_on(l_shx, s.dense_gate, s.normed2, L.ffn_gate_shexp,
-                               shexp_band, H))
-                    return false;
-                if (!proj_h_on(l_shx, s.dense_up, s.normed2, L.ffn_up_shexp,
-                               shexp_band, H))
-                    return false;
-                k3k::situ_f32(s.dense_situ, s.dense_gate, s.dense_up, shexp_band,
-                             cfg.situ_beta, cfg.situ_linear_beta, l_shx.st);
-                if (!proj_on(l_shx, s.shexp_out, s.dense_situ, L.ffn_down_shexp, H,
-                             shexp_band))
-                    return false;
+                if (!ffn_prepared) {
+                    if (!proj_h_on(l_shx, s.dense_gate, normed2_src,
+                                   L.ffn_gate_shexp, shexp_band, H))
+                        return false;
+                    if (!proj_h_on(l_shx, s.dense_up, normed2_src,
+                                   L.ffn_up_shexp, shexp_band, H))
+                        return false;
+                    k3k::situ_f32(s.dense_situ, s.dense_gate, s.dense_up,
+                                  shexp_band, cfg.situ_beta,
+                                  cfg.situ_linear_beta, l_shx.st);
+                    if (!proj_on(l_shx, s.shexp_out, s.dense_situ,
+                                 L.ffn_down_shexp, H, shexp_band))
+                        return false;
+                }
                 if (fwd.debug) fwd.debug("dbg_shexp_partial", layer, s.shexp_out, H);
             } else {
                 // The fused buffer is reduced whole, so a layer without a shared
                 // expert must still present a well-defined summand there.
-                cudaMemsetAsync(s.shexp_out, 0, (size_t)H * sizeof(float), l_shx.st);
+                if (!ffn_prepared)
+                    cudaMemsetAsync(s.shexp_out, 0, (size_t)H * sizeof(float), l_shx.st);
             }
             // JOIN the shared expert. Nothing on the main stream reads shexp_out,
             // but the DRIVER reduces it the moment this phase returns, and the

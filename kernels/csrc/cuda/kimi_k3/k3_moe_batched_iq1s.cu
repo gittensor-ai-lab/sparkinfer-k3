@@ -73,6 +73,55 @@ namespace {
 
 constexpr int kQK = 256;
 
+// One warp owns one local expert. It scans pair indices in increasing order, so the
+// compact rows within an expert are deterministic without atomics. Counting IDs below
+// the owned expert gives its exclusive CSR offset directly, following llama.cpp's
+// device MMID strategy; repeating this small router scan is cheaper than introducing
+// a host-visible count or a separate device scan into every captured MoE layer.
+__global__ void moe_build_csr_kernel(int* __restrict__ rows,
+                                     int* __restrict__ slots,
+                                     int* __restrict__ inverse,
+                                     int* __restrict__ bounds,
+                                     const int* __restrict__ ids,
+                                     int P, int top_k, int expert_begin,
+                                     int n_local) {
+    k3_pdl_sync();
+    const int e = (int)blockIdx.x;
+    const int lane = threadIdx.x;
+    const int global_e = expert_begin + e;
+    int own = 0, lower = 0;
+    for (int p = lane; p < P; p += 32) {
+        const int id = ids[p] - expert_begin;
+        own   += (id == e);
+        lower += (id >= 0 && id < e);
+    }
+#pragma unroll
+    for (int d = 16; d; d >>= 1) {
+        own   += __shfl_down_sync(0xffffffffu, own, d);
+        lower += __shfl_down_sync(0xffffffffu, lower, d);
+    }
+    const int base = __shfl_sync(0xffffffffu, lower, 0);
+    const int count = __shfl_sync(0xffffffffu, own, 0);
+    if (lane == 0) {
+        bounds[e] = base;
+        if (e + 1 == n_local) bounds[n_local] = base + count;
+    }
+
+    int cursor = 0;
+    for (int p0 = 0; p0 < P; p0 += 32) {
+        const int p = p0 + lane;
+        const bool hit = p < P && ids[p] == global_e;
+        const unsigned mask = __ballot_sync(0xffffffffu, hit);
+        if (hit) {
+            const int at = base + cursor + __popc(mask & ((1u << lane) - 1u));
+            rows[at] = p / top_k;
+            slots[at] = p % top_k;
+            inverse[p] = at;
+        }
+        cursor += __popc(mask);
+    }
+}
+
 // Bin the (token, slot) pairs this rank owns. `ids` holds GLOBAL expert indices — every
 // rank's router sees the same replicated ffn_gate_inp — and a rank stores only
 // [expert_begin, expert_begin + n_local). Out-of-band selections belong to another rank
@@ -143,6 +192,86 @@ __global__ void moe_scatter_add_kernel(float* __restrict__ out,
     atomicAdd(&out[(size_t)t * latent + c], wt * down[i]);
 }
 
+// Convert gate/up from compact CSR order to the compact hidden activation. Launching
+// over the original pair index makes the inverse map the only dispatch metadata this
+// stage needs and gives it a fixed graph shape.
+__global__ void moe_situ_compact_kernel(float* __restrict__ h,
+                                        const float* __restrict__ gate,
+                                        const float* __restrict__ up,
+                                        const int* __restrict__ inverse,
+                                        int P, int ffn, float beta, float lb) {
+    k3_pdl_sync();
+    const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (int64_t)P * ffn) return;
+    const int p = (int)(i / ffn), j = (int)(i % ffn);
+    const int at = inverse[p];
+    if (at < 0) return;
+    const float g = gate[(size_t)at * ffn + j];
+    const float u = up[(size_t)at * ffn + j];
+    const float a = beta * tanhf(g / beta) * (1.0f / (1.0f + __expf(-g)));
+    const float ub = lb > 0.0f ? lb * tanhf(u / lb) : u;
+    h[(size_t)at * ffn + j] = a * ub;
+}
+
+// One owner per output cell, with slots accumulated in their original top-k order.
+// This avoids the nondeterministic atomic combine used by the eager batching prototype.
+__global__ void moe_combine_compact_kernel(float* __restrict__ out,
+                                           const float* __restrict__ down,
+                                           const int* __restrict__ inverse,
+                                           const float* __restrict__ weights,
+                                           int T, int latent, int top_k) {
+    k3_pdl_sync();
+    const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (int64_t)T * latent) return;
+    const int t = (int)(i / latent), c = (int)(i % latent);
+    float sum = 0.0f;
+    for (int k = 0; k < top_k; ++k) {
+        const int p = t * top_k + k;
+        const int at = inverse[p];
+        if (at >= 0) sum += weights[p] * down[(size_t)at * latent + c];
+    }
+    out[i] = sum;
+}
+
+__global__ void moe_situ_pairs_kernel(float* __restrict__ h,
+                                      const float* __restrict__ gate,
+                                      const float* __restrict__ up,
+                                      const int* __restrict__ ids,
+                                      int P, int ffn, int expert_begin,
+                                      int n_local, float beta, float lb) {
+    k3_pdl_sync();
+    const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (int64_t)P * ffn) return;
+    const int p = (int)(i / ffn), j = (int)(i % ffn);
+    const int e = ids[p] - expert_begin;
+    if (e < 0 || e >= n_local) return;
+    const float g = gate[(size_t)p * ffn + j];
+    const float u = up[(size_t)p * ffn + j];
+    const float a = beta * tanhf(g / beta) * (1.0f / (1.0f + __expf(-g)));
+    const float ub = lb > 0.0f ? lb * tanhf(u / lb) : u;
+    h[(size_t)p * ffn + j] = a * ub;
+}
+
+__global__ void moe_combine_pairs_kernel(float* __restrict__ out,
+                                         const float* __restrict__ down,
+                                         const int* __restrict__ ids,
+                                         const float* __restrict__ weights,
+                                         int T, int latent, int top_k,
+                                         int expert_begin, int n_local) {
+    k3_pdl_sync();
+    const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (int64_t)T * latent) return;
+    const int t = (int)(i / latent), c = (int)(i % latent);
+    float sum = 0.0f;
+    for (int k = 0; k < top_k; ++k) {
+        const int p = t * top_k + k;
+        const int e = ids[p] - expert_begin;
+        if (e >= 0 && e < n_local)
+            sum += weights[p] * down[(size_t)p * latent + c];
+    }
+    out[i] = sum;
+}
+
 struct Scratch {
     void* p = nullptr;
     size_t n = 0;
@@ -160,6 +289,79 @@ struct Scratch {
 };
 
 }  // namespace
+
+bool k3_moe_build_expert_csr(int* rows, int* slots, int* inverse,
+                             int* expert_bounds, const int* ids,
+                             int T, int top_k, int expert_begin,
+                             int n_local_experts, cudaStream_t stream) {
+    if (!rows || !slots || !inverse || !expert_bounds || !ids || T <= 0 ||
+        top_k <= 0 || n_local_experts <= 0) return false;
+    const size_t P = (size_t)T * top_k;
+    if (P > (size_t)INT32_MAX) return false;
+    if (cudaMemsetAsync(inverse, 0xff, P * sizeof(int), stream) != cudaSuccess)
+        return false;
+    k3_pdl_launch((unsigned)n_local_experts, 32, 0, stream, moe_build_csr_kernel,
+                  rows, slots, inverse, expert_bounds, ids, (int)P, top_k,
+                  expert_begin, n_local_experts);
+    return true;
+}
+
+bool k3_moe_situ_compact(float* h, const float* gate, const float* up,
+                         const int* inverse, int T, int top_k, int ffn,
+                         float situ_beta, float situ_linear_beta,
+                         cudaStream_t stream) {
+    if (!h || !gate || !up || !inverse || T <= 0 || top_k <= 0 || ffn <= 0)
+        return false;
+    const int P = T * top_k;
+    if (cudaMemsetAsync(h, 0, (size_t)P * ffn * sizeof(float), stream) != cudaSuccess)
+        return false;
+    const int64_t n = (int64_t)P * ffn;
+    k3_pdl_launch((unsigned)((n + 255) / 256), 256, 0, stream,
+                  moe_situ_compact_kernel, h, gate, up, inverse, P, ffn,
+                  situ_beta, situ_linear_beta);
+    return true;
+}
+
+bool k3_moe_combine_compact(float* out, const float* down,
+                            const int* inverse, const float* weights,
+                            int T, int latent, int top_k, cudaStream_t stream) {
+    if (!out || !down || !inverse || !weights || T <= 0 || latent <= 0 || top_k <= 0)
+        return false;
+    const int64_t n = (int64_t)T * latent;
+    k3_pdl_launch((unsigned)((n + 255) / 256), 256, 0, stream,
+                  moe_combine_compact_kernel, out, down, inverse, weights,
+                  T, latent, top_k);
+    return true;
+}
+
+bool k3_moe_situ_pairs(float* h, const float* gate, const float* up,
+                       const int* ids, int pairs, int ffn,
+                       int expert_begin, int n_local_experts,
+                       float situ_beta, float situ_linear_beta,
+                       cudaStream_t stream) {
+    if (!h || !gate || !up || !ids || pairs <= 0 || ffn <= 0 ||
+        n_local_experts <= 0) return false;
+    if (cudaMemsetAsync(h, 0, (size_t)pairs * ffn * sizeof(float), stream) != cudaSuccess)
+        return false;
+    const int64_t n = (int64_t)pairs * ffn;
+    k3_pdl_launch((unsigned)((n + 255) / 256), 256, 0, stream,
+                  moe_situ_pairs_kernel, h, gate, up, ids, pairs, ffn,
+                  expert_begin, n_local_experts, situ_beta, situ_linear_beta);
+    return true;
+}
+
+bool k3_moe_combine_pairs(float* out, const float* down, const int* ids,
+                          const float* weights, int T, int latent, int top_k,
+                          int expert_begin, int n_local_experts,
+                          cudaStream_t stream) {
+    if (!out || !down || !ids || !weights || T <= 0 || latent <= 0 ||
+        top_k <= 0 || n_local_experts <= 0) return false;
+    const int64_t n = (int64_t)T * latent;
+    k3_pdl_launch((unsigned)((n + 255) / 256), 256, 0, stream,
+                  moe_combine_pairs_kernel, out, down, ids, weights,
+                  T, latent, top_k, expert_begin, n_local_experts);
+    return true;
+}
 
 bool k3_moe_expert_ffn_batched_iq1s(float* out, const float* x,
                                     const int* ids, const float* w,

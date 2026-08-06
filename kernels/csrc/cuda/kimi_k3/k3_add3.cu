@@ -72,6 +72,19 @@ __global__ void add3_f32_kernel(float* out, float* out_ab,
     out[i] = c[i] + ab;
 }
 
+__global__ void add3_rows_f32_kernel(float* out, float* out_ab,
+                                     const float* a, const float* b,
+                                     int64_t b_row_stride, const float* c,
+                                     int rows, int cols) {
+    k3_pdl_sync();
+    const int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
+    if (i >= (int64_t)rows * cols) return;
+    const int row = (int)(i / cols), col = (int)(i % cols);
+    const float ab = a[i] + b[(int64_t)row * b_row_stride + col];
+    out_ab[i] = ab;
+    out[i] = c[i] + ab;
+}
+
 }  // namespace
 
 bool k3_add3_f32(float* out, float* out_ab, const float* a, const float* b,
@@ -87,6 +100,19 @@ bool k3_add3_f32(float* out, float* out_ab, const float* a, const float* b,
     if (blocks > 0x7fffffffLL) return false;
     k3_pdl_launch((unsigned)blocks, T, 0, stream, add3_f32_kernel,
                   out, out_ab, a, b, c, n);
+    return true;
+}
+
+bool k3_add3_rows_f32(float* out, float* out_ab, const float* a,
+                      const float* b, int64_t b_row_stride, const float* c,
+                      int rows, int cols, cudaStream_t stream) {
+    if (!out || !out_ab || !a || !b || !c || rows <= 0 || cols <= 0 ||
+        b_row_stride < cols) return false;
+    const int64_t n = (int64_t)rows * cols;
+    const int64_t blocks = (n + 255) / 256;
+    if (blocks > 0x7fffffffLL) return false;
+    k3_pdl_launch((unsigned)blocks, 256, 0, stream, add3_rows_f32_kernel,
+                  out, out_ab, a, b, b_row_stride, c, rows, cols);
     return true;
 }
 

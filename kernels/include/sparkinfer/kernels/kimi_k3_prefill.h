@@ -63,7 +63,8 @@ bool k3_prefill_quantize_act(void* q8_out, const float* x, int K, int n_tok,
 // Returns false (never an error) for shapes outside its contract: the caller should treat
 // that as "use the per-token path".
 bool k3_prefill_proj_q8act(float* y, const void* q8_acts, const void* W, int wtype,
-                           int N, int K, int n_tok, cudaStream_t stream);
+                           int N, int K, int n_tok, cudaStream_t stream,
+                           int64_t y_row_stride = 0);
 
 // The token-tile width the projection will actually use for this shape. Exposed so a
 // caller can reason about the amortisation it is buying (weight traffic is divided by
