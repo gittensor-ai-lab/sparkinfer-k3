@@ -1334,7 +1334,23 @@ static bool k3_attn_batch_enabled() {
 static bool k3_kda_qkvg_batch_enabled() {
     static const bool on = [] {
         const char* e = std::getenv("SPARKINFER_K3_KDA_QKVG_BATCH");
-        return !(e && e[0] == '0');
+        // OPT-IN, as the block comment below and kimi_k3_attn_batch_ok() both state.
+        //
+        // This read used to be `!(e && e[0] == '0')`, which is the OPT-OUT form: unset
+        // meant ON, so all 69 KDA layers took the batched projection path by default
+        // while two comments said they did not. It faults --
+        //   [k3] LAUNCH FAILED at layer 0, phase Attn: invalid argument
+        // -- for every chunk >= 2 tokens at every prompt length, so with it on by
+        // default the chunk driver could not ingest anything at all: the 4-token parity
+        // probe died here, and so did a 128-token prompt at chunk widths 2, 4, 8 and 64.
+        // The only reason a 32k measurement ever completed is that --checkpoints routes
+        // the graded probes through the per-token loop instead.
+        //
+        // Turning it off restores the driver AND its speedup, because the projections it
+        // batches are not where the win comes from. Left opt-in until the fault in the
+        // batched KDA projection path is understood; the gate is the safe half of that
+        // question, not the answer to it.
+        return e && e[0] == '1';
     }();
     return on;
 }
