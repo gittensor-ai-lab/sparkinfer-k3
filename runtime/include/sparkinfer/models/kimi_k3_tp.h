@@ -231,19 +231,32 @@ bool kimi_k3_tp_init(const GGUF& g, const KimiK3Config& cfg, const K3PlanOptions
 // Equivalent to kimi_k3_forward_token on a single device up to float32 summation
 // order — the expert partials are reassociated by the reduce, so agreement is to
 // ~1 ulp, not bitwise. kimi_k3_tp_moe_check pins that bound.
+//
+// PASS nullptr TO INGEST WITHOUT READING BACK. The step runs identically — KV cache
+// written, d_pos bumped, recurrent state advanced, so the model state afterwards is
+// the same — but the logits are not copied to the host and the host barrier that
+// copy requires is not taken. That barrier is the only one inside a token, so
+// dropping it is what lets consecutive prompt tokens overlap. Use it for prompt
+// ingestion at every position whose logits nobody reads; pass a real buffer whenever
+// you need the distribution (decode, parity probes, checkpoint depths, the last
+// prompt token). The head projection still runs either way: it is inside the
+// captured graph and cannot be branched per token without a second graph.
 bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits);
 
-// TWO PROMPT-INGESTION DRIVERS LIVE HERE, AND THE SPLIT IS THE MEASUREMENT, NOT TASTE.
+// THREE PROMPT-INGESTION DRIVERS LIVE HERE, AND THE SPLIT IS THE MEASUREMENT, NOT TASTE.
 //
-// kimi_k3_tp_prefill is the tile driver and the one that ships: it keeps CUDA graph
-// capture. kimi_k3_tp_forward_prompt is the chunked walk, which does not capture and
+// kimi_k3_tp_prefill is the tile driver and the one that ships by default: it keeps CUDA
+// graph capture. kimi_k3_tp_forward_prompt is the chunked walk, which does not capture and
 // batches the COLLECTIVES instead. That second axis turned out not to be worth having:
 // under capture the host issues 0.08 ms of a token's 18.83 ms and the collectives cost
 // 0.01 ms, so the 1.77x the chunked walk measured for batched collectives was buying
 // back overhead that capture removes for free. It is kept as a control — it is the only
 // path that can isolate a collective effect — and not as a candidate.
+// kimi_k3_tp_prefill_chunk is a THIRD, independent driver: it batches the token axis
+// through the kernels themselves (M=B GEMMs, batched FFN/MoE/attention) rather than
+// batching only the collectives, and is selected by SPARKINFER_K3_PREFILL_CHUNK.
 //
-// Both leave the same state behind and produce the same final logits.
+// All three leave the same state behind and produce the same final logits.
 
 // Ingest a prompt, running the LAYER loop outside the TOKEN loop.
 //
@@ -291,6 +304,16 @@ bool kimi_k3_tp_prefill(KimiK3TP& p, const int* ids, int n_ids, float* out_logit
 // meant to be hundreds of tokens, not a handful.
 bool kimi_k3_tp_forward_prompt(KimiK3TP& p, const int* ids, int n,
                                float* out_logits);
+
+// ---------------------------------------------------------------------------
+// Ingest a prompt in chunks of `chunk` tokens (0 = SPARKINFER_K3_PREFILL_CHUNK,
+// default 16). Carries B tokens through each layer together so the attention and
+// MoE all-reduces are issued ONCE per layer-phase per chunk instead of once per
+// token — the rendezvous is ~98% barrier, so that latency is what amortises.
+// Same kernels and the same per-token summation order; only the schedule changes.
+// Leaves the KV cache, d_pos and the recurrent state exactly as the token loop
+// would. Produces no logits: read them with a final kimi_k3_tp_forward_token().
+bool kimi_k3_tp_prefill_chunk(KimiK3TP& p, const int* ids, int n_ids, int chunk);
 
 void kimi_k3_tp_free(KimiK3TP& p);
 

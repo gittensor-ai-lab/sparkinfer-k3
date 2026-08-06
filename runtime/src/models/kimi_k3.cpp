@@ -9,7 +9,6 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
-#include <algorithm>
 #include <cstdlib>
 #include <set>
 #include <mutex>
@@ -819,16 +818,18 @@ struct KimiK3Forward::Scratch {
     // another CTA is still reading it). 14 KB buys the spread on 92 launches.
     float* moe_normed = nullptr;
 
-    // KDA
-    float* qkv_q = nullptr, *qkv_k = nullptr, *qkv_v = nullptr;   // [qkv]
+    // KDA. The four marked [n_tok, qkv] are the ones the chunk crosses (see the
+    // allocation); the rest are transient within ONE iteration of the scan loop and
+    // stay a single row even when the projections take the whole chunk.
+    float* qkv_q = nullptr, *qkv_k = nullptr, *qkv_v = nullptr;   // [n_tok, qkv]
     float* conv_q = nullptr, *conv_k = nullptr, *conv_v = nullptr; // [qkv]
     float* f_a_out = nullptr;      // [head_dim]
     float* g_raw = nullptr;        // [qkv]
     float* decay_g = nullptr;      // [qkv]
-    float* beta_out = nullptr;     // [n_head]
+    float* beta_out = nullptr;     // [n_head]   <- 96, NOT qkv. No row axis.
     float* delta_out = nullptr;    // [qkv]
-    float* g_proj_out = nullptr;   // [qkv]
-    float* gate_out = nullptr;     // [qkv]
+    float* g_proj_out = nullptr;   // [n_tok, qkv]
+    float* gate_out = nullptr;     // [n_tok, qkv]
 
     // MLA
     float* q_lora_out = nullptr;   // [q_lora_rank]
@@ -854,10 +855,15 @@ struct KimiK3Forward::Scratch {
     float* moe_out = nullptr;         // = moe_fused,                 [expert_latent]
     float* dense_gate = nullptr, *dense_up = nullptr, *dense_situ = nullptr; // [dense_ffn]
     float* shexp_out = nullptr;        // = moe_fused + expert_latent, [H]
-    // Softmax scratch for attn_res_mix_f32, [max_ckpt + 1]. Persistent because the
-    // mix runs twice per layer: allocating it per call cost a cudaMallocAsync /
-    // cudaFreeAsync pair ~185 times per token.
-    float* res_scores = nullptr;       // [ceil(n_layers / attn_res_block_size) + 1]
+    // Softmax scratch for attn_res_mix_f32, [max_ckpt + 1] PER TOKEN ROW. Persistent
+    // because the mix runs twice per layer: allocating it per call cost a
+    // cudaMallocAsync / cudaFreeAsync pair ~185 times per token.
+    //
+    // FFN-SIDE (sized by ffn_cap), because the batched mix writes row r's scores at
+    // (res_scores + r*(n_ckpt+1)). It is scratch WITHIN one mix, not across layers —
+    // but it is live across the two launches of that mix, and the grid .y makes the
+    // rows concurrent. See the allocation for what a single shared row does.
+    float* res_scores = nullptr;       // [ceil(n_layers / attn_res_block_size) + 1, cap]
     void* proj_q8 = nullptr;           // optional llama CPU-compat block_q8_0 scratch
     // The HOISTED activation, quantised once and consumed by several projections. A
     // SEPARATE buffer from proj_q8 on purpose: every un-hoisted k3_proj_ggml_f32 call
@@ -866,6 +872,12 @@ struct KimiK3Forward::Scratch {
     // failure the cached quantise-once attempt shipped as top1 0.0.
     void* act_q8 = nullptr;
     void* moe_q8 = nullptr;            // optional llama CPU-compat block_q8_K scratch
+    // Counting-sort workspace for the token-batched expert dispatch. Integer only
+    // (counts, run offsets, and the (token, slot) index list) — the activations are
+    // never copied. Sized for the FULL chunk cap, so a call with fewer tokens is
+    // always within it; nullptr or a short size just declines the batched path.
+    void* moe_batch_ws = nullptr;
+    size_t moe_batch_ws_bytes = 0;
 
     // ---- DAG LANES -------------------------------------------------------
     //
@@ -935,8 +947,69 @@ struct KimiK3Forward::Scratch {
     // path gets its own bank back when the chunk ends.
     float* res_bank_orig = nullptr;
 
+    // How many TOKEN-MAJOR rows the batched buffers above were allocated for. That set
+    // is now the FFN-side ones PLUS the MLA-side ones (mixed, normed, q_lora_out,
+    // q_proj_out, kv_a_out, kv_cmpr_normed, absorbed_q, mla_attn_out, gate_proj_out),
+    // because the Attn phase batches an MLA layer.
+    //
+    // The KDA-side buffers (qkv_*, conv_*, f_a_out, g_raw, decay_g, beta_out,
+    // delta_out, gate_out) stay at ONE row, and that is the allocation enforcing the
+    // refusal rather than merely agreeing with it: a KDA layer is a recurrence in the
+    // conv state and the delta state, so a batched launch has nowhere correct to put
+    // its rows and the phase refuses n_tok > 1 for it.
+    //
+    // s.attn_out and s.moe_fused ARE sized for the cap even though the chunk driver
+    // repoints both through kimi_k3_swap_partial_buffer before it ever batches. They
+    // are READ (attn_out) and WRITTEN (moe_fused) by the batched FFN phases at
+    // per-token strides, so sizing them for one token would make "the caller forgot
+    // to swap" an out-of-bounds write instead of a wrong-but-contained result. 1 MB
+    // per rank to make a whole class of caller mistake impossible.
+    int ffn_cap = 1;
+
     std::vector<void*> owned;
 };
+
+// How many token rows the FFN-side scratch is sized for.
+//
+// Read from the SAME env the chunk driver takes its chunk size from, so the two
+// cannot be configured apart: a scratch sized 16 with a driver asking for 64 would
+// be an overflow, and the only reason it is not is that both read this. The phase
+// still refuses n_tok > ffn_cap, and kimi_k3_tp_prefill_chunk still clamps to it —
+// belt and braces, because the failure mode is a silent stomp on the next buffer.
+static int k3_ffn_batch_cap_env() {
+    static const int cap = [] {
+        const char* e = std::getenv("SPARKINFER_K3_PREFILL_CHUNK");
+        // 64 IS MEASURED, NOT PICKED. Swept at the scored 32k shape on 8xH200, with every
+        // arm byte-identical to every other so the sweep is pure scheduling. The curve
+        // turns over here: the expert regroup's win scales as B/56 while the scratch grows
+        // linearly, so past this point the larger allocation stops paying for itself.
+        int v = e ? std::atoi(e) : 64;
+        // 0 means "no chunked prefill" at the driver, which needs no batch capacity;
+        // it must still be at least 1 so every buffer keeps its single-token size.
+        if (v < 1) v = 1;
+        // RAISED 256 -> 512 FOR THE EXPERT-MAJOR REGROUP, and 512 is where the
+        // arithmetic stops paying, not where the machine stops coping.
+        //
+        // The regroup's win is proportional to rows-per-expert = B*top_k/n_experts =
+        // B/56, so B = 256 gives 4.6 and B = 512 gives 9.1 — the last doubling that
+        // still nearly doubles the amortisation. Past that the curve flattens
+        // (published M-scaling is ~4.75 us/token by M = 128) while the scratch keeps
+        // growing linearly.
+        //
+        // WHAT THE CEILING COSTS, since every FFN-side buffer is sized by it: ~700 KiB
+        // per token row per rank (dense_gate/up/situ at dense_ffn are 396 KiB of that,
+        // moe_scratch 48 KiB at the 2-D band, moe_fused 42 KiB, the four hidden-width
+        // buffers 112 KiB, the two q8 stages 70 KiB). 512 is therefore ~350 MiB per
+        // rank against ~175 MiB at 256. Nothing on a 141 GB H200 holding a ~69 GB
+        // shard, and NOT paid by anyone who leaves the default of 16 alone — this
+        // bound only limits what an operator may ask for.
+        //
+        // gridDim.y remains the hard structural limit at 65535 and is nowhere near.
+        if (v > 512) v = 512;
+        return v;
+    }();
+    return cap;
+}
 
 // This rank's per-expert FFN width: the model's under whole-expert sharding, its
 // band under 2-D MoE.
@@ -980,56 +1053,133 @@ bool kimi_k3_forward_alloc_scratch(const KimiK3Config& cfg, KimiK3Forward& fwd) 
         return true;
     };
 
-    bool ok = true;
-    ok &= alloc_f(s.mixed, H);
-    ok &= alloc_f(s.mixed2, H);
-    ok &= alloc_f(s.normed, H);
-    ok &= alloc_f(s.normed2, H);
-    ok &= alloc_f(s.attn_out, H);
-    ok &= alloc_f(s.ffn_out, H);
-    ok &= alloc_f(s.moe_normed, cfg.expert_latent);
+    // THE FFN-SIDE ROW AXIS. Every buffer multiplied by `cap` below is one the
+    // batched FfnPartial/FfnFinish addresses as [n_tok, <one token's width>]; every
+    // buffer left at one token is either attention-side (and the Attn phase refuses
+    // n_tok > 1) or is transient WITHIN one token's pass through the batched loops
+    // that stayed per-token (s.moe_scratch's q8k companion s.moe_q8).
+    //
+    // The multiply is applied at the ALLOCATION only. The per-token stride the phase
+    // uses is the buffer's natural one-token width, never `cap` — so growing the cap
+    // cannot move a row, and a cap of 1 is byte-for-byte the allocation this function
+    // made before the axis existed.
+    const int cap = k3_ffn_batch_cap_env();
+    s.ffn_cap = cap;
 
-    ok &= alloc_f(s.qkv_q, qkv);
-    ok &= alloc_f(s.qkv_k, qkv);
-    ok &= alloc_f(s.qkv_v, qkv);
+    bool ok = true;
+    // mixed / normed ARE ROW-AXIS BUFFERS NOW, because the Attn phase batches them on an
+    // MLA layer (attn_res_mix and attn_norm both carry n_rows). A KDA layer still runs
+    // one token at a time and simply uses row 0, so this is capacity the KDA path never
+    // reads rather than a change to it.
+    ok &= alloc_f(s.mixed, (size_t)H * cap);
+    ok &= alloc_f(s.mixed2, (size_t)H * cap);
+    ok &= alloc_f(s.normed, (size_t)H * cap);
+    ok &= alloc_f(s.normed2, (size_t)H * cap);
+    // attn_out is attention-side by name and FFN-side by use: the batched FfnPartial
+    // READS it at (b * H) for the residual combine. See Scratch::ffn_cap.
+    ok &= alloc_f(s.attn_out, (size_t)H * cap);
+    ok &= alloc_f(s.ffn_out, (size_t)H * cap);
+    ok &= alloc_f(s.moe_normed, (size_t)cfg.expert_latent * cap);
+
+    // ---- KDA-SIDE ROW AXIS: THE FIVE BUFFERS THE CHUNK CROSSES, AND NO OTHERS ----
+    //
+    // Under SPARKINFER_K3_KDA_QKVG_BATCH the KDA branch computes q/k/v/g for the WHOLE
+    // chunk before the scan walks it, and collects the scan's gate output for the whole
+    // chunk before attn_output projects it. Those five buffers are therefore
+    // [n_tok, qkv] and every one of them is addressed at (b * qkv).
+    //
+    // EVERY OTHER KDA BUFFER STAYS ONE ROW, DELIBERATELY. conv_*, f_a_out, g_raw,
+    // decay_g, beta_out and delta_out are transient WITHIN one iteration of the scan
+    // loop: token b writes them and the same iteration's decode step consumes them,
+    // on one stream, before token b+1 overwrites them. Widening them would be dead
+    // memory and would invite a stride where there is no row.
+    //
+    // beta_out IS THE ONE THAT WOULD HAVE BITTEN. It is n_q_heads (96) wide, not qkv
+    // (1536), so a single shared row stride across "the KDA buffers" is silently wrong
+    // from token 1 onward. It is not in this set at all, so there is no stride to get
+    // wrong; the loop rewrites its one row per token.
+    //
+    // The multiply is at the ALLOCATION only — the phase strides by the buffer's own
+    // one-token width — so a cap of 1 is byte-for-byte the allocation this made before.
+    ok &= alloc_f(s.qkv_q, (size_t)qkv * cap);
+    ok &= alloc_f(s.qkv_k, (size_t)qkv * cap);
+    ok &= alloc_f(s.qkv_v, (size_t)qkv * cap);
     ok &= alloc_f(s.conv_q, qkv);
     ok &= alloc_f(s.conv_k, qkv);
     ok &= alloc_f(s.conv_v, qkv);
-    ok &= alloc_f(s.f_a_out, cfg.kda_head_dim);
-    ok &= alloc_f(s.g_raw, qkv);
-    ok &= alloc_f(s.decay_g, qkv);
+    // ---- KDA PRE-SCAN ROW AXIS ------------------------------------------------
+    // These three are the KDA chain that touches NEITHER recurrence. f_a_out comes from
+    // `normed` alone, g_raw from f_a_out, decay_g from g_raw — none of them reads the
+    // conv state or the delta state, so token b's value does not depend on token b-1 and
+    // the whole chain can be computed for a chunk in one pass. Giving them a row axis is
+    // what lets the pre-scan batch below exist; conv_*, beta_out and delta_out stay at one
+    // row because they ARE in the recurrence (or, for beta, are shard-offset and 96 wide).
+    //
+    // The multiply is at the ALLOCATION only. At cap == 1 this is byte-for-byte the
+    // allocation it made before, and the per-token path strides by the buffer's own
+    // one-token width exactly as it always did.
+    ok &= alloc_f(s.f_a_out, (size_t)cfg.kda_head_dim * cap);
+    ok &= alloc_f(s.g_raw, (size_t)qkv * cap);
+    ok &= alloc_f(s.decay_g, (size_t)qkv * cap);
     ok &= alloc_f(s.beta_out, cfg.n_q_heads);
     ok &= alloc_f(s.delta_out, qkv);
-    ok &= alloc_f(s.g_proj_out, qkv);
-    ok &= alloc_f(s.gate_out, qkv);
+    ok &= alloc_f(s.g_proj_out, (size_t)qkv * cap);
+    ok &= alloc_f(s.gate_out, (size_t)qkv * cap);
 
-    ok &= alloc_f(s.q_lora_out, cfg.q_lora_rank);
-    ok &= alloc_f(s.q_proj_out, (size_t)qh * cfg.key_length_mla);
+    // ---- MLA-SIDE ROW AXIS ----------------------------------------------------
+    //
+    // Every buffer the batched Attn phase addresses as [n_tok, <one token's width>] is
+    // multiplied by `cap` here. `qh` is the MODEL's head count and the phase strides by
+    // THIS RANK's (fwd.w->mla.n_heads, which is qh/8 under head sharding), so the row
+    // pitch is never wider than the pitch this allocation assumed — the batched rows sit
+    // inside the allocation rather than at the edge of it.
+    //
+    // q_nope / q_pe are deliberately NOT in the set. They are written only when
+    // k3_mla_absorb_q_strided DECLINES, and that fallback stays a per-token loop of the
+    // two cudaMemcpy2DAsync de-interleaves plus mla_absorb_q_f32 — one token live at a
+    // time, straight-line on one stream, so one row is all it can ever need.
+    ok &= alloc_f(s.q_lora_out, (size_t)cfg.q_lora_rank * cap);
+    ok &= alloc_f(s.q_proj_out, (size_t)qh * cfg.key_length_mla * cap);
     ok &= alloc_f(s.q_nope, (size_t)qh * qk_nope);
     ok &= alloc_f(s.q_pe, (size_t)qh * cfg.rope_dim);
-    ok &= alloc_f(s.kv_a_out, cfg.key_length);
-    ok &= alloc_f(s.kv_cmpr_normed, cfg.kv_lora_rank);
-    ok &= alloc_f(s.absorbed_q, (size_t)qh * cfg.key_length);
-    ok &= alloc_f(s.mla_attn_out, (size_t)qh * cfg.value_length_mla);
-    ok &= alloc_f(s.gate_proj_out, (size_t)qh * cfg.value_length_mla);
+    ok &= alloc_f(s.kv_a_out, (size_t)cfg.key_length * cap);
+    ok &= alloc_f(s.kv_cmpr_normed, (size_t)cfg.kv_lora_rank * cap);
+    ok &= alloc_f(s.absorbed_q, (size_t)qh * cfg.key_length * cap);
+    ok &= alloc_f(s.mla_attn_out, (size_t)qh * cfg.value_length_mla * cap);
+    ok &= alloc_f(s.gate_proj_out, (size_t)qh * cfg.value_length_mla * cap);
 
-    ok &= alloc_f(s.router_logits, cfg.n_experts);
-    ok &= alloc_f(s.router_w, cfg.top_k);
-    ok &= alloc_i(s.router_ids, cfg.top_k);
-    ok &= alloc_f(s.routed_down_out, cfg.expert_latent);
+    // ROUTER, BATCHED. Both router kernels already index blockIdx.x as the token and
+    // stride logits by n_expert and out_w/out_ids by top_k, so these three only had to
+    // BE that wide — no kernel change, and the launch at n_tokens == 1 is unchanged.
+    ok &= alloc_f(s.router_logits, (size_t)cfg.n_experts * cap);
+    ok &= alloc_f(s.router_w, (size_t)cfg.top_k * cap);
+    ok &= alloc_i(s.router_ids, (size_t)cfg.top_k * cap);
+    ok &= alloc_f(s.routed_down_out, (size_t)cfg.expert_latent * cap);
     // THE SCRATCH IS THE RANK'S FFN WIDTH, NOT THE MODEL'S. Under 2-D MoE this rank
     // evaluates only its band of each expert's intermediate, so top_k * band is all
     // that is ever written — and sizing it from cfg would leave 3/4 of the buffer
     // untouched while the gate/up memset below still paid to clear it.
     const int moe_ffn_local = k3_moe_ffn_local(fwd, cfg);
-    ok &= alloc_f(s.moe_scratch, (size_t)cfg.top_k * moe_ffn_local);
+    // ONE SLAB PER TOKEN ROW. The expert dispatch itself stays per-token (router_ids
+    // differ per token, so batching it without an expert-major regroup buys launches
+    // and no bandwidth), and a single slab would in fact be safe today because that
+    // loop is straight-line on one stream. It is per-row anyway because the "foreign
+    // expert slots read as zero" invariant below is a statement about A SLAB, and the
+    // expert-major regroup that is the next win writes several tokens' slabs at once.
+    // Making the invariant true per row now costs 3 MB and removes the trap later.
+    ok &= alloc_f(s.moe_scratch, (size_t)cfg.top_k * moe_ffn_local * cap);
     // Establish the "foreign expert slots read as zero" invariant ONCE here, instead of
     // re-establishing it with a cudaMemsetAsync on every MoE layer. A rank's expert band
     // is fixed for the run and moe_gate_up writes only owned slots, so a foreign slot is
     // written by nobody and stays zero from this memset onward.
+    //
+    // THE LENGTH MUST COVER EVERY SLAB. A memset of one slab with cap slabs allocated
+    // leaves rows 1..cap-1 holding whatever cudaMalloc returned, and the dispatch reads
+    // a foreign slot expecting zero — fluent output, wrong logits, only on the prefill
+    // path, only for tokens after the first of a chunk.
     if (ok && s.moe_scratch)
         cudaMemset(s.moe_scratch, 0,
-                   (size_t)cfg.top_k * moe_ffn_local * sizeof(float));
+                   (size_t)cfg.top_k * moe_ffn_local * cap * sizeof(float));
     // ONE ALLOCATION, TWO TENSORS, BECAUSE ONE COLLECTIVE COVERS BOTH.
     //
     // The expert accumulator (expert_latent) and the shared-expert partial (hidden)
@@ -1041,29 +1191,67 @@ bool kimi_k3_forward_alloc_scratch(const KimiK3Config& cfg, KimiK3Forward& fwd) 
     //
     // moe_out MUST come first: the fused buffer's base is what the collective
     // reduces from, and routed_norm/routed_up read the latent prefix in place.
-    ok &= alloc_f(s.moe_fused, (size_t)cfg.expert_latent + (size_t)H);
+    //
+    // BATCHED, and the per-token stride is (expert_latent + hidden) — the FUSED width,
+    // not either view's own. That is the layout kimi_k3_tp_prefill_chunk allocates and
+    // the layout one collective over nb*(latent+hidden) reduces, so the phase must
+    // stride BOTH views by the fused width. moe_out row b is (moe_out + b*fused) and
+    // shexp_out row b is (shexp_out + b*fused) — NOT (shexp_out + b*hidden).
+    const size_t moe_fused_row = (size_t)cfg.expert_latent + (size_t)H;
+    ok &= alloc_f(s.moe_fused, moe_fused_row * cap);
     if (ok) {
         s.moe_out   = s.moe_fused;
         s.shexp_out = s.moe_fused + cfg.expert_latent;
     }
-    ok &= alloc_f(s.dense_gate, cfg.dense_ffn);
-    ok &= alloc_f(s.dense_up, cfg.dense_ffn);
-    ok &= alloc_f(s.dense_situ, cfg.dense_ffn);
+    ok &= alloc_f(s.dense_gate, (size_t)cfg.dense_ffn * cap);
+    ok &= alloc_f(s.dense_up, (size_t)cfg.dense_ffn * cap);
+    ok &= alloc_f(s.dense_situ, (size_t)cfg.dense_ffn * cap);
     // Same bound kimi_k3_alloc_state uses for max_ckpt, +1 for the current stream.
     // Sized from cfg rather than from the state so the scratch stays allocatable
     // without one; a mix that somehow saw more checkpoints than the bank can hold
     // would already have failed the `n_ckpt >= max_ckpt` guard in the forward.
+    //
+    // TIMES `cap`, BECAUSE THE MIX IS BATCHED AND EACH ROW OWNS ITS OWN SOFTMAX.
+    // attn_res_mix_f32's score kernel writes row r at (scores + r*(n_ckpt+1)) and its
+    // apply kernel reads the same slots back. One row shared across the grid .y would
+    // blend EVERY token of a chunk with the LAST token's softmax — no crash, no NaN,
+    // and no top-1 move, because the weights are a softmax over 2-9 near-equal scores
+    // and stay near-uniform. At short context n_ckpt is 0 or 1, so the parity probe
+    // cannot see it either; it only shows up at depth. Same `cap` as every other
+    // FFN-side row axis above, so the two cannot be configured apart. At cap 1 this is
+    // byte-for-byte the allocation this function made before the axis existed.
     ok &= alloc_f(s.res_scores,
-                  cfg.attn_res_block_size > 0
-                      ? (size_t)((cfg.n_layers + cfg.attn_res_block_size - 1) /
-                                 cfg.attn_res_block_size) + 1
-                      : 1);
-    ok &= alloc_bytes(s.proj_q8, k3k::k3_q8_0_bytes(cfg.dense_ffn));
+                  (cfg.attn_res_block_size > 0
+                       ? (size_t)((cfg.n_layers + cfg.attn_res_block_size - 1) /
+                                  cfg.attn_res_block_size) + 1
+                       : 1) * (size_t)cap);
+    // BOTH HOLD n_tok ROWS OF Q8_0 BLOCKS NOW. k3_proj_q8act_tok_f32 reads a
+    // token-major [n_tok, K/32] block array with a leading dimension it is told, so
+    // the staging has to be that wide; dense_ffn is still the widest K any projection
+    // contracts over, so one row size covers every activation either buffer stages.
+    // At cap 1 this is byte-for-byte the allocation above.
+    ok &= alloc_bytes(s.proj_q8, k3k::k3_q8_0_bytes(cfg.dense_ffn) * (size_t)cap);
     // Sized like proj_q8: dense_ffn is the widest K any projection contracts over, so
     // one allocation covers every activation this hoists.
-    ok &= alloc_bytes(s.act_q8, k3k::k3_q8_0_bytes(cfg.dense_ffn));
+    ok &= alloc_bytes(s.act_q8, k3k::k3_q8_0_bytes(cfg.dense_ffn) * (size_t)cap);
     ok &= alloc_bytes(s.moe_q8,
                       k3k::k3_moe_q8_k_bytes(cfg.expert_latent, moe_ffn_local, cfg.top_k));
+
+    // THE EXPERT-MAJOR REGROUP'S SORT SPACE. Sized from the SAME `cap` every other
+    // batched buffer uses and from the rank's OWN expert count — the band under
+    // tp > 1, the model's under tp = 1 — because that is the number of buckets the
+    // histogram and the run-offset array are indexed by, and a bucket array sized
+    // from cfg on a banded rank would have the scan writing past its end.
+    //
+    // Failing to allocate is NOT fatal: the dispatch checks the pointer, declines,
+    // and the per-token loop runs. At cap 1 this is 3.6 KB that is never touched.
+    {
+        const int n_slots = fwd.w && fwd.w->shard.tp_size > 1
+                                ? fwd.w->shard.expert_band.extent
+                                : cfg.n_experts;
+        const size_t nb = k3k::k3_moe_batch_ws_bytes(cap, cfg.top_k, n_slots);
+        if (nb > 0 && alloc_bytes(s.moe_batch_ws, nb)) s.moe_batch_ws_bytes = nb;
+    }
 
     if (!ok) { kimi_k3_forward_free_scratch(fwd); return false; }
 
@@ -1088,6 +1276,142 @@ bool kimi_k3_forward_alloc_scratch(const KimiK3Config& cfg, KimiK3Forward& fwd) 
     }
     lok &= cudaEventCreateWithFlags(&s.ev_fork, cudaEventDisableTiming) == cudaSuccess;
     s.lanes_ok = lok;
+    return true;
+}
+
+int kimi_k3_ffn_batch_cap(const KimiK3Forward& fwd) {
+    return fwd.s ? fwd.s->ffn_cap : 1;
+}
+
+// SPARKINFER_K3_ATTN_BATCH — the one gate that turns the batched Attn phase off.
+//
+// It must be read in EXACTLY ONE place, because the driver and the phase have to agree:
+// the driver picks between one batched call and a per-token loop, and the phase refuses
+// what it will not do. Two independent getenv lambdas would let a typo make the driver
+// issue a batched call the phase then refuses, which is a failed prefill rather than a
+// slow one. Default ON — the harness scores a default build — and =0 restores the
+// per-token attention on the SAME binary, which is what makes the parity A/B exact.
+static bool k3_attn_batch_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("SPARKINFER_K3_ATTN_BATCH");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+
+// SPARKINFER_K3_KDA_QKVG_BATCH — DEFAULT OFF. Lets the Attn phase take a whole chunk
+// on a KDA layer, for the PROJECTIONS only.
+//
+// WHAT THIS DOES AND DOES NOT CLAIM. The refusal above this was written about the
+// SCAN, and that part of it is still true: k3_kda_decode_step_ip carries the delta
+// state from token b-1 into token b and kda_conv_step_f32 shifts a 4-deep window per
+// token, so neither has a token axis and neither gets one here. The scan stays a
+// per-token loop in index order on one stream.
+//
+// But q/k/v/g are ELEMENTWISE in the token index — token b's projections are a function
+// of token b's own hidden state and nothing else — so they can be computed for the whole
+// chunk before the scan walks it. That is the entire change: WHEN the projections are
+// issued, not what they compute. Same weights, same activation bytes, same accumulation
+// order per output element (see the note at the batched call site).
+//
+// Read in exactly one place for the same reason SPARKINFER_K3_ATTN_BATCH is: the driver
+// picks between one batched call and a per-token loop by asking the same predicate the
+// phase enforces, so the two cannot disagree. Default OFF until measured — the scored
+// build must not move under an unmeasured scheduling change.
+// MEASURED 2026-08-06 ON 8xH200 AT THE SCORED SHAPE, which is why this now defaults ON.
+//
+// It was gated off because it had never been run at 32k, and the rule this file keeps is
+// that the shipped build does not move under an unmeasured scheduling change. It has now
+// been measured, on one binary against the same binary with the gate off, in one session:
+//
+// on one binary against the same binary with the gate off, in one session, and the logits
+// are BYTE-IDENTICAL between the two — so this buys throughput without touching the
+// arithmetic. That is the whole reason it can be defaulted on rather than left as a knob.
+//
+// SPARKINFER_K3_KDA_QKVG_BATCH=0 restores the per-token group on the same binary, so the
+// A/B that produced those numbers stays reproducible.
+static bool k3_kda_qkvg_batch_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("SPARKINFER_K3_KDA_QKVG_BATCH");
+        // OPT-IN, as the block comment below and kimi_k3_attn_batch_ok() both state.
+        //
+        // This read used to be `!(e && e[0] == '0')`, which is the OPT-OUT form: unset
+        // meant ON, so all 69 KDA layers took the batched projection path by default
+        // while two comments said they did not. It faults --
+        //   [k3] LAUNCH FAILED at layer 0, phase Attn: invalid argument
+        // -- for every chunk >= 2 tokens at every prompt length, so with it on by
+        // default the chunk driver could not ingest anything at all: the 4-token parity
+        // probe died here, and so did a 128-token prompt at chunk widths 2, 4, 8 and 64.
+        // The only reason a 32k measurement ever completed is that --checkpoints routes
+        // the graded probes through the per-token loop instead.
+        //
+        // Turning it off restores the driver AND its speedup, because the projections it
+        // batches are not where the win comes from. Left opt-in until the fault in the
+        // batched KDA projection path is understood; the gate is the safe half of that
+        // question, not the answer to it.
+        return e && e[0] == '1';
+    }();
+    return on;
+}
+
+// THE KDA PRE-SCAN BATCH: the f_a -> f_b -> decay chain, computed for a whole chunk
+// before the per-token scan loop instead of once per token inside it.
+//
+// WHY THERE IS ANYTHING LEFT TO BATCH ON A RECURRENT LAYER. A KDA layer has two
+// recurrences — the conv state and the delta state — and both are genuinely sequential
+// in the token index. But the decay chain is neither: f_a_out reads `normed`, g_raw reads
+// f_a_out, decay_g reads g_raw, and not one of them touches either state. Token b's decay
+// gate does not depend on token b-1 in any way, so the only reason it was computed inside
+// the loop is that it sits between two things that are.
+//
+// WHAT IT IS WORTH, AND IT IS OCCUPANCY RATHER THAN LAUNCH COUNT. kda_decay_gate launches
+// at dim3(n_head, n_rows) and n_head is 12 — twelve blocks on a 132-SM part, ~9% of the
+// machine, once per token on each of the 69 KDA layers. Batching a chunk of 64 makes that
+// dim3(12, 64) = 768 blocks and fills it. The three launches per token becoming three per
+// chunk is the smaller half of the win.
+//
+// BIT-IDENTICAL BY CONSTRUCTION, and the reason is the same one rms_norm_wide leans on:
+// every kernel involved already carries an (n_rows, row_stride) row axis whose row r
+// reduces over row r's own elements with the same partition and the same tree, so nothing
+// about a row's arithmetic depends on how many other rows are in flight. proj_hb is the
+// token-batched projection the FFN side already uses and falls back to a per-token loop
+// whenever its batched kernel declines. At n_rows == 1 every one of these is the call the
+// per-token path makes today.
+//
+// Default OFF. The scored build must not move under an unmeasured scheduling change —
+// this is measured on one binary against the same binary with the gate off.
+static bool k3_kda_pre_batch_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("SPARKINFER_K3_KDA_PRE_BATCH");
+        return e && e[0] == '1';
+    }();
+    return on;
+}
+
+bool kimi_k3_attn_batch_ok(const KimiK3Forward& fwd, int layer, int n_tok) {
+    if (n_tok <= 1) return false;
+    if (!fwd.s || !fwd.cfg || !fwd.w) return false;
+    if (n_tok > fwd.s->ffn_cap) return false;
+    if (!k3_attn_batch_enabled()) return false;
+    if (layer < 0 || layer >= fwd.cfg->n_layers) return false;
+    // KDA'S SCAN IS A RECURRENCE AND STAYS PER-TOKEN, WHICH IS THE HONEST HALF.
+    //
+    // k3_kda_decode_step_ip carries the delta state from token b-1 into token b and
+    // kda_conv_step_f32 shifts a 4-deep conv window per token; neither has a token axis
+    // and neither can have one without becoming a different (chunked-scan) algorithm
+    // with a different summation order. The KDA branch of the phase therefore keeps a
+    // per-token loop for everything from the convs to the gate.
+    //
+    // What it no longer refuses outright is the PROJECTION half. q/k/v/g and attn_output
+    // are elementwise in the token index, so under SPARKINFER_K3_KDA_QKVG_BATCH they run
+    // once for the chunk and the loop consumes their rows in order. Default OFF, so this
+    // still returns false for all 69 KDA layers unless the gate is set.
+    if (fwd.cfg->is_kda_layer(layer) && !k3_kda_qkvg_batch_enabled()) return false;
+    // The debug taps read a scratch buffer straight after the launch that wrote it and
+    // report ONE vector. On a batched phase they would report row 0 and silently say
+    // nothing about rows 1..n-1, which is the opposite of what the localisation mode is
+    // for. The validation path runs single-token anyway; this makes that explicit.
+    if (fwd.debug) return false;
     return true;
 }
 
@@ -1347,7 +1671,7 @@ static bool k3_check_launch(int layer, K3LayerPhase phase) {
 }
 
 bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase phase,
-                                const float* hidden_in, float* hidden_out) {
+                                const float* hidden_in, float* hidden_out, int n_tok) {
     const KimiK3Config& cfg = *fwd.cfg;
     const KimiK3LayerWeights& L = fwd.w->layers[layer];
     KimiK3RuntimeState& st = *fwd.state;
@@ -1362,7 +1686,44 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
     const bool do_ffn_p  = (phase == K3LayerPhase::All || phase == K3LayerPhase::FfnPartial);
     const bool do_ffn_f  = (phase == K3LayerPhase::All || phase == K3LayerPhase::FfnFinish);
 
+    // ---- THE TOKEN AXIS: what it costs to get wrong, and the three refusals ----
+    //
+    // 1. THE ATTN PHASE IS REFUSED UNLESS kimi_k3_attn_batch_ok() SAYS OTHERWISE, and
+    //    the one thing it never says yes to is a KDA layer. The KDA delta rule carries
+    //    state from token b-1 to token b and the short conv shifts a window per token;
+    //    there is no launch that does either for a chunk without changing the
+    //    algorithm. The MLA half IS batched (see the phase below and the contract in
+    //    kimi_k3.h): its cross-token dependence is a LENGTH, and every attention kernel
+    //    already lengths itself from its own *d_pos.
+    //
+    //    What made this refusable in the first place has not gone away. Running B
+    //    tokens through attention with ONE d_pos makes every one of them write the same
+    //    KV row and attend over the same prefix — silently wrong AND faster, i.e. it
+    //    survives a timing run, which is the exact failure this project already paid a
+    //    round for. The batched phase therefore indexes st.d_pos[b] and lengths token b
+    //    at st.position + 1 + b, and the driver's job is to make that pointer the chunk
+    //    position vector. `All` carries the Attn phase, so it is refused with it.
+    // 2. n_tok must fit the scratch. A row past the cap is a stomp on whatever cudaMalloc
+    //    handed out next, so it is checked rather than assumed from the driver's env.
+    // 3. n_tok < 1 is nonsense, not "do nothing".
+    if (n_tok < 1) return false;
+    const bool attn_batched =
+        (n_tok > 1) && do_attn && kimi_k3_attn_batch_ok(fwd, layer, n_tok);
+    if (n_tok != 1 && do_attn && !attn_batched) return false;
+    if (n_tok > s.ffn_cap) return false;
+
     const int H = cfg.hidden;
+    // ---- PER-TOKEN STRIDES, in elements. Every one is the buffer's own single-token
+    // width, so at n_tok == 1 none of them is ever added to a pointer. ----
+    //
+    // moe_row is the FUSED width, not expert_latent and not hidden: moe_out and
+    // shexp_out are two views of ONE payload (see kimi_k3_forward_alloc_scratch), so a
+    // token's shexp partial sits at (b*moe_row + expert_latent), and striding shexp_out
+    // by H instead would walk into the NEXT token's expert accumulator.
+    const int64_t moe_row  = (int64_t)cfg.expert_latent + H;
+    // Token b's residual bank. Cross-layer per-token state, so the batched phases index
+    // it explicitly; the caller binds TOKEN 0's bank and this walks from there.
+    const int64_t bank_row = (int64_t)st.res_bank_row_elems * st.max_ckpt;
     // THIS RANK's KDA widths. Under every policy but ExpertsAndKda these are the
     // full dimensions, because KimiK3Weights::kda is left at the tp=1 identity --
     // so the unsharded path is the same code with the same values, not a branch.
@@ -1386,6 +1747,29 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
     const bool banked = res_bs > 0 && (layer % res_bs == 0);
     const bool ggml_qact_proj = qact_proj();
     const bool ggml_qact_moe = qact_moe();
+
+    // ---- MLA-SIDE PER-TOKEN STRIDES, in elements ----------------------------
+    //
+    // Each is the buffer's own single-token width, so at n_tok == 1 every one of them
+    // is multiplied by b == 0 and no pointer moves. THEY ARE NOT ALL THE SAME NUMBER,
+    // and that is the point of writing them out: kv_a_out is key_length (576) wide
+    // because the KV store reads its rope tail past kv_lora, while kv_cmpr_normed is
+    // kv_lora_rank (512). Handing both one shared stride is silently wrong from token 1
+    // onward — the same shape of bug as striding s.shexp_out by hidden instead of by
+    // the fused MoE width.
+    //
+    // The head-count is THIS RANK's (md.n_heads), so under head sharding these pitches
+    // are an eighth of the allocation's per-row width. Narrower than the allocation
+    // assumed is safe; wider would not be.
+    const int64_t qlora_row = cfg.q_lora_rank;
+    const int64_t qproj_row = (int64_t)qh * cfg.key_length_mla;
+    const int64_t kva_row   = cfg.key_length;
+    const int64_t kvcmpr_row = cfg.kv_lora_rank;
+    const int64_t absq_row  = (int64_t)qh * cfg.key_length;
+    const int64_t mlaout_row = (int64_t)qh * cfg.value_length_mla;
+    // How many rows the Attn phase runs. ONE unless this layer took the batched path,
+    // which keeps every expression below in the form the single-token path already had.
+    const int a_tok = attn_batched ? n_tok : 1;
 
     // ---- DAG lanes: which stream (and which q8 scratch) a call is issued on ----
     //
@@ -1418,7 +1802,15 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
     // been computed yet -- reporting a mismatch in the one mode whose whole job is
     // to localise mismatches. The per-layer validation path runs main's linear
     // order instead; the scored path never sets fwd.debug.
-    const bool dag = dag_all && s.lanes_ok && !fwd.debug;
+    //
+    // AND THE LANES ARE OFF WHEN THE TOKEN AXIS IS ON. A lane is a stream PLUS its own
+    // quantisation scratch, and the lane scratches are sized for ONE token — a batched
+    // projection issued on a lane would stage n_tok rows of Q8_0 into a one-row buffer.
+    // Sizing them for the cap would fix the overflow and buy nothing: the fork exists
+    // to hide the latency of small dependent launches, which is exactly what batching
+    // removes. So the batched FFN is a linear stream, and at n_tok == 1 this term is
+    // `true` and the expression is unchanged.
+    const bool dag = dag_all && s.lanes_ok && !fwd.debug && n_tok == 1;
 
     // Fork n lanes off the main stream HERE. One event, n waiters: the lanes all
     // branch from the same point, so recording once is the same graph as recording
@@ -1544,6 +1936,18 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
     auto hoist_act = [&](const float* x, int K) {
         hoisted_src = nullptr;
         if (!want_hoist || !ggml_qact_proj || !s.act_q8) return;
+        if (n_tok > 1) {
+            // The two activations this ever stages -- s.normed in the Attn phase and
+            // s.normed2 in FfnPartial -- are both allocated CONTIGUOUS at exactly K
+            // (== H) per token, which is the one precondition the flat row quantise
+            // cannot check for itself. That is now load-bearing for BOTH: since the
+            // batched MLA Attn phase reaches this too, s.normed had to grow a row axis
+            // at exactly H (see kimi_k3_forward_alloc_scratch), not at some padded
+            // leading dimension. A padded s.normed would quantise the padding as data.
+            if (k3k::k3_quantize_act_rows_f32(s.act_q8, x, K, n_tok, stream))
+                hoisted_src = x;
+            return;
+        }
         if (k3k::k3_quantize_act_f32(s.act_q8, x, K, stream)) hoisted_src = x;
     };
     // The pointer check is not a staleness guard -- it only asks "is this the activation
@@ -1588,6 +1992,116 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
         return proj_h_on(main_lane, y, x, W, N, K);
     };
 
+    // ======================================================================
+    // TOKEN-BATCHED PROJECTION. Everything below is dead code at n_tok == 1.
+    // ======================================================================
+    //
+    // Ingestion's problem is the mirror image of decode's. Decode has one activation
+    // and re-reads it from every output row, so the decode kernels amortise the
+    // ACTIVATION. Ingestion re-streams every WEIGHT once per prompt token -- 15.2 GB
+    // per rank per token against a 7.6 KB activation -- so a 32k prompt reads the model
+    // 32,768 times. k3_proj_q8act_tok_f32 reads each weight tile ONCE for n_tok rows
+    // and is documented bit-identical per output element to n_tok separate
+    // k3_proj_q8act_f32 calls (same k-order, same int32 accumulation, same block
+    // reduction; only the CUDA-block grouping moves).
+    //
+    // EVERY ONE OF THESE RETURNS false MEANING "USE THE SLOW PATH", NEVER "ERROR".
+    // The fallback is the per-token loop, which at n_tok == 1 is the single call this
+    // function has always made.
+
+    // Stage n_tok token-major rows of `x` into `q8buf` as a CONTIGUOUS [n_tok, K/32]
+    // Q8_0 array -- the layout k3_proj_q8act_tok_f32 reads with ld_act_blocks = K/32.
+    //
+    // TWO SHAPES, because the source is not always contiguous. When x's rows are
+    // exactly K apart the whole thing is one flat run of blocks and quantises in ONE
+    // launch (k3_quantize_act_rows_f32; the kernel is flat over 32-element blocks and
+    // has no row index at all, which is what makes that free). When x sits in a buffer
+    // with a PADDED leading dimension -- s.dense_situ is allocated at dense_ffn but the
+    // shared expert only fills shexp_band of it -- there is no stride to hand a kernel
+    // that has no row concept, so each row is quantised by its own call INTO ITS OWN
+    // CONTIGUOUS SLOT. That is n_tok launches instead of 1, but it is still n_tok
+    // launches instead of n_tok*(quantise + projection), and it is the same kernel over
+    // the same 32 values per block either way: bit-identical, not merely equivalent.
+    auto quant_rows = [&](void* q8buf, const float* x, int K, int64_t x_stride) {
+        if (!q8buf || !x || K <= 0 || K % 32 != 0) return false;
+        if (x_stride == (int64_t)K)
+            return k3k::k3_quantize_act_rows_f32(q8buf, x, K, n_tok, stream);
+        const size_t row_bytes = k3k::k3_q8_0_bytes(K);
+        if (row_bytes == 0) return false;
+        for (int b = 0; b < n_tok; ++b)
+            if (!k3k::k3_quantize_act_f32((char*)q8buf + (size_t)b * row_bytes,
+                                          x + (int64_t)b * x_stride, K, stream))
+                return false;
+        return true;
+    };
+
+    // One batched projection: [n_tok, K] activation -> [n_tok, N] output, y's rows ldy
+    // apart and x's rows x_stride apart. `pre_q8` says q8buf ALREADY holds the n_tok
+    // staged rows (the hoist wrote them), exactly like k3_proj_q8_multirow_1bar's
+    // x_pre_q8 -- it is a statement about the two lines around the call, never a cache
+    // lookup. The cached form of that promise is what shipped top1 0.0 once already.
+    // ldy and x_stride are int64_t here because s.shexp_out's row stride is the FUSED
+    // moe width and every other stride in this file is already an int64_t element
+    // count; k3_proj_q8act_tok_f32 takes an int ldy, so the one narrowing happens here,
+    // guarded, rather than silently at each of the six call sites.
+    auto proj_tok = [&](float* y, int64_t ldy, const float* x, int64_t x_stride,
+                        const KimiK3Tensor& W, int N, int K, void* q8buf, bool pre_q8) {
+        if (n_tok <= 1) return false;          // nothing to amortise over
+        if (!ggml_qact_proj) return false;     // f32 activations have no staged form
+        if (!W.ok() || W.type != 8) return false;
+        if (!q8buf || K <= 0 || K % 32 != 0) return false;
+        if (ldy < (int64_t)N || ldy > 2147483647LL) return false;
+        if (!pre_q8 && !quant_rows(q8buf, x, K, x_stride)) return false;
+        return k3k::k3_proj_q8act_tok_f32(y, (int)ldy, q8buf, K / 32, W.data, W.type,
+                                          N, K, n_tok, stream);
+    };
+
+    // The two call-site forms. Both fall back to a per-token loop of the EXISTING call,
+    // so at n_tok == 1 they are `proj(...)` and `proj_h(...)` with the loop run once and
+    // b == 0 adding nothing to any pointer.
+    auto proj_b = [&](float* y, int64_t ldy, const float* x, int64_t x_stride,
+                      const KimiK3Tensor& W, int N, int K) {
+        if (proj_tok(y, ldy, x, x_stride, W, N, K, s.proj_q8, /*pre_q8=*/false))
+            return true;
+        for (int b = 0; b < n_tok; ++b)
+            if (!proj(y + (int64_t)b * ldy, x + (int64_t)b * x_stride, W, N, K))
+                return false;
+        return true;
+    };
+    // Hoisted variant. When `x` is the activation hoist_act staged, the staged rows are
+    // already in s.act_q8 and the quantise is skipped entirely; when it is not, the rows
+    // are staged into s.proj_q8 here. s.act_q8 is READ-ONLY on the batched path for the
+    // same reason it is on the decode one -- that is why the hoist and proj_q8 are
+    // separate buffers, and why a projection landing between a hoist and its consumers
+    // cannot corrupt it.
+    auto proj_hb = [&](float* y, int64_t ldy, const float* x, int64_t x_stride,
+                       const KimiK3Tensor& W, int N, int K) {
+        const bool pre = (hoisted_src == x);
+        if (proj_tok(y, ldy, x, x_stride, W, N, K, pre ? s.act_q8 : s.proj_q8, pre))
+            return true;
+        for (int b = 0; b < n_tok; ++b)
+            if (!proj_h(y + (int64_t)b * ldy, x + (int64_t)b * x_stride, W, N, K))
+                return false;
+        return true;
+    };
+    // LANE-AWARE FORMS, for the two MLA sites that issue on a side stream.
+    //
+    // The batched kernel always goes to `stream`, and that is correct rather than a
+    // shortcut: `dag` carries `n_tok == 1` (a lane's q8 scratch holds ONE row), so at
+    // every n_tok where proj_tok can fire, dag is false and ln.st IS stream. At
+    // n_tok == 1 proj_tok declines on its first line and the loop below is the exact
+    // single call these sites have always made, on their own lane.
+    auto proj_hb_on = [&](Lane ln, float* y, int64_t ldy, const float* x,
+                          int64_t x_stride, const KimiK3Tensor& W, int N, int K) {
+        const bool pre = (hoisted_src == x);
+        if (proj_tok(y, ldy, x, x_stride, W, N, K, pre ? s.act_q8 : s.proj_q8, pre))
+            return true;
+        for (int b = 0; b < n_tok; ++b)
+            if (!proj_h_on(ln, y + (int64_t)b * ldy, x + (int64_t)b * x_stride, W, N, K))
+                return false;
+        return true;
+    };
+
     // ---- phase 1: attention. Ends holding a FULL-WIDTH PARTIAL SUM,
     // because attn_output is ColShard. The driver reduces it before phase 2. ----
     // ---- PREFILL TILE REUSE: take the fill's work instead of redoing it ----
@@ -1626,7 +2140,15 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
         return !(e && e[0] == '0');
     }();
     const K3PrefillTile* pt_hit = nullptr;
-    if (fwd.prefill_tile && want_tile_reuse && !fwd.debug) {
+    // `a_tok == 1` MAKES TILE REUSE AND THE TOKEN AXIS PROVABLY EXCLUSIVE, in one place
+    // rather than at each of the five sites below that branch on pt_hit. A tile row is a
+    // SINGLE token's q/k/v/g/normed, selected by fwd.prefill_tok; there is no such thing
+    // as a tile hit for a chunk of a_tok rows, so reusing one would silently hand tokens
+    // 1..a_tok-1 token 0's activations. Today the two cannot co-occur anyway — only
+    // kimi_k3_tp_prefill sets fwd.prefill_tile and it drives one token at a time — so
+    // this costs nothing and turns "cannot happen" into "cannot compile a path where it
+    // happens".
+    if (fwd.prefill_tile && want_tile_reuse && !fwd.debug && a_tok == 1) {
         // The debug taps read these buffers straight after the launch that wrote them,
         // and on a reuse there IS no such launch — the value was produced by the fill,
         // one call earlier. Localising a mismatch is the taps' whole job, so they get
@@ -1667,22 +2189,57 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
 
     if (do_attn) {
         // --- pre-attention mix, then bank push (raw pre-mix value) ---
+        //
+        // BATCHED. `out` and `cur` are token-major activations and move by H; `ckpts`
+        // is the CROSS-LAYER residual bank and moves by bank_row. Two different pitches,
+        // which is why the kernel takes two -- and the ORDER is (n_rows, act_row_stride,
+        // bank_row_stride), not (n_rows, bank_row, H).
+        //
+        // ALL THREE MIX CALL SITES HAD THOSE TWO SWAPPED, and it hid because they are
+        // EQUAL until the model is deep enough to bank twice: bank_row is
+        // res_bank_row_elems * max_ckpt, max_ckpt is ceil(n_layers / 12), so at <= 12
+        // layers bank_row == H and each wrong argument lands on the right value. At 13+
+        // layers max_ckpt is 2, bank_row is 2H, and both strides are wrong -- the
+        // activations get read 2H apart and the banks H apart. n_rows == 1 never touches
+        // either stride, so decode, the token loop and a 1-token chunk were all exact.
+        // Bisected on the 4-token probe: bit-identical at 12 layers, KLD 1.64 at 14.
+        //
+        // n_ckpt STAYS A SCALAR, and that is a statement about the model rather than a
+        // simplification: banking is a function of the LAYER (res_bs > 0 && layer %
+        // res_bs == 0), so every token of a chunk enters this layer having banked the
+        // same count. The driver restores it before the call and reads it back after.
         if (res_bs > 0) {
             if (!L.attn_res_score.ok()) return false;
             // The mix is skipped on a hit, the PUSH below is not — see the note above.
+            // The token axis rides through unchanged: a tile hit only ever happens on
+            // the tile driver, where a_tok is 1, so the two gates never interact.
             if (!pt_hit) {
                 k3k::attn_res_mix_f32(s.mixed, st.res_bank, hidden_in,
                                       (const float*)L.attn_res_score.data, H, st.n_ckpt,
-                                      eps, stream, s.res_scores);
+                                      eps, stream, s.res_scores, /*cur_b=*/nullptr,
+                                      /*sum_out=*/nullptr, a_tok,
+                                      /*act_row_stride=*/H,
+                                      /*bank_row_stride=*/bank_row);
             }
             if (banked) {
                 if (st.n_ckpt >= st.max_ckpt) return false;
-                cudaMemcpyAsync(st.res_bank + (size_t)st.n_ckpt * H, hidden_in,
-                                (size_t)H * sizeof(float), cudaMemcpyDeviceToDevice, stream);
+                // ONE PUSH PER TOKEN, INTO THAT TOKEN'S OWN BANK, AT THE SAME SLOT.
+                // The slot is n_ckpt for every row (see above); the BANK is what moves,
+                // by bank_row. Writing all a_tok rows at (res_bank + n_ckpt*H) would put
+                // every token's checkpoint in token 0's bank — invisible at short
+                // context, where n_ckpt is 0 or 1, and wrong at depth. n_ckpt advances
+                // ONCE for the chunk, not once per row, for the same reason.
+                for (int b = 0; b < a_tok; ++b)
+                    cudaMemcpyAsync(st.res_bank + (int64_t)b * bank_row +
+                                        (size_t)st.n_ckpt * H,
+                                    hidden_in + (int64_t)b * H,
+                                    (size_t)H * sizeof(float), cudaMemcpyDeviceToDevice,
+                                    stream);
                 ++st.n_ckpt;
             }
         } else if (!pt_hit) {
-            cudaMemcpyAsync(s.mixed, hidden_in, (size_t)H * sizeof(float),
+            // Both sides are contiguous at H, so the whole chunk is ONE copy.
+            cudaMemcpyAsync(s.mixed, hidden_in, (size_t)H * a_tok * sizeof(float),
                             cudaMemcpyDeviceToDevice, stream);
         }
         if (fwd.debug) fwd.debug("attn_res_mix", layer, s.mixed, H);
@@ -1700,7 +2257,8 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             // s.normed again and the saving would stop at the qkvg group.
             hoisted_src = s.normed;
         } else {
-            k3k::rms_norm_f32(s.normed, s.mixed, (const float*)L.attn_norm.data, H, eps, stream);
+            k3k::rms_norm_f32(s.normed, s.mixed, (const float*)L.attn_norm.data, H, eps,
+                              stream, a_tok, H, H);
             if (fwd.debug) fwd.debug("attn_norm", layer, s.normed, H);
             // normed feeds ssm_f_a and ssm_beta on a KDA layer, and q_a/q_dense, kv_a and
             // attn_gate on an MLA one. The fused qkvg group keeps its own quantisation --
@@ -1710,6 +2268,15 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
 
         k3_profiler().start(L.is_kda ? "attn_kda" : "attn_mla", stream);
         if (L.is_kda) {
+            // BELT AND BRACES ON THE ONE REFUSAL THAT MATTERS. A chunk reaches this
+            // block only when SPARKINFER_K3_KDA_QKVG_BATCH is set; without it
+            // kimi_k3_attn_batch_ok() still refuses every KDA layer and a_tok is 1.
+            // The gate is re-read HERE rather than inferred from a_tok because the
+            // single-row scratch below (conv_*, decay_g, beta_out, delta_out) would
+            // otherwise take eight tokens into one token's buffers and produce a fluent
+            // wrong answer rather than a fault. `L.is_kda` and `cfg.is_kda_layer(layer)`
+            // are two derivations of the same fact; this is where they are made to agree.
+            if (a_tok != 1 && !k3_kda_qkvg_batch_enabled()) return false;
             const int kda_ord = kimi_k3_kda_ordinal(cfg, layer);
             if (kda_ord < 0) return false;
             const int head_dim = cfg.kda_head_dim;
@@ -1738,7 +2305,13 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             //
             // Every tensor either chain touches is checked here, before the fork,
             // so the failure paths below stay on a linear stream.
-            const bool kda_fork = dag && dag_kda &&
+            //
+            // ONE FORK, ONE JOIN, AND THE JOIN NOW SITS INSIDE A LOOP. `dag` already
+            // carries n_tok == 1 (a lane owns ONE row of q8 scratch), so a chunk can
+            // never reach the fork — but the join below is now per-token, and a fork
+            // taken once against a_tok joins would be an unbalanced capture rather than
+            // a wrong number. Said explicitly here instead of relied upon from `dag`.
+            const bool kda_fork = a_tok == 1 && dag && dag_kda &&
                 L.ssm_f_a.ok() && L.ssm_f_b.ok() && L.ssm_beta.ok() &&
                 L.ssm_dt_bias.ok() && L.ssm_a.ok() &&
                 // The convs are on the MAIN branch, but their check sits between
@@ -1834,10 +2407,82 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
                 s.g_proj_out = pt_hit->g + off;
                 qkvg_from_tile = true;
             }
-            // `||` SHORT-CIRCUITS, and that is load-bearing rather than stylistic: the
-            // right-hand side CALLS the projections. On a tile hit it must not be evaluated
-            // at all, or the work this exists to remove would still be issued.
-            const bool fused_qkvg = qkvg_from_tile || (fusable &&
+            // THE TILE ARM ABOVE AND THE CHUNK ARM BELOW CANNOT BOTH FIRE. `pt_hit` is
+            // only ever set under `a_tok == 1` (see the gate at the top of this function),
+            // so `qkvg_from_tile` implies a single token and `a_tok > 1` implies no tile.
+            // That exclusivity is what lets the two writers of s.qkv_* coexist in one
+            // function: the tile arm ALIASES those pointers at a foreign buffer and the
+            // chunk arm WRITES through them, and if both could fire the chunk projections
+            // would scribble into the tile driver's rows.
+            //
+            // ---- THE CHUNK ARM: FOUR TOKEN-BATCHED PROJECTIONS, NOT FOUR FUSED ONES ----
+            //
+            // WHAT IT REPLACES. At a_tok == 1 the group is ONE launch of
+            // proj_q8_fused4_1bar_kernel that streams 4 x 1536 x 7168 of Q8_0 weight —
+            // 46.8 MB per layer per rank — and spends it on ONE token. Over 69 KDA layers
+            // that is 3.23 GB per token per rank, the single largest weight stream in the
+            // model, and prompt ingestion re-reads all of it for every one of 32,768
+            // tokens. proj_q8_0_q8_0_tok_kernel reads the same tile once and spends it on
+            // a_tok tokens, so the term divides by a_tok; the activation it re-reads
+            // instead is 7.6 KB against 11.7 MB.
+            //
+            // WHY FOUR LAUNCHES IS STILL FEWER. The fused kernel's win was amortising ONE
+            // activation over four tensors, which was worth having when the activation was
+            // re-quantised per call. On the token axis the weight is what repeats, so
+            // four batched launches per layer per CHUNK replace a_tok fused launches per
+            // layer; at a chunk of 16 that is 4 instead of 16, with 1/16th the weight
+            // traffic. Fusing the token axis and the tensor axis in one kernel is the
+            // strictly better shape and is deliberately NOT done here — it needs a new
+            // kernel, and this arm needs none.
+            //
+            // BIT-IDENTICAL, PER OUTPUT ELEMENT, AND HERE IS THE WHOLE ARGUMENT.
+            // Compare proj_q8_fused4_1bar_kernel (what runs today) with
+            // proj_q8_0_q8_0_tok_kernel (what runs here) for a fixed output y[t][n]:
+            //   * b-striding.  Both walk `for (b = tx; b < blocks_per_row; b += BLOCK)`
+            //     with tx == threadIdx.x, so thread i owns exactly the same set of k
+            //     blocks in the same ascending order. BLOCK comes from the same rule
+            //     (block_for / proj_block_for, both `nb<=32?32:nb<=64?64:128`) applied to
+            //     the same nb == K/32, so it is the same number: 128 at K == 7168.
+            //   * inner product.  Both do `int sumi = 0; for i in 0..7:
+            //     sumi = __dp4a(<weight>, <activation>, sumi)` over get_int_b2 in
+            //     ascending i — int32, exact, same operand order (weight first).
+            //   * float promotion.  Both do `acc += (float)sumi * (dw * dx)`, the same
+            //     expression in the same associativity, accumulated in ascending b.
+            //   * reduction TREE, which is the one that would have broken it. 1bar does a
+            //     shfl_down butterfly off 16,8,4,2,1; lane 0 stashes; one __syncthreads();
+            //     one thread folds shm[w] over ASCENDING w. block_sum<BLOCK> (what the tok
+            //     kernel calls) does the identical butterfly over the identical lanes,
+            //     stashes per warp, and folds w = 0..NWARP-1 ascending. Same partials,
+            //     same order, same roundings — 1bar's own header makes this claim against
+            //     block_sum and it is the same claim being leaned on here.
+            // ROWS and TOKS change only which output elements share a CUDA block; neither
+            // appears in any accumulation order. The activation bytes are the same bytes:
+            // k3_quantize_act_rows_f32 is k3_quantize_q8_0 over a longer flat run, and
+            // s.normed is contiguous at exactly H per token (see its allocation), which is
+            // the precondition that flatness cannot check for itself.
+            //
+            // proj_hb falls back to a per-token loop of proj_h whenever the batched kernel
+            // declines (f32 weights, n_tok == 1, a shape it was not written for), so a
+            // decline here is the slow path and never a wrong one.
+            if (a_tok > 1) {
+                if (!proj_hb(s.qkv_q, qkv, s.normed, H, L.attn_q, qkv, H)) return false;
+                if (!proj_hb(s.qkv_k, qkv, s.normed, H, L.attn_k, qkv, H)) return false;
+                if (!proj_hb(s.qkv_v, qkv, s.normed, H, L.attn_v, qkv, H)) return false;
+                if (!proj_hb(s.g_proj_out, qkv, s.normed, H, L.ssm_g, qkv, H)) return false;
+            }
+            // `fused_qkvg` means "g_proj_out is already written", which the chunk arm
+            // above also satisfies — it projects ssm_g alongside q/k/v for the same
+            // reason the fused kernel does, so the late g projection below stays skipped.
+            //
+            // THE SHORT CIRCUIT IS LOAD-BEARING, NOT STYLE. The right operand of this ||
+            // LAUNCHES KERNELS. At a_tok > 1 it must not be evaluated at all, or the
+            // fused single-token group would run over token 0 and overwrite the chunk's
+            // row 0 with a duplicate of itself. `||` guarantees that; an eager form
+            // (computing both and or-ing) would be the wrong-and-faster bug again.
+            // The same argument covers `qkvg_from_tile`: on a tile hit the right-hand
+            // side must not be evaluated either, or the work the tile exists to remove
+            // would still be issued.
+            const bool fused_qkvg = qkvg_from_tile || a_tok > 1 || (fusable &&
                 (ggml_qact_proj
                      ? (k3k::k3_proj_q8_fused4_1bar(s.qkv_q, s.qkv_k, s.qkv_v,
                                                     s.g_proj_out, s.normed,
@@ -1868,6 +2513,78 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             // scan; k does not (see kda_decode_step_f32's contract on pre-scaled q).
             const float q_l2_scale = 1.0f / std::sqrt((float)head_dim);
 
+            // ================= THE SCAN, STILL ONE TOKEN AT A TIME =================
+            //
+            // Everything from here to the gate is the RECURRENCE and keeps the token
+            // loop, in index order, on ONE stream. st.conv_state_* shifts a 4-deep
+            // window per token and st.delta_state carries the delta rule from token
+            // b-1 into token b; both are updated IN PLACE by the calls below, so the
+            // stream order IS the recurrence order and there is nothing else holding
+            // it. At a_tok == 1 this loop runs exactly once with b == 0, every offset
+            // below is + 0, and the launch sequence is byte-for-byte the one this
+            // block has always issued.
+            //
+            // WHAT IT READS PER TOKEN. qkv_q/k/v and g_proj_out are the chunk-wide
+            // buffers the projections above filled, indexed at b * qkv — token b can
+            // only reach its own row, and the rows for tokens after b are already
+            // written but are never addressed here. normed is indexed at b * H. The
+            // scratch it WRITES (conv_*, f_a_out, g_raw, decay_g, beta_out, delta_out)
+            // is one row that this iteration produces and consumes before the next
+            // iteration overwrites it.
+            // ---- PRE-SCAN BATCH: the decay chain for the WHOLE chunk, before the loop.
+            //
+            // f_a_out <- normed, g_raw <- f_a_out, decay_g <- g_raw. None of the three
+            // reads the conv state or the delta state (see k3_kda_pre_batch_enabled), so
+            // computing them for all a_tok tokens here is the same arithmetic the loop
+            // would do one row at a time — it just does it at 12*a_tok blocks instead of
+            // 12, which is the point.
+            //
+            // The loop below skips this chain when it fired, and reads decay_g at its own
+            // row. Everything else in the loop is untouched.
+            bool kda_pre = false;
+            if (k3_kda_pre_batch_enabled() && a_tok > 1 && !fwd.debug &&
+                L.ssm_f_a.ok() && L.ssm_f_b.ok() && L.ssm_dt_bias.ok() && L.ssm_a.ok()) {
+                // proj_hb takes (y, ldy, x, x_stride, W, N, K) and falls back to a
+                // per-token loop of the single-row projection when its batched kernel
+                // declines — so a decline here is slower, never different.
+                if (!proj_hb(s.f_a_out, head_dim, s.normed, H, L.ssm_f_a, head_dim, H))
+                    return false;
+                if (!proj_hb(s.g_raw, qkv, s.f_a_out, head_dim, L.ssm_f_b, qkv, head_dim))
+                    return false;
+                // Same fused-then-fallback pair the per-token path uses, with the row axis
+                // supplied. dt_bias and A are SHARED across rows and are never strided —
+                // the kernels take them as the learned parameters they are.
+                if (!k3k::k3_kda_decay_gate_dt(s.decay_g, s.g_raw, w_dt, w_a, head_dim,
+                                               n_head, cfg.kda_gate_lower_bound, stream,
+                                               a_tok, qkv)) {
+                    // THE FALLBACK LOOPS, and that is not laziness — k3_add_f32's row axis
+                    // strides ALL THREE of its pointers (out, a AND b), which is right for
+                    // two tensors of the same shape and wrong here: w_dt is a SHARED bias
+                    // of one qkv-wide row, so a strided call would read w_dt + b*qkv, off
+                    // the end of the tensor, for every token after the first. The decay
+                    // gate's own row axis is safe (it leaves dt_bias and A unstrided), but
+                    // there is no point being half-batched across a pair that must agree.
+                    for (int pb = 0; pb < a_tok; ++pb) {
+                        float* const gr = s.g_raw   + (int64_t)pb * qkv;
+                        float* const dg = s.decay_g + (int64_t)pb * qkv;
+                        k3k::k3_add_f32(gr, gr, w_dt, qkv, stream);
+                        k3k::kda_decay_gate_f32(dg, gr, w_a, head_dim, n_head,
+                                                cfg.kda_gate_lower_bound, stream);
+                    }
+                }
+                kda_pre = true;
+            }
+            for (int b = 0; b < a_tok; ++b) {
+            const float* const nrm     = s.normed     + (int64_t)b * H;
+            // decay_g carries a row axis only when the pre-scan batch filled it; without
+            // it the buffer is one row that this iteration produces and consumes.
+            float* const       decay_b = s.decay_g + (kda_pre ? (int64_t)b * qkv : 0);
+            float* const       qkv_q_b = s.qkv_q      + (int64_t)b * qkv;
+            float* const       qkv_k_b = s.qkv_k      + (int64_t)b * qkv;
+            float* const       qkv_v_b = s.qkv_v      + (int64_t)b * qkv;
+            float* const       gproj_b = s.g_proj_out + (int64_t)b * qkv;
+            float* const       gate_b  = s.gate_out   + (int64_t)b * qkv;
+
             // FIVE DEPENDENT LAUNCHES FOR ~330 KB, ON ALL 69 KDA LAYERS.
             //
             // The three convs are mutually independent, and the q/k norms reduce over
@@ -1883,17 +2600,17 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
                     s.conv_q, s.conv_k, s.conv_v,
                     st.conv_state_q[kda_ord], st.conv_state_k[kda_ord],
                     st.conv_state_v[kda_ord],
-                    s.qkv_q, s.qkv_k, s.qkv_v, w_cq, w_ck, w_cv,
+                    qkv_q_b, qkv_k_b, qkv_v_b, w_cq, w_ck, w_cv,
                     cfg.kda_conv_kernel, head_dim, n_head, q_l2_scale, eps, stream);
 
             if (!kda_fused) {
-                k3k::kda_conv_step_f32(s.conv_q, st.conv_state_q[kda_ord], s.qkv_q,
+                k3k::kda_conv_step_f32(s.conv_q, st.conv_state_q[kda_ord], qkv_q_b,
                                        w_cq, cfg.kda_conv_kernel,
                                        qkv, stream);
-                k3k::kda_conv_step_f32(s.conv_k, st.conv_state_k[kda_ord], s.qkv_k,
+                k3k::kda_conv_step_f32(s.conv_k, st.conv_state_k[kda_ord], qkv_k_b,
                                        w_ck, cfg.kda_conv_kernel,
                                        qkv, stream);
-                k3k::kda_conv_step_f32(s.conv_v, st.conv_state_v[kda_ord], s.qkv_v,
+                k3k::kda_conv_step_f32(s.conv_v, st.conv_state_v[kda_ord], qkv_v_b,
                                        w_cv, cfg.kda_conv_kernel,
                                        qkv, stream);
                 if (fwd.debug) fwd.debug("dbg_conv_q", layer, s.conv_q, qkv);
@@ -1904,10 +2621,20 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             }
             if (fwd.debug) fwd.debug("dbg_l2_q", layer, s.conv_q, qkv);
 
-            if (!proj_h_on(l_dec, s.f_a_out, s.normed, L.ssm_f_a, head_dim, H)) return false;
-            if (!proj_on(l_dec, s.g_raw, s.f_a_out, L.ssm_f_b, qkv, head_dim)) return false;
+            // `nrm` rather than s.normed, and that is load-bearing rather than cosmetic:
+            // proj_h_on takes the hoisted Q8_0 rows only when its `x` IS the pointer
+            // hoist_act staged, and s.act_q8 holds TOKEN 0's row at offset 0. Passing
+            // s.normed here would hand every token of the chunk token 0's activation —
+            // the same shape of bug as one shared d_pos, and just as fast. At b == 0
+            // nrm == s.normed and the hoist is taken exactly as before; at b > 0 the
+            // pointers differ, the hoist is declined, and the ordinary path quantises
+            // this token's own row. Bit-identical either way (same quantiser, same
+            // bytes), only a launch cheaper at b == 0.
             if (!L.ssm_dt_bias.ok()) return false;
             if (!L.ssm_a.ok()) return false;
+            if (!kda_pre) {
+            if (!proj_h_on(l_dec, s.f_a_out, nrm, L.ssm_f_a, head_dim, H)) return false;
+            if (!proj_on(l_dec, s.g_raw, s.f_a_out, L.ssm_f_b, qkv, head_dim)) return false;
             // The gate reads g_raw anyway, so it adds the bias on the way in — one
             // launch instead of two, bit-identical. Declining runs both as main does.
             if (!k3k::k3_kda_decay_gate_dt(s.decay_g, s.g_raw, w_dt, w_a, head_dim,
@@ -1917,6 +2644,7 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
                                         head_dim, n_head, cfg.kda_gate_lower_bound,
                                         l_dec.st);
             }
+            }   // ---- end of the !kda_pre decay chain ----
 
             // ssm_beta is [n_heads, hidden] and stays REPLICATED: its suffix is shared
             // with Qwen's GDN, so one weight_plan entry governs both models. Project
@@ -1966,15 +2694,22 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
                 // and the weight is Q8_0, else the ordinary path. ssm_beta is f32 today
                 // so this resolves to k3_proj_f32, but writing it this way means the
                 // band does not silently opt out of the hoist if the weight ever moves.
+                //
+                // `nrm`, NOT s.normed, for the same reason as ssm_f_a above: s.act_q8
+                // holds token 0's row, so the hoist may only be taken when this token IS
+                // token 0. beta is also the buffer the parent trap is about — it is
+                // n_q_heads (96) wide, not qkv (1536), so it never gets a row stride at
+                // all; the loop rewrites its single row per token and the decode step
+                // below consumes it in the same iteration.
                 const bool okb =
-                    (hoisted_src == s.normed && L.ssm_beta.type == 8)
+                    (hoisted_src == nrm && L.ssm_beta.type == 8)
                         ? k3k::k3_proj_q8act_f32(s.beta_out + r_off, s.act_q8, wbase,
                                                  L.ssm_beta.type, n_rows, H, l_beta.st)
                         : (ggml_qact_proj
-                               ? k3k::k3_proj_ggml_f32(s.beta_out + r_off, s.normed,
+                               ? k3k::k3_proj_ggml_f32(s.beta_out + r_off, nrm,
                                                        wbase, L.ssm_beta.type, n_rows, H,
                                                        l_beta.q8, l_beta.st)
-                               : k3k::k3_proj_f32(s.beta_out + r_off, s.normed, wbase,
+                               : k3k::k3_proj_f32(s.beta_out + r_off, nrm, wbase,
                                                   L.ssm_beta.type, n_rows, H, l_beta.st));
                 if (!okb) return false;
             }
@@ -1990,7 +2725,7 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
                 // scratch is stale and never read.
                 k3k::sigmoid_inplace_f32(s.beta_out + beta_off, beta_rows, l_beta.st);
 
-            if (fwd.debug) fwd.debug("dbg_decay_g", layer, s.decay_g, qkv);
+            if (fwd.debug) fwd.debug("dbg_decay_g", layer, decay_b, qkv);
             if (fwd.debug) fwd.debug("dbg_beta", layer, s.beta_out, cfg.n_q_heads);
             // JOIN both lanes. The decode step below reads decay_g (lane 0) and
             // beta_out (lane 1) alongside the convs it read from the main stream,
@@ -2001,30 +2736,51 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             // Both read the same f32 state, so a decline is a slower path and never a
             // different answer.
             if (!k3k::k3_kda_decode_step_ip(s.delta_out, st.delta_state[kda_ord],
-                                            s.conv_q, s.conv_k, s.conv_v, s.decay_g,
+                                            s.conv_q, s.conv_k, s.conv_v, decay_b,
                                             s.beta_out + hd_off,
                                             head_dim, n_head, beta_sig_fused, stream)) {
                 // The fused step declined, so beta is still raw if the fold was on.
                 if (beta_sig_fused)
                     k3k::sigmoid_inplace_f32(s.beta_out + beta_off, beta_rows, stream);
                 k3k::kda_decode_step_f32(s.delta_out, st.delta_state[kda_ord],
-                                         s.conv_q, s.conv_k, s.conv_v, s.decay_g,
+                                         s.conv_q, s.conv_k, s.conv_v, decay_b,
                                          s.beta_out + hd_off,
                                          head_dim, n_head, stream);
             }
             if (fwd.debug) fwd.debug("dbg_delta_out", layer, s.delta_out, qkv);
 
-            // Already computed above when the q/k/v/g fusion took the fast path.
-            if (!fused_qkvg && !proj_h(s.g_proj_out, s.normed, L.ssm_g, qkv, H)) return false;
+            // Already computed above when the q/k/v/g fusion took the fast path, and
+            // by the chunk arm whenever a_tok > 1 — so this is a single-token fallback
+            // and `gproj_b` is s.g_proj_out with b == 0.
+            if (!fused_qkvg && !proj_h(gproj_b, nrm, L.ssm_g, qkv, H)) return false;
             if (!L.ssm_norm.ok()) return false;
-            k3k::kda_gate_out_f32(s.gate_out, s.delta_out, (const float*)L.ssm_norm.data,
-                                  s.g_proj_out, head_dim, n_head, eps, stream);
-            if (fwd.debug) fwd.debug("dbg_gate_out", layer, s.gate_out, qkv);
+            k3k::kda_gate_out_f32(gate_b, s.delta_out, (const float*)L.ssm_norm.data,
+                                  gproj_b, head_dim, n_head, eps, stream);
+            if (fwd.debug) fwd.debug("dbg_gate_out", layer, gate_b, qkv);
+            }   // ---- end of the per-token scan loop ----
 
-            // The tile driver projects all rows together directly into the collective
-            // slot. A marker miss retains the exact scalar path.
+            // ---- attn_output, ONCE FOR THE CHUNK ----
+            //
+            // The scan is what forced the token loop, and it has finished: gate_out now
+            // holds all a_tok rows and attn_output is elementwise in the token index
+            // again. So the last projection of the layer — N 7168, K 1536, another
+            // 11.7 MB of Q8_0 per layer per rank — is read once for the chunk instead of
+            // once per token. proj_b is the same helper the MLA branch uses for its own
+            // attn_output and falls back to a per-token loop of `proj` when the batched
+            // kernel declines; at a_tok == 1 it declines on its first line and this IS
+            // the call this site has always made.
+            //
+            // s.attn_out's per-token pitch is H, which is what the driver's ONE
+            // swap_partial_buffer to the chunk-wide base assumes and what the nb*hidden
+            // attention reduce then covers — the same layout the MLA branch writes.
+            //
+            // The tile driver projects all its rows together straight into the
+            // collective slot, so a marker hit means s.attn_out is already written for
+            // this token and re-projecting would overwrite it from an aliased gate_out.
+            // A marker miss retains the exact path above.
             if (!(pt_hit && pt_hit->kda_out_layer == layer) &&
-                !proj(s.attn_out, s.gate_out, L.attn_output, H, qkv)) return false;
+                !proj_b(s.attn_out, H, s.gate_out, qkv, L.attn_output, H, qkv))
+                return false;
             if (fwd.debug) fwd.debug("kda_out", layer, s.attn_out, H);
         } else {
             const int mla_ord = kimi_k3_mla_ordinal(cfg, layer);
@@ -2051,17 +2807,25 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             const Lane l_kv   = mla_fork ? lane_of(0) : main_lane;
             const Lane l_gate = mla_fork ? lane_of(1) : main_lane;
 
+            // EVERY PROJECTION AND NORM BELOW TAKES THE WHOLE CHUNK. At a_tok == 1 each
+            // of these is the single call it has always been: proj_tok declines at
+            // n_tok <= 1 and the fallback loop runs once with b == 0, and every
+            // rms_norm's n_rows == 1 grid is dim3(g, 1) == dim3(g).
             if (L.has_q_lora) {
-                if (!proj_h(s.q_lora_out, s.normed, L.attn_q_a, cfg.q_lora_rank, H)) return false;
+                if (!proj_hb(s.q_lora_out, qlora_row, s.normed, H, L.attn_q_a,
+                             cfg.q_lora_rank, H))
+                    return false;
                 if (!L.attn_q_a_norm.ok()) return false;
+                // In place, so both strides are the same buffer's own row pitch.
                 k3k::rms_norm_f32(s.q_lora_out, s.q_lora_out,
                                   (const float*)L.attn_q_a_norm.data, cfg.q_lora_rank, eps,
-                                  stream);
-                if (!proj(s.q_proj_out, s.q_lora_out, L.attn_q_b, qh * cfg.key_length_mla,
-                         cfg.q_lora_rank))
+                                  stream, a_tok, qlora_row, qlora_row);
+                if (!proj_b(s.q_proj_out, qproj_row, s.q_lora_out, qlora_row, L.attn_q_b,
+                            qh * cfg.key_length_mla, cfg.q_lora_rank))
                     return false;
             } else {
-                if (!proj_h(s.q_proj_out, s.normed, L.attn_q_dense, qh * cfg.key_length_mla, H))
+                if (!proj_hb(s.q_proj_out, qproj_row, s.normed, H, L.attn_q_dense,
+                             qh * cfg.key_length_mla, H))
                     return false;
             }
 
@@ -2071,15 +2835,20 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             // decided below and recorded so the call site stays a single decision.
             bool absorb_strided = false;
 
-            if (!proj_h_on(l_kv, s.kv_a_out, s.normed, L.attn_kv_a_mqa, cfg.key_length, H))
+            if (!proj_hb_on(l_kv, s.kv_a_out, kva_row, s.normed, H, L.attn_kv_a_mqa,
+                            cfg.key_length, H))
                 return false;
             if (!L.attn_kv_a_norm.ok()) return false;
+            // TWO DIFFERENT STRIDES, and this is the site the shared-stride bug would
+            // have hit first: the norm READS kv_a_out, which is key_length (576) wide,
+            // and WRITES kv_cmpr_normed, which is kv_lora_rank (512) wide. rms_norm_f32
+            // takes them separately for exactly this reason.
             k3k::rms_norm_f32(s.kv_cmpr_normed, s.kv_a_out,
                               (const float*)L.attn_kv_a_norm.data, cfg.kv_lora_rank, eps,
-                              l_kv.st);
+                              l_kv.st, a_tok, kvcmpr_row, kva_row);
             if (fwd.debug) fwd.debug("dbg_kvcmpr", layer, s.kv_cmpr_normed, cfg.kv_lora_rank);
 
-            // K-cache row for this position: concat(normed kv_cmpr, RAW k_pe).
+            // K-cache rows for this chunk's positions: concat(normed kv_cmpr, RAW k_pe).
             //
             // The row ADDRESS used to be computed here, on the host, from st.position —
             // which a captured graph freezes. One kernel that derives the row from d_pos
@@ -2087,74 +2856,131 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             // is bit-identical, and it is the reason replay 2 writes a different row from
             // replay 1 instead of overwriting replay 1's. The f16 twin narrows on the way
             // in and is otherwise the same kernel, same d_pos, same row layout.
+            //
+            // BATCHED, AND THE POSITION IS NOW INDEXED RATHER THAN DEREFERENCED: row b
+            // stores at st.d_pos[b]. That is the one place in this phase that depends on
+            // st.d_pos being the chunk's CONTIGUOUS position vector bound at token 0
+            // (see the preconditions on kimi_k3_forward_layer_phase). Handed a single
+            // shared position, all a_tok rows would write the same cache row — the bug
+            // that is both wrong and faster.
+            //
+            // Storing all a_tok rows BEFORE any token attends is not a reordering of the
+            // arithmetic: every attention kernel below walks *its own* d_pos + 1 rows, so
+            // token b reads [0, pos_b] and cannot see the rows written for the tokens
+            // after it. Causality here is the LENGTH, not the store order.
             if (st.kv_f16)
                 k3k::k3_mla_kv_store_f16(st.mla_kv_cache[mla_ord], s.kv_cmpr_normed,
                                          s.kv_a_out, st.d_pos, cfg.kv_lora_rank,
-                                         cfg.rope_dim, cfg.key_length, l_kv.st);
+                                         cfg.rope_dim, cfg.key_length, l_kv.st,
+                                         a_tok, kvcmpr_row, kva_row);
             else
                 k3k::k3_mla_kv_store_f32(st.mla_kv_cache[mla_ord], s.kv_cmpr_normed,
                                          s.kv_a_out, st.d_pos, cfg.kv_lora_rank,
-                                         cfg.rope_dim, cfg.key_length, l_kv.st);
+                                         cfg.rope_dim, cfg.key_length, l_kv.st,
+                                         a_tok, kvcmpr_row, kva_row);
 
             if (!L.attn_k_b.ok() || !L.attn_v_b.ok()) return false;
             absorb_strided = k3k::k3_mla_absorb_q_strided(
                 s.absorbed_q, s.q_proj_out, (const float*)L.attn_k_b.data, qk_nope,
-                cfg.kv_lora_rank, cfg.rope_dim, cfg.key_length_mla, qh, stream);
+                cfg.kv_lora_rank, cfg.rope_dim, cfg.key_length_mla, qh, stream,
+                a_tok, absq_row, qproj_row);
             if (!absorb_strided) {
-                cudaMemcpy2DAsync(s.q_nope, (size_t)qk_nope * sizeof(float),
-                                  s.q_proj_out,
-                                  (size_t)cfg.key_length_mla * sizeof(float),
-                                  (size_t)qk_nope * sizeof(float), qh,
-                                  cudaMemcpyDeviceToDevice, stream);
-                cudaMemcpy2DAsync(s.q_pe, (size_t)cfg.rope_dim * sizeof(float),
-                                  (const char*)s.q_proj_out +
-                                      (size_t)qk_nope * sizeof(float),
-                                  (size_t)cfg.key_length_mla * sizeof(float),
-                                  (size_t)cfg.rope_dim * sizeof(float), qh,
-                                  cudaMemcpyDeviceToDevice, stream);
-                k3k::mla_absorb_q_f32(s.absorbed_q, s.q_nope, s.q_pe,
-                                      (const float*)L.attn_k_b.data, qk_nope,
-                                      cfg.kv_lora_rank, cfg.rope_dim, qh, stream);
+                // THE DECLINE PATH STAYS PER-TOKEN, and s.q_nope / s.q_pe therefore stay
+                // one row wide. One token is live at a time and this is straight-line on
+                // one stream, so the two de-interleaves and the absorb that reads them
+                // cannot interleave across b. Buying a row axis for the two scratch
+                // buffers here would be VRAM spent on the path that already declined.
+                for (int b = 0; b < a_tok; ++b) {
+                    const float* qp_b = s.q_proj_out + (int64_t)b * qproj_row;
+                    cudaMemcpy2DAsync(s.q_nope, (size_t)qk_nope * sizeof(float),
+                                      qp_b,
+                                      (size_t)cfg.key_length_mla * sizeof(float),
+                                      (size_t)qk_nope * sizeof(float), qh,
+                                      cudaMemcpyDeviceToDevice, stream);
+                    cudaMemcpy2DAsync(s.q_pe, (size_t)cfg.rope_dim * sizeof(float),
+                                      (const char*)qp_b +
+                                          (size_t)qk_nope * sizeof(float),
+                                      (size_t)cfg.key_length_mla * sizeof(float),
+                                      (size_t)cfg.rope_dim * sizeof(float), qh,
+                                      cudaMemcpyDeviceToDevice, stream);
+                    k3k::mla_absorb_q_f32(s.absorbed_q + (int64_t)b * absq_row,
+                                          s.q_nope, s.q_pe,
+                                          (const float*)L.attn_k_b.data, qk_nope,
+                                          cfg.kv_lora_rank, cfg.rope_dim, qh, stream);
+                }
             }
             if (fwd.debug) fwd.debug("mla_absorb_q", layer, s.absorbed_q, qh * cfg.key_length);
 
-            // JOIN the KV lane. The decode kernel reads the row this token's store
-            // just wrote, so this is the edge that makes the fork legal at all.
+            // JOIN the KV lane. The decode kernel reads the rows this store just wrote,
+            // so this is the edge that makes the fork legal at all.
             if (mla_fork) dag_join(0);
 
             const float mla_scale = 1.0f / std::sqrt((float)cfg.key_length_mla);
-            // host length: picks the launch plan only.
-            // device length: what the kernel attends over.
-            if (st.kv_f16)
-                k3k::mla_decode_attn_kvf16(s.mla_attn_out, s.absorbed_q,
-                                           st.mla_kv_cache[mla_ord],
-                                           (const float*)L.attn_v_b.data, cfg.key_length,
-                                           cfg.kv_lora_rank, cfg.value_length_mla, qh,
-                                           st.position + 1, st.d_pos, mla_scale, stream);
-            else
-                k3k::mla_decode_attn_f32(s.mla_attn_out, s.absorbed_q,
-                                         st.mla_kv_cache[mla_ord],
-                                         (const float*)L.attn_v_b.data, cfg.key_length,
-                                         cfg.kv_lora_rank, cfg.value_length_mla, qh,
-                                         st.position + 1, st.d_pos, mla_scale, stream);
+            // ---- THE ONE PER-TOKEN LAUNCH LEFT IN A BATCHED MLA ATTN PHASE ----
+            //
+            // THE ATTENTION KERNEL ITSELF IS NOT BATCHED, AND THAT IS A BIT-IDENTITY
+            // DECISION, NOT AN EFFORT ONE. mla_decode_attn_launch derives `splits` from
+            // n_ctx, and the refinement is continuous in it (`by_len = n_ctx / min_slice`
+            // plus the reach-fill relaxation). One grid for the chunk means ONE split
+            // count for tokens sitting at a_tok different depths, and the split count is
+            // the partition of an online-softmax reduction — changing it re-associates
+            // the running max/exp-sum and moves the last bits. There is a pin
+            // (k3_mla_set_split_pin) that would make one count legal for the chunk, but
+            // pinning is exactly the arithmetic change this phase is not allowed to make.
+            //
+            // It is also the launch with the least to gain. Everything above streams a
+            // WEIGHT per token and amortises; this one streams the KV CACHE, whose bytes
+            // are proportional to each token's own prefix and do not amortise across
+            // tokens at all.
+            //
+            //   * host length picks the launch plan only, and token b sits b positions
+            //     deeper than token 0: st.position is TOKEN 0's position.
+            //   * device length is what the kernel attends over, and is st.d_pos[b].
+            // At a_tok == 1 this loop runs once with b == 0 and is the call this site
+            // has always made.
+            for (int b = 0; b < a_tok; ++b) {
+                float* out_b       = s.mla_attn_out + (int64_t)b * mlaout_row;
+                const float* q_b   = s.absorbed_q   + (int64_t)b * absq_row;
+                const int* pos_b   = st.d_pos + b;
+                const int  n_ctx_b = st.position + 1 + b;
+                if (st.kv_f16)
+                    k3k::mla_decode_attn_kvf16(out_b, q_b,
+                                               st.mla_kv_cache[mla_ord],
+                                               (const float*)L.attn_v_b.data, cfg.key_length,
+                                               cfg.kv_lora_rank, cfg.value_length_mla, qh,
+                                               n_ctx_b, pos_b, mla_scale, stream);
+                else
+                    k3k::mla_decode_attn_f32(out_b, q_b,
+                                             st.mla_kv_cache[mla_ord],
+                                             (const float*)L.attn_v_b.data, cfg.key_length,
+                                             cfg.kv_lora_rank, cfg.value_length_mla, qh,
+                                             n_ctx_b, pos_b, mla_scale, stream);
+            }
             if (fwd.debug) fwd.debug("dbg_preattn", layer, s.mla_attn_out, qh * cfg.value_length_mla);
 
             if (L.has_attn_gate) {
                 // Issued on its own lane so it runs UNDER the attention rather than
                 // after it. Host issue order is irrelevant here -- every launch is
                 // async and the lane's only dependency is the fork event, so the
-                // gate is free to start the moment the fork retires.
-                if (!proj_h_on(l_gate, s.gate_proj_out, s.normed, L.attn_gate,
-                               qh * cfg.value_length_mla, H))
+                // gate is free to start the moment the fork retires. (At a_tok > 1
+                // `dag` is off and this lane IS the main stream.)
+                if (!proj_hb_on(l_gate, s.gate_proj_out, mlaout_row, s.normed, H,
+                                L.attn_gate, qh * cfg.value_length_mla, H))
                     return false;
                 if (fwd.debug) fwd.debug("dbg_gateproj", layer, s.gate_proj_out, qh * cfg.value_length_mla);
                 if (mla_fork) dag_join(1);
                 k3k::mla_gate_out_f32(s.mla_attn_out, s.mla_attn_out, s.gate_proj_out,
-                                      (int64_t)qh * cfg.value_length_mla, stream);
+                                      (int64_t)qh * cfg.value_length_mla, stream,
+                                      a_tok, mlaout_row);
                 if (fwd.debug) fwd.debug("dbg_postgate", layer, s.mla_attn_out, qh * cfg.value_length_mla);
             }
 
-            if (!proj(s.attn_out, s.mla_attn_out, L.attn_output, H, qh * cfg.value_length_mla))
+            // The partial the driver reduces. s.attn_out is chunk-wide (allocated for
+            // the cap, and repointed at the collective's buffer by the driver), and its
+            // per-token pitch is H — the same layout the batched FfnPartial then READS
+            // it at, and the same one nb*hidden reduces.
+            if (!proj_b(s.attn_out, H, s.mla_attn_out, mlaout_row, L.attn_output, H,
+                        qh * cfg.value_length_mla))
                 return false;
             if (fwd.debug) fwd.debug("mla_out", layer, s.attn_out, H);
         }
@@ -2199,41 +3025,93 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             const char* e = std::getenv("SPARKINFER_K3_RES_FUSE");
             return !(e && e[0] == '0');
         }();
+        // BOTH RESIDUAL MIXES ARE BATCHED. This was ~186 nodes per token, the second
+        // biggest launch pool after the projections.
+        //
+        // attn_res_mix_f32 now carries the token axis on BOTH kinds of buffer it reads:
+        // out/cur/cur_b/sum_out are token-major activations at H, and the cross-layer
+        // residual BANK -- per-token state, [n_embd, max_ckpt] for THIS token -- strides
+        // by bank_row, the same pitch the per-token loop was adding by hand. s.res_scores
+        // is sized for the cap and the kernels give row r its own (n_ckpt+1) slots; see
+        // the allocation note, because sharing one row is the silent-at-short-context
+        // failure this change had to avoid.
+        //
+        // st.n_ckpt is one value for the whole chunk (it is a function of the layer, and
+        // the chunk driver restores it before each token), so it stays a scalar argument.
+        //
+        // At n_tok == 1 the launch is dim3(g, 1) == dim3(g) and every stride is
+        // multiplied by row 0: the decode path is byte-for-byte what it always was.
         if (res_fuse && res_bs > 0 && st.n_ckpt > 0) {
             if (!L.ffn_res_score.ok()) return false;
             k3k::attn_res_mix_f32(s.mixed2, st.res_bank,
                                   banked ? attn_src : hidden_in,
                                   (const float*)L.ffn_res_score.data, H, st.n_ckpt, eps,
                                   stream, s.res_scores,
-                                  banked ? nullptr : attn_src, hidden_out);
+                                  banked ? nullptr : attn_src,
+                                  hidden_out,
+                                  n_tok, /*act_row_stride=*/H,
+                                  /*bank_row_stride=*/bank_row);
         } else {
             if (banked) {
-                cudaMemcpyAsync(hidden_out, attn_src, (size_t)H * sizeof(float),
+                // ONE COPY FOR THE WHOLE CHUNK. hidden_out and s.attn_out are both
+                // token-major at exactly H, so nb rows are one contiguous range; a copy
+                // has no arithmetic to preserve.
+                cudaMemcpyAsync(hidden_out, attn_src,
+                                (size_t)H * n_tok * sizeof(float),
                                 cudaMemcpyDeviceToDevice, stream);
             } else {
-                k3k::k3_add_f32(hidden_out, hidden_in, attn_src, H, stream);
+                // All three operands are token-major activations at H. This is the
+                // residual combine, which is what k3_add_f32's row axis is FOR -- not a
+                // broadcast bias add, which would read past a shared vector.
+                k3k::k3_add_f32(hidden_out, hidden_in, attn_src, H, stream, n_tok, H);
             }
 
-            // --- pre-FFN mix, no bank push ---
+            // --- pre-FFN mix, no bank push. Batched on the same axis as the fused form
+            // above: s.mixed2 and hidden_out are token-major at H, the bank strides by
+            // bank_row, and s.res_scores gives each row its own softmax slots. ---
             if (res_bs > 0) {
                 if (!L.ffn_res_score.ok()) return false;
                 k3k::attn_res_mix_f32(s.mixed2, st.res_bank, hidden_out,
-                                      (const float*)L.ffn_res_score.data, H, st.n_ckpt, eps,
-                                      stream, s.res_scores);
+                                      (const float*)L.ffn_res_score.data, H, st.n_ckpt,
+                                      eps, stream, s.res_scores,
+                                      nullptr, nullptr, n_tok,
+                                      /*act_row_stride=*/H,
+                                      /*bank_row_stride=*/bank_row);
             } else {
-                cudaMemcpyAsync(s.mixed2, hidden_out, (size_t)H * sizeof(float),
+                cudaMemcpyAsync(s.mixed2, hidden_out, (size_t)H * n_tok * sizeof(float),
                                 cudaMemcpyDeviceToDevice, stream);
             }
         }
         if (!L.ffn_norm.ok()) return false;
-        k3k::rms_norm_f32(normed2_dst, s.mixed2, (const float*)L.ffn_norm.data, H, eps, stream);
+        // BATCHED. Both buffers are contiguous at H, so both strides are H -- which is
+        // what the launcher substitutes for a 0 stride anyway, making the n_tok == 1
+        // launch identical. The row is a new grid .y stacked on the existing span
+        // spread: span_units and grid .x still come from the PER-ROW unit count, so
+        // every row sees the same slicing and the same frozen-128 sum of squares.
+        k3k::rms_norm_f32(normed2_dst, s.mixed2, (const float*)L.ffn_norm.data, H, eps,
+                          stream, n_tok, H, H);
         if (fwd.debug) fwd.debug("ffn_norm", layer, normed2_dst, H);
     }
 
-    // ---- phase 2b: FFN partial. -------------------------------------------
+    // ---- phase 2b: the FFN / MoE itself. ------------------------------------
+    //
+    // SEPARATE FROM 2a ON PURPOSE. 2a is guarded by `do_ffn_prepare &&
+    // !ffn_norm_prepared` because a prefill tile computes the residual and the norm for
+    // every token in ONE FfnPrepare pass and must not redo them per token. 2b is guarded
+    // by `do_ffn_p` because the FFN itself runs in FfnPartial and must run EXACTLY once
+    // per token either way.
+    //
+    // Fusing the two guards is silent and total: FfnPrepare then runs the whole FFN on a
+    // tile-aliased normed2, and the FfnPartial that follows finds ffn_norm_prepared true
+    // and skips the FFN altogether. Nothing refuses; the layer simply does not happen.
     if (do_ffn_p) {
         // normed2 has up to four consumers below -- the router, routed_down, and both
         // shared-expert projections -- and every one of them used to re-quantise it.
+        // At n_tok > 1 this stages all n_tok rows in one launch.
+        //
+        // When the tile already produced the logits there is nothing on this activation
+        // left to hoist, and leaving `hoisted_src` set would send the projections below
+        // down the pre-quantised path against a staging buffer nobody filled.
         if (!ffn_prepared) {
             hoist_act(normed2_src, H);
         } else {
@@ -2242,14 +3120,26 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
 
         k3_profiler().start(layer < cfg.leading_dense ? "ffn_dense" : "ffn_moe", stream);
         if (layer < cfg.leading_dense) {
-            if (!proj_h(s.dense_gate, normed2_src, L.ffn_gate, cfg.dense_ffn, H)) return false;
-            if (!proj_h(s.dense_up, normed2_src, L.ffn_up, cfg.dense_ffn, H)) return false;
+            // s.dense_gate/up/situ are token-major at cfg.dense_ffn and s.ffn_out at H,
+            // so every ldy/stride here is the buffer's own single-token width.
+            if (!proj_hb(s.dense_gate, cfg.dense_ffn, normed2_src, H, L.ffn_gate,
+                         cfg.dense_ffn, H)) return false;
+            if (!proj_hb(s.dense_up, cfg.dense_ffn, normed2_src, H, L.ffn_up,
+                         cfg.dense_ffn, H)) return false;
             if (fwd.debug) fwd.debug("dbg_dense_gate", layer, s.dense_gate, cfg.dense_ffn);
             if (fwd.debug) fwd.debug("dbg_dense_up", layer, s.dense_up, cfg.dense_ffn);
+            // Elementwise, so the row is purely a grid .y and there is no reduction to
+            // re-partition.
             k3k::situ_f32(s.dense_situ, s.dense_gate, s.dense_up, cfg.dense_ffn,
-                         cfg.situ_beta, cfg.situ_linear_beta, stream);
+                         cfg.situ_beta, cfg.situ_linear_beta, stream,
+                         n_tok, cfg.dense_ffn);
             if (fwd.debug) fwd.debug("dbg_dense_situ", layer, s.dense_situ, cfg.dense_ffn);
-            if (!proj(s.ffn_out, s.dense_situ, L.ffn_down, H, cfg.dense_ffn)) return false;
+            // s.ffn_out is read back in FfnFinish, one phase and (in the chunk driver)
+            // one collective later, so it MUST be per-token. It was not, and the leading
+            // dense layer's FFN output was therefore the LAST token of the chunk's for
+            // every token of it -- see the note on this in the FfnFinish residual add.
+            if (!proj_b(s.ffn_out, H, s.dense_situ, cfg.dense_ffn, L.ffn_down, H,
+                        cfg.dense_ffn)) return false;
         } else {
             // --- FORK: routed_down and the whole shared expert ----------------
             //
@@ -2278,23 +3168,52 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             const Lane l_rd  = moe_fork ? lane_of(0) : main_lane;   // routed_down
             const Lane l_shx = moe_fork ? lane_of(1) : main_lane;   // shared expert
 
+            // BATCHED, and the router is the site where losing that is silent. The
+            // k3_moe_router_fast call below already takes n_tokens = n_tok and strides
+            // s.router_logits by cfg.n_experts, so a single-row fill here leaves rows
+            // 1..n_tok-1 holding whatever the previous layer left and the selection
+            // picks experts for them out of stale memory -- wrong output at a FASTER
+            // time, because 91 of 92 rows of this projection never ran.
+            // At n_tok == 1 proj_hb's loop runs once and this is the single call the
+            // tile driver has always made; `ffn_prepared` still short-circuits it when
+            // the tile already computed the logits.
             if (!ffn_prepared &&
-                !proj_h(s.router_logits, normed2_src, L.ffn_gate_inp, cfg.n_experts, H))
+                !proj_hb(s.router_logits, cfg.n_experts, normed2_src, H, L.ffn_gate_inp,
+                         cfg.n_experts, H))
                 return false;
             if (fwd.debug) fwd.debug("dbg_router_logits", layer, router_logits_src,
                                      cfg.n_experts);
             if (!L.exp_probs_b.ok()) return false;
             // Shared-memory selection first; it declines to the original below on any
             // shape it does not handle, and is bit-identical where it does.
+            //
+            // THE TOKEN COUNT WAS ALREADY A PARAMETER. Both kernels take `tok =
+            // blockIdx.x` and stride logits by n_expert and out_w/out_ids by top_k, so
+            // n_tokens = n_tok is the whole change and the three buffers only had to be
+            // that wide. NOTE what it costs: n_tokens != 1 makes k3_moe_router_fast
+            // DECLINE its register fast path (k3_moe_router_fast.cu:451 gates on
+            // n_tokens == 1, which is what justifies its __launch_bounds__(,1)) and take
+            // moe_router_shared_kernel instead. That kernel is the one the register path
+            // was written to replace and is documented bit-identical to it -- same
+            // sigmoid, same biased selection, same ascending normalisation sum -- so the
+            // selection and the weights are unchanged; only the launch shape moves. At
+            // n_tok == 1 the literal 1 is restored and the register path is taken exactly
+            // as it is today.
+            //
+            // SKIPPED WHOLESALE when the tile already selected: the selection reads
+            // s.router_logits, which `ffn_prepared` means was never written on this
+            // stream, and it WRITES s.router_w/s.router_ids, which would then overwrite
+            // the tile's selection with one derived from stale logits.
             if (!ffn_prepared) {
                 if (!k3k::k3_moe_router_fast(s.router_w, s.router_ids, s.router_logits,
-                                             (const float*)L.exp_probs_b.data,
-                                             cfg.n_experts, cfg.top_k, 1, true, 1.0f,
-                                             stream))
-                    k3k::moe_router_noaux_tc_f32(
-                        s.router_w, s.router_ids, s.router_logits,
-                        (const float*)L.exp_probs_b.data, cfg.n_experts,
-                        cfg.top_k, 1, true, 1.0f, stream);
+                                             (const float*)L.exp_probs_b.data, cfg.n_experts,
+                                             cfg.top_k, /*n_tokens=*/n_tok, /*norm_w=*/true,
+                                             /*w_scale=*/1.0f, stream))
+                    k3k::moe_router_noaux_tc_f32(s.router_w, s.router_ids, s.router_logits,
+                                                 (const float*)L.exp_probs_b.data,
+                                                 cfg.n_experts, cfg.top_k,
+                                                 /*n_tokens=*/n_tok, /*norm_w=*/true,
+                                                 /*w_scale=*/1.0f, stream);
             }
             if (fwd.debug) fwd.debug("dbg_router_w", layer, router_w_src, cfg.top_k);
 
@@ -2304,12 +3223,21 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             // moe_out = build_norm(moe_out, ...)", and only after that does
             // ffn_routed_up run. Getting this backwards (norm between routed_down and
             // the dispatch) was an earlier version's bug, same class as the ssm_norm fix.
+            //
+            // BATCHED. At n_tok == 1 proj_tok declines immediately and the fallback loop
+            // runs proj_h_on(l_rd, ...) once -- the lane is preserved, because `l_rd` is
+            // main_lane whenever the fork did not happen and the fork is what n_tok > 1
+            // turns off.
             const float* routed_down_src = s.routed_down_out;
             if (ffn_prepared) {
                 routed_down_src = ffn_pt->routed_down +
                     (size_t)fwd.prefill_tok * cfg.expert_latent;
-            } else if (!proj_h_on(l_rd, s.routed_down_out, normed2_src,
-                                  L.ffn_routed_down, cfg.expert_latent, H)) {
+            } else if (n_tok > 1) {
+                if (!proj_hb(s.routed_down_out, cfg.expert_latent, normed2_src, H,
+                             L.ffn_routed_down, cfg.expert_latent, H))
+                    return false;
+            } else if (!proj_h_on(l_rd, s.routed_down_out, normed2_src, L.ffn_routed_down,
+                                  cfg.expert_latent, H)) {
                 return false;
             }
 
@@ -2333,9 +3261,62 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             // likewise unchanged — the group is still a CONTIGUOUS id range, just a
             // longer one. What changes is only which bytes the loader packed.
             const int moe_ffn_rank = k3_moe_ffn_local(fwd, cfg);
-            if (!experts_prepared) {
+            // THE EXPERT DISPATCH, BATCHED BY AN EXPERT-MAJOR REGROUP.
+            //
+            // ~18% of GPU time, and the last phase of this FFN that was still per
+            // token. It could not take a token axis the way the norms and the six
+            // projections did, because `router_ids` DIFFERS PER TOKEN: the kernel is
+            // "for each of my top_k selections, walk that expert's weights", so B
+            // tokens with B different selections read B different sets of expert
+            // rows and a token axis buys the LAUNCH COUNT and not one byte of weight
+            // traffic. What pays is the inversion -- sort the B*top_k (token, slot)
+            // selections by expert id and run each expert ONCE over its run of rows
+            // -- and that is a different kernel, which is why it is a different front
+            // door rather than an argument. See "4b. THE TOKEN-BATCHED DISPATCH" in
+            // k3_kernels.cu for the shape and the bit-identity argument.
+            //
+            // THE ARITHMETIC THAT SIZES THE PRIZE: an expert sees B*top_k/n_experts =
+            // B/56 rows. At the DEFAULT chunk of 16 that is 0.29 and the regroup is
+            // worth only its launch count; it is the 256-512 range where each expert
+            // sees 5-9 rows and the gate/up weight traffic drops ~9x. Raising
+            // SPARKINFER_K3_PREFILL_CHUNK is what turns this on properly.
+            //
+            // DECLINING IS NOT AN ERROR. The batched door returns false for the q8k
+            // reference path, for a quant type it has no kernel for, for a chunk under
+            // the floor, and for SPARKINFER_K3_MOE_BATCH=0 -- and every one of those
+            // means "run the loop below", which is the shipped path.
+            //
+            // n_tok == 1 NEVER REACHES IT: the guard is n_tok > 1, so decode issues
+            // exactly the call it issued before, with the same arguments.
+            //
+            // `experts_prepared` means a prefill tile ALREADY ran this layer's dispatch
+            // for this token into s.moe_out. Both forms below are then skipped -- redoing
+            // it is what #136 added the flag to avoid, and dropping the flag turns the
+            // tile's reuse back into a recompute silently, at no correctness cost and
+            // full expert cost.
+            bool moe_done = experts_prepared;
+            if (!moe_done && n_tok > 1 && !ggml_qact_moe) {
+                moe_done = k3k::moe_expert_ffn_batch_f32_by_type(
+                    s.moe_out, moe_row,
+                    s.moe_scratch, (int64_t)cfg.top_k * moe_ffn_rank,
+                    routed_down_src, cfg.expert_latent,
+                    router_ids_src, router_w_src,
+                    L.ffn_gate_exps.data, L.ffn_up_exps.data, L.ffn_down_exps.data,
+                    cfg.expert_latent, moe_ffn_rank, cfg.top_k, n_tok, cfg.situ_beta,
+                    cfg.situ_linear_beta, L.ffn_gate_exps.type, stream,
+                    expert_begin, n_local_exp, cfg.n_experts,
+                    s.moe_batch_ws, s.moe_batch_ws_bytes);
+            }
+            // s.moe_q8 (the q8k staging) and the slab-zero invariant both hold per row:
+            // the loop is straight-line on ONE stream, so token b's dispatch completes
+            // before token b+1's begins, and each token owns its own moe_scratch slab.
+            for (int b = 0; !moe_done && b < n_tok; ++b) {
                 const bool moe_ok = k3k::moe_expert_ffn_f32_by_type(
-                    s.moe_out, s.moe_scratch, routed_down_src, router_ids_src, router_w_src,
+                    s.moe_out + (int64_t)b * moe_row,
+                    s.moe_scratch + (int64_t)b * cfg.top_k * moe_ffn_rank,
+                    routed_down_src + (int64_t)b * cfg.expert_latent,
+                    router_ids_src + (int64_t)b * cfg.top_k,
+                    router_w_src + (int64_t)b * cfg.top_k,
                     L.ffn_gate_exps.data, L.ffn_up_exps.data, L.ffn_down_exps.data,
                     cfg.expert_latent, moe_ffn_rank, cfg.top_k, cfg.situ_beta,
                     cfg.situ_linear_beta, L.ffn_gate_exps.type, stream,
@@ -2383,26 +3364,65 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
                                  cfg.moe_ffn * cfg.n_shared, tp_size);
                     return false;
                 }
+                // THE SHARED EXPERT'S BUFFERS ARE PADDED, AND THAT IS THE INTERESTING
+                // PART OF BATCHING IT.
+                //
+                //   * s.dense_gate/up/situ are allocated at cfg.dense_ffn per token but
+                //     the shared expert only fills shexp_band of each row. So the ldy
+                //     and the activation stride are dense_ffn while N and K are
+                //     shexp_band -- which is exactly what k3_proj_q8act_tok_f32's
+                //     separate ldy/ld_act_blocks are for -- and the staging of
+                //     dense_situ falls to quant_rows' per-row path, because a flat
+                //     quantise has no row index to apply a padded stride to.
+                //   * s.shexp_out's rows are moe_row apart, NOT H apart: it is the
+                //     second view of the fused partial. Passing H as its ldy would
+                //     write token b's shared-expert output over token b's own expert
+                //     accumulator.
+                //
+                // The whole group is skipped when a tile already ran it for this token:
+                // it WRITES s.shexp_out, which the driver reduces the moment this phase
+                // returns, so recomputing it here is not merely wasted work -- it would
+                // rewrite a partial the tile already placed.
                 if (!ffn_prepared) {
-                    if (!proj_h_on(l_shx, s.dense_gate, normed2_src,
-                                   L.ffn_gate_shexp, shexp_band, H))
+                    if (n_tok > 1) {
+                        if (!proj_hb(s.dense_gate, cfg.dense_ffn, normed2_src, H,
+                                     L.ffn_gate_shexp, shexp_band, H)) return false;
+                        if (!proj_hb(s.dense_up, cfg.dense_ffn, normed2_src, H,
+                                     L.ffn_up_shexp, shexp_band, H)) return false;
+                    } else {
+                        if (!proj_h_on(l_shx, s.dense_gate, normed2_src, L.ffn_gate_shexp,
+                                       shexp_band, H))
+                            return false;
+                        if (!proj_h_on(l_shx, s.dense_up, normed2_src, L.ffn_up_shexp,
+                                       shexp_band, H))
+                            return false;
+                    }
+                    k3k::situ_f32(s.dense_situ, s.dense_gate, s.dense_up, shexp_band,
+                                 cfg.situ_beta, cfg.situ_linear_beta, l_shx.st,
+                                 n_tok, cfg.dense_ffn);
+                    if (n_tok > 1) {
+                        if (!proj_b(s.shexp_out, moe_row, s.dense_situ, cfg.dense_ffn,
+                                    L.ffn_down_shexp, H, shexp_band)) return false;
+                    } else if (!proj_on(l_shx, s.shexp_out, s.dense_situ,
+                                        L.ffn_down_shexp, H, shexp_band)) {
                         return false;
-                    if (!proj_h_on(l_shx, s.dense_up, normed2_src,
-                                   L.ffn_up_shexp, shexp_band, H))
-                        return false;
-                    k3k::situ_f32(s.dense_situ, s.dense_gate, s.dense_up,
-                                  shexp_band, cfg.situ_beta,
-                                  cfg.situ_linear_beta, l_shx.st);
-                    if (!proj_on(l_shx, s.shexp_out, s.dense_situ,
-                                 L.ffn_down_shexp, H, shexp_band))
-                        return false;
+                    }
                 }
                 if (fwd.debug) fwd.debug("dbg_shexp_partial", layer, s.shexp_out, H);
             } else {
                 // The fused buffer is reduced whole, so a layer without a shared
                 // expert must still present a well-defined summand there.
+                //
+                // PER-TOKEN because the rows are moe_row apart while the range zeroed is
+                // H: this is a strided clear, not a contiguous one, and a single memset
+                // of n_tok*H would wipe the expert accumulators sitting between the
+                // rows. One memset node per token on a layer that has no shared expert
+                // at all -- K3 ships n_shared = 2, so this branch is not on the scored
+                // path.
                 if (!ffn_prepared)
-                    cudaMemsetAsync(s.shexp_out, 0, (size_t)H * sizeof(float), l_shx.st);
+                    for (int b = 0; b < n_tok; ++b)
+                        cudaMemsetAsync(s.shexp_out + (int64_t)b * moe_row, 0,
+                                        (size_t)H * sizeof(float), l_shx.st);
             }
             // JOIN the shared expert. Nothing on the main stream reads shexp_out,
             // but the DRIVER reduces it the moment this phase returns, and the
@@ -2431,16 +3451,25 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             // values — but out != x is what lets rms_norm_f32 grid-spread its
             // output sweep (RMSG), which the in-place form must decline.
             const float* moe_src = s.moe_out;
+            // THE TWO STRIDES ARE DIFFERENT HERE, which is the reason rms_norm_f32 takes
+            // two. The source is the latent prefix of the FUSED partial, so its rows are
+            // moe_row apart; the destination is moe_normed's own buffer, whose rows are
+            // expert_latent apart. One shared stride would read every row but the first
+            // from the wrong place. At n_tok == 1 the launcher substitutes n for a 0
+            // stride and both of these ARE n, so the launch is unchanged.
+            int64_t moe_src_row = moe_row;
             if (L.has_routed_norm) {
                 if (!L.ffn_routed_norm.ok()) return false;
                 k3k::rms_norm_f32(s.moe_normed, s.moe_out,
                                   (const float*)L.ffn_routed_norm.data, cfg.expert_latent,
-                                  eps, stream);
+                                  eps, stream, n_tok, cfg.expert_latent, moe_row);
                 moe_src = s.moe_normed;
+                moe_src_row = cfg.expert_latent;
             }
 
             if (fwd.debug) fwd.debug("dbg_moe_normed", layer, moe_src, cfg.expert_latent);
-            if (!proj(s.ffn_out, moe_src, L.ffn_routed_up, H, cfg.expert_latent))
+            if (!proj_b(s.ffn_out, H, moe_src, moe_src_row, L.ffn_routed_up, H,
+                        cfg.expert_latent))
                 return false;
             if (fwd.debug) fwd.debug("dbg_routed_up", layer, s.ffn_out, H);
 
@@ -2461,15 +3490,51 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
         // FFN residual is ALWAYS an add, never a replace. When the shared expert is
         // present its fold and this add are adjacent and share an operand, so they go
         // out as one launch; k3_add3_f32 declines to the original pair.
-        if (fused_tail &&
-            k3k::k3_add3_f32(hidden_out, s.ffn_out, s.ffn_out, s.shexp_out,
-                             hidden_out, H, stream)) {
+        //
+        // THE FUSED TAIL CANNOT TAKE THE ROW AXIS, and the reason is a stride, not a
+        // dependency. k3_add3_f32 has ONE row_stride for all five of its pointers, which
+        // is right for five same-shaped activations. Here four of them (hidden_out,
+        // s.ffn_out twice, hidden_out) stride by H and the fifth, s.shexp_out, strides
+        // by moe_row -- it is the second view of the fused partial. So the fold is a
+        // per-token loop, which costs exactly what it costs today (one node per token)
+        // and loses only the amortisation. Giving k3_add3_f32 a separate stride for `b`
+        // is a small additive kernel change and the obvious follow-up; it is not made
+        // here because it cannot be compiled or measured in this change.
+        //
+        // The UNFUSED tail's second add IS uniform (hidden_out and s.ffn_out both at H)
+        // and does take the axis.
+        //
+        // k3_add3_f32 declines as a WHOLE (SPARKINFER_K3_ADD3=0 / a null operand), never
+        // for one token and not another, so `fused` below is a single decision for the
+        // chunk and the split pair stays a straight-line fallback exactly as it is at
+        // n_tok == 1.
+        bool fused = false;
+        if (fused_tail) {
+            fused = true;
+            for (int b = 0; b < n_tok && fused; ++b)
+                fused = k3k::k3_add3_f32(hidden_out + (int64_t)b * H,
+                                         s.ffn_out + (int64_t)b * H,
+                                         s.ffn_out + (int64_t)b * H,
+                                         s.shexp_out + (int64_t)b * moe_row,
+                                         hidden_out + (int64_t)b * H, H, stream);
+        }
+        if (fused) {
             if (fwd.debug) fwd.debug("ffn_out", layer, s.ffn_out, H);
         } else {
             if (fused_tail)
-                k3k::k3_add_f32(s.ffn_out, s.ffn_out, s.shexp_out, H, stream);
+                for (int b = 0; b < n_tok; ++b)
+                    k3k::k3_add_f32(s.ffn_out + (int64_t)b * H,
+                                    s.ffn_out + (int64_t)b * H,
+                                    s.shexp_out + (int64_t)b * moe_row, H, stream);
             if (fwd.debug) fwd.debug("ffn_out", layer, s.ffn_out, H);
-            k3k::k3_add_f32(hidden_out, hidden_out, s.ffn_out, H, stream);
+            // BATCHED: hidden_out and s.ffn_out are both token-major at H.
+            //
+            // s.ffn_out is per-token now. IT WAS NOT, and on the leading dense layer
+            // that was a live wrong answer in the chunk driver: FfnPartial wrote one
+            // shared s.ffn_out for every token of the chunk and FfnFinish then added the
+            // LAST token's dense FFN output into every token's residual. Silent, and
+            // only on the ingestion path.
+            k3k::k3_add_f32(hidden_out, hidden_out, s.ffn_out, H, stream, n_tok, H);
         }
         if (fwd.debug) fwd.debug("l_out", layer, hidden_out, H);
     }

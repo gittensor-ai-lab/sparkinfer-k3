@@ -54,10 +54,17 @@ bool k3_kda_decode_step_ip(float* out, float* state,
 // 207 launches per token per rank (the dt_bias add, the decay gate, the beta sigmoid)
 // whose whole content is one operation per element, on a path where a launch costs
 // ~1.5-1.9 us however small it is. Both folds are bit-identical.
+//
+// TOKEN AXIS. n_rows > 1 processes n_rows token-major rows of [head_dim * n_head] in one
+// launch, row r at (base + r * row_stride); row_stride == 0 means contiguous, i.e.
+// head_dim * n_head. `out` and `g_raw` are per-token and are strided; `dt_bias` and `A`
+// are learned parameters shared by every row and are read at the same address for all of
+// them. Bit-identical: the row is a new grid .y, the block, the thread-to-element map and
+// the arithmetic per element are untouched. Declines above the 65535 gridDim.y cap.
 bool k3_kda_fuse_enabled();
 bool k3_kda_decay_gate_dt(float* out, const float* g_raw, const float* dt_bias,
                           const float* A, int head_dim, int n_head, float lower_bound,
-                          cudaStream_t stream);
+                          cudaStream_t stream, int n_rows = 1, int64_t row_stride = 0);
 
 // ---------------------------------------------------------------------------
 // Factor C — MLA query absorption, one warp per (head, latent row)
@@ -66,9 +73,19 @@ bool k3_kda_decay_gate_dt(float* out, const float* g_raw, const float* dt_bias,
 // it: `q_proj` is q_proj_out itself, laid out [n_head, q_stride] with each head's
 // qk_nope values followed by its rope_dim ones, so the split is an index rather than
 // a copy. Declines unless qk_nope is 128 and both bases are 16-byte aligned.
+//
+// TOKEN AXIS. n_tok > 1 absorbs n_tok token-major rows in one launch: token t reads
+// (q_proj + t * q_tok_stride) and writes (out + t * out_tok_stride); 0 on either means
+// the natural single-token width for that buffer (n_head * q_stride for the projection,
+// n_head * (kv_lora + rope_dim) for the output). `wk_b` is a WEIGHT and is never
+// strided. The token is a new grid .z, so warp (h, r) of token t does exactly what
+// warp (h, r) did when it was launched alone on token t's pointers — same lane map,
+// same float4 loads, same shuffle tree — which is what makes it bit-identical to n_tok
+// separate calls. Declines above the 65535 gridDim.z cap.
 bool k3_mla_absorb_q_strided(float* out, const float* q_proj, const float* wk_b,
                              int qk_nope, int kv_lora, int rope_dim, int q_stride,
-                             int n_head, cudaStream_t stream);
+                             int n_head, cudaStream_t stream, int n_tok = 1,
+                             int64_t out_tok_stride = 0, int64_t q_tok_stride = 0);
 
 // ---------------------------------------------------------------------------
 // Factor D — Q8_0 x Q8_0 multi-row GEMV with one barrier, not two per row
@@ -81,6 +98,17 @@ bool k3_mla_absorb_q_strided(float* out, const float* q_proj, const float* wk_b,
 // 859 launches per token per rank at 1-2 CUDA blocks each; this is 32x the threads and
 // bit-identical (the scan is a max over MAGNITUDES, so it is order-independent).
 // SPARKINFER_K3_QUANT_WARP=0 restores the reference shape.
+//
+// NO ROW AXIS IS NEEDED HERE, AND ADDING ONE WOULD BE DEAD WEIGHT. Both shapes are FLAT
+// over 32-element blocks with no row concept: the warp kernel derives b from a global
+// thread id and reads x[b*32 + lane] into out[b]; the reference kernel derives b from a
+// global thread id and reads x[b*32 + j] into out[b]. Nothing indexes a row, a K, or a
+// leading dimension. So a TOKEN-MAJOR [n_tok, K] f32 activation with K % 32 == 0 is
+// already a flat run of n_tok * (K/32) blocks whose block t*(K/32)+c is token t's c-th
+// block, and quantising all of it is one call with n_blocks = n_tok * (K/32), producing
+// a token-major [n_tok, K/32] Q8_0 array. Bit-identical per block by construction — the
+// same kernel over a longer range, with the same per-block magnitude max and the same
+// per-element rounding. k3_quantize_act_rows_f32 (kimi_k3.h) is exactly that call.
 void k3_quantize_q8_0(void* out, const float* x, int n_blocks, cudaStream_t stream);
 
 // x_pre_q8 mirrors k3_proj_ggml_f32_x4's: q8_scratch ALREADY holds this activation, so
@@ -136,8 +164,17 @@ bool k3_moe_router_fast(float* out_w, int* out_ids, const float* logits,
 // original calls reads it.
 //
 // Declines on SPARKINFER_K3_ADD3=0.
+//
+// TOKEN AXIS. n_rows > 1 does n_rows token-major rows of n elements in one launch, row r
+// at (base + r * row_stride) for ALL FIVE pointers; row_stride == 0 means contiguous
+// (== n). Every operand here is an activation — there is no shared weight to hold still.
+// Bit-identical: the row is a new grid .y and nothing inside a row moves. Declines above
+// the 65535 gridDim.y cap.
 bool k3_add3_f32(float* out, float* out_ab, const float* a, const float* b,
-                 const float* c, int64_t n, cudaStream_t stream);
+                 const float* c, int64_t n, cudaStream_t stream,
+                 int n_rows = 1, int64_t row_stride = 0);
+// #136's separate entry point, kept alongside the row axis above rather than folded into
+// it: this one strides `b` ALONE and takes a (rows, cols) shape, a different contract.
 bool k3_add3_rows_f32(float* out, float* out_ab, const float* a,
                       const float* b, int64_t b_row_stride, const float* c,
                       int rows, int cols, cudaStream_t stream);

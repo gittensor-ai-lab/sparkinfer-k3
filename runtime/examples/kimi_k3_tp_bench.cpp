@@ -277,14 +277,22 @@ int main(int argc, char** argv) {
             return std::chrono::duration<double, std::milli>(
                        std::chrono::steady_clock::now() - t0).count();
         };
-        // THREE INGESTION ARMS ON ONE BINARY, WHICH IS THE POINT. --prefill is the tile
+        // FOUR INGESTION ARMS ON ONE BINARY, WHICH IS THE POINT. --prefill is the tile
         // driver (captured), SPARKINFER_K3_PREFILL_BATCH=B is the chunked walk
-        // (uncaptured, batched collectives), and neither is the token loop below. All
-        // three read the same prompt and write the same .spkl, so a delta is the loop
-        // order and never a rebuild.
+        // (uncaptured, batched collectives), SPARKINFER_K3_PREFILL_CHUNK=B is the
+        // token-axis chunk driver (uncaptured, batched KERNELS), and none of them is the
+        // token loop below. All four read the same prompt and write the same .spkl, so a
+        // delta is the loop order and never a rebuild.
         //
-        // --prefill wins if both are asked for: it is the arm that ships, and silently
-        // running the other one would misattribute its number.
+        // PRECEDENCE, most specific request first:
+        //   --prefill  >  SPARKINFER_K3_PREFILL_BATCH>1  >  SPARKINFER_K3_PREFILL_CHUNK>0
+        //   >  the token loop.
+        // --prefill wins if several are asked for: it is the arm that ships, and silently
+        // running another one would misattribute its number. BATCH sits above CHUNK for
+        // the same reason in miniature: BATCH defaults to 1 (off), so BATCH>1 can only be
+        // an explicit request, whereas CHUNK defaults to 16 — letting a default shadow an
+        // explicit request is exactly the misattribution this ordering exists to stop.
+        // Since --prefill itself defaults ON, reaching either env arm needs --no-prefill.
         //
         // --prefill routes ingestion through the batched tile driver instead of the
         // per-token loop. It is a separate flag rather than the default because the two
@@ -311,7 +319,49 @@ int main(int argc, char** argv) {
             std::fflush(stdout);
             do_prefill = false;
         }
-        if (do_prefill) {
+        // WHICH INGESTION DRIVER RUNS BY DEFAULT — decided HERE, above the tile arm.
+        //
+        // This placement is the whole point. The tile arm RETURNS, so every gate read
+        // below it is unreachable on the default invocation: `bench <model> <tp> <L> 1
+        // --ids @… --ctx …` with no flags and no env, which is exactly how the scored
+        // harness runs it. A driver selected further down is a driver that never runs.
+        //
+        // Hoisting these two reads has no side effects — they are getenv and nothing
+        // else. The ORDER of the arms below is unchanged, and so is the MLA split floor,
+        // which still sits under the tile arm for the reason its own comment gives (it
+        // would otherwise be baked into the tile driver's captured graph).
+        const char* pb_env = std::getenv("SPARKINFER_K3_PREFILL_BATCH");
+        const int pb = pb_env ? std::atoi(pb_env) : 1;
+        static const int pf_chunk = [] {
+            const char* e = std::getenv("SPARKINFER_K3_PREFILL_CHUNK");
+            return e ? std::atoi(e) : 64;   // measured optimum; see k3_ffn_batch_cap_env
+
+        }();
+        // THE TOKEN-AXIS CHUNK DRIVER IS THE DEFAULT INGESTION PATH.
+        //
+        // It carries B tokens through the kernels together, so each weight tile is read
+        // once and spent on B tokens instead of one — M=1 GEMV becomes M=B GEMM. That is
+        // a different and larger effect than the tile driver's phase-major reordering,
+        // which batches the collectives but still streams the weights per token.
+        //
+        // THE TILE DRIVER REMAINS REACHABLE ON THE SAME BINARY, via
+        // SPARKINFER_K3_PREFILL_CHUNK=0. That is not a courtesy: it is what makes the two
+        // comparable at all — same build, same prompt, same reference logits, only the
+        // driver different. Every measurement on this branch that was trusted came from a
+        // same-binary control, and the ones that did not (rebuild vs rebuild) are the ones
+        // that had to be retracted.
+        //
+        // It yields to an explicit SPARKINFER_K3_PREFILL_BATCH>1, which is a deliberate
+        // request for that arm, and to --checkpoints, which needs per-token logits that a
+        // chunked walk only materialises at chunk boundaries.
+        const bool use_chunk = pf_chunk > 0 && pb <= 1 && checkpoints.empty() &&
+                               ids.size() > 1;
+        // PREFILL_BATCH>1 must skip the tile arm too, or "yields to it" would be a lie:
+        // the tile arm returns, so anyone setting that gate would silently get the tile
+        // driver instead of the arm they asked for. Both explicit gates now reach the arm
+        // they name, which is what makes this binary a three-way control.
+        const bool use_batch = pb > 1 && checkpoints.empty();
+        if (do_prefill && !use_chunk && !use_batch) {
             const auto t_b0 = std::chrono::steady_clock::now();
             if (!kimi_k3_tp_prefill(p, ids.data(), (int)ids.size(), logits.data())) {
                 std::printf("prefill failed\n"); return 1;
@@ -335,6 +385,18 @@ int main(int argc, char** argv) {
             return 0;
         }
 
+        // Ingestion opts into the shorter MLA slice for the whole prompt, chunked or
+        // not. It is honoured only above the parity window, so the graded probes stay
+        // on the shipped path; restored after the prompt so decode is untouched.
+        //
+        // DELIBERATELY BELOW THE TILE ARM. The tile driver captures a CUDA graph, so a
+        // split floor set before it would be baked into the captured plan and would
+        // change the shipped default path's behaviour. Everything from here down is
+        // uncaptured, and keeping the floor across BOTH remaining arms AND the token
+        // loop is what keeps the BATCH walk usable as a control against that loop.
+        sparkinfer::kernels::k3::k3_mla_set_split_min(512);
+        struct SplitRestore { ~SplitRestore() { sparkinfer::kernels::k3::k3_mla_set_split_min(0); } } split_restore;
+
         // CHUNKED INGESTION, when asked for. SPARKINFER_K3_PREFILL_BATCH=B carries B
         // tokens through each layer together; unset (or 1) keeps the token loop below,
         // so this bench measures both arms on ONE binary and any delta is the walk
@@ -344,15 +406,18 @@ int main(int argc, char** argv) {
         // logits after a SPECIFIC prefix, and a chunked walk only materialises them at
         // chunk boundaries. Refusing loudly beats dumping a .spkl for the wrong depth,
         // which would be compared against llama's and read as a parity failure.
-        const char* pb_env = std::getenv("SPARKINFER_K3_PREFILL_BATCH");
-        const int pb = pb_env ? std::atoi(pb_env) : 1;
+        // pb and pf_chunk are read once, above the tile arm — see the driver-selection
+        // block there. Re-reading them here would be a second source of truth for which
+        // driver runs, which is the defect that made the chunk arm unreachable.
         if (pb > 1 && !checkpoints.empty()) {
             std::printf("SPARKINFER_K3_PREFILL_BATCH=%d ignored: --checkpoints needs "
                         "per-token logits, which a chunked walk does not produce.\n", pb);
             std::fflush(stdout);
         }
-        const bool use_chunked = pb > 1 && checkpoints.empty();
-        if (use_chunked) {
+        // `use_batch` is this condition, computed with the other driver gates above. It
+        // used to be recomputed here under a second name; two spellings of one predicate
+        // is how the arms drift apart.
+        if (use_batch) {
             std::printf("chunked prefill: B=%d over %zu tokens\n", pb, ids.size());
             std::fflush(stdout);
             if (!kimi_k3_tp_forward_prompt(p, ids.data(), (int)ids.size(),
@@ -361,8 +426,48 @@ int main(int argc, char** argv) {
                 return 1;
             }
         }
-        for (size_t i = 0; !use_chunked && i < ids.size(); ++i) {
-            if (!kimi_k3_tp_forward_token(p, ids[i], logits.data())) {
+
+        // TOKEN-AXIS CHUNK INGESTION. With no --checkpoints to service mid-prompt, the
+        // whole prompt but its last token can go through the chunk driver, which carries
+        // B tokens through the KERNELS together — M=B GEMMs, batched FFN/MoE/attention —
+        // rather than only batching the collectives as the BATCH walk above does. The
+        // final token still goes through forward_token so the caller gets its logits.
+        // SPARKINFER_K3_PREFILL_CHUNK=0 restores the per-token loop on one binary.
+        //
+        // Yields to an explicit SPARKINFER_K3_PREFILL_BATCH>1: see the precedence note
+        // above — CHUNK is on by default, so it must not shadow a requested arm.
+        // `use_chunk` already excludes the PREFILL_BATCH arm (it requires pb <= 1), the
+        // checkpoint case and a one-token prompt, so it is the whole condition. Stating
+        // those clauses again here would let the two copies drift.
+        if (use_chunk && !use_batch) {
+            if (!kimi_k3_tp_prefill_chunk(p, ids.data(), (int)ids.size() - 1, pf_chunk)) {
+                std::printf("chunked prefill failed\n"); return 1;
+            }
+            if (!kimi_k3_tp_forward_token(p, ids.back(), logits.data())) {
+                std::printf("final prompt token failed\n"); return 1;
+            }
+            const double el = ms_since(t_pf0);
+            std::printf("PREFILL_TOTAL tokens=%zu ms=%.1f tok_s=%.2f ms_per_token=%.3f\n",
+                        ids.size(), el, ids.size() * 1000.0 / el, el / (double)ids.size());
+            std::fflush(stdout);
+            if (logits_path) {
+                std::printf("%s %s\n",
+                            write_spkl(logits_path, logits, cfg.vocab) ? "wrote" : "FAILED to write",
+                            logits_path);
+            }
+            kimi_k3_tp_free(p);
+            return 0;
+        }
+
+        // A prompt token's logits are read only at a --checkpoints depth or at the
+        // very end, so ask for them only there. nullptr puts the driver on its
+        // ingest-only path, which skips the read-back and its host barrier; the KV
+        // cache, d_pos and the recurrent state advance exactly as before.
+        for (size_t i = 0; !use_batch && i < ids.size(); ++i) {
+            const int depth_i = (int)i + 1;
+            bool want_logits = (i + 1 == ids.size());
+            for (int L : checkpoints) if (L == depth_i) want_logits = true;
+            if (!kimi_k3_tp_forward_token(p, ids[i], want_logits ? logits.data() : nullptr)) {
                 std::printf("prompt token %zu (id %d) failed\n", i, ids[i]); return 1;
             }
             // Depth i+1 is now complete: these logits are the (i+1)-token prefix's answer.

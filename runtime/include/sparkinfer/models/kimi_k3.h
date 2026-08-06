@@ -450,8 +450,88 @@ enum class K3LayerPhase {
     FfnFinish = 4
 };
 
+// ---------------------------------------------------------------------------
+// THE TOKEN AXIS ON THE FFN PHASES (`n_tok`)
+// ---------------------------------------------------------------------------
+// Prompt ingestion is launch-bound: ~3401 graph nodes per token, ~5 us each, every
+// GEMM at M=1, and the depth curve says ~90% of the 18.86 ms/token at 32k is a FIXED
+// per-token floor with no context dependence. Only ~348 of those nodes are genuinely
+// sequential (the KDA recurrence and the MLA walk). The FFN has NO cross-token
+// dependency at all, so B tokens can go through FfnPartial/FfnFinish in ONE call and
+// every launch in them amortises over B.
+//
+// n_tok > 1 means: hidden_in, hidden_out and every FFN-side scratch buffer are
+// TOKEN-MAJOR, token b's row of buffer `foo` starting at (foo + b * <one token's
+// element count for foo>). n_tok == 1 is the default and takes exactly the code path
+// this function had before the axis existed — same launches, same grids, same order.
+// That is not a claim about a fast path being "close enough": decode@128k is a hard
+// scoring guard, so every batched call site below is written as `pass n_tok through`
+// on a kernel whose n_rows == 1 launch is dim3(g, 1) == dim3(g), or as a
+// `for (b...)` loop that runs exactly once.
+//
+// THE ATTN PHASE TAKES n_tok ON AN MLA LAYER AND REFUSES IT ON A KDA ONE.
+//
+// What is genuinely cross-token in attention is not the same in the two layer types,
+// and that distinction is the whole change:
+//
+//   * MLA. Token b writes K-cache row b and attends over rows [0..b]. That is a
+//     LENGTH dependence, not an ordering one: every attention kernel lengths its walk
+//     with its own *d_pos + 1, so storing all n_tok rows first and then attending is
+//     exactly what the per-token order computed. Everything else in the phase — the
+//     residual mix, attn_norm, the five projections, the absorb, the gate fold — is
+//     independent per token and is issued once for the chunk. The MLA attention
+//     kernel ITSELF stays per-token: its split geometry is derived from that token's
+//     own n_ctx and moves continuously with it, so one grid for the chunk would
+//     re-partition the online-softmax reduction and stop being bit-identical.
+//   * KDA. The conv window and the delta state are carried from token b-1 to token b.
+//     There is no launch that does that for n_tok tokens without becoming a different
+//     algorithm with a different summation order, so THE SCAN stays a per-token loop in
+//     index order and always will. What is split off from it, under
+//     SPARKINFER_K3_KDA_QKVG_BATCH (DEFAULT OFF), is the PROJECTION half: q/k/v/g and
+//     attn_output are elementwise in the token index, so they are issued once for the
+//     chunk and the scan loop consumes/produces their rows in order. With the gate
+//     unset a KDA layer is refused exactly as before.
+//
+// Ask kimi_k3_attn_batch_ok() rather than inferring either half. Refusing is
+// deliberate and stays deliberate: the previous version of the chunk driver was fast
+// precisely because it was wrong, and a silent wrong answer here is that failure again.
+//
+// PRECONDITIONS the caller owns when n_tok > 1 (none are checkable here):
+//   * n_tok <= kimi_k3_ffn_batch_cap(fwd). Checked, and refused if violated.
+//   * state.res_bank points at TOKEN 0's bank, and token b's bank is
+//     (res_bank + b * res_bank_row_elems * max_ckpt) — the layout
+//     kimi_k3_tp_prefill_chunk allocates.
+//   * FOR THE ATTN PHASE ONLY: state.d_pos points at TOKEN 0's slot of a CONTIGUOUS
+//     n_tok-long position vector (k3_fill_pos_vec's output), so token b's position is
+//     state.d_pos[b]; and state.position is TOKEN 0's host position, so token b's
+//     context length is state.position + 1 + b. Handing it a single shared position is
+//     the "every token writes the same KV row and attends over the same prefix" bug —
+//     wrong AND faster, so a timing run cannot see it.
+//   * the partial buffers exposed by kimi_k3_swap_partial_buffer are chunk-wide:
+//     the Attn partial strides by `hidden`, the FfnPartial partial by
+//     (expert_latent + hidden). Left unswapped they are the scratch allocation,
+//     which IS sized for the cap, so this is safe rather than merely conventional.
+//   * state.n_ckpt is a function of the LAYER, not the token, so one value serves
+//     every row (which is why it is not per-token here).
 bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase phase,
-                                const float* hidden_in, float* hidden_out);
+                                const float* hidden_in, float* hidden_out,
+                                int n_tok = 1);
+
+// The largest n_tok the FFN-side scratch was allocated for. Read from
+// SPARKINFER_K3_PREFILL_CHUNK at kimi_k3_forward_alloc_scratch time (default 16,
+// clamped to [1, 256]). 1 when there is no scratch. A driver should clamp its chunk
+// size to this rather than discover it as a refused phase.
+int kimi_k3_ffn_batch_cap(const KimiK3Forward& fwd);
+
+// Will kimi_k3_forward_layer_phase() take K3LayerPhase::Attn with this n_tok on this
+// layer? THE DRIVER MUST ASK, not infer: it decides between one batched call and a
+// per-token loop, and inferring the answer from the layer type alone would miss the
+// scratch cap, the debug mode and SPARKINFER_K3_ATTN_BATCH=0 — each of which makes the
+// phase refuse, which is a FAILED prefill rather than a slow one. False for n_tok == 1
+// (there is nothing to batch), for every KDA layer unless SPARKINFER_K3_KDA_QKVG_BATCH
+// is set (the conv and delta-rule recurrences keep the scan per-token; only the
+// projections batch), and whenever the batched path is gated off.
+bool kimi_k3_attn_batch_ok(const KimiK3Forward& fwd, int layer, int n_tok);
 
 // The buffer holding THIS RANK'S partial sum after `phase`, and its element count.
 // Returns nullptr with *count = 0 for a phase that produces no partial (FfnFinish).
