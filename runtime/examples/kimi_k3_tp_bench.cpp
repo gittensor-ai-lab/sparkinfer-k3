@@ -144,13 +144,26 @@ int main(int argc, char** argv) {
     // runtime does not expose, and without paying to re-feed every shorter prefix.
     std::vector<int> checkpoints;
     const char* logits_prefix = nullptr;
+    bool ids_requested = false;
     for (int i = 2; i < argc; ++i) {
-        if (!std::strcmp(argv[i], "--ids") && i + 1 < argc) ids = parse_ids(argv[++i]);
+        if (!std::strcmp(argv[i], "--ids") && i + 1 < argc) {
+            ids = parse_ids(argv[++i]);
+            ids_requested = true;
+        }
         else if (!std::strcmp(argv[i], "--logits") && i + 1 < argc) logits_path = argv[++i];
         else if (!std::strcmp(argv[i], "--logits-prefix") && i + 1 < argc) logits_prefix = argv[++i];
         else if (!std::strcmp(argv[i], "--checkpoints") && i + 1 < argc) checkpoints = parse_ids(argv[++i]);
         else if (!std::strcmp(argv[i], "--ctx") && i + 1 < argc) max_ctx = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--seek")) do_seek = true;
+    }
+    // --ids that parses to nothing must not fall through to the synthetic timer.
+    // parse_ids returns {} for a missing @FILE and for a file with no numbers; the
+    // prompt path is gated on !ids.empty(), so without this check a typo'd path runs
+    // the timing loop, exits 0, and writes no .spkl — an accuracy caller that trusts
+    // the exit status records a false pass.
+    if (ids_requested && ids.empty()) {
+        std::printf("--ids: no ids parsed (missing/empty file, or nothing numeric in it)\n");
+        return 1;
     }
     if (!checkpoints.empty() && !logits_prefix) {
         std::printf("--checkpoints needs --logits-prefix\n");
@@ -302,10 +315,16 @@ int main(int argc, char** argv) {
         for (int i = 1; i < cfg.vocab; ++i)
             if (logits[(size_t)i] > logits[(size_t)best]) best = i;
         std::printf("argmax next-token id: %d  logit: %.6f\n", best, logits[(size_t)best]);
+        // Mirror the checkpoint dumps: a failed --logits write used to print FAILED and
+        // still exit 0. Accuracy scripts that only check status then treat a missing
+        // dump as a successful run.
         if (logits_path) {
-            std::printf("%s %s\n",
-                        write_spkl(logits_path, logits, cfg.vocab) ? "wrote" : "FAILED to write",
-                        logits_path);
+            if (!write_spkl(logits_path, logits, cfg.vocab)) {
+                std::printf("FAILED to write %s\n", logits_path);
+                kimi_k3_tp_free(p);
+                return 1;
+            }
+            std::printf("wrote %s\n", logits_path);
         }
         kimi_k3_tp_free(p);
         return 0;

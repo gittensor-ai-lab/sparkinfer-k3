@@ -2934,6 +2934,22 @@ class CiWorkflowTest(unittest.TestCase):
         self.assertIn("FAILED to write", src)
         self.assertIn("--checkpoints needs --logits-prefix", src)
 
+    def test_empty_ids_and_failed_logits_write_are_hard_failures(self):
+        """An accuracy caller that only checks exit status must never see a false pass.
+
+        Two harness defects made a broken run look successful:
+          1. --ids that parsed to nothing fell through to the synthetic timing loop and
+             exited 0 with no .spkl.
+          2. A failed --logits write printed FAILED but still returned 0.
+        """
+        src = (ROOT / "runtime/examples/kimi_k3_tp_bench.cpp").read_text()
+        self.assertIn("ids_requested", src)
+        self.assertIn("no ids parsed", src)
+        # The final --logits path must return 1 on write failure (checkpoint dumps already did).
+        ids_path = src[src.index("argmax next-token id"):src.index("Warm-up token")]
+        self.assertIn("FAILED to write", ids_path)
+        self.assertIn("return 1", ids_path)
+
     def test_a_partial_parity_suite_is_never_scored(self):
         """Nine of ten probes returning is not a pass at 90%. It is an unmeasured depth."""
         src = (ROOT / "eval/k3_eval_bot.py").read_text()
