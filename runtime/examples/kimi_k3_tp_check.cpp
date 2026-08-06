@@ -24,6 +24,7 @@
 #include "sparkinfer/models/kimi_k3_config.h"
 #include "sparkinfer/models/kimi_k3_gguf_manifest.h"
 #include "sparkinfer/models/kimi_k3_tp.h"
+#include "sparkinfer/tp/shard.h"
 
 #include <cuda_runtime.h>
 
@@ -165,6 +166,7 @@ int main(int argc, char** argv) {
     // ---- candidate: tp_size N ----
     std::vector<std::vector<float>> got(n_tokens);
     long collectives = 0;
+    KimiK3Weights::ShardPolicy cand_policy = KimiK3Weights::ShardPolicy::ExpertsOnly;
     {
         std::vector<int> devs;
         for (int i = 0; i < tp_size; ++i) devs.push_back(i);
@@ -173,6 +175,7 @@ int main(int argc, char** argv) {
             std::printf("tp=%d init failed\n", tp_size); return 1;
         }
         if (trace_on) many.ranks[0].fwd.debug = make_tracer(&tr_got);
+        cand_policy = many.ranks[0].weights.policy;
         for (int t = 0; t < n_tokens; ++t) {
             got[(size_t)t].assign((size_t)cfg.vocab, 0.0f);
             if (!kimi_k3_tp_forward_token(many, prompt[(size_t)t], got[(size_t)t].data())) {
@@ -183,10 +186,28 @@ int main(int argc, char** argv) {
         kimi_k3_tp_free(many);
     }
 
-    // One collective per MoE layer per token; the leading dense layer has none.
-    const long want_coll = (long)(cfg.n_layers - cfg.leading_dense) * n_tokens;
-    std::printf("candidate (tp=%d): %ld collectives (expected %ld = %d MoE layers x %d tokens)\n",
-                tp_size, collectives, want_coll, cfg.n_layers - cfg.leading_dense, n_tokens);
+    // Count from the live shard policy, not a hardcoded ExpertsOnly formula.
+    // Defaults today are Full (attn + dense): 69 KDA + 24 MLA + 92 MoE + 1 dense
+    // = 186 collectives/token. SPARKINFER_K3_SHARD_*=0 narrows that.
+    const bool kda_on = KimiK3Weights::shards_kda(cand_policy);
+    const bool mla_on = KimiK3Weights::shards_mla(cand_policy);
+    const bool dense_on = KimiK3Weights::shards_dense(cand_policy);
+    const int n_kda = [&] {
+        int n = 0;
+        for (int i = 0; i < cfg.n_layers; ++i) if (cfg.is_kda_layer(i)) ++n;
+        return n;
+    }();
+    const int n_mla = cfg.n_layers - n_kda;
+    const int n_moe = cfg.n_layers - cfg.leading_dense;
+    const int n_dense = dense_on ? cfg.leading_dense : 0;
+    const long want_coll = (long)tp::k3_reduce_count_per_token(
+        n_kda, n_mla, n_moe, kda_on, mla_on, n_dense) * n_tokens;
+    std::printf("candidate (tp=%d): %ld collectives (expected %ld = "
+                "%d kda%s + %d mla%s + %d moe + %d dense, x %d tokens)\n",
+                tp_size, collectives, want_coll,
+                n_kda, kda_on ? "" : " off",
+                n_mla, mla_on ? "" : " off",
+                n_moe, n_dense, n_tokens);
 
     int failures = 0;
     if (collectives != want_coll) {

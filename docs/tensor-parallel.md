@@ -13,17 +13,18 @@ sharded. Read the status table, then the limit at the bottom.
 | | |
 |---|---|
 | ✅ **Shard math** | `runtime/src/tp/shard.cpp` — CUDA-free, **4972 checks passing** |
-| ✅ **Backend selection** | `runtime/src/tp/backend_select.cpp` — CUDA-free, **44 checks passing** |
+| ✅ **Backend selection** | `runtime/src/tp/backend_select.cpp` — CUDA-free, **51 checks passing** |
 | ✅ **Tensor→rule mapping** | `runtime/src/tp/weight_plan.cpp` — CUDA-free, **230 checks passing** |
 | ✅ **NCCL collective** | bf16 **and f32** — **validated exact on 8× H200, every rank** |
-| ✅ **Fast collectives** | peer-oneshot + multimem — **validated on 8× H200 (bf16 only)** |
+| ✅ **Fast collectives** | peer-oneshot + multimem — Auto: multimem (bind probe) → peer → NCCL; peer validated on 8× H200; multimem f32 + `kInputSlots=3` / 1-bar |
 | ✅ **Validation tool** | `tp_allreduce_check` — **run; numbers in `bench/results/`** |
 | ✅ **Reduce points** | corrected: the MoE collective is at `expert_latent`, not hidden — see below |
-| ⚠️ **f32 fast collectives** | peer-oneshot/multimem are bf16-only; K3 f32 falls back to NCCL |
+| ✅ **f32 fast collectives** | peer-oneshot and multimem both reduce f32; K3 no longer falls back to NCCL for either |
 | ✅ **Forward integration** | `kimi_k3_tp.cpp` — phase-split forward, one collective per MoE layer |
 | ✅ **Sharded weight loading** | `upload_sliced()` consumes `plan_tensor_residency()`'s StridedCopy |
 | ✅ **End to end** | 93 layers on 8x H200, text in text out, matches the pipeline to 1.85e-09 |
-| ❌ **`ShardPolicy::Full`** | attention is REPLICATED. Declared, not enabled — see the limit below |
+| ❌ **`ShardPolicy::Full` (lm_head)** | vocab RowShard still unsupported — Full today is Attn + dense FFN only |
+| ✅ **Dense FFN under Full** | leading dense gate/up/down banded; one extra all-reduce/token |
 
 ### Two corrections this table used to hide
 
@@ -56,7 +57,7 @@ They live in the shard arithmetic, and that is exactly the part that can be
 verified without a GPU. So the shard math is tested to death here, and the CUDA
 plumbing is written to be validated by one command on a real node.
 
-## Why NCCL first
+## Why NCCL is the correctness floor (not the default)
 
 The custom communication engine at `/home/speedy/sn14/cacheon-sglang-miner/cuda/`
 has two collectives that should beat NCCL on this workload:
@@ -66,23 +67,31 @@ has two collectives that should beat NCCL on this workload:
 | `peer-oneshot` | every rank reads all peers, sums in FP32, **in-kernel flag barrier** | one kernel per rank, no host events, no cross-stream graph edges |
 | `multimem` | `multimem.ld_reduce` — the **NVSwitch** does the reduction | one reduced load per rank instead of N peer loads; needs sm_90+ and NVLS |
 
-**Both are now vendored** under `runtime/csrc/tp/`, and `select_backend()` honours
-an explicit request for either on hardware that can run it. Two things remain true
-and matter:
+**Both are vendored** under `runtime/csrc/tp/`. Selection and construction:
 
-1. **Neither is validated on hardware.** `peer_oneshot_allreduce.h` says *"UNTESTED
-   on the 8x H200 target as committed"*; `multimem_allreduce.h` says *"UNTESTED on
-   hardware as committed"*. That is not selection's problem to solve — the
-   protection is that `make_collective()` falls back to NCCL when construction
-   fails, and that `tp_allreduce_check` must pass before a forward trusts either.
-   **NCCL remains the default**, so nothing gets a fast collective by accident.
-2. **Attribution.** `tp_allreduce.cuh` is *"Adapted from vLLM
+1. **Auto preference.** `select_backend(Auto)` prefers **multimem** when the
+   multicast *bind probe* passes and the box is sm_90+, else **peer-oneshot** when
+   all-pairs peer access is available, else NCCL. Unset `SPARKINFER_TP_BACKEND`
+   means Auto — NCCL is no longer the silent default. Peer-oneshot is
+   **validated** on 8× H200 (bf16 and f32, exact on every rank via
+   `tp_allreduce_check`). Multimem f32 is new in this PR: same `kInputSlots=3` /
+   single-barrier contract as peer, gated by a real `cuMulticastBindMem` probe
+   (attribute-only checks lied on containers without Fabric Manager).
+2. **Construction fallback.** If multimem construction fails after Auto chose it,
+   `make_collective()` tries **peer-oneshot before NCCL** — falling straight to
+   NCCL would regress ~7% vs the measured peer path. Explicit `peer` / `multimem`
+   pins still honour hardware gates; NCCL remains the last correctness floor.
+3. **Attribution.** `tp_allreduce.cuh` is *"Adapted from vLLM
    `csrc/custom_all_reduce.cuh` (Apache-2.0, Copyright the vLLM project)"* — the
    `Signal` layout, the dual-counter barrier, the acquire/release flag ops and the
    packed FP32 reduce. Apache-2.0 and MIT are compatible; §4 requires retaining the
    copyright notice and stating the file was modified. Both are done: the header
    keeps its attribution, and [`NOTICE`](../NOTICE) records it. The rest of the
    comm engine is first-party code.
+
+`SPARKINFER_K3_MM_CTAS=<N>` (optional) raises the multimem f32 CTA grid above the
+default 36-block clamp, capped at 132 — Signal storage matches that cap so a
+raised grid cannot OOB the in-kernel barrier flags.
 
 ### Two calling modes, because the fast backends need it
 
@@ -179,6 +188,11 @@ microseconds per call rather than GB/s. But the measured 5.4 ms/token is **under
 281.6 ms token**, so the collective is NOT the bottleneck. Launch overhead in the ~30
 unfused kernels per layer is.
 
+On the residual seam, `SPARKINFER_K3_RES_FUSE` (default ON) folds the pre-FFN residual
+add into `attn_res_mix` when checkpoints are banked (`attn_res_block_size=12`). Set it
+to `0` for the bit-identical separate add + mix path. `k3_ffn_prep` / `k3_attn_prep`
+still only apply when `res_bs==0`.
+
 ## Validate before trusting
 
 ```bash
@@ -198,9 +212,9 @@ total. And every rank is verified, not just rank 0 — a collective that reduces
 correctly on one rank and not another is a real bug, and checking only rank 0 is
 how it ships.
 
-`SPARKINFER_TP_BACKEND=nccl|peer|multimem|none` overrides the request; an unknown
-value falls back to NCCL with a warning rather than killing a run that took twenty
-minutes to load 802 GiB.
+`SPARKINFER_TP_BACKEND=auto|nccl|peer|multimem|none` overrides the request; unset
+means Auto (multimem → peer → NCCL). An unknown value falls back to Auto with a
+warning rather than killing a run that took twenty minutes to load 802 GiB.
 
 ## Build
 
@@ -220,15 +234,17 @@ benchmark measure one card.
 Steps 1-3 of the old list are done: the collective is validated on hardware, the loader
 shards, and the forward issues the reduce. What is left:
 
-1. **`ShardPolicy::Full` — shard attention.** This is the whole ballgame now. See below.
+1. **`ShardPolicy::Full` — dense FFN done; lm_head vocab shard still open.** Attention
+   bands and the leading dense FFN are sharded under Full (default with
+   `SPARKINFER_K3_SHARD_DENSE` on). Vocab RowShard for lm_head is still refused by the
+   loader allowlist — the forward indexes full vocab on rank 0.
 2. **Batched prefill.** There is none; prompt ingestion is one forward per prompt token.
 3. **CUDA-graph capture across ranks.** ~30 unfused launches per layer x 93 layers, and
    the profile is launch/occupancy-bound at 13x off roofline. An 8-stream capture with
    collectives inside is where the host-event vs in-kernel-barrier distinction starts to
    matter, and where `peer-oneshot` would finally earn its keep.
-4. **f32 fast collectives.** peer-oneshot and multimem are bf16-only, so K3 falls back to
-   NCCL. peer-oneshot was 3.3x faster than NCCL in bf16, so an f32 variant is worth roughly
-   3.5 ms/token — real, but far behind item 1.
+4. ~~**f32 fast collectives.**~~ **Done.** peer-oneshot and multimem both reduce f32;
+   `SPARKINFER_TP_BACKEND=multimem` no longer downgrades to NCCL for K3's residual stream.
 
 ## The limit of ExpertsOnly, and why it is now the whole story
 

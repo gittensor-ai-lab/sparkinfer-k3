@@ -149,10 +149,12 @@ struct KimiK3Weights {
     //                divides the FLOPs but not the cache read. It buys a fraction
     //                and pays a full collective.
     //
-    //   Full         Also row/col-shard the MLA and dense-FFN projections, per
-    //                weight_plan. NOT YET SUPPORTED by the forward — the loader
-    //                would shard weights the executor still indexes at full width,
-    //                which reads past the end of the slice.
+    //   Full         ExpertsAndAttn PLUS the leading dense FFN (gate/up RowShard,
+    //                down ColShard). Costs one extra all-reduce per token on the
+    //                leading dense layer. lm_head / token_embd stay REPLICATED —
+    //                weight_plan would RowShard them, but the forward still indexes
+    //                full vocab on rank 0, so Full is NOT "honor every weight_plan
+    //                rule"; it is Attn + dense FFN via the loader allowlist.
     //
     // Kept explicit rather than inferred from tp_size so that turning one on is a
     // deliberate act with a matching forward, not a silent consequence of tp>1.
@@ -193,10 +195,17 @@ struct KimiK3Weights {
     // each `== ExpertsAndKda` would have been six chances to miss one, and a
     // missed site shards weights the forward still indexes at full width.
     static bool shards_kda(ShardPolicy p) {
-        return p == ShardPolicy::ExpertsAndKda || p == ShardPolicy::ExpertsAndAttn;
+        return p == ShardPolicy::ExpertsAndKda || p == ShardPolicy::ExpertsAndAttn
+            || p == ShardPolicy::Full;
     }
     static bool shards_mla(ShardPolicy p) {
-        return p == ShardPolicy::ExpertsAndMla || p == ShardPolicy::ExpertsAndAttn;
+        return p == ShardPolicy::ExpertsAndMla || p == ShardPolicy::ExpertsAndAttn
+            || p == ShardPolicy::Full;
+    }
+    // Leading dense FFN (gate/up/down). Full only — ExpertsAndAttn leaves it
+    // replicated so the dense path stays the single-GPU code with full width.
+    static bool shards_dense(ShardPolicy p) {
+        return p == ShardPolicy::Full;
     }
 
     // WHICH SLICE OF EACH TENSOR THIS RANK HOLDS. Set BEFORE calling the loader;
@@ -438,6 +447,9 @@ bool kimi_k3_forward_layer(KimiK3Forward& fwd, int layer, const float* hidden_in
 //               Everything here is Replicate and reads the ALREADY-REDUCED value,
 //               which is exactly why the collective cannot be deferred past it:
 //               routed_norm is an rms_norm and rms_norm is not linear.
+//               Optionally, kimi_k3_issue_routed_norm may have already enqueued the
+//               RMS on moe_out right after the MoE all-reduce (overlap with host
+//               issue / peer exit); FfnFinish then skips the re-launch.
 //
 // `All` runs all three back to back and is what kimi_k3_forward_layer calls, so the
 // tp_size 1 path is unchanged. Running All must be bit-identical to running the
@@ -516,6 +528,12 @@ void kimi_k3_forward_select_slot(KimiK3Forward& fwd, int slot);
 void kimi_k3_forward_batch_end(KimiK3Forward& fwd);
 float* kimi_k3_batch_partial_buffer(KimiK3Forward& fwd, int layer,
                                     K3LayerPhase phase, int n_slots, int* count);
+
+// Enqueue ffn_routed_norm on moe_out (in place) for this layer. Returns true if
+// launched (or layer has no routed_norm). Sets an internal skip so the next
+// FfnFinish on this Forward will not re-run the same RMS. SPARKINFER_K3_AR_RMS=0
+// makes this a no-op that returns false (caller keeps the FfnFinish path).
+bool kimi_k3_issue_routed_norm(KimiK3Forward& fwd, int layer);
 
 // Print the SPARKINFER_K3_PROFILE=1 phase breakdown to stderr (no-op when unset).
 void kimi_k3_profile_report();

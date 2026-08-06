@@ -558,18 +558,12 @@ std::unique_ptr<Collective> make_collective(const std::vector<int>& devices,
     const int tp_size = static_cast<int>(devices.size());
     Capabilities caps = probe_capabilities();
 
-    // The owned-buffer backends reduce bf16 only. Downgrade BEFORE selection rather
-    // than after construction: K3 spends ~20 minutes loading weights, and finding out
-    // at the first collective that the chosen backend cannot reduce f32 wastes all of
-    // it. NCCL reduces both, so the downgrade always has somewhere to land.
-    // peer-oneshot now carries an f32 mirror of its bf16 path, so only multimem —
-    // whose vendored kernels are still bf16-typed — is downgraded for an f32 stream.
-    if (need_f32 && requested == Backend::Multimem) {
-        std::fprintf(stderr,
-                     "[tp] multimem reduces bf16 only; f32 was requested (Kimi K3 runs an f32 "
-                     "residual stream) — using nccl\n");
-        requested = Backend::Nccl;
-    }
+    // Owned-buffer backends used to reduce bf16 only. peer-oneshot and multimem
+    // now both carry an f32 mirror of their bf16 path (Kimi K3 runs an f32 residual
+    // stream by design), so need_f32 no longer forces a downgrade. Kept as a
+    // parameter so a future bf16-only backend can still be gated here before the
+    // 20-minute weight load rather than failing at the first collective.
+    (void)need_f32;
 
     std::string reason;
     const Backend chosen = select_backend(requested, tp_size, caps, &reason);
@@ -612,6 +606,10 @@ std::unique_ptr<Collective> make_collective(const std::vector<int>& devices,
         }
 
         case Backend::Multimem: {
+            // Auto prefers multimem when the multicast bind probe passes. If
+            // construction still fails (bind race, mapping, permissions), do NOT
+            // fall straight to NCCL — that would regress ~7% vs peer-oneshot
+            // (#59 measured at 128k). Try peer first; NCCL is the last resort.
             std::string e;
             auto c = make_multimem_collective(devices, max_count, &e);
             if (c) {
@@ -620,7 +618,21 @@ std::unique_ptr<Collective> make_collective(const std::vector<int>& devices,
                              tp_size, max_count);
                 return c;
             }
-            return try_nccl(e.c_str());
+            std::fprintf(stderr,
+                "[tp] multimem construction failed (%s) — trying peer-oneshot "
+                "before nccl (Auto chose multimem; nccl would regress ~7%% vs peer)\n",
+                e.c_str());
+            std::string peer_e;
+            auto peer = make_peer_oneshot_collective(devices, max_count, &peer_e);
+            if (peer) {
+                std::fprintf(stderr, "[tp] all-reduce backend: peer-oneshot "
+                                     "(multimem unavailable), %d rank(s), "
+                                     "max_count %zu (owned buffers)\n",
+                             tp_size, max_count);
+                return peer;
+            }
+            std::string both = e + "; peer-oneshot also failed: " + peer_e;
+            return try_nccl(both.c_str());
         }
 
         case Backend::None:

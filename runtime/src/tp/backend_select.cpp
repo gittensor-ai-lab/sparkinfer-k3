@@ -24,11 +24,11 @@ bool backend_vendored(Backend b) {
         case Backend::Nccl: return true;
         case Backend::Auto: return true;   // resolved before it reaches here
         // Vendored: runtime/csrc/tp/{peer_oneshot,multimem}_allreduce.cu.
-        // Present in this tree, but still NOT VALIDATED ON HARDWARE — their own
-        // headers say so. select_backend() therefore lets them through (the
-        // operator asked for them explicitly) while make_collective() falls back
-        // to NCCL if construction fails, and tp_allreduce_check is what proves
-        // any of it. Attribution for the vLLM-derived barrier: see NOTICE.
+        // Peer is validated on 8x H200; multimem f32 is gated by a real multicast
+        // bind probe. select_backend() lets an explicit request through when the
+        // caps allow it; make_collective() tries peer before NCCL if multimem
+        // construction fails (Auto chose multimem — NCCL would regress ~7%).
+        // Attribution for the vLLM-derived barrier: see NOTICE.
         case Backend::PeerOneShot:
         case Backend::Multimem:
             return true;
@@ -47,9 +47,10 @@ Backend backend_from_string(const std::string& s, std::string* reason) {
     // what the recorded frontier shows: 17.46 tok/s (57.3 ms) tracks the NCCL
     // number, not the 18.35 the PR led with.
     //
-    // Auto is not a blind switch: select_backend() still gates on peer access
-    // across all pairs, and make_collective() falls back to NCCL if the peer
-    // collective fails to construct. An operator can still pin either one.
+    // Auto is not a blind switch: select_backend() prefers multimem when the
+    // multicast bind probe passes (sm_90+), else peer-oneshot when peer access
+    // is available across all pairs, else NCCL. make_collective() tries peer
+    // before NCCL if multimem construction fails. An operator can still pin.
     if (s.empty() || s == "auto")    return Backend::Auto;
     if (s == "nccl")                 return Backend::Nccl;
     if (s == "none" || s == "off")   return Backend::None;
@@ -100,20 +101,27 @@ Backend select_backend(Backend requested, int tp_size, const Capabilities& caps,
     }
 
     // Auto: take the fastest backend this box can actually run, then fall back.
-    // Deliberately does NOT consider multimem — that one is still unvalidated on
-    // hardware, whereas peer-oneshot has a measured before/after on this exact
-    // node (#59) and a numeric check (tp_allreduce_check).
+    // Prefer multimem when multicast is real (bind probe passed) and the silicon
+    // is SM90+: one NVSwitch ld_reduce beats N peer loads for the decode AR.
+    // Fall back to peer-oneshot (measured 7.2% faster than nccl at 128k in #59)
+    // when multicast is unavailable — same path Auto used before multimem
+    // gained the rotating-slot / single-barrier f32 contract.
     if (requested == Backend::Auto) {
+        if (caps.multicast_supported && caps.min_compute_capability >= 90) {
+            say("backend auto: multimem (multicast supported, sm_90+; "
+                "NVSwitch ld_reduce preferred over peer-N)");
+            return Backend::Multimem;
+        }
         if (caps.peer_access_all_pairs) {
-            say("backend auto: peer-oneshot (peer access across all pairs; "
-                "measured 7.2% faster than nccl at 128k in #59)");
+            say("backend auto: peer-oneshot (no multicast; peer access across "
+                "all pairs; measured 7.2% faster than nccl at 128k in #59)");
             return Backend::PeerOneShot;
         }
         if (caps.nccl_available) {
-            say("backend auto: nccl (no peer access across all pairs)");
+            say("backend auto: nccl (no multicast and no peer access across all pairs)");
             return Backend::Nccl;
         }
-        say("backend auto: no peer access and no NCCL — refusing to run sharded");
+        say("backend auto: no multimem, no peer access, and no NCCL — refusing to run sharded");
         return Backend::None;
     }
 

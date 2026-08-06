@@ -28,8 +28,9 @@
 //
 // The collective is f32, not bf16: K3's residual stream is f32 by design and reducing
 // it in bf16 would truncate to ~8 mantissa bits 92 times per token. make_collective is
-// called with need_f32=true, which downgrades a bf16-only fast backend to NCCL up
-// front rather than failing after a twenty-minute weight load.
+// called with need_f32=true; peer-oneshot and multimem both implement the f32 path, and
+// kimi_k3_tp_load refuses any backend that reports !supports_f32() rather than failing
+// after a twenty-minute weight load.
 
 #include "sparkinfer/gguf.h"
 #include "sparkinfer/models/kimi_k3.h"

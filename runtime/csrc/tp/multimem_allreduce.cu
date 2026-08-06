@@ -22,12 +22,14 @@
 
 #include "sparkinfer/tp/multimem_allreduce.h"
 #include "tp_allreduce.cuh"
+#include "tp_pdl.cuh"
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 
 // Multicast VMM needs the CUDA driver API and CUDA >= 12.1.
 #include <cuda.h>
@@ -40,12 +42,16 @@ namespace sparkinfer::tp {
 
 using tpar::Signal;
 using tpar::RankSignals;
+using tpar::kSlotCount;
 using tpar::barrier_at_start;
 using tpar::barrier_at_end;
+using tpar::tp_pdl_sync;
+using tpar::tp_pdl_launch;
 
 namespace {
 
 constexpr int kVecBf16 = 8;  // bf16 per uint4 (one multimem.ld_reduce.v4.bf16x2)
+constexpr int kVecF32  = 4;  // f32  per uint4 (one multimem.ld_reduce.v4.f32)
 
 #if SPARKINFER_TP_MULTIMEM_DRIVER_OK
 // Log + return false on driver-API error (setup is allowed to fail → fallback).
@@ -102,7 +108,53 @@ __global__ void multimem_allreduce_kernel(const uint4* __restrict__ mc_in,
     barrier_at_end<N, true>(sg, self_sg, rank);
 }
 
+// f32 one-shot: same barrier shape as the bf16 kernel, but each thread reduces
+// 4 floats (one uint4) via multimem.ld_reduce.global.add.v4.f32. Exists because
+// Kimi K3 keeps its residual stream f32 by design — without this path every
+// SPARKINFER_TP_BACKEND=multimem request fell back to NCCL at construction.
+//
+// kEndBar=true is main's two-barrier kernel. kEndBar=false is the single-barrier
+// form: the caller has rotated `mc_in` onto one of kSlotCount input slots and
+// passes the same rotation index as `arr`, so the exit rendezvous is no longer
+// what keeps a fast rank off a slow peer's input. Mirrors PeerOneShotAllreduce.
+template <int N, bool kEndBar>
+__global__ void multimem_allreduce_f32_kernel(const float* __restrict__ mc_in,
+                                              float* __restrict__ uc_out,
+                                              RankSignals<N> sg, Signal* self_sg,
+                                              int rank, std::size_t n_vec, int arr) {
+    // ABOVE barrier_at_start — same safety argument as peer_oneshot: this grid
+    // may spin up while the kernel that fills the input is still retiring.
+    tp_pdl_sync();
+
+    barrier_at_start<N>(sg, self_sg, rank, kEndBar ? 0 : arr);
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    for (std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < n_vec; i += static_cast<std::size_t>(gridDim.x) * blockDim.x) {
+        const float* addr = mc_in + i * 4;
+        float v0, v1, v2, v3;
+        asm volatile(
+            "multimem.ld_reduce.global.add.v4.f32 {%0,%1,%2,%3}, [%4];"
+            : "=f"(v0), "=f"(v1), "=f"(v2), "=f"(v3)
+            : "l"(addr)
+            : "memory");
+        float* out = uc_out + i * 4;
+        out[0] = v0; out[1] = v1; out[2] = v2; out[3] = v3;
+    }
+#else
+    (void)mc_in; (void)uc_out;
+#endif
+    // No early cudaTriggerProgrammaticLaunchCompletion — same reasoning as peer:
+    // PDL edges are pairwise and an early trigger would run past the kSlotCount
+    // reuse distance the rotation provides. Keep the SUCCESSOR half (above) only.
+    if constexpr (kEndBar) barrier_at_end<N, true>(sg, self_sg, rank);
+}
+
 }  // namespace detail
+
+// Host header names the slot count so collective.cpp can branch on it; the
+// device side sizes Signal with kSlotCount. Same number, enforced here.
+static_assert(MultimemAllreduce::kInputSlots == kSlotCount,
+              "host and device slot counts must agree");
 
 // ---------------------------------------------------------------------------
 // Support probe
@@ -205,14 +257,16 @@ bool multimem_allreduce_supported(const std::vector<int>& devices) noexcept {
 // ---------------------------------------------------------------------------
 struct MultimemAllreduce::Impl {
     std::vector<int> devices;
-    std::size_t count = 0;       // elements per region (hidden_size)
-    std::size_t region_bytes = 0;  // bytes per input/output region
+    std::size_t count = 0;         // elements per slot / output region (hidden_size)
+    std::size_t region_bytes = 0;  // bytes per slot (= count * sizeof(float))
+    std::size_t out_offset = 0;    // byte offset of output (= region_bytes * kSlotCount)
 #if SPARKINFER_TP_MULTIMEM_DRIVER_OK
     CUmemGenericAllocationHandle mc_handle = 0;
     std::size_t alloc_bytes = 0;  // granularity-rounded total per device
     std::vector<CUmemGenericAllocationHandle> phys;  // per device
-    std::vector<CUdeviceptr> uc_va;  // per device unicast VA (input @0, output @region_bytes)
-    std::vector<CUdeviceptr> mc_va;  // per device multicast VA
+    // Per device unicast VA: input slots @ [0, out_offset), output @ out_offset.
+    std::vector<CUdeviceptr> uc_va;
+    std::vector<CUdeviceptr> mc_va;  // per device multicast VA (same layout)
     std::vector<Signal*> sig;        // per device in-kernel-barrier sync buffer
 #endif
 };
@@ -223,9 +277,14 @@ struct MultimemAllreduce::Impl {
 static bool setup_multicast(MultimemAllreduce::Impl* s) {
     const int N = static_cast<int>(s->devices.size());
 
-    // Region: count bf16, two regions (input + output) per device.
-    s->region_bytes = s->count * sizeof(__nv_bfloat16);
-    const std::size_t want_bytes = s->region_bytes * 2;
+    // Region: sized for f32, the wider of the two element types this class now
+    // reduces; bf16 uses the front half. One allocation serves both — same
+    // discipline as PeerOneShotAllreduce. The INPUT is allocated kSlotCount
+    // times over so the single-barrier f32 kernel can rotate through the slots
+    // (k3_coll_1bar.h); the output region is untouched (one copy).
+    s->region_bytes = s->count * sizeof(float);
+    s->out_offset = s->region_bytes * (std::size_t)kSlotCount;
+    const std::size_t want_bytes = s->out_offset + s->region_bytes;
 
     // Per-device PINNED allocation prop, reused for cuMemCreate below.
     CUmemAllocationProp ap = {};
@@ -382,20 +441,28 @@ MultimemAllreduce::~MultimemAllreduce() noexcept {
 }
 
 void* MultimemAllreduce::rank_buffer(int rank) const noexcept {
+    return rank_buffer(rank, 0);
+}
+
+void* MultimemAllreduce::rank_buffer(int rank, int slot) const noexcept {
 #if SPARKINFER_TP_MULTIMEM_DRIVER_OK
     if (!ok_ || rank < 0 || rank >= static_cast<int>(impl_->uc_va.size()))
         return nullptr;
-    return reinterpret_cast<void*>(impl_->uc_va[rank]);  // input @ offset 0
+    if (slot < 0 || slot >= kSlotCount) return nullptr;
+    return reinterpret_cast<float*>(impl_->uc_va[rank]) +
+           (std::size_t)slot * impl_->count;
 #else
-    (void)rank; return nullptr;
+    (void)rank; (void)slot; return nullptr;
 #endif
 }
+
+int MultimemAllreduce::slots() noexcept { return kSlotCount; }
 
 void* MultimemAllreduce::rank_result(int rank) const noexcept {
 #if SPARKINFER_TP_MULTIMEM_DRIVER_OK
     if (!ok_ || rank < 0 || rank >= static_cast<int>(impl_->uc_va.size()))
         return nullptr;
-    return reinterpret_cast<void*>(impl_->uc_va[rank] + impl_->region_bytes);
+    return reinterpret_cast<void*>(impl_->uc_va[rank] + impl_->out_offset);
 #else
     (void)rank; return nullptr;
 #endif
@@ -410,8 +477,9 @@ static void launch_mm(MultimemAllreduce::Impl* s, std::size_t n_vec, int grid,
     for (int r = 0; r < N; ++r) sg.sg[r] = s->sig[r];
     for (int r = 0; r < N; ++r) {
         cudaSetDevice(s->devices[r]);
+        // bf16 path stays on slot 0 (front of the input region); two barriers.
         const auto* mc_in = reinterpret_cast<const uint4*>(s->mc_va[r]);
-        auto* uc_out = reinterpret_cast<uint4*>(s->uc_va[r] + s->region_bytes);
+        auto* uc_out = reinterpret_cast<uint4*>(s->uc_va[r] + s->out_offset);
         detail::multimem_allreduce_kernel<N><<<grid, block, 0,
             reinterpret_cast<cudaStream_t>(streams[r])>>>(
             mc_in, uc_out, sg, s->sig[r], r, n_vec);
@@ -439,6 +507,111 @@ void MultimemAllreduce::allreduce_bf16(std::size_t count,
     }
 #else
     (void)count; (void)streams;
+#endif
+}
+
+#if SPARKINFER_TP_MULTIMEM_DRIVER_OK
+template <int N>
+static void launch_mm_f32(MultimemAllreduce::Impl* s, std::size_t n_vec, int grid,
+                          int block, const std::vector<void*>& streams, int slot) {
+    // slot < 0 means "the caller is not rotating": one buffer, exit barrier kept,
+    // byte-for-byte the previous launch. Anything else selects an input slot AND
+    // the matching counter array — one index drives both.
+    const bool one_bar = slot >= 0;
+    const int  s_idx   = one_bar ? slot : 0;
+    RankSignals<N> sg{};
+    for (int r = 0; r < N; ++r) sg.sg[r] = s->sig[r];
+    for (int r = 0; r < N; ++r) {
+        cudaSetDevice(s->devices[r]);
+        const auto* mc_in = reinterpret_cast<const float*>(s->mc_va[r]) +
+                            (std::size_t)s_idx * s->count;
+        auto* uc_out = reinterpret_cast<float*>(s->uc_va[r] + s->out_offset);
+        if (one_bar) {
+            tp_pdl_launch(dim3((unsigned)grid), dim3((unsigned)block), 0,
+                          reinterpret_cast<cudaStream_t>(streams[r]),
+                          detail::multimem_allreduce_f32_kernel<N, false>,
+                          mc_in, uc_out, sg, s->sig[r], r, n_vec, s_idx);
+        } else {
+            tp_pdl_launch(dim3((unsigned)grid), dim3((unsigned)block), 0,
+                          reinterpret_cast<cudaStream_t>(streams[r]),
+                          detail::multimem_allreduce_f32_kernel<N, true>,
+                          mc_in, uc_out, sg, s->sig[r], r, n_vec, 0);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Grid selection for the f32 multimem path.
+//
+// Default: ceil(n_vec / block), clamped to tpar::kMaxBlocks (36) — the vLLM
+// NVLink-contention cap that peer-oneshot and the bf16 multimem path still use.
+//
+// SPARKINFER_K3_MM_CTAS=<N>: raise (or pin) the CTA count up to kMaxBlocksCap
+// (132). Multimem's reduce is one NVSwitch ld_reduce per vector, not N peer
+// loads over NVLink, so the contention argument that froze the default at 36
+// does not transfer one-for-one. Larger grids help when the payload is big
+// enough that a 36-block grid-stride walks many iterations; for the decode
+// 14 KiB / 4-float packs the natural grid is already tiny, so the knob is
+// mainly for larger validation sizes and A/B sweeps.
+//
+// Signal storage is sized to kMaxBlocksCap (see tp_allreduce.cuh) so a raised
+// grid never indexes past the flag arrays. Values <= 0 or unparsable fall back
+// to the default clamp. Cap is hard: env cannot exceed kMaxBlocksCap.
+// ---------------------------------------------------------------------------
+static int mm_f32_grid_for(std::size_t n_vec, int block) {
+    int need = static_cast<int>((n_vec + static_cast<std::size_t>(block) - 1) /
+                                static_cast<std::size_t>(block));
+    if (need < 1) need = 1;
+
+    static const int env_ctas = [] {
+        const char* e = std::getenv("SPARKINFER_K3_MM_CTAS");
+        if (!e || !e[0]) return 0;  // 0 = unset → default behaviour
+        char* end = nullptr;
+        long v = std::strtol(e, &end, 10);
+        if (end == e || v <= 0) return 0;
+        if (v > tpar::kMaxBlocksCap) v = tpar::kMaxBlocksCap;
+        return static_cast<int>(v);
+    }();
+
+    if (env_ctas > 0) {
+        // Pin / raise: at least cover the work, at most the env request (already
+        // capped). Never below need — under-covering would leave elements unread.
+        int g = env_ctas;
+        if (g < need) g = need;
+        if (g > tpar::kMaxBlocksCap) g = tpar::kMaxBlocksCap;
+        return g;
+    }
+
+    // Default: same clamp as bf16 multimem / peer-oneshot.
+    if (need > tpar::kMaxBlocks) need = tpar::kMaxBlocks;
+    return need;
+}
+#endif
+
+void MultimemAllreduce::allreduce_f32(std::size_t count,
+                                      const std::vector<void*>& streams) {
+    allreduce_f32(count, streams, -1);
+}
+
+void MultimemAllreduce::allreduce_f32(std::size_t count,
+                                      const std::vector<void*>& streams,
+                                      int slot) {
+#if SPARKINFER_TP_MULTIMEM_DRIVER_OK
+    if (!ok_) return;
+    const int N = static_cast<int>(impl_->devices.size());
+    const std::size_t n_vec = count / kVecF32;
+    const int block = 512;
+    const int grid = mm_f32_grid_for(n_vec, block);
+    if (slot >= kSlotCount) slot = -1;  // never guess: fall back safe
+
+    switch (N) {
+        case 2: launch_mm_f32<2>(impl_, n_vec, grid, block, streams, slot); break;
+        case 4: launch_mm_f32<4>(impl_, n_vec, grid, block, streams, slot); break;
+        case 8: launch_mm_f32<8>(impl_, n_vec, grid, block, streams, slot); break;
+        default: break;
+    }
+#else
+    (void)count; (void)streams; (void)slot;
 #endif
 }
 

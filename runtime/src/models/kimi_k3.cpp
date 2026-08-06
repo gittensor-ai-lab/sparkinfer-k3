@@ -145,13 +145,16 @@ bool upload_sliced(const GGUF& g, const std::string& name, KimiK3Weights& w,
     }
 
     // --- tp_size > 1 ---
-    // Under ExpertsOnly, only the three routed-expert stacks are banded. Everything
-    // else takes the replicate path above, at full width, so the forward's cfg-derived
-    // shapes stay correct on every rank. Matching on the tensor SUFFIX rather than on
-    // the rule is deliberate: attn_k_b/attn_v_b also carry Rule::ExpertShard (they
-    // band the head axis), and banding those without teaching the MLA kernels their
-    // per-rank head count would silently drop 7/8 of the attention heads.
-    if (w.policy != KimiK3Weights::ShardPolicy::Full) {
+    // Allowlist, ALWAYS — including under ShardPolicy::Full. Full used to skip this
+    // gate and honour every weight_plan rule, which would RowShard lm_head while
+    // the forward still indexes full vocab on rank 0. Full now means "Attn + dense
+    // FFN on the allowlist", not "the plan is law".
+    //
+    // Matching on the tensor SUFFIX rather than on the rule is deliberate:
+    // attn_k_b/attn_v_b also carry Rule::ExpertShard (they band the head axis), and
+    // banding those without teaching the MLA kernels their per-rank head count
+    // would silently drop 7/8 of the attention heads.
+    {
         auto ends_with = [&](const char* suf) {
             const std::size_t n = std::strlen(suf);
             return name.size() >= n && name.compare(name.size() - n, n, suf) == 0;
@@ -207,7 +210,18 @@ bool upload_sliced(const GGUF& g, const std::string& name, KimiK3Weights& w,
                                          ends_with("ffn_up_shexp.weight")   ||
                                          ends_with("ffn_down_shexp.weight");
 
-        if (!routed_expert_stack && !shared_expert_stack &&
+        // Full: leading dense FFN, same Row/Col pattern as the shared expert.
+        // Only the three dense projections — never lm_head / token_embd.
+        const bool dense_ffn_stack =
+            KimiK3Weights::shards_dense(w.policy) &&
+            (ends_with("ffn_gate.weight") || ends_with("ffn_up.weight") ||
+             ends_with("ffn_down.weight")) &&
+            !ends_with("ffn_gate_exps.weight") && !ends_with("ffn_up_exps.weight") &&
+            !ends_with("ffn_down_exps.weight") && !ends_with("ffn_gate_shexp.weight") &&
+            !ends_with("ffn_up_shexp.weight") && !ends_with("ffn_down_shexp.weight") &&
+            !ends_with("ffn_gate_inp.weight");
+
+        if (!routed_expert_stack && !shared_expert_stack && !dense_ffn_stack &&
             !kda_sharded && !mla_sharded) {
             void* d = nullptr;
             if (cudaMalloc(&d, (size_t)t->n_bytes) != cudaSuccess) {
@@ -854,6 +868,10 @@ struct KimiK3Forward::Scratch {
     float* moe_out = nullptr;         // = moe_fused,                 [expert_latent]
     float* dense_gate = nullptr, *dense_up = nullptr, *dense_situ = nullptr; // [dense_ffn]
     float* shexp_out = nullptr;        // = moe_fused + expert_latent, [H]
+    // Set by kimi_k3_issue_routed_norm when the TP driver early-issues the MoE
+    // RMS after the all-reduce; FfnFinish skips its own launch when true.
+    // Cleared at FfnPartial start (MoE) so a stale flag cannot leak across layers.
+    bool routed_norm_done = false;
     // Softmax scratch for attn_res_mix_f32, [max_ckpt + 1]. Persistent because the
     // mix runs twice per layer: allocating it per call cost a cudaMallocAsync /
     // cudaFreeAsync pair ~185 times per token.
@@ -1298,6 +1316,30 @@ float* kimi_k3_swap_partial_buffer(KimiK3Forward& fwd, K3LayerPhase phase,
     return old;
 }
 
+bool kimi_k3_issue_routed_norm(KimiK3Forward& fwd, int layer) {
+    // Default ON: after a 1-bar MoE all-reduce the sum sits in a private
+    // reduce_out, so launching ffn_routed_norm here hides that RMS behind host
+    // issue of other ranks and peer barrier exit. SPARKINFER_K3_AR_RMS=0 keeps
+    // the FfnFinish path bit-identical (no early launch, no skip flag).
+    static const bool ar_rms = !env_zero("SPARKINFER_K3_AR_RMS");
+    if (!ar_rms) return false;
+
+    const KimiK3Config& cfg = *fwd.cfg;
+    const KimiK3LayerWeights& L = fwd.w->layers[layer];
+    auto& s = *fwd.s;
+
+    // Dense layers and MoE layers without a routed_norm have nothing to skip —
+    // return true so the caller does not treat this as a soft-disable.
+    if (layer < cfg.leading_dense || !L.has_routed_norm) return true;
+    if (!L.ffn_routed_norm.ok()) return false;
+
+    // Out of place into moe_normed — same as FfnFinish — so rms_norm_f32 can
+    // grid-spread its output sweep (RMSG), which the in-place form must decline.
+    k3k::rms_norm_f32(s.moe_normed, s.moe_out, (const float*)L.ffn_routed_norm.data,
+                      cfg.expert_latent, cfg.rms_eps, fwd.stream);
+    s.routed_norm_done = true;
+    return true;
+}
 
 // ---------------------------------------------------------------------------
 // Launch-failure guard.
@@ -2201,6 +2243,8 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
         }();
         if (res_fuse && res_bs > 0 && st.n_ckpt > 0) {
             if (!L.ffn_res_score.ok()) return false;
+            // cur = banked ? attn_out : hidden_in; cur_b folds the add when not
+            // replacing; sum_out writes the combined residual to hidden_out once.
             k3k::attn_res_mix_f32(s.mixed2, st.res_bank,
                                   banked ? attn_src : hidden_in,
                                   (const float*)L.ffn_res_score.data, H, st.n_ckpt, eps,
@@ -2213,16 +2257,28 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             } else {
                 k3k::k3_add_f32(hidden_out, hidden_in, attn_src, H, stream);
             }
+            if (!ffn_prep) {
+                // combine: replace on a checkpoint layer, add otherwise. Uses hidden_in
+                // (the RAW pre-mix value), not s.mixed — the reference's residual add is
+                // against the unmixed prefix_sum, only the norm/attention input was mixed.
+                if (banked) {
+                    cudaMemcpyAsync(hidden_out, s.attn_out, (size_t)H * sizeof(float),
+                                    cudaMemcpyDeviceToDevice, stream);
+                } else {
+                    k3k::k3_add_f32(hidden_out, hidden_in, s.attn_out, H, stream);
+                }
 
-            // --- pre-FFN mix, no bank push ---
-            if (res_bs > 0) {
-                if (!L.ffn_res_score.ok()) return false;
-                k3k::attn_res_mix_f32(s.mixed2, st.res_bank, hidden_out,
-                                      (const float*)L.ffn_res_score.data, H, st.n_ckpt, eps,
-                                      stream, s.res_scores);
-            } else {
-                cudaMemcpyAsync(s.mixed2, hidden_out, (size_t)H * sizeof(float),
-                                cudaMemcpyDeviceToDevice, stream);
+                // pre-FFN mix, no bank push
+                if (res_bs > 0) {
+                    if (!L.ffn_res_score.ok()) return false;
+                    k3k::attn_res_mix_f32(s.mixed2, st.res_bank, hidden_out,
+                                          (const float*)L.ffn_res_score.data, H, st.n_ckpt, eps,
+                                          stream, s.res_scores);
+                } else {
+                    cudaMemcpyAsync(s.mixed2, hidden_out, (size_t)H * sizeof(float),
+                                    cudaMemcpyDeviceToDevice, stream);
+                }
+                k3k::rms_norm_f32(s.normed2, s.mixed2, (const float*)L.ffn_norm.data, H, eps, stream);
             }
         }
         if (!L.ffn_norm.ok()) return false;
@@ -2232,6 +2288,11 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
 
     // ---- phase 2b: FFN partial. -------------------------------------------
     if (do_ffn_p) {
+        // Drop any stale early-issue flag before this layer's MoE work. A failed
+        // or abandoned kimi_k3_issue_routed_norm on a prior layer must not make
+        // this layer's FfnFinish skip a real RMS.
+        if (layer >= cfg.leading_dense) s.routed_norm_done = false;
+
         // normed2 has up to four consumers below -- the router, routed_down, and both
         // shared-expert projections -- and every one of them used to re-quantise it.
         if (!ffn_prepared) {
@@ -2242,14 +2303,38 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
 
         k3_profiler().start(layer < cfg.leading_dense ? "ffn_dense" : "ffn_moe", stream);
         if (layer < cfg.leading_dense) {
-            if (!proj_h(s.dense_gate, normed2_src, L.ffn_gate, cfg.dense_ffn, H)) return false;
-            if (!proj_h(s.dense_up, normed2_src, L.ffn_up, cfg.dense_ffn, H)) return false;
-            if (fwd.debug) fwd.debug("dbg_dense_gate", layer, s.dense_gate, cfg.dense_ffn);
-            if (fwd.debug) fwd.debug("dbg_dense_up", layer, s.dense_up, cfg.dense_ffn);
-            k3k::situ_f32(s.dense_situ, s.dense_gate, s.dense_up, cfg.dense_ffn,
+            // Same Row/Col banding as the shared expert (weight_plan: gate/up
+            // RowShard, down ColShard). Widths from rank_ne — never cfg.dense_ffn /
+            // tp_size — because block_aligned_band can hand a remainder to the low
+            // ranks. Under ExpertsAndAttn the tensors are full width and rank_ne
+            // equals cfg.dense_ffn, so this is the same code path with the same
+            // values it always had. Activation is normed2_src (tile-prep may have
+            // already written it; hoist_act above is skipped when ffn_prepared).
+            if (!L.ffn_gate.ok() || !L.ffn_up.ok() || !L.ffn_down.ok()) return false;
+            const int dense_band = (int)L.ffn_gate.rank_ne[1];
+            if (dense_band <= 0 || (int)L.ffn_down.rank_ne[0] != dense_band)
+                return false;
+            const int tp_size = fwd.w->shard.tp_size;
+            if (tp_size > 1 && KimiK3Weights::shards_dense(fwd.w->policy) &&
+                dense_band * tp_size != cfg.dense_ffn) {
+                std::fprintf(stderr,
+                             "[k3] layer %d: dense FFN not banded — rank width %d x "
+                             "tp_size %d != %d. The reduce would sum %d copies of a "
+                             "complete dense FFN output.\n",
+                             layer, dense_band, tp_size, cfg.dense_ffn, tp_size);
+                return false;
+            }
+            if (!proj_h(s.dense_gate, normed2_src, L.ffn_gate, dense_band, H)) return false;
+            if (!proj_h(s.dense_up, normed2_src, L.ffn_up, dense_band, H)) return false;
+            if (fwd.debug) fwd.debug("dbg_dense_gate", layer, s.dense_gate, dense_band);
+            if (fwd.debug) fwd.debug("dbg_dense_up", layer, s.dense_up, dense_band);
+            k3k::situ_f32(s.dense_situ, s.dense_gate, s.dense_up, dense_band,
                          cfg.situ_beta, cfg.situ_linear_beta, stream);
-            if (fwd.debug) fwd.debug("dbg_dense_situ", layer, s.dense_situ, cfg.dense_ffn);
-            if (!proj(s.ffn_out, s.dense_situ, L.ffn_down, H, cfg.dense_ffn)) return false;
+            if (fwd.debug) fwd.debug("dbg_dense_situ", layer, s.dense_situ, dense_band);
+            // ColShard over the band → full-width PARTIAL in ffn_out. The TP driver
+            // reduces it when shards_dense; under ExpertsAndAttn dense_band ==
+            // cfg.dense_ffn so the result is already complete and must NOT be reduced.
+            if (!proj(s.ffn_out, s.dense_situ, L.ffn_down, H, dense_band)) return false;
         } else {
             // --- FORK: routed_down and the whole shared expert ----------------
             //
@@ -2433,10 +2518,19 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             const float* moe_src = s.moe_out;
             if (L.has_routed_norm) {
                 if (!L.ffn_routed_norm.ok()) return false;
-                k3k::rms_norm_f32(s.moe_normed, s.moe_out,
-                                  (const float*)L.ffn_routed_norm.data, cfg.expert_latent,
-                                  eps, stream);
+                // Early-issued after the MoE all-reduce (kimi_k3_issue_routed_norm):
+                // the RMS already wrote moe_normed on this stream; skip the re-launch
+                // but always clear the flag so it cannot stick across layers.
+                if (s.routed_norm_done) {
+                    s.routed_norm_done = false;
+                } else {
+                    k3k::rms_norm_f32(s.moe_normed, s.moe_out,
+                                      (const float*)L.ffn_routed_norm.data,
+                                      cfg.expert_latent, eps, stream);
+                }
                 moe_src = s.moe_normed;
+            } else if (s.routed_norm_done) {
+                s.routed_norm_done = false;
             }
 
             if (fwd.debug) fwd.debug("dbg_moe_normed", layer, moe_src, cfg.expert_latent);

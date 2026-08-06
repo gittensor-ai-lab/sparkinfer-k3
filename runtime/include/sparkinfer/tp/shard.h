@@ -433,9 +433,12 @@ ShardError mla_shard_dims(const MlaShape& shape, const Config& cfg, int rank,
 // ExpertsOnly today: one per MoE layer (the expert partial at expert_latent).
 // With KDA sharded: that, plus one per KDA layer (the attn_output partial at
 // hidden). With MLA sharded: plus one per MLA layer, same partial, same width.
+// With dense FFN sharded (Full): plus one per leading-dense layer (ffn_down
+// partial at hidden).
 int k3_reduce_count_per_token(int n_kda_layers, int n_moe_layers, bool kda_sharded);
 int k3_reduce_count_per_token(int n_kda_layers, int n_mla_layers, int n_moe_layers,
-                              bool kda_sharded, bool mla_sharded);
+                              bool kda_sharded, bool mla_sharded,
+                              int n_dense_ffn_layers = 0);
 
 }  // namespace tp
 }  // namespace sparkinfer

@@ -36,15 +36,20 @@ namespace sparkinfer::tp::tpar {
 using FlagType = uint32_t;
 
 // vLLM uses 36 blocks for the all-reduce: "too many SMs cause contention on the
-// NVLink bus." We cap Signal storage to that and clamp the launch likewise.
+// NVLink bus." We cap peer Signal indexing to kMaxBlocks and clamp peer launch
+// likewise.
 //
-// STORAGE ceiling only. vLLM's 36 was a budget in THREADS -- 36 blocks of 512 is
-// 18432 -- and this kernel now launches 64-thread blocks, so 36 CTAs spends an
-// eighth of the contention that number was chosen to bound. Signal is the reason
-// the ceiling has to be a compile-time constant (it sizes four peer-visible flag
-// arrays, ~6.4 KB at 64); the ceiling that is actually applied is grid_for's
-// runtime cap, which still defaults to 36.
+// STORAGE ceiling for peer: vLLM's 36 was a budget in THREADS -- 36 blocks of
+// 512 is 18432 -- and this kernel now launches 64-thread blocks, so 36 CTAs
+// spends an eighth of the contention that number was chosen to bound. Signal is
+// the reason the ceiling has to be a compile-time constant; peer grid_for's
+// runtime cap still defaults via COLL_CAP up to kMaxBlocks.
 constexpr int kMaxBlocks = 64;
+// Multimem f32 may raise its CTA grid via SPARKINFER_K3_MM_CTAS (NVSwitch
+// ld_reduce is not the same contention profile as peer-N NVLink loads). Signal
+// storage is sized to this larger cap so a raised multimem grid never indexes
+// past the flag arrays; peer still clamps to kMaxBlocks.
+constexpr int kMaxBlocksCap = 132;
 
 // Per-rank synchronization buffer, peer-accessible from every rank. Two counter
 // sets (start/end) are needed because a peer block can reach the second sync
@@ -60,10 +65,10 @@ constexpr int kMaxBlocks = 64;
 // the guarantee: consecutive barriers never share an array, and the rotation
 // period is 3, which is also what the buffer needs (see kSlotCount).
 struct Signal {
-    alignas(128) FlagType start[kMaxBlocks][8];
-    alignas(128) FlagType end[kMaxBlocks][8];
-    alignas(128) FlagType mid[kMaxBlocks][8];
-    alignas(128) FlagType _flag[kMaxBlocks];  // per-rank incremental flag
+    alignas(128) FlagType start[kMaxBlocksCap][8];
+    alignas(128) FlagType end[kMaxBlocksCap][8];
+    alignas(128) FlagType mid[kMaxBlocksCap][8];
+    alignas(128) FlagType _flag[kMaxBlocksCap];  // per-rank incremental flag
 };
 
 // How many input slots the ping-pong rotates through, and therefore how many

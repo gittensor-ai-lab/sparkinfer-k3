@@ -92,9 +92,11 @@ static void test_vendored_backends_are_selectable_on_capable_hardware() {
     CHECK_BACKEND(select_backend(Backend::Multimem, 8, h200x8(), &why), Backend::Multimem);
     CHECK(why.empty(), "no downgrade expected on capable hardware: %s", why.c_str());
 
-    // They are still NOT VALIDATED on hardware — their own headers say so. That
-    // is not selection's job to enforce: make_collective() falls back to NCCL if
-    // construction fails, and tp_allreduce_check is what actually proves them.
+    // They are still gated at construction: make_collective() tries multimem,
+    // then peer-oneshot, then NCCL if a fast backend's setup fails. Selection
+    // only refuses a backend the box cannot run; tp_allreduce_check proves the
+    // reduce. Construction-fallback ordering is not exercised here (needs CUDA
+    // + a deliberate bind failure) — see collective.cpp Backend::Multimem.
     // Selection's job is only to never claim a backend the box cannot run, which
     // test_hardware_gates_are_reported_before_vendoring covers.
 }
@@ -155,6 +157,38 @@ static void test_missing_nccl_does_not_silently_unshard() {
           "should tell the caller to refuse: %s", why.c_str());
 }
 
+static void test_auto_prefers_multimem_then_peer() {
+    std::printf("auto_prefers_multimem_then_peer\n");
+    // Auto must prefer multimem on a multicast-capable SM90+ box so K3's
+    // rotating-slot f32 path can take the NVSwitch reduce without an env pin.
+    // Without multicast it falls back to peer-oneshot (#59 measured win).
+    //
+    // NOTE: construction-time multimem→peer fallback (bind fails after the probe
+    // passed) lives in make_collective() and needs CUDA — not coverable here.
+    // Selection only asserts the preference order above.
+    std::string why;
+    CHECK_BACKEND(select_backend(Backend::Auto, 8, h200x8(), &why), Backend::Multimem);
+    CHECK(why.find("multimem") != std::string::npos, "should name multimem: %s", why.c_str());
+
+    Capabilities no_mc = h200x8();
+    no_mc.multicast_supported = false;
+    why.clear();
+    CHECK_BACKEND(select_backend(Backend::Auto, 8, no_mc, &why), Backend::PeerOneShot);
+    CHECK(why.find("peer-oneshot") != std::string::npos,
+          "should fall back to peer-oneshot: %s", why.c_str());
+
+    Capabilities old_arch = h200x8();
+    old_arch.min_compute_capability = 89;
+    why.clear();
+    CHECK_BACKEND(select_backend(Backend::Auto, 8, old_arch, &why), Backend::PeerOneShot);
+
+    Capabilities no_peer = h200x8();
+    no_peer.multicast_supported = false;
+    no_peer.peer_access_all_pairs = false;
+    why.clear();
+    CHECK_BACKEND(select_backend(Backend::Auto, 8, no_peer, &why), Backend::Nccl);
+}
+
 static void test_env_parsing() {
     std::printf("env_parsing\n");
     std::string why;
@@ -203,6 +237,7 @@ int main() {
     test_too_few_devices_is_a_hard_downgrade();
     test_backend_none_at_tp8_is_rejected_loudly();
     test_missing_nccl_does_not_silently_unshard();
+    test_auto_prefers_multimem_then_peer();
     test_env_parsing();
     test_backend_names_are_stable();
 
