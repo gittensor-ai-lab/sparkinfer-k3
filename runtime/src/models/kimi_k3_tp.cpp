@@ -1786,7 +1786,7 @@ static bool k3_tp_prefill_tile(KimiK3TP& p, const int* ids, int T) {
         // replayed tile to the one it was recorded at — fluent output over wrong KV rows.
         static const bool want_mla_batch = [] {
             const char* e = std::getenv("SPARKINFER_K3_MLA_BATCH_PREFILL");
-            return e && e[0] == '1';
+            return !(e && e[0] == '0');
         }();
         const bool mla_batch = want_mla_batch && !cfg.is_kda_layer(layer) && T > 1;
         if (mla_batch) {

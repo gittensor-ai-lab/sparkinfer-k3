@@ -56,7 +56,7 @@ bool k3_prefill_tile_alloc(const KimiK3Config& cfg, int tile, int qkv, int max_c
     ok = ok && alloc_f(t.v, (size_t)tile * Q);
     ok = ok && alloc_f(t.g, (size_t)tile * Q);
     const char* mla_env = std::getenv("SPARKINFER_K3_MLA_BATCH_PREFILL");
-    if (mla_env && mla_env[0] == '1') {
+    if (!(mla_env && mla_env[0] == '0')) {
         const size_t mla_q = (size_t)tile * cfg.n_q_heads * cfg.key_length;
         const size_t mla_v = (size_t)tile * cfg.n_q_heads * cfg.value_length_mla;
         ok = ok && alloc_f(t.mla_query, mla_q);
