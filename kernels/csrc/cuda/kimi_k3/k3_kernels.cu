@@ -3431,6 +3431,16 @@ __global__ void mla_kv_store_kernel(float* __restrict__ cache,
 // cannot change. k3_read_pos_f32 exists so a test can prove the two never drift.
 __global__ void bump_pos_kernel(int* __restrict__ p) { *p += 1; }
 
+// The same advance by an arbitrary signed step. A tile driver runs the layer loop
+// OUTSIDE the token loop, so within one layer the position walks base..base+T-1 and
+// then has to come back to base for the next layer — which is a -(T-1), not a bump.
+//
+// RELATIVE, and that is the whole reason this is not a `set`. A set would bake the
+// absolute position into the launch, and a captured graph replayed on the next tile
+// would rewind every token to the tile it was recorded at: fluent output, wrong KV
+// rows, invisible to timing. An add is the same instruction on every tile.
+__global__ void add_pos_kernel(int* __restrict__ p, int d) { *p += d; }
+
 // Original single-block norm. Kept as the bit-identical reference path: the sum of
 // squares is partitioned across exactly 128 threads with stride 128, and the apply
 // walk matches. Widening the sum changes that partition and moves KL vs main past the
@@ -3475,12 +3485,30 @@ __global__ void rms_norm_kernel(float* __restrict__ out, const float* __restrict
 // is resident to cover the reduction's latency.
 //
 // n4 is the float4 count when vec4!=0; n is always the element count (the mean divisor).
+// A TOKEN AXIS ON gridDim.y, and it is deliberately an OFFSET rather than a second kernel.
+//
+// rms_norm_wide is 302 graph nodes per prefill token — 9% of a captured tile's graph, and
+// a captured tile is bound by its node count. Batching it over T tokens turns T launches
+// into one. The prefill module's header declined to batch the norms because doing it the
+// obvious way means copying rms_norm_block_for and block_sum into another file, and a
+// duplicated tier is exactly what produced the block_for defect the prefill CPU test now
+// pins. This avoids that entirely: same kernel, same block_for, same block_sum, same
+// reduction order, same span logic — only the base pointers move.
+//
+// Bit-identical to the single-row launch by construction. Every block already recomputes
+// the whole row's sum of squares, so nothing about a row's arithmetic depends on how many
+// other rows are in flight, and at gridDim.y == 1 blockIdx.y is 0 and the offset vanishes.
 template <int BLOCK, bool UNROLL>
 __global__ void rms_norm_wide_kernel(float* __restrict__ out, const float* __restrict__ x,
                                      const float* __restrict__ w, int n, float eps,
-                                     int n4, int vec4, int span_units) {
+                                     int n4, int vec4, int span_units,
+                                     long long row_stride) {
     k3_pdl_sync();
     __shared__ float shm[BLOCK / 32 + 1];
+    // Row this block serves. Zero-cost on the single-row path.
+    const long long row_off = (long long)blockIdx.y * row_stride;
+    x   += row_off;
+    out += row_off;
 
     float acc = 0.0f;
     if (threadIdx.x < 128) {
@@ -4187,6 +4215,11 @@ void k3_mla_kv_store_f32(float* cache, const float* kv_cmpr_normed,
 void k3_bump_pos(int* d_pos, cudaStream_t stream) {
     if (!d_pos) return;
     k3_pdl_launch(1, 1, 0, stream, bump_pos_kernel, d_pos);
+}
+
+void k3_add_pos(int* d_pos, int delta, cudaStream_t stream) {
+    if (!d_pos || delta == 0) return;
+    k3_pdl_launch(1, 1, 0, stream, add_pos_kernel, d_pos, delta);
 }
 
 // TWO LENGTHS, AND THE SPLIT BETWEEN THEM IS THE WHOLE POINT.
@@ -5018,7 +5051,19 @@ static inline bool rms_norm_aligned16(const void* p) {
 
 void rms_norm_f32(float* out, const float* x, const float* w, int n, float eps,
                   cudaStream_t stream) {
-    if (n <= 0) return;
+    rms_norm_f32_rows(out, x, w, n, eps, 1, 0, stream);
+}
+
+// `rows` rows of `n` elements, `row_stride` apart, in ONE launch. rows == 1 with stride 0
+// is the single-row call and takes an identical path, so this is not a second
+// implementation to keep in step — it IS the implementation.
+//
+// Returns false, never a wrong answer, when the geometry would not take the wide-kernel
+// path the batching relies on (the narrow fallback below is single-row only). The caller
+// then loops, which is what it did before.
+bool rms_norm_f32_rows(float* out, const float* x, const float* w, int n, float eps,
+                       int rows, long long row_stride, cudaStream_t stream) {
+    if (n <= 0 || rows <= 0) return false;
 
     // At BLOCK==128 with no vec4 the wide kernel is the original kernel (same 128-thread
     // sum, same 128-thread apply), so that path stays on rms_norm_kernel for a one-line
@@ -5062,24 +5107,29 @@ void rms_norm_f32(float* out, const float* x, const float* w, int n, float eps,
     }
 
     if (grid == 1u && !rmsu && block == 128 && !vec4) {
+        // rms_norm_kernel is a DIFFERENT reduction from the wide one, and it has no token
+        // axis. Batching through it would change the arithmetic, so decline and let the
+        // caller loop rather than quietly emit different numbers.
+        if (rows > 1) return false;
         k3_pdl_launch(1, 128, 0, stream, rms_norm_kernel<128>, out, x, w, n, eps);
-        return;
+        return true;
     }
 
 #define K3_RMSN(BLK)                                                                   \
     do {                                                                               \
         if (rmsu)                                                                      \
-            k3_pdl_launch(grid, (BLK), 0, stream, rms_norm_wide_kernel<(BLK), true>,   \
-                          out, x, w, n, eps, n4, vec4 ? 1 : 0, span_units);            \
+            k3_pdl_launch(g2, (BLK), 0, stream, rms_norm_wide_kernel<(BLK), true>,    \
+                          out, x, w, n, eps, n4, vec4 ? 1 : 0, span_units, row_stride); \
         else                                                                           \
-            k3_pdl_launch(grid, (BLK), 0, stream, rms_norm_wide_kernel<(BLK), false>,  \
-                          out, x, w, n, eps, n4, vec4 ? 1 : 0, span_units);            \
+            k3_pdl_launch(g2, (BLK), 0, stream, rms_norm_wide_kernel<(BLK), false>,   \
+                          out, x, w, n, eps, n4, vec4 ? 1 : 0, span_units, row_stride); \
     } while (0)
+    const dim3 g2(grid, (unsigned)rows);
     switch (launch_block) {
-        case 1024: K3_RMSN(1024); return;
-        case 512:  K3_RMSN(512);  return;
-        case 256:  K3_RMSN(256);  return;
-        default:   K3_RMSN(128);  return;
+        case 1024: K3_RMSN(1024); return true;
+        case 512:  K3_RMSN(512);  return true;
+        case 256:  K3_RMSN(256);  return true;
+        default:   K3_RMSN(128);  return true;
     }
 #undef K3_RMSN
 }

@@ -129,6 +129,19 @@ struct KimiK3TPRank {
     float* x_next = nullptr;         // [hidden]
     float* logits = nullptr;         // [vocab], rank 0 only
 
+    // ---- chunked prompt ingestion (kimi_k3_tp_forward_prompt) --------------
+    // The hidden pair, B tokens wide. Separate from x/x_next rather than a
+    // resize of them: the decode path's captured graph bakes x/x_next, so
+    // growing those would invalidate every recorded graph on the box.
+    float* xb = nullptr;             // [b_cap][hidden]
+    float* xnb = nullptr;            // [b_cap][hidden]
+    // The chunk's base position, ON THE DEVICE. The per-layer reset of d_pos has
+    // to be stream-ordered — a host memcpy per layer per rank would be 93 * 8
+    // synchronising copies per chunk on the critical path — so the base lives in
+    // device memory and the reset is a 4-byte D2D copy.
+    int*   d_pos_base = nullptr;
+    int    b_cap = 0;
+
     // THE CANONICAL ASSIGNMENT OF THE x/x_next PAIR, AND WHY IT HAS TO EXIST.
     //
     // Phase 3 swaps x and x_next once per layer. 93 layers is an ODD number, and rank 0
@@ -196,6 +209,15 @@ struct KimiK3TP {
     int n_coll_slots = 1;
     std::vector<float*> orig_moe;        // scratch pointer, restored at free
     std::vector<float*> orig_attn;       // same, for the attention partial
+
+    // Prefill tile scratch: the per-rank tile buffers and the per-token residual
+    // banks kimi_k3_tp_prefill needs. Allocated on the first prefill call and
+    // released by kimi_k3_tp_free, so a decode-only run never pays for it.
+    //
+    // Opaque here on purpose. Naming the type would pull the prefill kernels'
+    // header into every translation unit that drives a decode step, and nothing
+    // outside the prefill driver has any business reaching into it.
+    struct K3PrefillPool* prefill = nullptr;
 };
 
 // Load the model once per rank, banding the routed experts. `devices` gives tp_size.
@@ -210,6 +232,65 @@ bool kimi_k3_tp_init(const GGUF& g, const KimiK3Config& cfg, const K3PlanOptions
 // order — the expert partials are reassociated by the reduce, so agreement is to
 // ~1 ulp, not bitwise. kimi_k3_tp_moe_check pins that bound.
 bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits);
+
+// TWO PROMPT-INGESTION DRIVERS LIVE HERE, AND THE SPLIT IS THE MEASUREMENT, NOT TASTE.
+//
+// kimi_k3_tp_prefill is the tile driver and the one that ships: it keeps CUDA graph
+// capture. kimi_k3_tp_forward_prompt is the chunked walk, which does not capture and
+// batches the COLLECTIVES instead. That second axis turned out not to be worth having:
+// under capture the host issues 0.08 ms of a token's 18.83 ms and the collectives cost
+// 0.01 ms, so the 1.77x the chunked walk measured for batched collectives was buying
+// back overhead that capture removes for free. It is kept as a control — it is the only
+// path that can isolate a collective effect — and not as a candidate.
+//
+// Both leave the same state behind and produce the same final logits.
+
+// Ingest a prompt, running the LAYER loop outside the TOKEN loop.
+//
+// WHAT THIS CHANGES, AND WHAT IT DOES NOT. Every token still computes exactly what
+// kimi_k3_tp_forward_token would compute for it, in the same order, against the same
+// KV cache and the same KDA recurrence — the inner loop walks tokens in sequence, which
+// is the order those recurrences require. What changes is that T tokens are resident at
+// one layer at a time, so a weight block can be read once and multiplied into T
+// activations instead of being re-streamed from HBM for every token. At ~22 GB of active
+// weights per token per rank that stream IS prefill's cost, which is why prefill tok/s
+// and decode tok/s are the same number today.
+//
+// `out_logits` (cfg.vocab floats) receives the LAST token's logits, so the caller can
+// sample from it exactly as it would after the final forward_token of a per-token loop.
+//
+// Falls back to the per-token path — never fails — for any prompt or geometry outside
+// the tile path's contract, so a caller gets a correct result either way and the only
+// observable difference is how long it took.
+bool kimi_k3_tp_prefill(KimiK3TP& p, const int* ids, int n_ids, float* out_logits);
+
+// ---------------------------------------------------------------------------
+// Chunked prompt ingestion.
+//
+// Ingests `n` prompt tokens and leaves `out_logits` holding the distribution
+// after the LAST of them — the same contract as calling kimi_k3_tp_forward_token
+// n times and keeping the final result, and the same state afterwards.
+//
+// SPARKINFER_K3_PREFILL_BATCH picks the chunk size B (default 1). At B == 1 this
+// runs the identical per-token phase sequence through a one-slot arena and is
+// bit-identical to the token loop, which is what makes it the control: any
+// divergence at B > 1 is the batching, not the batched code.
+//
+// WHAT BATCHING BUYS, AND WHAT IT DOES NOT. Measured on 8x H200 at 1k context,
+// same binary and session: with CUDA graph capture ON the host issues 0.08 ms of
+// a token's 18.83 ms (0.4%) and the collectives cost 0.01 ms, because the graph
+// replays 2232 phase calls as 2. Prefill under capture is GPU-BOUND. So the
+// motivation is NOT fewer launches or fewer rendezvous — those are already free —
+// it is that every projection runs as an M=1 GEMV at ~13% of the bandwidth
+// roofline, and a chunk turns them into M=B GEMMs.
+//
+// That also sets the floor on B. Under 8-way expert sharding a rank holds 112 of
+// the 896 experts and sees ~2 of a token's 16 selections, so the rows per expert
+// reaching its MoE GEMM are B/56: a chunk of 8 leaves the tensor cores as idle as
+// a chunk of 1, and one full mma.m16n8k32 tile needs B ~ 896. Chunks here are
+// meant to be hundreds of tokens, not a handful.
+bool kimi_k3_tp_forward_prompt(KimiK3TP& p, const int* ids, int n,
+                               float* out_logits);
 
 void kimi_k3_tp_free(KimiK3TP& p);
 
