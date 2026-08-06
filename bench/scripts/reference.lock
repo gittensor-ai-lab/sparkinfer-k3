@@ -234,7 +234,21 @@ KIMI_K3_H200X8_IQ1S_LLAMA_32K_PP="${KIMI_K3_H200X8_IQ1S_LLAMA_32K_PP:-143.88}"
 # +25.4%, +24.5% and +5.3% which are -4.6%, -5.3% and -19.8% against the real number. Only
 # #133 measured main itself, and landed within 0.23% of the bot (53.14 vs 53.02).
 #
-# 69.02 -> 98.80 on 2026-08-06 with #148, the first BATCHED prompt ingestion: the layer
+# HELD AT 69.02, THE LAST VALUE AN EVAL ROUND MEASURED (main @ 2a6c66f9).
+#
+# #148 landed batched prompt ingestion after that round and measures 98.80 on the node --
+# same box, same weights, output bit-identical to the per-token walk at every chunk width.
+# That number is REAL and reproducible, but no round has sealed it, so the pin stays at the
+# last attested value until one does. The tier basis is what this slot is for, and it should
+# not move on a measurement the log cannot show you.
+#
+# KNOWN CONSEQUENCE, recorded rather than discovered later: main is faster than its own pin,
+# so the #141 claim gate is currently LENIENT here -- a PR claiming anything above 69.02 will
+# book the node even if main already beats it. That is the stale-low direction #146 was
+# written to avoid, accepted deliberately this once because an unattested pin is the worse
+# failure. The next round closes it.
+#
+# For the record, what #148 did: the layer
 # loop moves outside the token loop and a chunk of tokens goes through the kernels
 # together, so each weight tile is read once and spent on the whole chunk instead of once
 # per token. Same-binary against its own per-token walk, 32,768 real tokens: 69.41 ->
@@ -251,7 +265,7 @@ KIMI_K3_H200X8_IQ1S_LLAMA_32K_PP="${KIMI_K3_H200X8_IQ1S_LLAMA_32K_PP:-143.88}"
 # measure the CURRENT head, and say which commit -- see the notice reconcile_lock now emits
 # when a measured frontier overshoots its pin.
 # frontier: measured by eval/k3_eval_bot.py on main @ 2a6c66f9cb1d (h200x8, UD-IQ1_S). Do not hand-edit — the bot rewrites this each round.
-KIMI_K3_H200X8_IQ1S_SPARKINFER_32K_PP="${KIMI_K3_H200X8_IQ1S_SPARKINFER_32K_PP:-98.80}"
+KIMI_K3_H200X8_IQ1S_SPARKINFER_32K_PP="${KIMI_K3_H200X8_IQ1S_SPARKINFER_32K_PP:-69.02}"
 
 KIMI_K3_H200X8_LLAMA_128="${KIMI_K3_H200X8_LLAMA_128:-0}"
 KIMI_K3_H200X8_LLAMA_512="${KIMI_K3_H200X8_LLAMA_512:-0}"

@@ -163,10 +163,10 @@ now 3.08× ahead, and the untouched gap is ingestion:
 | @ 32k | tok/s | |
 |---|--:|---|
 | llama.cpp | **143.88** | batches the prompt |
-| sparkinfer | **98.80** | **1.46× behind** — it batches the prompt too, since #148 |
+| sparkinfer | **69.02** | **2.08× behind** — it batches the prompt too, since #148 |
 
 Prompt ingestion was one forward per token until #148 landed batched ingestion on
-2026-08-06 (69.02 → 98.80 at 32k). The gap to llama.cpp is now 1.46×, not 3.57×, and what
+2026-08-06 (the pinned frontier reached 69.02; the batched driver measures 98.80 unsealed). The gap to llama.cpp is 2.08× at the pin, not 3.57×, and what
 is left is the batching's own efficiency rather than its absence.
 
 Two consequences worth knowing before you start:

@@ -10,9 +10,10 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 - **Batched prefill** (#148) — prompt ingestion carried one token at a time through 93
   layers. The layer loop now sits outside the token loop, so a chunk of tokens goes
   through each kernel together and a weight tile is read once for the chunk instead of
-  once per token. **69.02 → 98.80 tok/s at 32k**, measured same-binary against its own
-  per-token walk, output bit-identical at every chunk width. llama.cpp's lead here falls
-  from 3.57× to 1.46×.
+  once per token. Measured same-binary against its own per-token walk at **98.80 tok/s at
+  32k**, output bit-identical at every chunk width. The pinned frontier stays at **69.02**,
+  the last value an eval round measured — 98.80 is real but unsealed, and the tier basis
+  does not move on a number the log cannot show you.
 
 ### Fixed
 
