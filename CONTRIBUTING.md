@@ -163,11 +163,11 @@ now 3.08× ahead, and the untouched gap is ingestion:
 | @ 32k | tok/s | |
 |---|--:|---|
 | llama.cpp | **143.88** | batches the prompt |
-| sparkinfer | **53.02** | **2.71× behind** |
+| sparkinfer | **98.80** | **1.46× behind** — it batches the prompt too, since #148 |
 
-There is no batched prefill: every prompt token goes through the single-token decode step,
-so a prompt costs what generating it costs. A 32,768-token prompt takes ~13.5 minutes to
-ingest before the first token appears. That is the work now being paid for.
+Prompt ingestion was one forward per token until #148 landed batched ingestion on
+2026-08-06 (69.02 → 98.80 at 32k). The gap to llama.cpp is now 1.46×, not 3.57×, and what
+is left is the batching's own efficiency rather than its absence.
 
 Two consequences worth knowing before you start:
 

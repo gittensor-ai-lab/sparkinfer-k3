@@ -32,7 +32,7 @@ $ KIMI_K3_MODEL=.../Kimi-K3-UD-IQ1_S-00001-of-00014.gguf \
 | ✅ **llama.cpp baseline** | **Measured on 8× H200**, pinned, backed by a committed sweep JSON |
 | ✅ **Eval + scoring** | Deterministic `eval:XS`..`eval:XL` from measured speed **and** KL/top-1 parity |
 | ✅ **Speed** | **3.08× faster than llama.cpp at the scored 128k context** (56.82 vs 18.44). Started 18× behind on 2026-08-01 |
-| ❌ **Prefill** | No batched prefill. Prompt ingestion is one forward per token |
+| ✅ **Prefill** | **Batched** since #148 — a chunk of prompt tokens goes through the kernels together. **98.80 tok/s @ 32k**, up from 40.35 on 2026-08-05 |
 | ❌ **Vision** | `mmproj` wired up, no image benchmark — M4 |
 
 ### The headline, stated plainly
@@ -333,7 +333,7 @@ Tests need no GPU: `python3 bench/scripts/test_kimi_k3_baseline.py` (117).
 
 ## Powered by SN74 — moving at the speed of ⚡
 
-Contributors submit PRs; the eval verifies correctness and speed **on an 8x H200 node**; SN74 rewards verified marginal speedups. The Qwen3.6 track this forks from reached **+86% decode / +127% prefill @ 32k** that way. K3 started 18x behind llama.cpp at the scored 128k context and is now **3.08x ahead** (56.82 vs 18.44) — every round a sealed receipt, reproducible from the log without trusting us.
+Contributors submit PRs; the eval verifies correctness and speed **on an 8x H200 node**; SN74 rewards verified marginal speedups. The Qwen3.6 track this forks from reached **+86% decode / +127% prefill @ 32k** that way. K3 started 18x behind llama.cpp at the scored 128k context and is now **3.08x ahead** (56.82 vs 18.44); prefill at 32k went 40.35 → **98.80** in two days once it became the scored metric — every round a sealed receipt, reproducible from the log without trusting us.
 
 1. Pick a narrow bottleneck in the Hopper decode path.
 2. Submit a PR with source changes and benchmark evidence.
@@ -363,8 +363,11 @@ that already works, not the thing that makes it work.
 - **Shard attention.** `ShardPolicy::ExpertsOnly` shards the experts and replicates
   attention, so TP scaling collapsed to ~1.1× once the MoE got 3× faster. Attention is
   now the whole serial term — `ShardPolicy::Full` is the main lever.
-- **Batched prefill.** There is none: prompt ingestion is one forward per token. At long
-  context that dominates, and none of the decode numbers speak to it.
+- **Batched prefill — landed (#148).** The layer loop moved outside the token loop, so a
+  chunk of tokens goes through each kernel together and a weight tile is read once for the
+  chunk instead of once per token. 69.02 → 98.80 tok/s at 32k, bit-identical to the
+  per-token walk. What remains is the batching's efficiency, not its absence: llama.cpp is
+  still 1.46× ahead here.
 - **CUDA-graph capture — landed (#89).** ~4,100 graph nodes per rank replay one captured
   token, re-planned as the MLA split count grows with depth. The single largest step in the
   ladder (+18%).

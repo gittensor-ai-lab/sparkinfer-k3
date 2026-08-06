@@ -3,6 +3,41 @@
 Notable changes to sparkinfer. Format loosely follows [Keep a Changelog](https://keepachangelog.com);
 versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkinfer/releases).
 
+## [Unreleased] — Batched prompt ingestion
+
+### Added
+
+- **Batched prefill** (#148) — prompt ingestion carried one token at a time through 93
+  layers. The layer loop now sits outside the token loop, so a chunk of tokens goes
+  through each kernel together and a weight tile is read once for the chunk instead of
+  once per token. **69.02 → 98.80 tok/s at 32k**, measured same-binary against its own
+  per-token walk, output bit-identical at every chunk width. llama.cpp's lead here falls
+  from 3.57× to 1.46×.
+
+### Fixed
+
+- **The mix took its two strides in the wrong order** (#148) — `attn_res_mix_f32` is
+  `(n_rows, act_row_stride, bank_row_stride, …)` and all three call sites passed
+  `(n_rows, bank_row, H)`, so activations were read at the bank's pitch and banks at the
+  activation's. It is invisible until the model is deep enough to bank twice: `bank_row`
+  is `res_bank_row_elems * max_ckpt`, `max_ckpt` is `ceil(n_layers / 12)`, so at ≤12
+  layers the two are equal and each wrong argument lands on the right value. `n_rows == 1`
+  never reads either, so decode and the per-token loop were always exact — the chunk
+  driver is the first caller to pass more than one row. Bisected on the 4-token probe:
+  bit-identical through 12 layers, KLD 1.64 at 14, 3.47 at 93.
+- **A gate documented default-off was read opt-out** (#148) —
+  `SPARKINFER_K3_KDA_QKVG_BATCH` says `DEFAULT OFF` in its own comment and again in
+  `kimi_k3_attn_batch_ok`, but `!(e && e[0] == '0')` made unset mean ON. Its sibling
+  `k3_kda_pre_batch_enabled()` eight lines below already had the opt-in form. With it on,
+  every chunk ≥ 2 tokens died with `LAUNCH FAILED at layer 0, phase Attn`.
+
+### Note on a retracted number
+
+#148 first measured **169.72 tok/s** and was rejected on accuracy. That number was
+produced with both defects above live, and the corrupted walk was *faster* because it was
+reading the wrong rows — the failure mode this codebase warns about repeatedly. **98.80**
+is what the same change does once it computes the right answer.
+
 ## [Unreleased] — CI retargeted for the H200×8 setup
 
 The seven workflows inherited from sparkinfer were SN74 competition governance for an

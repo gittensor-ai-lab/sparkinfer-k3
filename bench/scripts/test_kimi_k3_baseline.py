@@ -2335,7 +2335,7 @@ class CiWorkflowTest(unittest.TestCase):
             
             | | before (main) | after (this PR) |
             |---|--:|--:|
-            | prefill @ 32k | 53.02 | 62.00 |
+            | prefill @ 32k | 98.80 | 120.00 |
             | decode @ 128k | 56.82 | 56.79 |
             ## Checklist
             - [x] `bench/scripts/kimi_k3_baseline.sh --node h200x8 --dry-run` resolves
@@ -3276,7 +3276,7 @@ class CiWorkflowTest(unittest.TestCase):
                 "- [x] **Prefill measured at 32k** on 8× H200\n"
                 "- [x] **No 128k decode regression** on 8× H200\n"
                 "\n| | before (main) | after (this PR) |\n|---|--:|--:|\n"
-                "| prefill @ 32k | 53.02 | 62.00 |\n"
+                "| prefill @ 32k | 98.80 | 120.00 |\n"
                 "| decode @ 128k | 56.82 | 56.79 |\n")
         calls = []
 
@@ -3496,7 +3496,7 @@ class CiWorkflowTest(unittest.TestCase):
             
             | | before (main) | after (this PR) |
             |---|--:|--:|
-            | prefill @ 32k | 53.02 | 62.00 |
+            | prefill @ 32k | 98.80 | 120.00 |
             | decode @ 128k | 56.82 | 56.79 |
         """)
         pr = lambda **kw: {"isDraft": False, "labels": [], "body": body, **kw}
@@ -3530,7 +3530,7 @@ class CiWorkflowTest(unittest.TestCase):
                 "- [x] **Prefill measured at 32k** on 8× H200\n"
                 "- [x] **No 128k decode regression** on 8× H200\n"
                 "\n| | before (main) | after (this PR) |\n|---|--:|--:|\n"
-                "| prefill @ 32k | 53.02 | 62.00 |\n"
+                "| prefill @ 32k | 98.80 | 120.00 |\n"
                 "| decode @ 128k | 56.82 | 56.79 |\n")
         ok, _ = bot.eligibility({"isDraft": False, "body": body,
                                  "labels": [{"name": "needs-rebase"}]})
@@ -4091,7 +4091,7 @@ class PrefillAttestationTest(unittest.TestCase):
             ln if "Blocked" in ln else ln.replace("- [ ]", "- [x]")
             for ln in self._template_section().splitlines()
         ) + ("\n| | before (main) | after (this PR) |\n|---|--:|--:|\n"
-             "| prefill @ 32k | 53.02 | 62.00 |\n"
+             "| prefill @ 32k | 98.80 | 120.00 |\n"
              "| decode @ 128k | 56.82 | 56.79 |\n")
         ok, why = self._bot().eligibility(self._pr(sec))
         self.assertTrue(ok, why)
@@ -4170,7 +4170,7 @@ class AttestationNeedsEvidenceTest(unittest.TestCase):
 
     def test_measured_numbers_are_eligible(self):
         t = ("\n| | before (main) | after (this PR) |\n|---|--:|--:|\n"
-             "| prefill @ 32k | 53.02 | **62.00** |\n"
+             "| prefill @ 32k | 53.02 | **120.00** |\n"
              "| decode @ 128k | 56.82 | 56.79 |\n")
         ok, why = self._bot().eligibility(self._pr(t))
         self.assertTrue(ok, why)
@@ -4190,7 +4190,7 @@ class AttestationNeedsEvidenceTest(unittest.TestCase):
         the box says the regression was checked on 8x H200, and the guard exists precisely
         because prefill and decode share kernels."""
         t = ("\n| | before (main) | after (this PR) |\n|---|--:|--:|\n"
-             "| prefill @ 32k | 53.02 | 62.00 |\n"
+             "| prefill @ 32k | 98.80 | 120.00 |\n"
              "| decode @ 128k | 56.82 | **no change — no decode path is touched** |\n")
         ok, why = self._bot().eligibility(self._pr(t))
         self.assertFalse(ok)
@@ -4200,7 +4200,7 @@ class AttestationNeedsEvidenceTest(unittest.TestCase):
     def test_the_after_column_is_found_by_header_not_position(self):
         """#133 adds a delta column, so the measured value is not the last cell."""
         t = ("\n| | before (main) | after (this PR) | delta |\n|---|--:|--:|--:|\n"
-             "| prefill @ 32k | **53.02** | **62.00** | +16.9% |\n"
+             "| prefill @ 32k | **53.02** | **120.00** | +16.9% |\n"
              "| decode @ 128k | **56.81** | **56.80** | -0.02% |\n")
         ok, why = self._bot().eligibility(self._pr(t))
         self.assertTrue(ok, why)
