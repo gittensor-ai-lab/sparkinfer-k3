@@ -237,8 +237,8 @@ KIMI_K3_H200X8_IQ1S_LLAMA_32K_PP="${KIMI_K3_H200X8_IQ1S_LLAMA_32K_PP:-143.88}"
 # A seeded frontier is a claim about main that nobody measured. If one is unavoidable,
 # measure the CURRENT head, and say which commit -- see the notice reconcile_lock now emits
 # when a measured frontier overshoots its pin.
-# frontier: measured by eval/k3_eval_bot.py on main @ e1999272830f (h200x8, UD-IQ1_S). Do not hand-edit — the bot rewrites this each round.
-KIMI_K3_H200X8_IQ1S_SPARKINFER_32K_PP="${KIMI_K3_H200X8_IQ1S_SPARKINFER_32K_PP:-59.59}"
+# frontier: measured by eval/k3_eval_bot.py on main @ 23949db69fd9 (h200x8, UD-IQ1_S). Do not hand-edit — the bot rewrites this each round.
+KIMI_K3_H200X8_IQ1S_SPARKINFER_32K_PP="${KIMI_K3_H200X8_IQ1S_SPARKINFER_32K_PP:-66.62}"
 
 KIMI_K3_H200X8_LLAMA_128="${KIMI_K3_H200X8_LLAMA_128:-0}"
 KIMI_K3_H200X8_LLAMA_512="${KIMI_K3_H200X8_LLAMA_512:-0}"
