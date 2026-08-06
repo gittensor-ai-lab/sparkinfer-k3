@@ -23,6 +23,7 @@
 #include "sparkinfer/kernels/iq1s_tables.h"
 
 #include <cuda_runtime.h>
+#include <algorithm>   // std::shuffle — the batched-parity case picks distinct experts
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -322,6 +323,130 @@ int main() {
 
         cudaFree(dg); cudaFree(du); cudaFree(dd); cudaFree(dx);
         cudaFree(dw); cudaFree(did); cudaFree(dout); cudaFree(dscr);
+    }
+
+    // ------------------------------------------- 3. batched dispatch, BIT-IDENTITY
+    //
+    // THE ONLY CHECK THAT CAN FAIL THE PARITY CLAIM. The token-batched front door
+    // regroups the (token, slot) selections expert-major, which changes which warp
+    // computes what and in which order the rows of one expert are visited — but it is
+    // written to leave every output element's floating-point PROGRAM untouched. That
+    // is a byte-comparison claim, not a tolerance one, so this compares bytes: a relL2
+    // of 1e-7 here would mean the association moved and the claim is wrong.
+    //
+    // The shape matters. B must be large enough that experts genuinely collect several
+    // rows (otherwise the NR row tiling and the run-offset walk never execute their
+    // multi-row path), and n_expert must exceed top_k so the sort has empty buckets to
+    // skip. B=12 over 6 experts at top_k=3 gives 36 selections, ~6 rows per expert.
+    {
+        const int LAT = 512, FFN = 512, TOPK = 3, NEXP = 6, B = 12;
+        const int bpr_gu = LAT/256, bpr_d = FFN/256;
+        const float beta = 4.0f, lb = 25.0f;
+
+        std::vector<BlockIQ1S> hg((size_t)NEXP*FFN*bpr_gu), hu(hg.size()),
+                               hd((size_t)NEXP*LAT*bpr_d);
+        fill_blocks(hg, rng); fill_blocks(hu, rng); fill_blocks(hd, rng);
+
+        std::vector<float> x((size_t)B*LAT);
+        std::uniform_real_distribution<float> U(-1.f, 1.f);
+        for (auto& v : x) v = U(rng);
+
+        // Distinct experts within a token (the router never repeats one), and weights
+        // spanning the SPARKINFER_K3_MOE_WEPS default of 0.08 in both directions so the
+        // threshold's skip path is exercised on both sides of the comparison.
+        std::vector<int> ids((size_t)B*TOPK);
+        std::vector<float> w((size_t)B*TOPK);
+        std::uniform_real_distribution<float> W(0.01f, 0.9f);
+        for (int b = 0; b < B; ++b) {
+            std::vector<int> pool(NEXP);
+            for (int e = 0; e < NEXP; ++e) pool[e] = e;
+            std::shuffle(pool.begin(), pool.end(), rng);
+            for (int k = 0; k < TOPK; ++k) {
+                ids[(size_t)b*TOPK + k] = pool[k];
+                w[(size_t)b*TOPK + k] = W(rng);
+            }
+        }
+
+        void *dg, *du, *dd, *dws; float *dx, *dw, *da, *db, *dscr; int* did;
+        CU(cudaMalloc(&dg, hg.size()*50)); CU(cudaMalloc(&du, hu.size()*50));
+        CU(cudaMalloc(&dd, hd.size()*50));
+        CU(cudaMemcpy(dg, hg.data(), hg.size()*50, cudaMemcpyHostToDevice));
+        CU(cudaMemcpy(du, hu.data(), hu.size()*50, cudaMemcpyHostToDevice));
+        CU(cudaMemcpy(dd, hd.data(), hd.size()*50, cudaMemcpyHostToDevice));
+        CU(cudaMalloc(&dx, (size_t)B*LAT*4));
+        CU(cudaMemcpy(dx, x.data(), (size_t)B*LAT*4, cudaMemcpyHostToDevice));
+        CU(cudaMalloc(&dw, (size_t)B*TOPK*4));
+        CU(cudaMemcpy(dw, w.data(), (size_t)B*TOPK*4, cudaMemcpyHostToDevice));
+        CU(cudaMalloc(&did, (size_t)B*TOPK*4));
+        CU(cudaMemcpy(did, ids.data(), (size_t)B*TOPK*4, cudaMemcpyHostToDevice));
+        CU(cudaMalloc(&da, (size_t)B*LAT*4));      // per-token result
+        CU(cudaMalloc(&db, (size_t)B*LAT*4));      // batched result
+        CU(cudaMalloc(&dscr, (size_t)B*TOPK*FFN*4));
+        const size_t wsb = k3_moe_batch_ws_bytes(B, TOPK, NEXP);
+        CU(cudaMalloc(&dws, wsb));
+
+        // Both runs start from a ZEROED scratch, which is the invariant the runtime
+        // establishes once at allocation. A slot that neither run writes (band-foreign
+        // or below the weight threshold) therefore holds the same bytes in both, so a
+        // difference in the OUTPUT can only come from the arithmetic.
+        bool ok_ref = true;
+        CU(cudaMemset(dscr, 0, (size_t)B*TOPK*FFN*4));
+        for (int b = 0; b < B; ++b)
+            ok_ref &= moe_expert_ffn_f32_by_type(
+                da + (size_t)b*LAT, dscr + (size_t)b*TOPK*FFN, dx + (size_t)b*LAT,
+                did + (size_t)b*TOPK, dw + (size_t)b*TOPK, dg, du, dd,
+                LAT, FFN, TOPK, beta, lb, /*ggml_type=*/19, 0);
+        CU(cudaDeviceSynchronize());
+
+        CU(cudaMemset(dscr, 0, (size_t)B*TOPK*FFN*4));
+        const bool ok_bat = moe_expert_ffn_batch_f32_by_type(
+            db, LAT, dscr, (int64_t)TOPK*FFN, dx, LAT, did, dw, dg, du, dd,
+            LAT, FFN, TOPK, B, beta, lb, /*ggml_type=*/19, 0,
+            /*expert_begin=*/0, /*n_local_experts=*/0, /*n_expert_total=*/NEXP,
+            dws, wsb);
+        CU(cudaDeviceSynchronize());
+
+        std::vector<float> A((size_t)B*LAT), Bv((size_t)B*LAT);
+        CU(cudaMemcpy(A.data(),  da, (size_t)B*LAT*4, cudaMemcpyDeviceToHost));
+        CU(cudaMemcpy(Bv.data(), db, (size_t)B*LAT*4, cudaMemcpyDeviceToHost));
+
+        int diff = 0, nonfinite = 0; double worst = 0.0, rms = 0.0;
+        for (size_t i = 0; i < A.size(); ++i) {
+            if (!std::isfinite(A[i]) || !std::isfinite(Bv[i])) ++nonfinite;
+            if (std::memcmp(&A[i], &Bv[i], sizeof(float)) != 0) {
+                ++diff;
+                worst = std::fmax(worst, std::fabs((double)A[i] - (double)Bv[i]));
+            }
+            rms += (double)A[i] * (double)A[i];
+        }
+        rms = std::sqrt(rms / (double)A.size());
+        std::printf("\n[3] batched vs per-token dispatch, B=%d top_k=%d n_expert=%d\n",
+                    B, TOPK, NEXP);
+        std::printf("    both front doors accepted    : %s / %s\n",
+                    ok_ref ? "yes" : "NO", ok_bat ? "yes" : "NO");
+        std::printf("    elements differing (bytes)   : %d of %zu  (worst abs %.3e, RMS %.6g)\n",
+                    diff, A.size(), worst, rms);
+        if (!ok_ref || !ok_bat || diff || nonfinite || !(rms > 0)) ++g_fail;
+
+        // An unsupported type must DECLINE (so the caller falls back), not run.
+        const bool badt = moe_expert_ffn_batch_f32_by_type(
+            db, LAT, dscr, (int64_t)TOPK*FFN, dx, LAT, did, dw, dg, du, dd,
+            LAT, FFN, TOPK, B, beta, lb, /*ggml_type=*/12, 0, 0, 0, NEXP, dws, wsb);
+        // A short workspace must decline rather than write past it.
+        const bool badw = moe_expert_ffn_batch_f32_by_type(
+            db, LAT, dscr, (int64_t)TOPK*FFN, dx, LAT, did, dw, dg, du, dd,
+            LAT, FFN, TOPK, B, beta, lb, /*ggml_type=*/19, 0, 0, 0, NEXP, dws, wsb - 4);
+        // n_tok == 1 must decline: decode has to keep the per-token path.
+        const bool bad1 = moe_expert_ffn_batch_f32_by_type(
+            db, LAT, dscr, (int64_t)TOPK*FFN, dx, LAT, did, dw, dg, du, dd,
+            LAT, FFN, TOPK, 1, beta, lb, /*ggml_type=*/19, 0, 0, 0, NEXP, dws, wsb);
+        std::printf("    declines type/ws/n_tok=1     : %s / %s / %s\n",
+                    badt ? "NO -- BUG" : "yes", badw ? "NO -- BUG" : "yes",
+                    bad1 ? "NO -- BUG" : "yes");
+        if (badt || badw || bad1) ++g_fail;
+
+        cudaFree(dg); cudaFree(du); cudaFree(dd); cudaFree(dx); cudaFree(dw);
+        cudaFree(did); cudaFree(da); cudaFree(db); cudaFree(dscr); cudaFree(dws);
     }
 
     std::printf("\n%s\n", g_fail ? "FAIL" : "PASS: IQ1_S device path verified");

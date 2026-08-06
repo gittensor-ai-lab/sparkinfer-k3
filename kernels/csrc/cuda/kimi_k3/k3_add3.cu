@@ -61,15 +61,27 @@ namespace {
 // alias would be a lie it is entitled to act on. Only `b` is genuinely distinct, and it
 // is the only one marked. Nothing is lost — every address here is read once and written
 // once, so there is no reordering for __restrict__ to unlock.
+//
+// ROW AXIS (blockIdx.y). All five operands are row-major activations of the same width,
+// so all five are offset by the same row_stride; there is no shared weight here. Block
+// (bx, r) performs exactly what block bx performed, on row r — same block size, same
+// thread-to-element map, same two f32 operations in the same order. Elementwise, so
+// there is no reduction that could be re-partitioned.
 __global__ void add3_f32_kernel(float* out, float* out_ab,
                                 const float* a, const float* __restrict__ b,
-                                const float* c, int64_t n) {
+                                const float* c, int64_t n, int64_t row_stride) {
     k3_pdl_sync();
+    const int64_t roff = (int64_t)blockIdx.y * row_stride;
+    float* o_r = out + roff;
+    float* oab_r = out_ab + roff;
+    const float* a_r = a + roff;
+    const float* __restrict__ b_r = b + roff;
+    const float* c_r = c + roff;
     const int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
     if (i >= n) return;
-    const float ab = a[i] + b[i];
-    out_ab[i] = ab;
-    out[i] = c[i] + ab;
+    const float ab = a_r[i] + b_r[i];
+    oab_r[i] = ab;
+    o_r[i] = c_r[i] + ab;
 }
 
 __global__ void add3_rows_f32_kernel(float* out, float* out_ab,
@@ -88,18 +100,23 @@ __global__ void add3_rows_f32_kernel(float* out, float* out_ab,
 }  // namespace
 
 bool k3_add3_f32(float* out, float* out_ab, const float* a, const float* b,
-                 const float* c, int64_t n, cudaStream_t stream) {
+                 const float* c, int64_t n, cudaStream_t stream,
+                 int n_rows, int64_t row_stride) {
     static const bool want = [] {
         const char* e = std::getenv("SPARKINFER_K3_ADD3");
         return !(e && e[0] == '0');
     }();
     if (!want) return false;
-    if (!out || !out_ab || !a || !b || !c || n <= 0) return false;
+    if (!out || !out_ab || !a || !b || !c || n <= 0 || n_rows <= 0) return false;
+    // gridDim.y is capped at 65535; above it there is no equivalent launch, so decline
+    // rather than silently drop rows.
+    if (n_rows > 65535) return false;
     const int T = 256;
     const int64_t blocks = (n + T - 1) / T;
     if (blocks > 0x7fffffffLL) return false;
-    k3_pdl_launch((unsigned)blocks, T, 0, stream, add3_f32_kernel,
-                  out, out_ab, a, b, c, n);
+    if (row_stride == 0) row_stride = n;
+    k3_pdl_launch(dim3((unsigned)blocks, (unsigned)n_rows), T, 0, stream, add3_f32_kernel,
+                  out, out_ab, a, b, c, n, row_stride);
     return true;
 }
 

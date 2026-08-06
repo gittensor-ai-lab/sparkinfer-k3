@@ -52,22 +52,31 @@ __device__ __forceinline__ float sigmoidf_fused(float x) {
 
 // Same grid, same block, same arithmetic as kda_decay_gate_kernel — it just reads the
 // bias itself instead of being handed a buffer somebody wrote one launch earlier.
+//
+// ROW AXIS (blockIdx.y). g_raw and out are per-token activations and are offset by
+// blockIdx.y * row_stride; dt_bias and A are LEARNED PARAMETERS shared by every token
+// and are read at the same address for every row — offsetting them would be the bug.
+// One thread still owns exactly one (head, channel) of one row, and the arithmetic per
+// element is the same add and the same multiply in the same order, so widening cannot
+// move a bit.
 __global__ void kda_decay_gate_dt_kernel(float* __restrict__ out,
                                          const float* __restrict__ g_raw,
                                          const float* __restrict__ dt_bias,
                                          const float* __restrict__ A,
-                                         int head_dim, float lower_bound) {
+                                         int head_dim, float lower_bound,
+                                         int64_t row_stride) {
     k3_pdl_sync();   // no-op unless launched programmatically
     const int h = blockIdx.x;
     const int d = threadIdx.x;
     if (d >= head_dim) return;
     const size_t i = (size_t)h * head_dim + d;
+    const int64_t roff = (int64_t)blockIdx.y * row_stride;
     const float Ah = A[h];
     // One f32 add, exactly what add_f32_kernel stored — then the gate reads it as the
     // standalone kernel would have.
-    const float gr = g_raw[i] + dt_bias[i];
+    const float gr = g_raw[roff + i] + dt_bias[i];
     // g = lb * sigmoid(-(A * g_raw))
-    out[i] = lower_bound * sigmoidf_fused(-(Ah * gr));
+    out[roff + i] = lower_bound * sigmoidf_fused(-(Ah * gr));
 }
 
 }  // namespace
@@ -82,15 +91,18 @@ bool k3_kda_fuse_enabled() {
 
 bool k3_kda_decay_gate_dt(float* out, const float* g_raw, const float* dt_bias,
                           const float* A, int head_dim, int n_head, float lower_bound,
-                          cudaStream_t stream) {
+                          cudaStream_t stream, int n_rows, int64_t row_stride) {
     if (!k3_kda_fuse_enabled()) return false;
-    if (head_dim <= 0 || n_head <= 0 || !dt_bias) return false;
+    if (head_dim <= 0 || n_head <= 0 || n_rows <= 0 || !dt_bias) return false;
     // kda_decay_gate_f32 launches head_dim threads per head and guards d >= head_dim;
     // above the hardware block limit there is no equivalent launch, so decline.
     if (head_dim > 1024) return false;
-    k3_pdl_launch(dim3((unsigned)n_head), dim3((unsigned)head_dim), 0, stream,
-                  kda_decay_gate_dt_kernel, out, g_raw, dt_bias, A, head_dim,
-                  lower_bound);
+    // gridDim.y is capped at 65535; decline rather than silently drop rows.
+    if (n_rows > 65535) return false;
+    if (row_stride == 0) row_stride = (int64_t)head_dim * n_head;
+    k3_pdl_launch(dim3((unsigned)n_head, (unsigned)n_rows), dim3((unsigned)head_dim), 0,
+                  stream, kda_decay_gate_dt_kernel, out, g_raw, dt_bias, A, head_dim,
+                  lower_bound, row_stride);
     return true;
 }
 
