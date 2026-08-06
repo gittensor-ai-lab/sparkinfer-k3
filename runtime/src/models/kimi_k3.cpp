@@ -894,6 +894,30 @@ struct KimiK3Forward::Scratch {
     bool  lanes_ok = false;            // every lane object above was created
 
     std::vector<void*> owned;
+
+    // ---- PROMPT-BATCH SLABS --------------------------------------------------
+    //
+    // At batch_n = B every buffer above is allocated B times contiguously and
+    // kimi_k3_forward_aim_token repoints the field at slice b. That gives ISOLATION (token
+    // b's phases write only slice b, so the aliasing inside Scratch -- dense_gate/up/situ
+    // overlapping, proj_q8 rewritten per projection, proj_q8_lane off the main stream -- is
+    // preserved rather than re-reasoned about) and CONTIGUITY (slice b is base + b*n, the
+    // layout a batched kernel wants, with no gather).
+    //
+    // THE LIST IS BUILT BY THE ALLOCATOR, so a field added later is slabbed automatically.
+    // A hand-maintained one is the failure mode: a missed buffer is not a crash, it is B
+    // tokens quietly sharing an intermediate.
+    struct Slab {
+        void** slot;     // the field to repoint
+        size_t stride;   // bytes per token
+        void*  base;     // slice 0
+    };
+    int  batch_n = 1;    // 1 = not batched; the single-token path is untouched
+    int  batch_cur = 0;  // which slice the fields currently point at
+    // Recorded at allocation so aiming can re-derive moe_out/shexp_out without a cfg,
+    // which is not guaranteed non-null here.
+    int  expert_latent = 0;
+    std::vector<Slab> slabs;
 };
 
 // This rank's per-expert FFN width: the model's under whole-expert sharding, its
@@ -910,7 +934,8 @@ int k3_moe_ffn_local(const KimiK3Forward& fwd, const KimiK3Config& cfg) {
     return cfg.moe_ffn;
 }
 
-bool kimi_k3_forward_alloc_scratch(const KimiK3Config& cfg, KimiK3Forward& fwd) {
+bool kimi_k3_forward_alloc_scratch_n(const KimiK3Config& cfg, KimiK3Forward& fwd,
+                                     int batch_n) {
     fwd.s = new KimiK3Forward::Scratch();
     auto& s = *fwd.s;
     const int H = cfg.hidden;
@@ -918,23 +943,38 @@ bool kimi_k3_forward_alloc_scratch(const KimiK3Config& cfg, KimiK3Forward& fwd) 
     const int qh = cfg.n_q_heads;
     const int qk_nope = cfg.key_length_mla - cfg.rope_dim;
 
+    // B = 1 reproduces the single-token allocator exactly, which is what makes this safe
+    // on the decode path.
+    const int B = batch_n > 1 ? batch_n : 1;
+    s.batch_n = B;
+    s.expert_latent = cfg.expert_latent;
+
+    // Register a field for aiming. `n` is ONE TOKEN'S bytes, which is also the stride,
+    // because the slab is [B][n] contiguous.
+    auto reg = [&](void** slot, void* base, size_t n) {
+        if (B > 1) s.slabs.push_back(KimiK3Forward::Scratch::Slab{slot, n, base});
+    };
+
     auto alloc_f = [&](float*& ptr, size_t n) {
         void* p = nullptr;
-        if (cudaMalloc(&p, n * sizeof(float)) != cudaSuccess) return false;
+        if (cudaMalloc(&p, n * sizeof(float) * (size_t)B) != cudaSuccess) return false;
         s.owned.push_back(p);
         ptr = (float*)p;
+        reg((void**)&ptr, p, n * sizeof(float));
         return true;
     };
     auto alloc_i = [&](int*& ptr, size_t n) {
         void* p = nullptr;
-        if (cudaMalloc(&p, n * sizeof(int)) != cudaSuccess) return false;
+        if (cudaMalloc(&p, n * sizeof(int) * (size_t)B) != cudaSuccess) return false;
         s.owned.push_back(p);
         ptr = (int*)p;
+        reg((void**)&ptr, p, n * sizeof(int));
         return true;
     };
     auto alloc_bytes = [&](void*& ptr, size_t n) {
-        if (n == 0 || cudaMalloc(&ptr, n) != cudaSuccess) return false;
+        if (n == 0 || cudaMalloc(&ptr, n * (size_t)B) != cudaSuccess) return false;
         s.owned.push_back(ptr);
+        reg(&ptr, ptr, n);
         return true;
     };
 
@@ -985,9 +1025,10 @@ bool kimi_k3_forward_alloc_scratch(const KimiK3Config& cfg, KimiK3Forward& fwd) 
     // re-establishing it with a cudaMemsetAsync on every MoE layer. A rank's expert band
     // is fixed for the run and moe_gate_up writes only owned slots, so a foreign slot is
     // written by nobody and stays zero from this memset onward.
+    // The whole slab, not one slice: this is the only place the invariant is established.
     if (ok && s.moe_scratch)
         cudaMemset(s.moe_scratch, 0,
-                   (size_t)cfg.top_k * moe_ffn_local * sizeof(float));
+                   (size_t)cfg.top_k * moe_ffn_local * sizeof(float) * (size_t)B);
     // ONE ALLOCATION, TWO TENSORS, BECAUSE ONE COLLECTIVE COVERS BOTH.
     //
     // The expert accumulator (expert_latent) and the shared-expert partial (hidden)
@@ -1046,6 +1087,40 @@ bool kimi_k3_forward_alloc_scratch(const KimiK3Config& cfg, KimiK3Forward& fwd) 
     }
     lok &= cudaEventCreateWithFlags(&s.ev_fork, cudaEventDisableTiming) == cudaSuccess;
     s.lanes_ok = lok;
+    return true;
+}
+
+bool kimi_k3_forward_alloc_scratch(const KimiK3Config& cfg, KimiK3Forward& fwd) {
+    return kimi_k3_forward_alloc_scratch_n(cfg, fwd, 1);
+}
+
+int kimi_k3_forward_batch_n(const KimiK3Forward& fwd) {
+    return fwd.s ? fwd.s->batch_n : 1;
+}
+
+bool kimi_k3_forward_aim_token(KimiK3Forward& fwd, int b) {
+    if (!fwd.s) return false;
+    auto& s = *fwd.s;
+    if (s.batch_n <= 1) return b == 0;          // single-token scratch: only slice 0
+    if (b < 0 || b >= s.batch_n) return false;
+    for (const auto& sl : s.slabs)
+        *sl.slot = (void*)((char*)sl.base + (size_t)b * sl.stride);
+    // THE TWO DERIVED POINTERS. moe_out/shexp_out are not allocations — they are names
+    // for the halves of moe_fused, and the collective reduces from moe_fused's base
+    // with routed_norm/routed_up reading the latent prefix in place. Re-derive them
+    // from the slice, in the same order the allocator establishes them, or the MoE
+    // reduce reads token 0's latent for every token.
+    if (s.moe_fused) {
+        s.moe_out   = s.moe_fused;
+        s.shexp_out = s.moe_fused + s.expert_latent;
+    }
+    // The per-token state that lives outside Scratch. See K3BatchState on d_pos.
+    if (fwd.batch && fwd.state && b < fwd.batch->n_tok) {
+        if (fwd.batch->d_pos_base)    fwd.state->d_pos    = fwd.batch->d_pos_base + b;
+        if (fwd.batch->res_bank_base) fwd.state->res_bank =
+            fwd.batch->res_bank_base + (long)b * fwd.batch->res_bank_stride;
+    }
+    s.batch_cur = b;
     return true;
 }
 

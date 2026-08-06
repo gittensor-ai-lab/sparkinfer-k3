@@ -259,12 +259,12 @@ int main(int argc, char** argv) {
             return std::chrono::duration<double, std::milli>(
                        std::chrono::steady_clock::now() - t0).count();
         };
-        for (size_t i = 0; i < ids.size(); ++i) {
-            if (!kimi_k3_tp_forward_token(p, ids[i], logits.data())) {
-                std::printf("prompt token %zu (id %d) failed\n", i, ids[i]); return 1;
-            }
-            // Depth i+1 is now complete: these logits are the (i+1)-token prefix's answer.
-            const int depth = (int)i + 1;
+        // kimi_k3_tp_forward_prompt carries SPARKINFER_K3_PREFILL_BATCH tokens through
+        // each layer together; at 1 it is precisely the loop this replaces, so the
+        // PREFILL lines stay comparable across both. The dump callback fires at the end
+        // of the chunk that COMPLETES a requested depth, so a checkpoint must land on a
+        // chunk boundary to be exact -- which is why the chunk is cut at every depth.
+        auto on_depth = [&](int depth) -> bool {
             for (int L : checkpoints) {
                 if (L != depth) continue;
                 // Report the cumulative ingestion cost at this depth BEFORE the dump, so
@@ -288,6 +288,11 @@ int main(int argc, char** argv) {
                             L, b, logits[(size_t)b], path.c_str());
                 std::fflush(stdout);
             }
+            return true;
+        };
+        if (!kimi_k3_tp_forward_prompt(p, ids.data(), (int)ids.size(), logits.data(),
+                                       on_depth)) {
+            std::printf("prompt ingestion failed\n"); return 1;
         }
         // Whole-prompt ingestion: this is TTFT for a prompt of this length, minus load.
         {

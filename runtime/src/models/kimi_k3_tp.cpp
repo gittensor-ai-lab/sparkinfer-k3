@@ -327,7 +327,17 @@ bool kimi_k3_tp_init(const GGUF& g, const KimiK3Config& cfg, const K3PlanOptions
         R.fwd.state = &R.state;
         R.fwd.opt = out.opt;
         R.fwd.stream = R.stream;
-        if (!kimi_k3_forward_alloc_scratch(cfg, R.fwd)) {
+        // SPARKINFER_K3_PREFILL_BATCH=B widens every scratch buffer to a [B][n] slab so
+        // a chunked prefill can hold B tokens in flight. Unset or 1 is byte-for-byte the
+        // single-token allocator — the scored DECODE path must not move because a
+        // prefill feature exists, and that is checkable rather than asserted: with B > 1
+        // and every aim landing on slot 0, the logits must still match main exactly.
+        static const int prefill_batch = [] {
+            const char* e = std::getenv("SPARKINFER_K3_PREFILL_BATCH");
+            const int v = e ? std::atoi(e) : 1;
+            return (v >= 1 && v <= 64) ? v : 1;
+        }();
+        if (!kimi_k3_forward_alloc_scratch_n(cfg, R.fwd, prefill_batch)) {
             rank_err[(size_t)r] = "forward_alloc_scratch failed";
             return false;
         }
@@ -1219,6 +1229,281 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
     // doing it again here would double-advance and skip every other KV row.
     for (auto& R : p.ranks) ++R.state.position;
     return true;
+}
+
+
+// Chunked prompt ingestion — see kimi_k3_tp.h.
+//
+// Every kernel here is the single-token kernel at the single-token grid, in the same order,
+// and every collective is still one per token, so this is bit-identical to the forward_token
+// loop it replaces. The batched kernels land separately; arriving together would make a
+// parity failure unattributable.
+//
+// Graph capture is off on this path: the recorded decode graph is one token with one plan
+// baked in. A real cost, not hidden.
+bool kimi_k3_tp_forward_prompt(KimiK3TP& p, const int* ids, int n_ids, float* out_logits,
+                               const std::function<bool(int)>& on_depth) {
+    if (!ids || n_ids <= 0) return true;
+    static const int want_B = [] {
+        const char* e = std::getenv("SPARKINFER_K3_PREFILL_BATCH");
+        const int v = e ? std::atoi(e) : 1;
+        return (v >= 1 && v <= 64) ? v : 1;
+    }();
+    const int B = want_B;
+    const bool batched = B > 1 && !p.ranks.empty() &&
+                         kimi_k3_forward_batch_n(p.ranks[0].fwd) >= B;
+    if (!batched) {
+        for (int i = 0; i < n_ids; ++i) {
+            if (!kimi_k3_tp_forward_token(p, ids[i], out_logits)) return false;
+            if (on_depth && !on_depth(i + 1)) return false;
+        }
+        return true;
+    }
+
+    const KimiK3Config& cfg = p.cfg;
+    const int H = cfg.hidden;
+    const int tp_size = (int)p.ranks.size();
+
+    // The hidden pair and the positions live on the rank / runtime state, not in Scratch,
+    // so the slab machinery cannot reach them.
+    struct CR { std::vector<float*> xb, xb_next; float* bank; int* pos; long bank_stride; };
+    std::vector<CR> cr((size_t)tp_size);
+    bool ok = true;
+    for (int r = 0; r < tp_size && ok; ++r) {
+        KimiK3TPRank& R = p.ranks[(size_t)r];
+        CR& C = cr[(size_t)r];
+        C.bank = nullptr; C.pos = nullptr;
+        C.bank_stride = (long)H * R.state.max_ckpt;
+        if (cudaSetDevice(R.device) != cudaSuccess) { ok = false; break; }
+        C.xb.assign((size_t)B, nullptr); C.xb_next.assign((size_t)B, nullptr);
+        for (int b = 0; b < B && ok; ++b) {
+            if (cudaMalloc((void**)&C.xb[(size_t)b], (size_t)H * sizeof(float)) != cudaSuccess ||
+                cudaMalloc((void**)&C.xb_next[(size_t)b], (size_t)H * sizeof(float)) != cudaSuccess)
+                ok = false;
+        }
+        if (ok && C.bank_stride > 0 &&
+            cudaMalloc((void**)&C.bank, (size_t)C.bank_stride * B * sizeof(float)) != cudaSuccess)
+            ok = false;
+        if (ok && cudaMalloc((void**)&C.pos, (size_t)B * sizeof(int)) != cudaSuccess) ok = false;
+    }
+    if (!ok) std::fprintf(stderr, "[k3-prefill] FAIL: chunk buffer alloc\n");
+
+    // A rank left unbound would keep writing token 0's KV row for every token — silent.
+    std::vector<K3BatchState> bs((size_t)tp_size);
+    if (ok) for (int r = 0; r < tp_size; ++r) {
+        bs[(size_t)r].n_tok           = B;
+        bs[(size_t)r].d_pos_base      = cr[(size_t)r].pos;
+        bs[(size_t)r].res_bank_base   = cr[(size_t)r].bank;
+        bs[(size_t)r].res_bank_stride = cr[(size_t)r].bank_stride;
+        p.ranks[(size_t)r].fwd.batch  = &bs[(size_t)r];
+    }
+
+    std::vector<int> hpos((size_t)B);
+    for (int base = 0; base < n_ids && ok; base += B) {
+        const int n = (n_ids - base) < B ? (n_ids - base) : B;
+
+        for (int b = 0; b < n; ++b) hpos[(size_t)b] = p.ranks[0].state.position + b;
+        for (int r = 0; r < tp_size && ok; ++r) {
+            if (cudaSetDevice(p.ranks[(size_t)r].device) != cudaSuccess) { ok = false; break; }
+            if (cudaMemcpy(cr[(size_t)r].pos, hpos.data(), (size_t)n * sizeof(int),
+                           cudaMemcpyHostToDevice) != cudaSuccess) ok = false;
+        }
+        // n_ckpt advances with the LAYER index and is identical for every token in the
+        // chunk, so it is one host counter reset per chunk pass — exactly as forward_token
+        // resets it per token.
+        for (auto& R : p.ranks) R.state.n_ckpt = 0;
+
+        for (int b = 0; b < n && ok; ++b)
+            for (int r = 0; r < tp_size && ok; ++r) {
+                KimiK3TPRank& R = p.ranks[(size_t)r];
+                if (cudaSetDevice(R.device) != cudaSuccess) { ok = false; break; }
+                if (!kimi_k3_forward_aim_token(R.fwd, b)) {
+                    std::fprintf(stderr, "[k3-prefill] FAIL: aim b=%d (batch_n=%d)\n",
+                                 b, kimi_k3_forward_batch_n(R.fwd)); ok = false;
+                } else if (!embed_token(R.weights, cfg, ids[base + b],
+                                        cr[(size_t)r].xb[(size_t)b], R.stream)) {
+                    std::fprintf(stderr, "[k3-prefill] FAIL: embed b=%d\n", b); ok = false;
+                }
+            }
+
+        for (int layer = 0; layer < cfg.n_layers && ok; ++layer) {
+            const bool is_moe = layer >= cfg.leading_dense;
+            const bool kda_reduce = tp_size > 1 && cfg.is_kda_layer(layer) &&
+                KimiK3Weights::shards_kda(p.ranks[0].weights.policy);
+            const bool mla_reduce = tp_size > 1 && !cfg.is_kda_layer(layer) &&
+                KimiK3Weights::shards_mla(p.ranks[0].weights.policy);
+            const bool attn_reduce = kda_reduce || mla_reduce;
+
+            // n_ckpt ADVANCES PER LAYER, NOT PER TOKEN. A banked layer pushes a checkpoint
+            // in the Attn phase; that is a property of the layer, so the counter is rewound
+            // per token and advances once. Letting it advance per token trips the
+            // n_ckpt >= max_ckpt guard on token 1 of layer 0 -- or, with a larger max_ckpt,
+            // silently mixes over the wrong number of checkpoints.
+            const int n_ckpt_in = p.ranks[0].state.n_ckpt;
+            int n_ckpt_out = n_ckpt_in;
+
+            // One token at a time, so the KDA recurrence and the KV writes stay in order.
+            for (int b = 0; b < n && ok; ++b) {
+                for (auto& R : p.ranks) R.state.n_ckpt = n_ckpt_in;
+                for (int r = 0; r < tp_size && ok; ++r) {
+                    KimiK3TPRank& R = p.ranks[(size_t)r];
+                    if (cudaSetDevice(R.device) != cudaSuccess) { ok = false; break; }
+                    if (!kimi_k3_forward_aim_token(R.fwd, b)) { ok = false; break; }
+                    if (!kimi_k3_forward_layer_phase(R.fwd, layer, K3LayerPhase::Attn,
+                            cr[(size_t)r].xb[(size_t)b], cr[(size_t)r].xb_next[(size_t)b]))
+                        { std::fprintf(stderr, "[k3-prefill] FAIL: Attn L%d b%d\n", layer, b);
+                          ok = false; break; }
+                    if (!attn_reduce &&
+                        !kimi_k3_forward_layer_phase(R.fwd, layer, K3LayerPhase::FfnPartial,
+                            cr[(size_t)r].xb[(size_t)b], cr[(size_t)r].xb_next[(size_t)b]))
+                        { ok = false; break; }
+                }
+                if (!ok) break;
+                if (attn_reduce) {
+                    int count = 0;
+                    for (int r = 0; r < tp_size && ok; ++r) {
+                        int cn = 0;
+                        kimi_k3_forward_aim_token(p.ranks[(size_t)r].fwd, b);
+                        float* buf = kimi_k3_partial_buffer(p.ranks[(size_t)r].fwd, layer,
+                                                            K3LayerPhase::Attn, &cn);
+                        if (!buf || cn <= 0 || (r && cn != count)) { ok = false; break; }
+                        count = cn; p.reduce_bufs[(size_t)r] = buf;
+                    }
+                    if (ok && !p.coll->allreduce_f32_group(p.reduce_bufs, (size_t)count,
+                                                           p.streams)) ok = false;
+                    if (ok) ++p.n_collectives;
+                    for (int r = 0; r < tp_size && ok; ++r) {
+                        KimiK3TPRank& R = p.ranks[(size_t)r];
+                        if (cudaSetDevice(R.device) != cudaSuccess) { ok = false; break; }
+                        if (!kimi_k3_forward_aim_token(R.fwd, b) ||
+                            !kimi_k3_forward_layer_phase(R.fwd, layer, K3LayerPhase::FfnPartial,
+                                cr[(size_t)r].xb[(size_t)b], cr[(size_t)r].xb_next[(size_t)b]))
+                            ok = false;
+                    }
+                }
+                if (ok && is_moe && tp_size > 1) {
+                    int count = 0;
+                    for (int r = 0; r < tp_size && ok; ++r) {
+                        int cn = 0;
+                        kimi_k3_forward_aim_token(p.ranks[(size_t)r].fwd, b);
+                        float* buf = kimi_k3_partial_buffer(p.ranks[(size_t)r].fwd, layer,
+                                                            K3LayerPhase::FfnPartial, &cn);
+                        if (!buf || cn <= 0 || (r && cn != count)) { ok = false; break; }
+                        count = cn; p.reduce_bufs[(size_t)r] = buf;
+                    }
+                    if (ok && !p.coll->allreduce_f32_group(p.reduce_bufs, (size_t)count,
+                                                           p.streams)) ok = false;
+                    if (ok) ++p.n_collectives;
+                }
+                for (int r = 0; r < tp_size && ok; ++r) {
+                    KimiK3TPRank& R = p.ranks[(size_t)r];
+                    if (cudaSetDevice(R.device) != cudaSuccess) { ok = false; break; }
+                    if (!kimi_k3_forward_aim_token(R.fwd, b) ||
+                        !kimi_k3_forward_layer_phase(R.fwd, layer, K3LayerPhase::FfnFinish,
+                            cr[(size_t)r].xb[(size_t)b], cr[(size_t)r].xb_next[(size_t)b]))
+                        { std::fprintf(stderr, "[k3-prefill] FAIL: FfnFinish L%d b%d\n", layer, b);
+                          ok = false; break; }
+                    // The pair alternates per layer exactly as it does in forward_token.
+                    std::swap(cr[(size_t)r].xb[(size_t)b], cr[(size_t)r].xb_next[(size_t)b]);
+                }
+                n_ckpt_out = p.ranks[0].state.n_ckpt;
+            }
+            for (auto& R : p.ranks) R.state.n_ckpt = n_ckpt_out;
+        }
+
+        // The head, for the last token of the chunk only: ingestion throws the other B-1
+        // distributions away, and the head is the largest projection in the model.
+        //
+        // Duplicated from forward_token rather than factored out of it. Factoring would edit
+        // the decode path, and decode @131072 is the guard the round refuses to score
+        // without -- a prefill feature must not be able to move it.
+        if (ok) {
+            const KimiK3Weights& w0 = p.ranks[0].weights;
+            K3HeadBand hb0;
+            bool band_head = w0.output.ok() &&
+                             k3_head_band(cfg.vocab, (size_t)w0.output.n_bytes, tp_size, 0, &hb0);
+            if (band_head)
+                for (int r = 1; r < tp_size; ++r) {
+                    K3HeadBand hbr;
+                    const KimiK3Weights& wr = p.ranks[(size_t)r].weights;
+                    if (p.ranks[(size_t)r].logits && wr.output.ok() &&
+                        wr.output.n_bytes == w0.output.n_bytes &&
+                        k3_head_band(cfg.vocab, (size_t)wr.output.n_bytes, tp_size, r, &hbr))
+                        continue;
+                    band_head = false; break;
+                }
+
+            const int last = n - 1;
+            for (int r = 0; r < tp_size && ok; ++r) {
+                KimiK3TPRank& R = p.ranks[(size_t)r];
+                const KimiK3Weights& wr = R.weights;
+                if (cudaSetDevice(R.device) != cudaSuccess) { ok = false; break; }
+                // Aim so the mix reads THIS token's residual bank; n_ckpt is shared.
+                if (!kimi_k3_forward_aim_token(R.fwd, last)) { ok = false; break; }
+                float* hx  = cr[(size_t)r].xb[(size_t)last];
+                float* htm = cr[(size_t)r].xb_next[(size_t)last];
+                if (cfg.attn_res_block_size > 0) {
+                    if (!wr.has_output_res_score || !wr.output_res_score.ok()) { ok = false; break; }
+                    k3k::attn_res_mix_f32(htm, R.state.res_bank, hx,
+                                          (const float*)wr.output_res_score.data, H,
+                                          R.state.n_ckpt, cfg.rms_eps, R.stream);
+                    std::swap(hx, htm);
+                }
+                if (!wr.output_norm.ok()) { ok = false; break; }
+                k3k::rms_norm_f32(htm, hx, (const float*)wr.output_norm.data, H,
+                                  cfg.rms_eps, R.stream);
+                if (band_head) {
+                    K3HeadBand hb;
+                    if (!k3_head_band(cfg.vocab, (size_t)wr.output.n_bytes, tp_size, r, &hb) ||
+                        !k3k::k3_proj_f32(R.logits, htm,
+                            (const void*)((const char*)wr.output.data + hb.byte_off),
+                            wr.output.type, hb.rows, H, R.stream)) ok = false;
+                } else if (r == 0) {
+                    if (!wr.output.ok() ||
+                        !k3k::k3_proj_f32(R.logits, htm, wr.output.data, wr.output.type,
+                                          cfg.vocab, H, R.stream)) ok = false;
+                }
+            }
+
+            // Eager only -- nothing here is inside a capture.
+            if (ok && out_logits) {
+                if (band_head) {
+                    for (int r = 0; r < tp_size && ok; ++r) {
+                        KimiK3TPRank& R = p.ranks[(size_t)r];
+                        K3HeadBand hb;
+                        if (cudaSetDevice(R.device) != cudaSuccess ||
+                            !k3_head_band(cfg.vocab, (size_t)R.weights.output.n_bytes,
+                                          tp_size, r, &hb) ||
+                            cudaStreamSynchronize(R.stream) != cudaSuccess ||
+                            cudaMemcpy(out_logits + hb.offset, R.logits,
+                                       (size_t)hb.rows * sizeof(float),
+                                       cudaMemcpyDeviceToHost) != cudaSuccess) ok = false;
+                    }
+                } else {
+                    KimiK3TPRank& R0 = p.ranks[0];
+                    if (cudaSetDevice(R0.device) != cudaSuccess ||
+                        cudaStreamSynchronize(R0.stream) != cudaSuccess ||
+                        cudaMemcpy(out_logits, R0.logits, (size_t)cfg.vocab * sizeof(float),
+                                   cudaMemcpyDeviceToHost) != cudaSuccess) ok = false;
+                }
+            }
+        }
+
+        if (ok) {
+            for (auto& R : p.ranks) R.state.position += n;
+            if (on_depth && !on_depth(base + n)) ok = false;
+        }
+    }
+
+    for (auto& R : p.ranks) R.fwd.batch = nullptr;
+    for (int r = 0; r < tp_size && r < (int)cr.size(); ++r) {
+        cudaSetDevice(p.ranks[(size_t)r].device);
+        for (auto* q : cr[(size_t)r].xb)      if (q) cudaFree(q);
+        for (auto* q : cr[(size_t)r].xb_next) if (q) cudaFree(q);
+        if (cr[(size_t)r].bank) cudaFree(cr[(size_t)r].bank);
+        if (cr[(size_t)r].pos)  cudaFree(cr[(size_t)r].pos);
+    }
+    return ok;
 }
 
 void kimi_k3_tp_free(KimiK3TP& p) {
