@@ -124,8 +124,21 @@ bool k3_prefill_fill_qkvg(K3PrefillTile& t, const KimiK3LayerWeights& L,
         else
             cudaMemcpyAsync(mi, xi, (size_t)H * sizeof(float), cudaMemcpyDeviceToDevice,
                             stream);
-        k3k::rms_norm_f32(t.normed + (size_t)i * H, mi,
-                          (const float*)L.attn_norm.data, H, cfg.rms_eps, stream);
+    }
+    // ONE norm for the whole tile instead of n_tok of them. `mixed` and `normed` are both
+    // [tile][H], so the rows are H apart and the batched launch is the same kernel with a
+    // token axis — bit-identical to the loop it replaces, which is why this is a launcher
+    // change and not a numerics change.
+    //
+    // It declines rather than guessing for any geometry outside the wide kernel, and the
+    // loop below is the fallback. That path does not fire at K3's H (7168 is a multiple of
+    // 4 and the tile buffers are 16-byte aligned, so vec4 holds), but a shape that reached
+    // it would otherwise get a different reduction tree and silently different logits.
+    if (!k3k::rms_norm_f32_rows(t.normed, t.mixed, (const float*)L.attn_norm.data, H,
+                                cfg.rms_eps, n_tok, (long long)H, stream)) {
+        for (int i = 0; i < n_tok; ++i)
+            k3k::rms_norm_f32(t.normed + (size_t)i * H, t.mixed + (size_t)i * H,
+                              (const float*)L.attn_norm.data, H, cfg.rms_eps, stream);
     }
 
     // One quantise for the whole tile. Per row this is byte-for-byte what the decode path's

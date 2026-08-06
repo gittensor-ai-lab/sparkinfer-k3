@@ -819,6 +819,23 @@ size_t k3_moe_q8_k_bytes(int latent, int ffn, int top_k);
 void rms_norm_f32(float* out, const float* x, const float* w, int n, float eps,
                   cudaStream_t stream);
 
+// `rows` rows of `n`, `row_stride` elements apart, in ONE launch — the same kernel with a
+// token axis on gridDim.y, not a second implementation. rms_norm_f32 above is this with
+// rows == 1, so the two cannot drift.
+//
+// WHY IT EXISTS. rms_norm is 302 graph nodes per prefill token, 9% of a captured tile's
+// graph, and a captured tile's cost IS its node count (capture is worth 1.93x on a
+// 3308-node graph and 1.56x on a 61258-node one). T launches become one.
+//
+// Bit-identical to looping rms_norm_f32: every block already recomputes the whole row's
+// sum of squares, so a row's arithmetic does not depend on how many rows are in flight.
+//
+// Returns FALSE rather than a wrong answer for a geometry that would not take the wide
+// kernel — the narrow fallback is a different reduction with no token axis. The caller
+// loops in that case, which is what it did before.
+bool rms_norm_f32_rows(float* out, const float* x, const float* w, int n, float eps,
+                       int rows, long long row_stride, cudaStream_t stream);
+
 // ---------------------------------------------------------------------------
 // 16. Elementwise add (residual combine)
 // ---------------------------------------------------------------------------
