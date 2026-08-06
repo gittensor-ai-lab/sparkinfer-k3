@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cuda_runtime.h>
+#include <cstddef>
 
 namespace sparkinfer::kernels::k3 {
 
@@ -36,5 +37,22 @@ bool k3_mla_prefill_attention_kvf16(float* output, const float* query,
                                     int context, int heads, int key_length,
                                     int kv_lora, int value_dim, float scale,
                                     cudaStream_t stream);
+
+// Split-context path. Workspace holds one (max, denominator, latent) partial per
+// (token, head, split), and must remain live until work on `stream` completes.
+size_t k3_mla_prefill_attention_workspace_bytes(int tokens, int heads,
+                                                int kv_lora, int splits);
+
+bool k3_mla_prefill_attention_split_f32(
+    float* output, void* workspace, size_t workspace_bytes, const float* query,
+    const float* kv_cache, const float* wv_b, const float* gate, int start_pos,
+    int tokens, int context, int heads, int key_length, int kv_lora,
+    int value_dim, int splits, float scale, cudaStream_t stream);
+
+bool k3_mla_prefill_attention_split_kvf16(
+    float* output, void* workspace, size_t workspace_bytes, const float* query,
+    const void* kv_cache, const float* wv_b, const float* gate, int start_pos,
+    int tokens, int context, int heads, int key_length, int kv_lora,
+    int value_dim, int splits, float scale, cudaStream_t stream);
 
 }  // namespace sparkinfer::kernels::k3
