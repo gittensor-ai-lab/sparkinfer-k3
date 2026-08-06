@@ -635,15 +635,17 @@ COMMIT="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 # which used to surface as "reported label != re-derived: payload edited or harness version
 # mismatch", naming the two things that were not wrong. Publishing the bars lets the
 # workflow say which knob was moved instead of guessing.
+TOP1_BAR="${KIMI_K3_TOP1_BAR:-0.95}"
 KL_BAR="${KIMI_K3_KL_BAR:-0.05}"
 KL_PREFER="${KIMI_K3_KL_PREFER:-0.02}"
 
 PROV="$(python3 - "$NODE" "$DEVICES" "$LAYERS" "$MODEL" "$MSTOK" "$FINGERPRINT" \
         "${EXT_TOP1:+controller}" "$SCORED_CTX" "$KL_BAR" "$KL_PREFER" \
-        "$SCORED_METRIC" "$DECODE_TPS" "$DECODE_CTX" "$DECODE_GUARD_PCT" <<'PY'
+        "$SCORED_METRIC" "$DECODE_TPS" "$DECODE_CTX" "$DECODE_GUARD_PCT" "$TOP1_BAR" <<'PY'
 import json, sys, os
 node, devs, layers, model, mstok, fp, acc_src, ctx, kl_bar, kl_prefer = sys.argv[1:11]
 metric, decode_tps, decode_ctx, guard_pct = (sys.argv[11:15] + ["", "", "", ""])[:4]
+top1_bar = (sys.argv[15:16] + [""])[0]
 print(json.dumps({
     "node": node, "devices": devs, "layers": int(layers),
     "quant": os.path.basename(os.path.dirname(model)),
@@ -676,6 +678,10 @@ print(json.dumps({
     # allowlist would reject it if it were -- but the trusted re-derivation compares it to
     # its own pin, so a moved knob is named rather than inferred.
     "kl_bar": float(kl_bar),
+    # Recorded for the same reason as kl_bar: when the workflow and the box disagree about a
+    # verdict, the first question is which policy each ran, and a bar that is not in the
+    # payload turns that into guesswork.
+    **({"top1_bar": float(top1_bar)} if top1_bar else {}),
     "kl_prefer": float(kl_prefer),
 }, separators=(",", ":")))
 PY
@@ -712,6 +718,7 @@ if [[ "$CTX_SUFFIX" == *_PP ]]; then
 fi
 RESULT="$(env "${ANCHOR_ENV[@]}" \
     SPARKINFER_DIFFICULTY_REF="$LLAMA_REF" SPARKINFER_SCORED_CONTEXT="$SCORED_CTX" \
+    SPARKINFER_TOP1_BAR="$TOP1_BAR" \
     SPARKINFER_KL_BAR="$KL_BAR" \
     SPARKINFER_KL_PREFER="$KL_PREFER" \
     python3 "$HERE/label.py" "$TPS" "$FRONTIER" 0 "$TOP1" "$KL" "$COMMIT" "$PROV")"

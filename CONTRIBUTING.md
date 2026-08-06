@@ -46,8 +46,15 @@ K3's harness is `kimi_k3_*`.
 
 **Accuracy gate, and it runs FIRST.** `kimi_k3_eval.sh` compares your build's logits
 against the captured llama.cpp reference (`bench/refdata/`) on identical weights and
-identical token ids. `label.py` REJECTs below **top-1 0.90** or **mean KL 0.05** no matter
+identical token ids. `label.py` REJECTs below **top-1 0.95** or **mean KL 0.05** no matter
 how fast the run was — a speedup that erodes parity is not a speedup worth taking.
+
+In practice **top-1 is pass/fail, not a 5% tolerance.** Each probe dumps one logit row, so
+top-1 is `argmax_ref == argmax_ours` — a boolean — and the suite takes the worst depth. Any
+bar in (0, 1] behaves the same, and all 48 top-1 values in the sealed log are exactly `1.0`.
+Treat it as *the argmax must match at every depth*, and treat **KL as the graded gate**: it
+sums over all 163,840 vocab entries, so it moves long before an argmax flips (merged runs sit
+at 0.004–0.008 against the 0.05 bar).
 
 **It is measured at seven context depths.** The evaluator probes 4, 128, 256, 512, 1024,
 2048 and 4096 tokens — nested prefixes of one document — and takes the **worst**

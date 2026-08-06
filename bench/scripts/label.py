@@ -72,6 +72,39 @@ prov     = json.loads(sys.argv[7]) if len(sys.argv) > 7 and sys.argv[7] else {}
 # way the frontier is. That is a governance decision rather than a constant, and it has not
 # been taken. Do not tighten the floor toward main's number instead: at 2x measured parity
 # it would REJECT on ordinary run-to-run variation, which is how a gate stops being read.
+# 0.95, raised from 0.90 on 2026-08-06.
+#
+# READ THIS BEFORE TRUSTING THE NUMBER. The K3 probes dump ONE logit row per depth
+# (bench/refdata/*.spkl all carry n_tok=1), so top1_agreement is the mean of a single
+# boolean: it is 0.0 or 1.0 and nothing else, and k3_eval_bot aggregates with min() across
+# depths. Any bar in (0, 1] therefore behaves identically -- "the argmax must match exactly
+# at every depth". All 48 top1 values in the sealed log are exactly 1.0, and not one verdict
+# would change at 0.90, 0.95 or 0.99.
+#
+# So this raise tightens the STATED policy, not the executed one. It becomes a real 5%
+# tolerance only when a depth carries >= 20 rows; until then treat top-1 as a boolean and KL
+# as the graded gate -- KL sums over all 163,840 vocab entries and moves long before an
+# argmax flips, which is why sealed runs sit at 0.004-0.008 against a 0.05 bar.
+#
+# The gate is also weaker than it looks: 7 single-token trials means a change that really
+# corrupts 10% of argmaxes passes with probability 0.9^7 = 48%.
+# 0.90 is the QWEN TRACK'S bar and must stay loose for it, exactly as KL_BAR below is
+# Qwen's 0.20 while K3 pins 0.05 in kimi_k3_eval.sh and eval-label.yml. K3 pins 0.95 the same
+# way (2026-08-06). Do not raise this default to tighten K3 -- the Qwen path grades top-1
+# over many rows (accuracy.sh runs bars of 0.875 and 0.80), so a number that is inert for K3
+# is load-bearing there.
+#
+# READ THIS BEFORE TRUSTING K3'S NUMBER. The K3 probes dump ONE logit row per depth
+# (bench/refdata/*.spkl all carry n_tok=1), so top1_agreement is the mean of a single
+# boolean: 0.0 or 1.0 and nothing else, and k3_eval_bot aggregates with min() across depths.
+# Any bar in (0, 1] therefore behaves identically there -- "the argmax must match exactly at
+# every depth". All 48 top-1 values in K3's sealed log are exactly 1.0, and not one verdict
+# would change at 0.90, 0.95 or 0.99. It becomes a real 5% tolerance only when a depth
+# carries >= 20 rows; until then KL is K3's graded gate -- it sums over all 163,840 vocab
+# entries and moves long before an argmax flips.
+#
+# K3's gate is also weaker than it looks: 7 single-token trials means a change that really
+# corrupts 10% of argmaxes passes with probability 0.9^7 = 48%.
 TOP1_BAR  = float(os.environ.get("SPARKINFER_TOP1_BAR",  "0.90"))
 KL_BAR    = float(os.environ.get("SPARKINFER_KL_BAR",    "0.20"))
 KL_PREFER = float(os.environ.get("SPARKINFER_KL_PREFER", "0.15"))

@@ -135,6 +135,28 @@ jobs:
             const claims = tickedClaims(pr.body);
             const missingClaims = CLAIMS.filter(c => !claims.includes(c.key));
 
+            // A TICKED "BLOCKED" BOX IS AN ANSWER, NOT A MISSING NODE RUN.
+            //
+            // #144 measured both metrics on one binary, held the decode guard, verified
+            // parity bit-exact at 1k and 4k, then found parity FAILS at 32k, pasted the
+            // failing compare_logits output, and said do not merge on the perf number. To
+            // fit that in, the author restructured the body -- which cost the '## Node run'
+            // heading this scan keys on, so the loop told the most thorough submission in
+            // the queue that it had not touched a GPU.
+            //
+            // Read from the WHOLE body rather than the node-run section, for exactly that
+            // reason: an author with something to disclose is the one most likely to have
+            // reorganised around it. The narrow body-wide scan that #74 abused was for
+            // CLEARING the label on an unproven claim; this only ever suppresses a nag on
+            // someone volunteering a defect, and it costs them the round either way.
+            const blocked = (pr.body || '').split('\n')
+              .some(ln => /-\s*\[\s*[xX]\s*\]/.test(ln) && /\bblocked\b/i.test(ln));
+            if (blocked) {
+              core.info(`#${num}: author marked this blocked — not asking for a node run`);
+              await setLabel(false);
+              return;
+            }
+
             async function setLabel(on) {
               const has = labels.includes(LABEL);
               if (on && !has) {

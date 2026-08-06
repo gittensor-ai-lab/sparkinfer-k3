@@ -1552,6 +1552,140 @@ class CiWorkflowTest(unittest.TestCase):
         # one is still caught.
         self.assertNotIn("XL", {label(59.06), label(59.06, "off")})
 
+    def test_a_self_declared_block_skips_instead_of_demanding_a_node_run(self):
+        """#144 measured prefill 63.28 vs 59.07 on one binary, held the decode guard, verified
+        parity bit-exact at 1k and 4k -- then found parity FAILS at 32k, pasted the failing
+        compare_logits output into the body, and said do not merge on the perf number. The
+        most careful submission in the queue.
+
+        The template had nowhere to put that, so the author restructured the body, which cost
+        the '## Node run' heading the attestation scan keys on, and the PR was labelled
+        needs-node-run. The loop told someone who had run more experiments than anyone that
+        they had not touched a GPU.
+
+        Both readers now take a ticked Blocked box from the WHOLE body, not from the node-run
+        section -- an author with something to disclose is the one most likely to have
+        reorganised around it."""
+        bot = self._bot()
+        # WITH the needs-node-run label already on it. That is the state the mechanism has to
+        # win from: #144 was labelled before it could adopt the box, and a blocked declaration
+        # that loses to a stale label reports the same wrong reason it was meant to replace.
+        blocked = {"number": 1, "isDraft": False, "labels": [{"name": "needs-node-run"}],
+                   "body": "## Summary\n- [x] **Blocked — do not evaluate yet.** parity @32k\n"}
+        ok, why = bot.eligibility(blocked)
+        self.assertFalse(ok)
+        self.assertIn("marked this blocked", why)
+        # ...and it is not reported as a missing node run, which is the whole point.
+        self.assertNotIn("needs-node-run", why)
+        self.assertNotIn("has not attested", why)
+
+        # Unticked is the normal state and must not skip anything: the box is a declaration,
+        # not a keyword. #144's own body carried an UNTICKED "parity @32k — FAILS ... Blocking."
+        # line, and reading that as a block would let any mention of the word stop a round.
+        unblocked = dict(blocked, body="## Summary\n- [ ] **Blocked** — no\nblocked blocked\n")
+        self.assertNotIn("marked this blocked", bot.eligibility(unblocked)[1])
+
+        wf = (ROOT / ".github/workflows/node-attestation.yml").read_text()
+        self.assertIn("author marked this blocked", wf,
+                      "the label must not be applied to a PR that already said 'not yet'")
+        tpl = (ROOT / ".github/PULL_REQUEST_TEMPLATE.md").read_text()
+        self.assertIn("Blocked — do not evaluate yet", tpl)
+        self.assertIn("Known problems", tpl,
+                      "there has to be somewhere to write the defect that is not a "
+                      "machine-read section")
+
+    def test_the_template_never_hardcodes_a_frontier_number(self):
+        """A frontier quoted in a doc is stale the next time anything merges, and a stale one
+        is not a cosmetic error: #135, #136 and #138 were all optimised against a pin that
+        understated main by 31%, all measured honestly, and all landed under the bar.
+
+        The template used to print 'main does 40.35' directly. It now sends people to
+        reference.lock on main, and tells them to measure main themselves in the same session
+        as their own arm -- which is what kept #133's self-measured before within 0.2% of what
+        the node independently found."""
+        tpl = (ROOT / ".github/PULL_REQUEST_TEMPLATE.md").read_text()
+        for stale in ("40.35", "53.02", "56.8", "59.06"):
+            self.assertNotIn(stale, tpl,
+                             f"{stale} is a measurement with a shelf life — link the lock "
+                             f"instead of copying the number into a template")
+        self.assertIn("reference.lock", tpl)
+        self.assertIn("measure `main` yourself", tpl)
+
+    def test_merging_a_winner_advances_the_pin_in_the_same_breath(self):
+        """reconcile_lock only runs when a round STARTS, so between a merge and the next round
+        the pin describes the main that existed before the winner landed. After #133 that gap
+        was 53.02 pinned against ~59.06 on main.
+
+        A stale-low pin does not merely mislead. The pin is what the claim gate compares
+        against, so it makes the gate too LENIENT: a PR claiming 55 clears a 53.02 bar while
+        being slower than the main it would merge into, and buys ~25 GPU-minutes to find that
+        out."""
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        merge_at = src.index("if merge_winner(args.repo, winner")
+        after = src[merge_at:merge_at + 1600]
+        self.assertIn("reconcile_lock(args.repo, NODE, quant, winner_tps", after,
+                      "the pin has to move with the merge, not with the next round")
+        self.assertIn("winner_tps > 0", after,
+                      "a missing measurement must not write a zero frontier")
+
+    def test_the_top1_bar_is_095_everywhere_that_can_disagree(self):
+        """Three readers apply this bar -- label.py's default, the harness, and the workflow's
+        re-derivation -- and eval-label.yml REFUSES a payload whose label it cannot reproduce.
+        A bar that differs between them does not produce a wrong verdict, it produces
+        'payload edited' on every PR, so they are pinned together."""
+        # label.py's DEFAULT stays 0.90 -- that is the Qwen track's bar, and accuracy.sh
+        # grades top-1 there over many rows at 0.875/0.80, so raising the shared default to
+        # tighten K3 would silently tighten a gate whose numbers we have never measured.
+        # K3 pins its own, exactly as it pins KL 0.05 against label.py's Qwen default 0.20.
+        lp = (ROOT / "bench/scripts/label.py").read_text()
+        self.assertIn('SPARKINFER_TOP1_BAR",  "0.90"', lp)
+        ev = (ROOT / "bench/scripts/kimi_k3_eval.sh").read_text()
+        self.assertIn('TOP1_BAR="${KIMI_K3_TOP1_BAR:-0.95}"', ev)
+        self.assertIn('SPARKINFER_TOP1_BAR="$TOP1_BAR"', ev)
+        self.assertIn('"top1_bar": float(top1_bar)', ev,
+                      "the bar the box ran must be in the payload, or a disagreement is "
+                      "guesswork")
+        wf = (ROOT / ".github/workflows/eval-label.yml").read_text()
+        self.assertIn('TOP1_BAR = "0.05", "0.02", "0.95"', wf)
+        self.assertIn('env["SPARKINFER_TOP1_BAR"] = TOP1_BAR', wf)
+
+    def test_top1_is_a_boolean_because_every_probe_dumps_one_row(self):
+        """THE BAR IS NOT A 5% TOLERANCE AND THE DOCS MUST NOT IMPLY ONE.
+
+        compare_logits computes (argmax_ref == argmax_test).mean() over the rows in the .spkl,
+        and every reference file carries n_tok=1. The mean of one boolean is 0.0 or 1.0;
+        k3_eval_bot then takes min() across depths. So every bar in (0, 1] behaves identically
+        -- 'the argmax must match exactly at every depth' -- and all 48 top-1 values in the
+        sealed log are exactly 1.0.
+
+        This test fails the day a probe dumps more than one row, which is the point: at that
+        moment 0.95 starts to mean something and the prose below it has to be revisited."""
+        import struct
+        refs = sorted((ROOT / "bench/refdata").glob("*.spkl"))
+        self.assertTrue(refs, "no reference logits to check")
+        for f in refs:
+            with open(f, "rb") as fh:
+                self.assertEqual(fh.read(4), b"SPKL", f.name)
+                _, n_tok, _ = struct.unpack("<III", fh.read(12))
+            self.assertEqual(n_tok, 1,
+                             f"{f.name} now carries {n_tok} rows -- top-1 is no longer a "
+                             f"boolean, so revisit the 0.95 bar and the docs that call it "
+                             f"pass/fail")
+        for doc, needle in ((("CONTRIBUTING.md"), "top-1 is pass/fail"),
+                            (("README.md"), "effectively pass/fail")):
+            self.assertIn(needle, (ROOT / doc).read_text(),
+                          f"{doc} must not present the bar as a graded tolerance")
+
+    def test_the_docs_quote_k3s_own_kl_bar_not_the_qwen_default(self):
+        """README said 'KL <= 0.20' in two places. That is label.py's shared default, which is
+        the Qwen track's; K3 pins 0.05 in the harness and in eval-label.yml. Quoting 0.20
+        tells a K3 contributor their PR has 4x the parity headroom it really has."""
+        readme = (ROOT / "README.md").read_text()
+        self.assertNotIn("KL <= 0.20", readme)
+        self.assertNotIn("KL ≤ 0.20", readme)
+        self.assertIn("KL ≤ 0.05", readme)
+        self.assertIn("KL <= 0.05", readme)
+
     def test_decode_is_guarded_at_128k_even_though_prefill_is_scored(self):
         """Prefill and decode share kernels, so batching the prompt WILL move decode. The
         guard bounds how far, and it is a refusal rather than a tier: a prefill gain bought
@@ -2102,8 +2236,8 @@ class CiWorkflowTest(unittest.TestCase):
                       "the bar label.py is given must be the one recorded in provenance")
         self.assertIn('SPARKINFER_KL_PREFER="$KL_PREFER"', ev)
         wf = (ROOT / ".github/workflows/eval-label.yml").read_text()
-        self.assertIn('KL_BAR, KL_PREFER = "0.05", "0.02"', wf,
-                      "the trusted re-derivation would use the Qwen default and disagree")
+        self.assertIn('KL_BAR, KL_PREFER, TOP1_BAR = "0.05", "0.02", "0.95"', wf,
+                      "the trusted re-derivation would use the Qwen defaults and disagree")
 
     def test_a_moved_kl_knob_names_itself(self):
         """The harness bar is env-overridable and the workflow's is pinned, so a box running
@@ -3950,10 +4084,15 @@ class PrefillAttestationTest(unittest.TestCase):
         """The shipped template ships EMPTY measurement cells on purpose, so ticking every box
         without filling them is not enough -- see AttestationNeedsEvidenceTest. Fill them the
         way an author who actually ran it would."""
-        sec = (self._template_section().replace("- [ ]", "- [x]")
-               + "\n| | before (main) | after (this PR) |\n|---|--:|--:|\n"
-                 "| prefill @ 32k | 53.02 | 62.00 |\n"
-                 "| decode @ 128k | 56.82 | 56.79 |\n")
+        # Every box EXCEPT Blocked: that one is a declaration that something is wrong, so an
+        # author with three clean measurements leaves it alone. Ticking it is what #144 needed
+        # and is covered by its own test.
+        sec = "\n".join(
+            ln if "Blocked" in ln else ln.replace("- [ ]", "- [x]")
+            for ln in self._template_section().splitlines()
+        ) + ("\n| | before (main) | after (this PR) |\n|---|--:|--:|\n"
+             "| prefill @ 32k | 53.02 | 62.00 |\n"
+             "| decode @ 128k | 56.82 | 56.79 |\n")
         ok, why = self._bot().eligibility(self._pr(sec))
         self.assertTrue(ok, why)
 

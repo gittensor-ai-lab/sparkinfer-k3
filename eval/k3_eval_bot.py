@@ -174,6 +174,10 @@ def measured_values(section):
 # the outcome.
 CLAIM_SIG = float(os.environ.get("K3_CLAIM_SIG", "0.02"))
 
+# A ticked "Blocked" box. Deliberately loose about surrounding markup -- the authors who
+# need this are the ones whose bodies do not look like the template.
+BLOCKED_CLAIM = re.compile(r'\bblocked\b', re.I)
+
 
 def pinned_frontier(slot):
     """The pinned frontier for `slot`, from this checkout's reference.lock. None if absent."""
@@ -248,6 +252,25 @@ def eligibility(pr):
     labels = {l.get("name", "") for l in pr.get("labels") or []}
     if "hold" in labels:
         return False, "hold label set"
+
+    # THE AUTHOR SAYING "NOT YET" IS THE CHEAPEST SIGNAL THIS LOOP GETS, AND IT HAD NOWHERE
+    # TO GO.
+    #
+    # #144 measured prefill 63.28 vs 59.07 on one binary, held the decode guard, verified
+    # parity bit-exact at 1k and 4k -- and then found parity FAILS at 32k, wrote the failing
+    # compare_logits output into the body, and said "do not merge on the perf number until
+    # that resolves". The most careful submission in the queue. The template had no way to
+    # say that, so the author restructured the body, which cost the '## Node run' heading the
+    # attestation scan keys on, and the PR was labelled needs-node-run: the loop told someone
+    # who had run more experiments than anyone that they had not touched a GPU.
+    #
+    # Read from the WHOLE body, not the node-run section, precisely because an author with
+    # something to disclose is the one most likely to have reorganised around it.
+    if any(TICKED.search(ln) and BLOCKED_CLAIM.search(ln)
+           for ln in (pr.get("body") or "").splitlines()):
+        return False, ("the author marked this blocked — evaluating it would spend ~25 "
+                       "GPU-minutes to re-derive a number they already have and already "
+                       "said not to act on. Untick the box when it resolves")
 
     # A conflicted branch cannot be brought current, so it cannot be measured against a
     # frontier that is about to move under it, and it cannot be merged at the end. #64 sat in
@@ -2470,7 +2493,24 @@ def main():
     if args.merge_admin and mergeable:
         winner = max(mergeable, key=lambda r: r[1].get("tps") or 0)[0]
         by_num = {p["number"]: p for p in prs}
+        winner_tps = float(dict(mergeable).get(winner, {}).get("tps") or 0)
         if merge_winner(args.repo, winner, by_num.get(winner, {}), args.dry_run):
+            # THE PIN MUST MOVE WITH THE MERGE, NOT WITH THE NEXT ROUND.
+            #
+            # reconcile_lock only runs when a round starts, so between a merge and the next
+            # round the pin describes the main that existed BEFORE the winner landed. After
+            # #133 that gap was 53.02 pinned against ~59.06 on main -- 11.4% -- and the pin
+            # is what the claim gate compares against and what CONTRIBUTING tells authors to
+            # beat. A stale-low pin does not just mislead: it makes the gate too LENIENT, so
+            # a PR claiming 55 clears a 53.02 bar while being slower than the main it would
+            # merge into, and buys ~25 GPU-minutes to discover that.
+            #
+            # The value is the winner's own measurement, taken on the merge candidate against
+            # this round's frontier minutes earlier -- the most recent honest reading of what
+            # main is about to do. reconcile_lock still refuses to LOWER the pin, so a
+            # throttled box cannot walk the frontier down through this path either.
+            if winner_tps > 0:
+                reconcile_lock(args.repo, NODE, quant, winner_tps, main_sha, args.dry_run)
             # Only after something actually merged does the frontier move, so the rebase
             # sweep is conditional on the merge -- labelling everything needs-rebase after a
             # merge that was blocked would tell every contributor to redo work for nothing.
