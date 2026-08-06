@@ -9,7 +9,6 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
-#include <algorithm>
 #include <cstdlib>
 #include <set>
 #include <mutex>
@@ -2191,10 +2190,19 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
     if (do_attn) {
         // --- pre-attention mix, then bank push (raw pre-mix value) ---
         //
-        // BATCHED, in exactly the form the two FFN-side mixes already use: (a_tok,
-        // bank_row, H) appended. `out` and `cur` are token-major activations at H;
-        // `ckpts` is the CROSS-LAYER residual bank and moves by bank_row, which is a
-        // different pitch and is why the kernel takes two.
+        // BATCHED. `out` and `cur` are token-major activations and move by H; `ckpts`
+        // is the CROSS-LAYER residual bank and moves by bank_row. Two different pitches,
+        // which is why the kernel takes two -- and the ORDER is (n_rows, act_row_stride,
+        // bank_row_stride), not (n_rows, bank_row, H).
+        //
+        // ALL THREE MIX CALL SITES HAD THOSE TWO SWAPPED, and it hid because they are
+        // EQUAL until the model is deep enough to bank twice: bank_row is
+        // res_bank_row_elems * max_ckpt, max_ckpt is ceil(n_layers / 12), so at <= 12
+        // layers bank_row == H and each wrong argument lands on the right value. At 13+
+        // layers max_ckpt is 2, bank_row is 2H, and both strides are wrong -- the
+        // activations get read 2H apart and the banks H apart. n_rows == 1 never touches
+        // either stride, so decode, the token loop and a 1-token chunk were all exact.
+        // Bisected on the 4-token probe: bit-identical at 12 layers, KLD 1.64 at 14.
         //
         // n_ckpt STAYS A SCALAR, and that is a statement about the model rather than a
         // simplification: banking is a function of the LAYER (res_bs > 0 && layer %
@@ -2209,7 +2217,9 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
                 k3k::attn_res_mix_f32(s.mixed, st.res_bank, hidden_in,
                                       (const float*)L.attn_res_score.data, H, st.n_ckpt,
                                       eps, stream, s.res_scores, /*cur_b=*/nullptr,
-                                      /*sum_out=*/nullptr, a_tok, bank_row, H);
+                                      /*sum_out=*/nullptr, a_tok,
+                                      /*act_row_stride=*/H,
+                                      /*bank_row_stride=*/bank_row);
             }
             if (banked) {
                 if (st.n_ckpt >= st.max_ckpt) return false;
@@ -3039,7 +3049,8 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
                                   stream, s.res_scores,
                                   banked ? nullptr : attn_src,
                                   hidden_out,
-                                  n_tok, bank_row, H);
+                                  n_tok, /*act_row_stride=*/H,
+                                  /*bank_row_stride=*/bank_row);
         } else {
             if (banked) {
                 // ONE COPY FOR THE WHOLE CHUNK. hidden_out and s.attn_out are both
@@ -3063,7 +3074,9 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
                 k3k::attn_res_mix_f32(s.mixed2, st.res_bank, hidden_out,
                                       (const float*)L.ffn_res_score.data, H, st.n_ckpt,
                                       eps, stream, s.res_scores,
-                                      nullptr, nullptr, n_tok, bank_row, H);
+                                      nullptr, nullptr, n_tok,
+                                      /*act_row_stride=*/H,
+                                      /*bank_row_stride=*/bank_row);
             } else {
                 cudaMemcpyAsync(s.mixed2, hidden_out, (size_t)H * n_tok * sizeof(float),
                                 cudaMemcpyDeviceToDevice, stream);
