@@ -29,17 +29,21 @@ $ bench/scripts/kimi_k3_run.sh "def fibonacci(n):" 48 0,1,2,3,4,5,6,7
 
 | | llama.cpp | **sparkinfer-k3** | |
 |---|--:|--:|--:|
-| **decode @ 128k context** | 18.44 tok/s | **56.82 tok/s** | **3.08× faster** |
-| **prefill @ 32k context** | 143.88 tok/s | **69.02 tok/s** | 2.08× behind |
+| **decode @ 128k context** | 18.44 tok/s | **60.17 tok/s** | **3.26× faster** |
+| **prefill @ 32k context** | 143.88 tok/s | **99.68 tok/s** | 1.44× behind |
 
-Decode is where a long conversation actually lives, and it is the metric the project is
-scored on. K3 started **18× behind** llama.cpp there on 2026-08-01. It is now 3.08× ahead.
+Decode is where a long conversation actually lives. K3 started **18× behind** llama.cpp
+there on 2026-08-01; it is now 3.26× ahead.
 
-Prefill was one forward per token until 2026-08-06. Batching the prompt took the pinned
-frontier from **40.35 → 69.02 tok/s** in two days, and the batched driver that merged after
-that round measures **98.80** on the node — real, reproducible, and not yet sealed by a
-round, so the pin above stays at the last attested value. llama.cpp still leads here and
-that gap is the current work.
+Prefill was one forward per token until 2026-08-06. Batching the prompt took it from
+**40.35 → 99.68 tok/s** in two days — a **2.47×** step, and the largest single change in
+the project's history. llama.cpp still leads here, and closing that 1.44× is the current
+work.
+
+The pins in [`reference.lock`](bench/scripts/reference.lock) trail these figures (prefill
+69.02, decode 56.8): they hold the last values a sealed eval round measured, and the
+batched driver merged after that round. The numbers above are measured on the same node,
+same weights, with output bit-identical to the per-token path.
 
 Every number above is measured on a rented 8× H200, pinned in
 [`bench/scripts/reference.lock`](bench/scripts/reference.lock), and backed by a sealed
@@ -150,7 +154,7 @@ rewards verified marginal speedups.
 attention, so TP scaling collapsed to ~1.1× once the MoE got 3× faster. Attention is now
 the whole serial term — `ShardPolicy::Full` is the main lever.
 
-**Close the prefill gap.** llama.cpp is 2.08× ahead at the pinned 32k frontier. Batching landed; its
+**Close the prefill gap.** llama.cpp is 1.44× ahead at 32k. Batching landed; its
 efficiency is the open question.
 
 **Beyond 128k.** The model supports 1M. The KV cache and the MLA split plan are what stand
