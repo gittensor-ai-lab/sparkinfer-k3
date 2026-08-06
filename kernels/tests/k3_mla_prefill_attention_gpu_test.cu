@@ -7,13 +7,16 @@
 #include <vector>
 
 using sparkinfer::kernels::k3::k3_mla_prefill_attention_f32;
+using sparkinfer::kernels::k3::k3_mla_prefill_attention_supported;
 
 int main() {
     int ndev = 0;
     if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev == 0) {
         std::puts("k3_mla_prefill_attention_gpu_test: SKIP (no CUDA device)"); return 0;
     }
-    constexpr int T=5, C=12, S=7, H=3, K=11, L=7, V=5;
+    // H=5 exercises both a full four-head band and the ragged tail band.
+    constexpr int T=5, C=12, S=7, H=5, K=11, L=7, V=5;
+    assert(k3_mla_prefill_attention_supported(64, 32768, 12, 576, 512, 128));
     std::mt19937 rng(11); std::uniform_real_distribution<float> d(-0.2f,0.2f);
     std::vector<float> q((size_t)T*H*K), c((size_t)C*K), w((size_t)H*V*L), g((size_t)T*H*V);
     for (auto* a : {&q,&c,&w,&g}) for (float& x : *a) x=d(rng);
