@@ -65,6 +65,15 @@ struct K3PrefillTile {
     float* k      = nullptr;   // [tile][qkv] KDA attn_k
     float* v      = nullptr;   // [tile][qkv] KDA attn_v
     float* g      = nullptr;   // [tile][qkv] KDA ssm_g
+
+    // MLA tile staging. Unlike the KDA projection reuse above, these buffers bridge
+    // two explicit runtime phases: prepare writes every token's absorbed query and
+    // gate, the tiled attention fills mla_out, then finish applies o_proj.
+    float* mla_query = nullptr; // [tile][n_q_heads][key_length]
+    float* mla_gate  = nullptr; // [tile][n_q_heads][value_length_mla]
+    float* mla_out   = nullptr; // [tile][n_q_heads][value_length_mla]
+    void*  mla_workspace = nullptr;
+    size_t mla_workspace_bytes = 0;
     // Softmax scratch for attn_res_mix, [max_ckpt + 1]. Owned so the mix never falls
     // back to the cudaMallocAsync/cudaFreeAsync pair it uses when handed nullptr —
     // which is not merely slow here but uncapturable, and a tile is the unit a graph

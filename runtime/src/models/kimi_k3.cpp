@@ -1334,7 +1334,9 @@ static bool k3_check_launch(int layer, K3LayerPhase phase) {
     if (e == cudaSuccess) return true;
     const char* pn = phase == K3LayerPhase::All        ? "All"
                    : phase == K3LayerPhase::Attn       ? "Attn"
-                   : phase == K3LayerPhase::FfnPartial ? "FfnPartial" : "FfnFinish";
+                   : phase == K3LayerPhase::FfnPartial ? "FfnPartial"
+                   : phase == K3LayerPhase::MlaPrepare ? "MlaPrepare"
+                   : phase == K3LayerPhase::MlaFinish  ? "MlaFinish" : "FfnFinish";
     std::fprintf(stderr,
                  "[k3] LAUNCH FAILED at layer %d, phase %s: %s\n"
                  "     A kernel did not launch. Its output buffer still holds the "
@@ -1354,7 +1356,8 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
     cudaStream_t stream = fwd.stream;
     const float eps = cfg.rms_eps;
 
-    const bool do_attn   = (phase == K3LayerPhase::All || phase == K3LayerPhase::Attn);
+    const bool do_attn   = (phase == K3LayerPhase::All || phase == K3LayerPhase::Attn ||
+                            phase == K3LayerPhase::MlaPrepare);
     const bool do_ffn_p  = (phase == K3LayerPhase::All || phase == K3LayerPhase::FfnPartial);
     const bool do_ffn_f  = (phase == K3LayerPhase::All || phase == K3LayerPhase::FfnFinish);
 
@@ -1622,7 +1625,7 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
         return !(e && e[0] == '0');
     }();
     const K3PrefillTile* pt_hit = nullptr;
-    if (fwd.prefill_tile && want_tile_reuse && !fwd.debug) {
+    if (fwd.prefill_tile && want_tile_reuse && !fwd.debug && cfg.is_kda_layer(layer)) {
         // The debug taps read these buffers straight after the launch that wrote them,
         // and on a reuse there IS no such launch — the value was produced by the fill,
         // one call earlier. Localising a mismatch is the taps' whole job, so they get
@@ -1652,6 +1655,20 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
         tile_alias.kp = &s.qkv_k;      tile_alias.k0 = s.qkv_k;
         tile_alias.vp = &s.qkv_v;      tile_alias.v0 = s.qkv_v;
         tile_alias.gp = &s.g_proj_out; tile_alias.g0 = s.g_proj_out;
+    }
+
+    // Second half of tiled MLA attention. Prepare already performed the residual mix,
+    // bank push, projections and KV store; the tile kernel supplied the gated attention
+    // row. Only o_proj remains, producing the same Attn-phase partial as the ordinary
+    // path. Decode never selects this phase.
+    if (phase == K3LayerPhase::MlaFinish) {
+        if (cfg.is_kda_layer(layer) || !fwd.prefill_tile || fwd.prefill_tok < 0) return false;
+        const K3PrefillTile* pt = (const K3PrefillTile*)fwd.prefill_tile;
+        if (pt->layer != layer || fwd.prefill_tok >= pt->n_live || !pt->mla_out) return false;
+        const float* row = pt->mla_out +
+            (size_t)fwd.prefill_tok * qh * cfg.value_length_mla;
+        if (!proj(s.attn_out, row, L.attn_output, H, qh * cfg.value_length_mla)) return false;
+        return k3_check_launch(layer, phase);
     }
 
     if (do_attn) {
@@ -2107,6 +2124,27 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             // JOIN the KV lane. The decode kernel reads the row this token's store
             // just wrote, so this is the edge that makes the fork legal at all.
             if (mla_fork) dag_join(0);
+
+            if (phase == K3LayerPhase::MlaPrepare) {
+                if (!fwd.prefill_tile || fwd.prefill_tok < 0) return false;
+                K3PrefillTile* pt = (K3PrefillTile*)const_cast<void*>(fwd.prefill_tile);
+                if (fwd.prefill_tok >= pt->n_live || !pt->mla_query || !pt->mla_gate)
+                    return false;
+                float* qrow = pt->mla_query +
+                    (size_t)fwd.prefill_tok * qh * cfg.key_length;
+                cudaMemcpyAsync(qrow, s.absorbed_q,
+                                (size_t)qh * cfg.key_length * sizeof(float),
+                                cudaMemcpyDeviceToDevice, stream);
+                if (L.has_attn_gate) {
+                    float* grow = pt->mla_gate +
+                        (size_t)fwd.prefill_tok * qh * cfg.value_length_mla;
+                    if (!proj_h_on(l_gate, grow, s.normed, L.attn_gate,
+                                   qh * cfg.value_length_mla, H)) return false;
+                    if (mla_fork) dag_join(1);
+                }
+                k3_profiler().stop("attn_mla", stream);
+                return k3_check_launch(layer, phase);
+            }
 
             const float mla_scale = 1.0f / std::sqrt((float)cfg.key_length_mla);
             // host length: picks the launch plan only.

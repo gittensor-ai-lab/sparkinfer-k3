@@ -4,9 +4,11 @@
 #include "sparkinfer/models/kimi_k3_prefill.h"
 #include "sparkinfer/kernels/kimi_k3.h"
 #include "sparkinfer/kernels/kimi_k3_prefill.h"
+#include "sparkinfer/kernels/k3_mla_prefill_attention.h"
 
 #include <cstdio>
 #include <cstddef>
+#include <cstdlib>
 
 namespace sparkinfer {
 
@@ -53,6 +55,18 @@ bool k3_prefill_tile_alloc(const KimiK3Config& cfg, int tile, int qkv, int max_c
     ok = ok && alloc_f(t.k, (size_t)tile * Q);
     ok = ok && alloc_f(t.v, (size_t)tile * Q);
     ok = ok && alloc_f(t.g, (size_t)tile * Q);
+    const char* mla_env = std::getenv("SPARKINFER_K3_MLA_BATCH_PREFILL");
+    if (mla_env && mla_env[0] == '1') {
+        const size_t mla_q = (size_t)tile * cfg.n_q_heads * cfg.key_length;
+        const size_t mla_v = (size_t)tile * cfg.n_q_heads * cfg.value_length_mla;
+        ok = ok && alloc_f(t.mla_query, mla_q);
+        ok = ok && alloc_f(t.mla_gate, mla_v);
+        ok = ok && alloc_f(t.mla_out, mla_v);
+        t.mla_workspace_bytes = k3k::k3_mla_prefill_attention_workspace_bytes(
+            tile, cfg.n_q_heads, cfg.kv_lora_rank, 4);
+        if (ok && t.mla_workspace_bytes)
+            ok = cudaMalloc(&t.mla_workspace, t.mla_workspace_bytes) == cudaSuccess;
+    }
     if (ok) {
         const size_t qb = k3k::k3_prefill_act_q8_bytes(cfg.hidden, tile);
         ok = qb != 0 && cudaMalloc(&t.q8, qb) == cudaSuccess;
@@ -70,6 +84,8 @@ void k3_prefill_tile_free(K3PrefillTile& t) {
     auto f = [](void*& p) { if (p) { cudaFree(p); p = nullptr; } };
     f((void*&)t.x); f((void*&)t.x_next); f((void*&)t.mixed); f((void*&)t.normed);
     f((void*&)t.q); f((void*&)t.k); f((void*&)t.v); f((void*&)t.g);
+    f((void*&)t.mla_query); f((void*&)t.mla_gate); f((void*&)t.mla_out);
+    f(t.mla_workspace); t.mla_workspace_bytes = 0;
     f((void*&)t.res_scores); f(t.q8);
     t.tile = t.hidden = t.qkv = t.max_ckpt = 0;
     t.n_live = 0;

@@ -3,6 +3,7 @@
 #include "sparkinfer/models/kimi_k3_tp.h"
 
 #include "sparkinfer/kernels/kimi_k3.h"
+#include "sparkinfer/kernels/k3_mla_prefill_attention.h"
 #include "sparkinfer/models/k3_head_band.h"
 #include "sparkinfer/models/kimi_k3_prefill.h"
 #include "sparkinfer/tp/k3_coll_1bar.h"
@@ -10,6 +11,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
@@ -1782,7 +1784,89 @@ static bool k3_tp_prefill_tile(KimiK3TP& p, const int* ids, int T) {
         // returns the position to `base` so the next layer starts where this one did. An
         // absolute set would bake this tile's base into a captured graph and rewind every
         // replayed tile to the one it was recorded at — fluent output over wrong KV rows.
-        for (int t = 0; t < T; ++t) {
+        static const bool want_mla_batch = [] {
+            const char* e = std::getenv("SPARKINFER_K3_MLA_BATCH_PREFILL");
+            return e && e[0] == '1';
+        }();
+        const bool mla_batch = want_mla_batch && !cfg.is_kda_layer(layer) && T > 1;
+        if (mla_batch) {
+            // PREPARE all causal rows before attention: each call performs the normal
+            // residual mix/bank push, Q+KV projections, KV store and query absorption,
+            // but stops before the token-at-a-time decode attention.
+            for (auto& tl : pool.tiles) { tl.layer = layer; tl.n_live = T; }
+            for (int t = 0; t < T; ++t) {
+                set_tok(t);
+                if (!issue_all([&](int r) {
+                        KimiK3TPRank& R = p.ranks[(size_t)r];
+                        K3PrefillTile& tl = pool.tiles[(size_t)r];
+                        pick_slot(r, t);
+                        if (!kimi_k3_forward_layer_phase(
+                                R.fwd, layer, K3LayerPhase::MlaPrepare,
+                                tl.x + (size_t)t * H, tl.x_next + (size_t)t * H))
+                            return false;
+                        if (R.state.d_pos)
+                            k3k::k3_add_pos(R.state.d_pos,
+                                            (t + 1 < T) ? 1 : -(T - 1), R.stream);
+                        return true;
+                    })) return false;
+                save_ckpt(t);
+            }
+
+            const int context = base + T;
+            const int splits = context >= 2048 ? 4 : 1;
+            const float scale = 1.0f / std::sqrt((float)cfg.key_length_mla);
+            if (!issue_all([&](int r) {
+                    KimiK3TPRank& R = p.ranks[(size_t)r];
+                    K3PrefillTile& tl = pool.tiles[(size_t)r];
+                    const tp::MlaShardDims& md = R.weights.mla;
+                    const int qh = md.n_heads;
+                    const int ord = kimi_k3_mla_ordinal(cfg, layer);
+                    if (ord < 0 || !tl.mla_query || !tl.mla_out) return false;
+                    const float* gate = R.weights.layers[(size_t)layer].has_attn_gate
+                                      ? tl.mla_gate : nullptr;
+                    const float* wv = (const float*)R.weights.layers[(size_t)layer]
+                                          .attn_v_b.data;
+                    if (splits == 1) {
+                        return R.state.kv_f16
+                            ? k3k::k3_mla_prefill_attention_kvf16(
+                                  tl.mla_out, tl.mla_query,
+                                  R.state.mla_kv_cache[(size_t)ord], wv, gate, base, T,
+                                  context, qh, cfg.key_length, cfg.kv_lora_rank,
+                                  cfg.value_length_mla, scale, R.stream)
+                            : k3k::k3_mla_prefill_attention_f32(
+                                  tl.mla_out, tl.mla_query,
+                                  R.state.mla_kv_cache[(size_t)ord], wv, gate, base, T,
+                                  context, qh, cfg.key_length, cfg.kv_lora_rank,
+                                  cfg.value_length_mla, scale, R.stream);
+                    }
+                    return R.state.kv_f16
+                        ? k3k::k3_mla_prefill_attention_split_kvf16(
+                              tl.mla_out, tl.mla_workspace, tl.mla_workspace_bytes,
+                              tl.mla_query, R.state.mla_kv_cache[(size_t)ord], wv, gate,
+                              base, T, context, qh, cfg.key_length, cfg.kv_lora_rank,
+                              cfg.value_length_mla, splits, scale, R.stream)
+                        : k3k::k3_mla_prefill_attention_split_f32(
+                              tl.mla_out, tl.mla_workspace, tl.mla_workspace_bytes,
+                              tl.mla_query, R.state.mla_kv_cache[(size_t)ord], wv, gate,
+                              base, T, context, qh, cfg.key_length, cfg.kv_lora_rank,
+                              cfg.value_length_mla, splits, scale, R.stream);
+                })) return false;
+
+            // FINISH projects each gated tile result into the ordinary Attn partial.
+            for (int t = 0; t < T; ++t) {
+                set_tok(t);
+                if (!issue_all([&](int r) {
+                        KimiK3TPRank& R = p.ranks[(size_t)r];
+                        K3PrefillTile& tl = pool.tiles[(size_t)r];
+                        pick_slot(r, t);
+                        if (attn_reduce)
+                            aim(r, t, K3LayerPhase::Attn, w_attn, slot_attn, true);
+                        return kimi_k3_forward_layer_phase(
+                            R.fwd, layer, K3LayerPhase::MlaFinish,
+                            tl.x + (size_t)t * H, tl.x_next + (size_t)t * H);
+                    })) return false;
+            }
+        } else for (int t = 0; t < T; ++t) {
             set_tok(t);
             if (!issue_all([&](int r) {
                     KimiK3TPRank& R = p.ranks[(size_t)r];
