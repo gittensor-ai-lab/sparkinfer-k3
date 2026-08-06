@@ -2,6 +2,7 @@
 
 #include "sparkinfer/kernels/kimi_k3.h"
 #include "sparkinfer/kernels/kimi_k3_fast.h"
+#include "sparkinfer/models/k3_head_band.h"
 #include "sparkinfer/models/kimi_k3_gguf_manifest.h"
 #include "sparkinfer/tp/weight_residency.h"   // plan_tensor_residency for the sharded loader
 
@@ -815,6 +816,23 @@ struct KimiK3Forward::Scratch {
     // another CTA is still reading it). 14 KB buys the spread on 92 launches.
     float* moe_normed = nullptr;
 
+    // ---- per-token slots for the batched qkvg projection ---------------------
+    //
+    // SEVEN buffers, not the four the projection obviously needs, and the extra three are
+    // the correctness point. `mixed` is read again by the residual add and `normed` by
+    // ssm_f_a / ssm_beta, both AFTER the projection — so leaving either as shared scratch
+    // hands every token the LAST token's value. Fluent, wrong, and invisible to a timing
+    // run: the same hazard the phase-3 deferral note describes for ffn_out.
+    //
+    // batch_cap is the number of slots actually allocated. Zero means the batched path is
+    // unavailable and every phase runs its single-token form.
+    int    batch_cap = 0;
+    float* b_mixed  = nullptr;     // [cap][H]
+    float* b_normed = nullptr;     // [cap][H]
+    void*  b_act_q8 = nullptr;     // [cap][H/32] Q8_0 blocks
+    float* b_qkv_q  = nullptr, *b_qkv_k = nullptr, *b_qkv_v = nullptr;  // [cap][qkv]
+    float* b_g_proj = nullptr;     // [cap][qkv]
+
     // KDA
     float* qkv_q = nullptr, *qkv_k = nullptr, *qkv_v = nullptr;   // [qkv]
     float* conv_q = nullptr, *conv_k = nullptr, *conv_v = nullptr; // [qkv]
@@ -908,6 +926,76 @@ int k3_moe_ffn_local(const KimiK3Forward& fwd, const KimiK3Config& cfg) {
     if (fwd.w && fwd.w->shard.moe_2d && fwd.w->shard.moe_ffn > 0)
         return fwd.w->shard.moe_ffn;
     return cfg.moe_ffn;
+}
+
+// Its OWN switch, deliberately not SPARKINFER_K3_HEAD_BAND. The two reuse the same band
+// arithmetic but are different optimisations on different tensors, and sharing one env var
+// would make it impossible to A/B either of them alone.
+// DEFAULT OFF, and it has to stay off until the projection it bands goes through the same
+// kernel the unsharded path uses.
+//
+// Measured at ctx 1024: correct (same argmax at every depth, logits within ~1%) but 50.50
+// against 53.19 tok/s — a 5% LOSS, not the ~13% win the weight arithmetic predicts. The
+// cause is not the sharding. The unsharded call goes through the `proj` lambda, which
+// dispatches to the Q8-ACTIVATION kernels (k3_proj_q8soa_f32 / k3_proj_q8_multirow_1bar);
+// the banded call below goes straight to k3_proj_f32, the F32-activation kernel, which
+// reads unquantised activations and does considerably more work per row. So it cuts the row
+// count eightfold and hands the rows to a kernel expensive enough to more than eat the
+// saving — which is also why the result is not bit-identical.
+//
+// Turning this on by default before that is fixed would ship a measured regression. The fix
+// is to route the banded call through the same dispatch with N = the band's rows.
+bool k3_routed_up_band_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("SPARKINFER_K3_ROUTED_UP_BAND");
+        return e && e[0] == '1';
+    }();
+    return on;
+}
+
+bool kimi_k3_forward_alloc_proj_batch(const KimiK3Config& cfg, KimiK3Forward& fwd,
+                                      int n_tok) {
+    if (!fwd.s || n_tok <= 1) return false;
+    auto& s = *fwd.s;
+    if (s.batch_cap >= n_tok) return true;      // already wide enough
+    if (s.batch_cap != 0) return false;         // never grow: the old slots are live
+
+    const int H   = cfg.hidden;
+    const int qkv = cfg.n_q_heads * cfg.kda_head_dim;
+    // Q8_0 is 32 values per 34-byte block, and the activation is H wide.
+    const size_t q8_bytes_per_tok = (size_t)(H / 32) * 34u;
+
+    auto alloc_f = [&](float*& ptr, size_t n) {
+        void* p = nullptr;
+        if (cudaMalloc(&p, n * sizeof(float)) != cudaSuccess) return false;
+        s.owned.push_back(p);
+        ptr = (float*)p;
+        return true;
+    };
+    bool ok = true;
+    ok &= alloc_f(s.b_mixed,  (size_t)n_tok * H);
+    ok &= alloc_f(s.b_normed, (size_t)n_tok * H);
+    ok &= alloc_f(s.b_qkv_q,  (size_t)n_tok * qkv);
+    ok &= alloc_f(s.b_qkv_k,  (size_t)n_tok * qkv);
+    ok &= alloc_f(s.b_qkv_v,  (size_t)n_tok * qkv);
+    ok &= alloc_f(s.b_g_proj, (size_t)n_tok * qkv);
+    if (ok) {
+        void* p = nullptr;
+        ok = cudaMalloc(&p, (size_t)n_tok * q8_bytes_per_tok) == cudaSuccess;
+        if (ok) { s.owned.push_back(p); s.b_act_q8 = p; }
+    }
+    if (!ok) {
+        // Leave the machinery OFF rather than half-built. Everything allocated above is on
+        // the owned list and frees with the rest of scratch; batch_cap staying 0 is what
+        // makes every phase keep running its single-token form.
+        s.b_mixed = s.b_normed = nullptr;
+        s.b_qkv_q = s.b_qkv_k = s.b_qkv_v = s.b_g_proj = nullptr;
+        s.b_act_q8 = nullptr;
+        s.batch_cap = 0;
+        return false;
+    }
+    s.batch_cap = n_tok;
+    return true;
 }
 
 bool kimi_k3_forward_alloc_scratch(const KimiK3Config& cfg, KimiK3Forward& fwd) {
@@ -1079,6 +1167,20 @@ float* kimi_k3_partial_buffer(KimiK3Forward& fwd, int layer, K3LayerPhase phase,
         if (count) *count = cfg.hidden;
         return s.attn_out;
     }
+    if (phase == K3LayerPhase::FfnUp) {
+        // The banded up-projection's partial: hidden wide, and only a band of it is
+        // non-zero on any one rank (the rest was memset). The reduce sums the bands into
+        // the full result every rank needs before FfnTail.
+        //
+        // The leading dense layer has no routed_up at all — its FfnUp is a no-op — so it
+        // has nothing to reduce and says so with a null/0, exactly as FfnFinish does.
+        if (layer < cfg.leading_dense) {
+            if (count) *count = 0;
+            return nullptr;
+        }
+        if (count) *count = cfg.hidden;
+        return s.ffn_out;
+    }
     if (phase == K3LayerPhase::FfnPartial) {
         // The leading dense layer reduces ffn_down's full-width partial; every MoE
         // layer reduces the expert accumulator, which is LATENT wide. Two different
@@ -1108,6 +1210,12 @@ float* kimi_k3_swap_partial_buffer(KimiK3Forward& fwd, K3LayerPhase phase,
     if (phase == K3LayerPhase::Attn) {
         old = s.attn_out;
         s.attn_out = buf;
+    } else if (phase == K3LayerPhase::FfnUp) {
+        // The banded up-projection writes s.ffn_out, and the reduce that sums the bands
+        // has to run over a buffer the COLLECTIVE owns — passing this scratch straight to
+        // the collective reduces nothing and leaves every rank holding just its own band.
+        old = s.ffn_out;
+        s.ffn_out = buf;
     } else if (phase == K3LayerPhase::FfnPartial) {
         // The FUSED buffer moves, and both views move with it — they are offsets into
         // one reduced payload, so repointing the base alone would leave the shared
@@ -1178,7 +1286,16 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
 
     const bool do_attn   = (phase == K3LayerPhase::All || phase == K3LayerPhase::Attn);
     const bool do_ffn_p  = (phase == K3LayerPhase::All || phase == K3LayerPhase::FfnPartial);
-    const bool do_ffn_f  = (phase == K3LayerPhase::All || phase == K3LayerPhase::FfnFinish);
+    // FfnFinish is still both halves, so every existing caller is unchanged.
+    const bool do_ffn_up = (phase == K3LayerPhase::All || phase == K3LayerPhase::FfnFinish ||
+                            phase == K3LayerPhase::FfnUp);
+    const bool do_ffn_tl = (phase == K3LayerPhase::All || phase == K3LayerPhase::FfnFinish ||
+                            phase == K3LayerPhase::FfnTail);
+    const bool do_ffn_f  = do_ffn_up || do_ffn_tl;
+    // Band the up-projection ONLY when the caller asked for FfnUp on its own, because that
+    // is exactly the case where it has undertaken to reduce the bands afterwards. Under
+    // FfnFinish/All nobody is going to, so the full projection is the only correct answer.
+    const bool band_up = (phase == K3LayerPhase::FfnUp);
 
     const int H = cfg.hidden;
     // THIS RANK's KDA widths. Under every policy but ExpertsAndKda these are the
@@ -2006,8 +2123,14 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
     if (do_ffn_f) {
         // Set when the shared expert is present, i.e. when the layer's tail is the
         // adjacent PAIR of adds that k3_add3_f32 fuses.
-        bool fused_tail = false;
-        if (layer >= cfg.leading_dense) {
+        //
+        // DERIVED FROM THE LAYER, NOT SET BY THE BLOCK BELOW. It used to be assigned
+        // inside the up-projection block, which was fine while one call did both halves —
+        // but a FfnTail-only call does not enter that block, so the flag would read false
+        // and the shared expert would be silently dropped from the residual. The condition
+        // is a property of the layer, so it is written as one.
+        const bool fused_tail = (layer >= cfg.leading_dense) && L.has_shared_experts;
+        if (do_ffn_up && layer >= cfg.leading_dense) {
             // Post-collective: every rank must now hold the SAME complete expert sum,
             // equal to what tp=1 computed. If this tag differs, the dispatch or the
             // reduce is wrong; if it matches and ffn_out still differs, the fault is
@@ -2026,23 +2149,50 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             }
 
             if (fwd.debug) fwd.debug("dbg_moe_normed", layer, moe_src, cfg.expert_latent);
-            if (!proj(s.ffn_out, moe_src, L.ffn_routed_up, H, cfg.expert_latent))
+            // THE ONE REDUNDANT PROJECTION IN THE LAYER. ffn_routed_up is Replicate, so
+            // without a band every rank computes all 7168 rows of the identical result —
+            // 2.51 GB per token per rank over 92 layers, eight times over. The rows of a
+            // GGUF 2-D tensor are contiguous, so a band is a pointer offset and a smaller
+            // N; k3_head_band already does that arithmetic and is not head-specific.
+            K3HeadBand ub;
+            const bool up_banded =
+                band_up && L.ffn_routed_up.ok() &&
+                k3_routed_up_band_enabled() &&
+                k3_head_band(H, (size_t)L.ffn_routed_up.n_bytes,
+                             fwd.w->shard.tp_size, fwd.w->shard.rank, &ub);
+            if (up_banded) {
+                // ZEROING IS LOAD-BEARING, not hygiene. The reduce that follows sums every
+                // rank's FULL-WIDTH buffer, so every element outside this rank's band has
+                // to be exactly 0.0f or it is added eight times. Stale scratch here is a
+                // fluent wrong model, not a crash.
+                cudaMemsetAsync(s.ffn_out, 0, (size_t)H * sizeof(float), stream);
+                if (!k3k::k3_proj_f32(s.ffn_out + ub.offset, moe_src,
+                                      (const void*)((const char*)L.ffn_routed_up.data +
+                                                    ub.byte_off),
+                                      L.ffn_routed_up.type, ub.rows, cfg.expert_latent,
+                                      stream))
+                    return false;
+            } else if (!proj(s.ffn_out, moe_src, L.ffn_routed_up, H, cfg.expert_latent)) {
                 return false;
-            if (fwd.debug) fwd.debug("dbg_routed_up", layer, s.ffn_out, H);
+            }
+            if (fwd.debug && !up_banded) fwd.debug("dbg_routed_up", layer, s.ffn_out, H);
 
             // The shared expert was computed in phase FfnPartial and its partial has
             // been reduced along with the expert accumulator, so what is left here is
             // the add. Both contributions are at hidden width by this point:
             // ffn_routed_up lifted the latent, shexp_out was already hidden-wide.
-            if (L.has_shared_experts) {
-                if (fwd.debug) fwd.debug("dbg_shexp", layer, s.shexp_out, H);
-                // The shared-expert fold is issued BELOW, fused with the residual add
-                // that consumes it — see k3_add3.cu. `fused_tail` records that decision
-                // so the fallback path stays a single straight-line pair.
-                fused_tail = true;
-            }
+            if (L.has_shared_experts && fwd.debug)
+                fwd.debug("dbg_shexp", layer, s.shexp_out, H);
         }
-        k3_profiler().stop(layer < cfg.leading_dense ? "ffn_dense" : "ffn_moe", stream);
+        // Paired with the start that the phase issued, so it only stops on a call that
+        // actually opened it. A FfnTail-only call never did.
+        if (do_ffn_up)
+            k3_profiler().stop(layer < cfg.leading_dense ? "ffn_dense" : "ffn_moe", stream);
+
+        // Stop here when the caller only asked for the up-projection: the bands still have
+        // to be summed before the shared-expert fold and the residual add can read
+        // s.ffn_out, and issuing that reduce is the caller's job.
+        if (!do_ffn_tl) return k3_check_launch(layer, phase);
 
         // FFN residual is ALWAYS an add, never a replace. When the shared expert is
         // present its fold and this add are adjacent and share an operand, so they go

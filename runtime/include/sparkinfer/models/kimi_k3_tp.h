@@ -146,6 +146,53 @@ struct KimiK3TPRank {
     float* x_canon = nullptr;
     float* x_next_canon = nullptr;
 
+    // ---- chunked prefill state (kimi_k3_tp_forward_prompt) ------------------
+    //
+    // Empty unless kimi_k3_tp_init was given prefill_chunk > 1. A chunk carries B
+    // prompt tokens through one layer before moving to the next, so everything the
+    // single-token path keeps ONE of has to exist B times: the hidden pair, the
+    // cross-layer residual bank, and the position the KV store indexes with.
+    //
+    // The scratch inside KimiK3Forward is deliberately NOT duplicated. Token b's
+    // three phases run to completion on the stream before token b+1's begin, so the
+    // intermediates (normed, router, q/kv) are dead by then — only the values that
+    // outlive a layer are per-token.
+    std::vector<float*> xb, xb_next;   // [chunk] each [hidden]
+    // What xb/xb_next were when they were ALLOCATED. Phase 3 swaps a token's pair once
+    // per layer, so after 93 layers the pair is flipped; the uncaptured path does not
+    // care because aim() re-points the kernels at whatever xb[b] currently is, but a
+    // CAPTURED graph baked the addresses it saw. Without resetting to these at the top of
+    // every chunk, the next chunk's embed writes into the flipped buffer while the graph
+    // still reads the original — every chunk after the first attends to stale data, which
+    // is silent and fast rather than loud.
+    std::vector<float*> xb_canon, xb_next_canon;
+    std::vector<float*> res_bank_b;    // [chunk] each [hidden * max_ckpt]
+    // [chunk] ints, holding base+0 .. base+B-1. The kernels read the position from
+    // memory (see KimiK3RuntimeState::d_pos), so handing token b a POINTER TO ITS OWN
+    // SLOT is what gives B different positions inside one layer with no writes
+    // between tokens — the single-token path's bump_pos has nothing to do here.
+    int* d_pos_chunk = nullptr;
+    // What KimiK3RuntimeState held before a chunk re-aimed it. Saved at init, not
+    // captured on entry: a chunk that returned early through one of the forward's
+    // error paths would otherwise leave the state pointing into chunk buffers, and the
+    // next forward_token would decode against token B-1's residual bank.
+    int*   d_pos_single    = nullptr;
+    float* res_bank_single = nullptr;
+
+    // Captured chunk. The measurement that made this necessary: the chunk path amortises
+    // 185 collectives over B tokens and still lost, because leaving capture off costs
+    // ~3,449 eager launches per token per rank. At ctx 1024 the loop ran 18.81 ms/token
+    // and the uncaptured chunk 26.53 — a 7.72 ms/token regression against a ~6.9 ms
+    // predicted host-issue cost. The amortisation was real; the launch cost was larger.
+    //
+    // A chunk is capturable for the same reason the decode step is: everything that
+    // varies between chunks lives in DEVICE memory (the positions in d_pos_chunk) or is
+    // issued outside the captured region (the B embeds, and the head). The host-side
+    // pointer aiming repeats identically every chunk, so the addresses the graph bakes
+    // stay valid.
+    cudaGraph_t     chunk_graph = nullptr;
+    cudaGraphExec_t chunk_exec  = nullptr;
+
     // Per-rank capture. One graph per rank, because each rank owns its own stream and
     // its own device; they rendezvous inside the collective at replay time exactly as
     // they do eagerly.
@@ -196,13 +243,55 @@ struct KimiK3TP {
     int n_coll_slots = 1;
     std::vector<float*> orig_moe;        // scratch pointer, restored at free
     std::vector<float*> orig_attn;       // same, for the attention partial
+
+    // Tokens per chunked-prefill pass. 0/1 means the buffers above were never
+    // allocated and kimi_k3_tp_forward_prompt degrades to a forward_token loop —
+    // which is exactly what prompt ingestion is today, so the fallback is main's
+    // behaviour and not a second-class path.
+    int prefill_chunk = 0;
+    // The chunk graph is captured once and replayed. It is valid only for the B it was
+    // captured at and the MLA split plan it was captured under, so both are recorded and
+    // checked: the tail chunk of a prompt is a different B and runs eager, and a context
+    // that crosses a kMlaSplitMinCtx boundary throws the graph away exactly as the decode
+    // step does. chunk_ckpt is the checkpoint count a captured chunk ENDS on, replayed
+    // host-side because the graph does not carry host bookkeeping.
+    int  chunk_graph_b    = 0;
+    int  chunk_graph_plan = -1;
+    int  chunk_ckpt_end   = 0;
+    // Collectives a captured chunk issues. A replay runs them inside the graph, where
+    // nothing increments the counter, so the accounting has to be replayed too — an
+    // undercount here would make the collectives-per-token line report a saving that
+    // came from not counting rather than from not doing.
+    long n_coll_per_chunk = 0;
+    // How much of a prefill went into building graphs rather than running them. The MLA
+    // split plan steps with context, and every step throws the chunk graph away, so a long
+    // ingestion re-captures several times over — invisible in a tok/s number, and the
+    // suspect for the 29 s that a 32k run lost between 2048 and 4096.
+    // The context the chunk graph's MLA split plan is PINNED to for a whole ingestion.
+    // The plan is min(max_splits, ceil(n_ctx/4096)), so it steps at every 4096 boundary and
+    // each step throws the graph away: a 32k prompt paid EIGHT captures, 21.0 s, 3.24% of
+    // the run, 87% of it re-recording 50,809 nodes. Pinning to the end of the prompt makes
+    // it one. Over-large splits are explicitly supported -- mla_decode_attn_split_kernel
+    // writes m=-1e30, l=0 for an empty slice -- and n_ctx itself is read from the device at
+    // replay, so only the grid is frozen, never the length attended over.
+    int    prefill_plan_ctx = 0;
+    long   n_chunk_captures = 0;
+    double ms_chunk_capture = 0.0;
+    bool chunk_graph_ready = false;
+    bool chunk_graph_off   = false;
 };
 
 // Load the model once per rank, banding the routed experts. `devices` gives tp_size.
 // Returns false rather than falling back to one GPU: a silent downgrade would make a
 // TP benchmark measure a single card.
+// `prefill_chunk` sizes the chunked-prefill machinery: the collective's peer buffers
+// are allocated for that many tokens' partials at once, and each rank gets that many
+// hidden pairs / residual banks / position slots. 0 or 1 leaves every allocation
+// exactly as it was, so a decode-only caller pays nothing and measures the same
+// numbers — the scored path must not move because a prefill feature exists.
 bool kimi_k3_tp_init(const GGUF& g, const KimiK3Config& cfg, const K3PlanOptions& opt,
-                    const std::vector<int>& devices, int max_ctx, KimiK3TP& out);
+                    const std::vector<int>& devices, int max_ctx, KimiK3TP& out,
+                    int prefill_chunk = 0);
 
 // One decode step across every rank. `out_logits` must hold cfg.vocab floats.
 //
@@ -210,6 +299,44 @@ bool kimi_k3_tp_init(const GGUF& g, const KimiK3Config& cfg, const K3PlanOptions
 // order — the expert partials are reassociated by the reduce, so agreement is to
 // ~1 ulp, not bitwise. kimi_k3_tp_moe_check pins that bound.
 bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits);
+
+// ---------------------------------------------------------------------------
+// CHUNKED PREFILL — ingest a prompt B tokens per pass instead of one.
+//
+// WHAT IT CHANGES. forward_token walks all 93 layers for ONE token, and prompt
+// ingestion calls it n_ids times: 185 collectives and one LM head per prompt token.
+// This walks each layer for B tokens before moving on, so the 185 collectives and the
+// head are paid ONCE PER CHUNK. At B=16 that is 1/16th of the rendezvous count and
+// 1/16th of the 1.25 GB head, for the same arithmetic in the same order.
+//
+// WHY THAT IS LEGAL. Prompt tokens are known in advance, so the only true
+// dependencies inside a layer are causal: token b's attention needs tokens 0..b-1
+// already in the KV cache, and the KDA recurrent state must advance in order. Running
+// the tokens of one layer in index order satisfies both — token b's phases complete on
+// the stream before token b+1's are issued. Everything else (the projections, the
+// router, the experts, the norms) is per-token independent and simply reuses the same
+// scratch, which is why no scratch is duplicated.
+//
+// WHAT IT DOES NOT CHANGE. Every kernel is the single-token kernel, launched with the
+// single-token grid, over the same values. Per token this is bit-identical to the
+// forward_token loop; across the reduce it is the same ~1-ulp reassociation the TP
+// decode path already has, and for the same reason (the collective sums B tokens'
+// partials in one call rather than B).
+//
+// LOGITS ARE NOT COMPUTED PER TOKEN. Ingestion throws them away — the bench dumps at a
+// handful of depths — so the head runs only on the last token of a chunk, and chunks
+// are cut so that every requested depth ends one. `dump_at` holds those depths as
+// 1-based prefix lengths; n_ids is always treated as one. After each is reached,
+// out_logits holds that prefix's next-token distribution and on_depth(depth) is called
+// (return false from it to abort). out_logits must have room for cfg.vocab floats.
+//
+// Falls back to a forward_token loop — main's exact behaviour — when the chunk
+// machinery is unavailable (prefill_chunk <= 1, or a collective that does not own its
+// buffers, since batching the payload means writing B partials into peer memory).
+bool kimi_k3_tp_forward_prompt(KimiK3TP& p, const int* ids, int n_ids,
+                               const int* dump_at, int n_dump,
+                               float* out_logits,
+                               const std::function<bool(int)>& on_depth);
 
 void kimi_k3_tp_free(KimiK3TP& p);
 

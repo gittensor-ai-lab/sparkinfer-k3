@@ -191,9 +191,28 @@ int main(int argc, char** argv) {
     std::vector<int> devs;
     for (int i = 0; i < tp_size; ++i) devs.push_back(i);
 
+    // CHUNKED PREFILL, and only when there is a prompt to ingest.
+    //
+    // The chunk buffers cost the collective a B-times-larger peer allocation, so asking
+    // for them on a decode-only run would change what the SCORED path allocates for a
+    // feature it never uses. --ids is exactly the flag that means "ingest something".
+    //
+    // 16 is a default, not a tuned number: it divides the 185 rendezvous per token by
+    // 16 while keeping the extra peer memory under a megabyte per rank. B has NOT been
+    // swept — SPARKINFER_K3_PREFILL_CHUNK=1 turns the chunk path off on the same binary
+    // (the A/B behind every number claimed for it) and any other value re-sizes it.
+    int prefill_chunk = 0;
+    if (!ids.empty()) {
+        prefill_chunk = 16;
+        if (const char* e = std::getenv("SPARKINFER_K3_PREFILL_CHUNK")) {
+            const int v = std::atoi(e);
+            if (v > 0) prefill_chunk = v;
+        }
+    }
+
     const auto t_load0 = std::chrono::steady_clock::now();
     KimiK3TP p;
-    if (!kimi_k3_tp_init(g, cfg, opt, devs, max_ctx, p)) {
+    if (!kimi_k3_tp_init(g, cfg, opt, devs, max_ctx, p, prefill_chunk)) {
         std::printf("init failed at tp=%d, %d layers\n", tp_size, cfg.n_layers);
         return 1;
     }
@@ -246,11 +265,17 @@ int main(int argc, char** argv) {
                 return 1;
             }
         }
-        // TIME THE INGESTION. Prompt ingestion is prefill, and there is no batched path --
-        // every prompt token goes through the same single-token decode step, so a prompt
-        // costs exactly what generating the same number of tokens costs. Nothing in this
-        // bench reported that, so the only prefill numbers the project had were inferred
-        // from checkpoint file mtimes. PREFILL lines below are the measurement.
+        // TIME THE INGESTION. Prompt ingestion is prefill, and it used to be one
+        // single-token decode step per prompt token, so a prompt cost exactly what
+        // generating the same number of tokens cost. Nothing in this bench reported that,
+        // so the only prefill numbers the project had were inferred from checkpoint file
+        // mtimes. PREFILL lines below are the measurement.
+        //
+        // kimi_k3_tp_forward_prompt now carries a CHUNK of prompt tokens through each
+        // layer together, so the 185 collectives and the 1.25 GB output head are paid per
+        // chunk rather than per token. It falls back to precisely the loop that used to be
+        // here when the chunk machinery is unavailable, so this call is never slower than
+        // what it replaced and the PREFILL lines stay comparable across both.
         //
         // Measured from AFTER init: model load is a separate, one-off cost and folding it
         // in would flatter longer prompts.
@@ -259,35 +284,42 @@ int main(int argc, char** argv) {
             return std::chrono::duration<double, std::milli>(
                        std::chrono::steady_clock::now() - t0).count();
         };
-        for (size_t i = 0; i < ids.size(); ++i) {
-            if (!kimi_k3_tp_forward_token(p, ids[i], logits.data())) {
-                std::printf("prompt token %zu (id %d) failed\n", i, ids[i]); return 1;
+        // The depths at which logits are wanted ARE the chunk boundaries, so every dump
+        // still comes from the last token of a chunk and is the same distribution the
+        // per-token loop produced at that depth.
+        bool dump_failed = false;
+        auto on_depth = [&](int L) -> bool {
+            if (std::find(checkpoints.begin(), checkpoints.end(), L) == checkpoints.end())
+                return true;
+            // Report the cumulative ingestion cost at this depth BEFORE the dump, so
+            // the .spkl write and the argmax scan are not charged to prefill.
+            const double el = ms_since(t_pf0);
+            std::printf("PREFILL tokens=%d ms=%.1f tok_s=%.2f ms_per_token=%.3f\n",
+                        L, el, L * 1000.0 / el, el / L);
+            std::fflush(stdout);
+            const std::string path = std::string(logits_prefix) + ".ctx" +
+                                     std::to_string(L) + ".spkl";
+            if (!write_spkl(path.c_str(), logits, cfg.vocab)) {
+                // A missing dump would silently become "no comparison at this depth",
+                // which is exactly the failure this suite exists to remove.
+                std::printf("FAILED to write %s\n", path.c_str());
+                dump_failed = true;
+                return false;
             }
-            // Depth i+1 is now complete: these logits are the (i+1)-token prefix's answer.
-            const int depth = (int)i + 1;
-            for (int L : checkpoints) {
-                if (L != depth) continue;
-                // Report the cumulative ingestion cost at this depth BEFORE the dump, so
-                // the .spkl write and the argmax scan are not charged to prefill.
-                const double el = ms_since(t_pf0);
-                std::printf("PREFILL tokens=%d ms=%.1f tok_s=%.2f ms_per_token=%.3f\n",
-                            L, el, L * 1000.0 / el, el / L);
-                std::fflush(stdout);
-                const std::string path = std::string(logits_prefix) + ".ctx" +
-                                         std::to_string(L) + ".spkl";
-                if (!write_spkl(path.c_str(), logits, cfg.vocab)) {
-                    // A missing dump would silently become "no comparison at this depth",
-                    // which is exactly the failure this suite exists to remove.
-                    std::printf("FAILED to write %s\n", path.c_str());
-                    return 1;
-                }
-                int b = 0;
-                for (int v = 1; v < cfg.vocab; ++v)
-                    if (logits[(size_t)v] > logits[(size_t)b]) b = v;
-                std::printf("ctx %6d -> argmax %d  logit %.6f  [%s]\n",
-                            L, b, logits[(size_t)b], path.c_str());
-                std::fflush(stdout);
-            }
+            int b = 0;
+            for (int v = 1; v < cfg.vocab; ++v)
+                if (logits[(size_t)v] > logits[(size_t)b]) b = v;
+            std::printf("ctx %6d -> argmax %d  logit %.6f  [%s]\n",
+                        L, b, logits[(size_t)b], path.c_str());
+            std::fflush(stdout);
+            return true;
+        };
+        if (!kimi_k3_tp_forward_prompt(p, ids.data(), (int)ids.size(),
+                                       checkpoints.data(), (int)checkpoints.size(),
+                                       logits.data(), on_depth)) {
+            std::printf(dump_failed ? "checkpoint dump failed\n"
+                                    : "prompt ingestion failed\n");
+            return 1;
         }
         // Whole-prompt ingestion: this is TTFT for a prompt of this length, minus load.
         {

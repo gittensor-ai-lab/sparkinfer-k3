@@ -363,6 +363,16 @@ int kimi_k3_mla_ordinal(const KimiK3Config& cfg, int layer);   // -1 if layer is
 // nothing when fwd.debug is unset.
 using KimiK3DebugFn = std::function<void(const char* tag, int layer, const float* dev_ptr, int64_t n)>;
 
+// Set on KimiK3Forward while a chunk is in flight. n_tok == 0 means "no batch": every
+// phase behaves exactly as it did before this existed.
+//
+// `slot` is which token AttnPre/Attn are currently working on and is re-pointed by the
+// driver per call, the same way it re-aims x/x_next.
+struct K3ProjBatch {
+    int n_tok = 0;
+    int slot  = 0;
+};
+
 struct KimiK3Forward {
     const KimiK3Config* cfg = nullptr;
     const KimiK3Weights* w = nullptr;
@@ -375,7 +385,21 @@ struct KimiK3Forward {
     // kimi_k3_forward_alloc_scratch(); forward_token() assumes they exist.
     struct Scratch;
     Scratch* s = nullptr;
+
+    // Zero unless a chunk is in flight — see K3ProjBatch.
+    K3ProjBatch pb;
 };
+
+// Whether the routed up-projection may be row-sharded across ranks. Its own switch
+// (SPARKINFER_K3_ROUTED_UP_BAND), deliberately not the head band's, so the two can be
+// A/B'd separately on one binary. The driver checks it too: sharding is only correct when
+// the caller issues the reduce that sums the bands.
+bool k3_routed_up_band_enabled();
+
+// Size the per-token slots the batched projection needs. Idempotent, and a failure leaves
+// the batch machinery OFF (n_tok stays 0) rather than half-built, so the caller falls back
+// to the per-token path instead of reading a slot that was never allocated.
+bool kimi_k3_forward_alloc_proj_batch(const KimiK3Config& cfg, KimiK3Forward& fwd, int n_tok);
 
 bool kimi_k3_forward_alloc_scratch(const KimiK3Config& cfg, KimiK3Forward& fwd);
 void kimi_k3_forward_free_scratch(KimiK3Forward& fwd);
@@ -427,7 +451,42 @@ bool kimi_k3_forward_layer(KimiK3Forward& fwd, int layer, const float* hidden_in
 // `All` runs all three back to back and is what kimi_k3_forward_layer calls, so the
 // tp_size 1 path is unchanged. Running All must be bit-identical to running the
 // three phases in sequence — asserted by kimi_k3_tp_phase_check.
-enum class K3LayerPhase { All = 0, Attn = 1, FfnPartial = 2, FfnFinish = 3 };
+// AttnPre / AttnProj exist to get the qkvg group off the per-token path.
+//
+// The KDA q/k/v/g group is the largest weight stream in the token — 4 x 1536x7168 over 69
+// layers = 3.23 GB per token per rank — and prompt ingestion re-reads every byte of it for
+// every token, even though all of them multiply the SAME four matrices. Batching needs the
+// B activations to exist at once, so the phase splits at the projection:
+//
+//   AttnPre   per token, driver has aimed the state: residual mix -> norm -> quantise,
+//             into THIS token's slot. Owns the state mutation (n_ckpt, the bank push), so
+//             it runs exactly once per token.
+//   AttnProj  once per layer: one batched projection over every slot.
+//   Attn      per token again: everything from the conv1d on, reading its slot.
+//
+// Attn keeps doing the whole thing when no batch is set, so the single-token path is
+// untouched and is still the fallback.
+// FfnUp / FfnTail split FfnFinish so the routed up-projection can be SHARDED.
+//
+// ffn_routed_up is Replicate, so every rank computes the identical 7168x3584 projection on
+// all 92 MoE layers — 2.51 GB per token per rank, eight times over. Row-sharding it gives
+// each rank 1/tp of the rows, but the result feeds the residual and the next layer's norm
+// needs the full hidden vector, so the bands have to be summed before the layer ends. That
+// is one all-reduce, and a phase boundary is the only place to put it.
+//
+//   FfnUp    routed_norm, then THIS RANK's band of the up-projection into a zeroed
+//            hidden-wide buffer. The zero matters: the reduce sums every rank's whole
+//            buffer, so anything outside the band must be exactly 0.
+//   FfnTail  the shared-expert fold and the residual add, unchanged.
+//
+// FfnFinish still runs both, so the unsharded path — and every existing caller — is
+// untouched. Sharding happens only when a driver asks for FfnUp explicitly, which is also
+// the only way the reduce between them gets issued.
+enum class K3LayerPhase {
+    All = 0, Attn = 1, FfnPartial = 2, FfnFinish = 3, AttnPre = 4, AttnProj = 5,
+    FfnUp = 6, FfnTail = 7
+};
+
 
 bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase phase,
                                 const float* hidden_in, float* hidden_out);
