@@ -1011,6 +1011,112 @@ __device__ __forceinline__ float block_dot(const BlockIQ1S& b,
     return acc;
 }
 
+// Warp-local gate/up activation fuse. Gate and up share the same activation
+// block; two block_dot calls reload xs[] twice. CTA smem staging measured -3.1%
+// (barrier). Keeping xs in registers and decoding both weight rows against it
+// has no barrier. Same FMAs, gate-then-up within each lane group: bit-identical.
+template <bool XVEC, bool GPACK = false, bool GS = false>
+__device__ __forceinline__ void block_dot_pair(const BlockIQ2XS& g,
+                                               const BlockIQ2XS& u,
+                                               const float* __restrict__ x,
+                                               int lane, int nlanes,
+                                               float& g_out, float& u_out) {
+    (void)GPACK; (void)GS;
+    float gacc = 0.0f, uacc = 0.0f;
+    for (int l = lane; l < 32; l += nlanes) {
+        const float* xv = x + l * 8;
+        float xs[8];
+        if (XVEC) {
+            const float4* xv4 = (const float4*)xv;
+            const float4 xa = xv4[0], xb = xv4[1];
+            xs[0] = xa.x; xs[1] = xa.y; xs[2] = xa.z; xs[3] = xa.w;
+            xs[4] = xb.x; xs[5] = xb.y; xs[6] = xb.z; xs[7] = xb.w;
+        } else {
+#pragma unroll
+            for (int j = 0; j < 8; ++j) xs[j] = xv[j];
+        }
+        const int ib32 = l >> 2, sub = l & 3;
+#pragma unroll
+        for (int side = 0; side < 2; ++side) {
+            const BlockIQ2XS& b = side ? u : g;
+            const float d = __half2float(__ushort_as_half(b.d));
+            const uint8_t sc = b.scales[ib32];
+            const float db = (sub < 2) ? d * (0.5f + (float)(sc & 0xf)) * 0.25f
+                                       : d * (0.5f + (float)(sc >> 4))  * 0.25f;
+            const uint16_t q = b.qs[l];
+            const uint64_t gw = c_iq2xs_grid[q & 511];
+            const uint8_t signs = c_ksigns_iq2xs[q >> 9];
+            float acc = 0.0f;
+        #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const uint8_t gj = (uint8_t)((gw >> (8 * j)) & 0xffu);
+                acc += db * (float)gj * ((signs & c_kmask_iq2xs[j]) ? -1.0f : 1.0f) * xs[j];
+            }
+            if (side) uacc += acc; else gacc += acc;
+        }
+    }
+    g_out = gacc;
+    u_out = uacc;
+}
+
+template <bool XVEC, bool GPACK = false, bool GS = false>
+__device__ __forceinline__ void block_dot_pair(const BlockIQ1S& g,
+                                               const BlockIQ1S& u,
+                                               const float* __restrict__ x,
+                                               int lane, int nlanes,
+                                               float& g_out, float& u_out) {
+    float gacc = 0.0f, uacc = 0.0f;
+    for (int l32 = lane; l32 < 32; l32 += nlanes) {
+        const float* xv = x + l32 * 8;
+        float xs[8];
+        if (XVEC || GPACK) {
+            const float4* xv4 = (const float4*)xv;
+            const float4 xa = xv4[0], xb = xv4[1];
+            xs[0] = xa.x; xs[1] = xa.y; xs[2] = xa.z; xs[3] = xa.w;
+            xs[4] = xb.x; xs[5] = xb.y; xs[6] = xb.z; xs[7] = xb.w;
+        } else {
+#pragma unroll
+            for (int j = 0; j < 8; ++j) xs[j] = xv[j];
+        }
+        const int ib32 = l32 >> 2, l = l32 & 3;
+#pragma unroll
+        for (int side = 0; side < 2; ++side) {
+            const BlockIQ1S& b = side ? u : g;
+            const float d = __half2float(__ushort_as_half(b.d));
+            const uint16_t h = b.qh[ib32];
+            const float dl    = d * (float)(2 * ((h >> 12) & 7) + 1);
+            const float delta = (h & 0x8000) ? -SPARKINFER_IQ1S_DELTA : SPARKINFER_IQ1S_DELTA;
+            const uint32_t idx =
+                (uint32_t)b.qs[4 * ib32 + l] | (((uint32_t)(h >> (3 * l)) & 7u) << 8);
+            float acc = 0.0f;
+            if (GPACK) {
+                uint32_t pw;
+                if (GS) {
+                    extern __shared__ uint16_t s_iq1s_grid[];
+                    pw = s_iq1s_grid[idx];
+                } else {
+                    pw = iq1s_grid_p[idx];
+                }
+            #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const int gj = ((int)(pw << (30 - 2 * j))) >> 30;
+                    acc += dl * ((float)gj + delta) * xs[j];
+                }
+            } else {
+                const uint64_t gw = iq1s_grid_c[idx];
+            #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const int8_t gj = (int8_t)((gw >> (8 * j)) & 0xffu);
+                    acc += dl * ((float)gj + delta) * xs[j];
+                }
+            }
+            if (side) uacc += acc; else gacc += acc;
+        }
+    }
+    g_out = gacc;
+    u_out = uacc;
+}
+
 // llama.cpp CPU vec_dot contracts for the pinned reference. The activation has
 // already been converted to block_q8_K. Keep the integer dot integer until the
 // whole 256-value block has been reduced, then apply the two block scales once;
@@ -1149,15 +1255,39 @@ __global__ void moe_gate_up_situ_kernel(float* __restrict__ scratch,
     const Blk* u_row = up_exps   + (size_t)(e * ffn + j) * blocks_per_row;
 
     float gacc = 0.0f, uacc = 0.0f;
-    // blocks_per_row arrives as a runtime argument, so nvcc cannot unroll this and each
-    // iteration's divergent iq1s_grid_c gather sits alone on a dependent chain. Unrolling
-    // puts four independent gathers and four weight loads in flight. Accumulation order
-    // is unchanged, so this is bit-identical.
+    // BPR14: scored K3 latent is 3584 → blocks_per_row is exactly 14, but it arrives
+    // as a RUNTIME bound — `#pragma unroll 4` on a 14-trip runtime loop only peels
+    // four at a time and leaves each divergent lattice gather alone on a dependent
+    // chain. A compile-time 14 issues all fourteen LDG→gather→FMA chains back to
+    // back (same pattern as BPR3 on down below). Ascending b preserved: bit-identical.
+    if (blocks_per_row == 14) {
+        // Software-pipeline + act-fuse: prefetch weight/act for b+1 while
+        // contracting gate+up against one staged xs for b.
+        Blk g_cur = g_row[0], u_cur = u_row[0];
+        const float* x_cur = x;
+#pragma unroll
+        for (int b = 0; b < 13; ++b) {
+            const Blk g_nxt = g_row[b + 1];
+            const Blk u_nxt = u_row[b + 1];
+            const float* x_nxt = x + (b + 1) * 256;
+            float dg = 0.0f, du = 0.0f;
+            block_dot_pair<XVEC, GPACK, GSMEM>(g_cur, u_cur, x_cur, lane, 32, dg, du);
+            gacc += dg; uacc += du;
+            g_cur = g_nxt; u_cur = u_nxt; x_cur = x_nxt;
+        }
+        {
+            float dg = 0.0f, du = 0.0f;
+            block_dot_pair<XVEC, GPACK, GSMEM>(g_cur, u_cur, x_cur, lane, 32, dg, du);
+            gacc += dg; uacc += du;
+        }
+    } else {
 #pragma unroll 4
-    for (int b = 0; b < blocks_per_row; ++b) {
-        const float* xb = x + b * 256;
-        gacc += block_dot<XVEC, GPACK, GSMEM>(g_row[b], xb, lane, 32);
-        uacc += block_dot<XVEC, GPACK, GSMEM>(u_row[b], xb, lane, 32);
+        for (int b = 0; b < blocks_per_row; ++b) {
+            const float* xb = x + b * 256;
+            float dg = 0.0f, du = 0.0f;
+            block_dot_pair<XVEC, GPACK, GSMEM>(g_row[b], u_row[b], xb, lane, 32, dg, du);
+            gacc += dg; uacc += du;
+        }
     }
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
@@ -1310,9 +1440,61 @@ __global__ void moe_down_combine_kernel(float* __restrict__ out,
         // unrolled body.) A compile-time 3 issues all three chains back to back.
         // Ascending b preserved; unrolling does not reassociate: bit-identical.
         if (blocks_per_row == 3) {
+            // Soft-pipeline BPR=3 (scored K3 down): prefetch weight/act for
+            // b+1 while contracting b. Same three FMAs, ascending-b order.
+            Blk d_cur = d_row[0];
+            const float* x_cur = act;
 #pragma unroll
-            for (int b = 0; b < 3; ++b)
+            for (int b = 0; b < 2; ++b) {
+                const Blk d_nxt = d_row[b + 1];
+                const float* x_nxt = act + (b + 1) * 256;
+                acc += block_dot<XVEC, GPACK>(d_cur, x_cur, lane, 32);
+                d_cur = d_nxt;
+                x_cur = x_nxt;
+            }
+            acc += block_dot<XVEC, GPACK>(d_cur, x_cur, lane, 32);
+        } else if (blocks_per_row == 6) {
+#pragma unroll
+            for (int b = 0; b < 6; ++b)
                 acc += block_dot<XVEC, GPACK>(d_row[b], act + b * 256, lane, 32);
+        } else if (blocks_per_row == 7) {
+            // Soft-pipe BPR=7 (half-width / alt shapes).
+            Blk d_cur = d_row[0];
+            const float* x_cur = act;
+#pragma unroll
+            for (int b = 0; b < 6; ++b) {
+                const Blk d_nxt = d_row[b + 1];
+                const float* x_nxt = act + (b + 1) * 256;
+                acc += block_dot<XVEC, GPACK>(d_cur, x_cur, lane, 32);
+                d_cur = d_nxt;
+                x_cur = x_nxt;
+            }
+            acc += block_dot<XVEC, GPACK>(d_cur, x_cur, lane, 32);
+        } else if (blocks_per_row == 12) {
+            Blk d_cur = d_row[0];
+            const float* x_cur = act;
+#pragma unroll
+            for (int b = 0; b < 11; ++b) {
+                const Blk d_nxt = d_row[b + 1];
+                const float* x_nxt = act + (b + 1) * 256;
+                acc += block_dot<XVEC, GPACK>(d_cur, x_cur, lane, 32);
+                d_cur = d_nxt;
+                x_cur = x_nxt;
+            }
+            acc += block_dot<XVEC, GPACK>(d_cur, x_cur, lane, 32);
+        } else if (blocks_per_row == 14) {
+            // Gate/up latent width reused as down on some alternate configs.
+            Blk d_cur = d_row[0];
+            const float* x_cur = act;
+#pragma unroll
+            for (int b = 0; b < 13; ++b) {
+                const Blk d_nxt = d_row[b + 1];
+                const float* x_nxt = act + (b + 1) * 256;
+                acc += block_dot<XVEC, GPACK>(d_cur, x_cur, lane, 32);
+                d_cur = d_nxt;
+                x_cur = x_nxt;
+            }
+            acc += block_dot<XVEC, GPACK>(d_cur, x_cur, lane, 32);
         } else
         for (int b = 0; b < blocks_per_row; ++b)
             acc += block_dot<XVEC, GPACK>(d_row[b], act + b * 256, lane, 32);
@@ -4010,8 +4192,10 @@ static void moe_expert_ffn_launch_w(float* out, float* scratch,
             return e && e[0] == '1';
         }();
         static const bool rebal = [] {
+            // Live-expert rebalance across warps. Bit-identical; default ON.
+            // SPARKINFER_K3_MOE_REBAL=0 restores the static warp→k map.
             const char* e = std::getenv("SPARKINFER_K3_MOE_REBAL");
-            return e && e[0] == '1';
+            return !(e && e[0] == '0');
         }();
         if (gpack && gsmem) {
             k3_pdl_launch(g1, GATE_WARPS * 32, sizeof(uint16_t) * SPARKINFER_IQ1S_NGRID,
@@ -5074,8 +5258,8 @@ bool k3_quantize_act_rows_f32(void* q8_out, const float* x, int K, int n_rows,
 // the caller's straight-line code instead of an invariant someone has to maintain.
 bool k3_proj_q8act_f32(float* y, const void* q8_scratch, const void* W, int wtype,
                        int N, int K, cudaStream_t stream) {
-    // SoA-first (k3_q8soa.cu): engages only for load-registered tensors under
-    // SPARKINFER_K3_Q8SOA=1; bit-identical to the dispatch below by construction.
+    // SoA-first (k3_q8soa.cu): load-registered tensors under SPARKINFER_K3_Q8SOA
+    // (default ON; =0 restores AoS). Bit-identical to the dispatch below.
     if (k3_proj_q8soa(y, q8_scratch, W, N, K, stream)) return true;
 
     if (N <= 0 || K <= 0) return false;

@@ -1577,6 +1577,8 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             // lane can share it. That is the whole reason the hoist and proj_q8 are
             // separate buffers: a read-only activation is safe to fan out, a
             // scratch that each call rewrites is not.
+            if (k3k::k3_proj_q8soa(y, s.act_q8, W.data, N, K, ln.st))
+                return true;
             if (k3k::k3_proj_q8_multirow_1bar(y, x, W.data, W.type, N, K,
                                               s.act_q8, ln.st, /*x_pre_q8=*/true))
                 return true;
@@ -1839,7 +1841,18 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             // at all, or the work this exists to remove would still be issued.
             const bool fused_qkvg = qkvg_from_tile || (fusable &&
                 (ggml_qact_proj
-                     ? (k3k::k3_proj_q8_fused4_1bar(s.qkv_q, s.qkv_k, s.qkv_v,
+                     ? ((qkvg_pre
+                             ? k3k::k3_proj_q8soa_fused4(s.qkv_q, s.qkv_k, s.qkv_v,
+                                                        s.g_proj_out, s.act_q8,
+                                                        L.attn_q.data, L.attn_k.data,
+                                                        L.attn_v.data, L.ssm_g.data,
+                                                        qkv, H, stream)
+                             : k3k::k3_proj_q8soa_fused4_f32(s.qkv_q, s.qkv_k, s.qkv_v,
+                                                            s.g_proj_out, s.normed,
+                                                            L.attn_q.data, L.attn_k.data,
+                                                            L.attn_v.data, L.ssm_g.data,
+                                                            qkv, H, s.proj_q8, stream)) ||
+                        k3k::k3_proj_q8_fused4_1bar(s.qkv_q, s.qkv_k, s.qkv_v,
                                                     s.g_proj_out, s.normed,
                                                     L.attn_q.data, L.attn_k.data,
                                                     L.attn_v.data, L.ssm_g.data,
@@ -2242,8 +2255,26 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
 
         k3_profiler().start(layer < cfg.leading_dense ? "ffn_dense" : "ffn_moe", stream);
         if (layer < cfg.leading_dense) {
-            if (!proj_h(s.dense_gate, normed2_src, L.ffn_gate, cfg.dense_ffn, H)) return false;
-            if (!proj_h(s.dense_up, normed2_src, L.ffn_up, cfg.dense_ffn, H)) return false;
+            bool dense_gu = false;
+            if (ggml_qact_proj && L.ffn_gate.type == 8 && L.ffn_up.type == 8) {
+                if (hoisted_src == normed2_src) {
+                    dense_gu = k3k::k3_proj_q8soa_fused2(
+                        s.dense_gate, s.dense_up, s.act_q8,
+                        L.ffn_gate.data, L.ffn_up.data,
+                        cfg.dense_ffn, H, stream);
+                } else {
+                    dense_gu = k3k::k3_proj_q8soa_fused2_f32(
+                        s.dense_gate, s.dense_up, normed2_src,
+                        L.ffn_gate.data, L.ffn_up.data,
+                        cfg.dense_ffn, H, s.proj_q8, stream);
+                }
+            }
+            if (!dense_gu) {
+                if (!proj_h(s.dense_gate, normed2_src, L.ffn_gate, cfg.dense_ffn, H))
+                    return false;
+                if (!proj_h(s.dense_up, normed2_src, L.ffn_up, cfg.dense_ffn, H))
+                    return false;
+            }
             if (fwd.debug) fwd.debug("dbg_dense_gate", layer, s.dense_gate, cfg.dense_ffn);
             if (fwd.debug) fwd.debug("dbg_dense_up", layer, s.dense_up, cfg.dense_ffn);
             k3k::situ_f32(s.dense_situ, s.dense_gate, s.dense_up, cfg.dense_ffn,
@@ -2384,12 +2415,32 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
                     return false;
                 }
                 if (!ffn_prepared) {
-                    if (!proj_h_on(l_shx, s.dense_gate, normed2_src,
-                                   L.ffn_gate_shexp, shexp_band, H))
-                        return false;
-                    if (!proj_h_on(l_shx, s.dense_up, normed2_src,
-                                   L.ffn_up_shexp, shexp_band, H))
-                        return false;
+                    // Prefer fused-2 SoA for gate+up: one activation load, two
+                    // weight contractions. Declines when SoA/fused2 is off or either
+                    // weight was never registered — fall through to separate projs.
+                    bool shexp_gu = false;
+                    if (ggml_qact_proj &&
+                        L.ffn_gate_shexp.type == 8 && L.ffn_up_shexp.type == 8) {
+                        if (hoisted_src == normed2_src) {
+                            shexp_gu = k3k::k3_proj_q8soa_fused2(
+                                s.dense_gate, s.dense_up, s.act_q8,
+                                L.ffn_gate_shexp.data, L.ffn_up_shexp.data,
+                                shexp_band, H, l_shx.st);
+                        } else {
+                            shexp_gu = k3k::k3_proj_q8soa_fused2_f32(
+                                s.dense_gate, s.dense_up, normed2_src,
+                                L.ffn_gate_shexp.data, L.ffn_up_shexp.data,
+                                shexp_band, H, l_shx.q8, l_shx.st);
+                        }
+                    }
+                    if (!shexp_gu) {
+                        if (!proj_h_on(l_shx, s.dense_gate, normed2_src,
+                                       L.ffn_gate_shexp, shexp_band, H))
+                            return false;
+                        if (!proj_h_on(l_shx, s.dense_up, normed2_src,
+                                       L.ffn_up_shexp, shexp_band, H))
+                            return false;
+                    }
                     k3k::situ_f32(s.dense_situ, s.dense_gate, s.dense_up,
                                   shexp_band, cfg.situ_beta,
                                   cfg.situ_linear_beta, l_shx.st);

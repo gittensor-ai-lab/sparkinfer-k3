@@ -445,8 +445,10 @@ bool k3_moe_router_fast(float* out_w, int* out_ids, const float* logits,
     // The two-phase form drops the register kernel's 32 per-pass block barriers to
     // three. Same guards, same shapes; =0 keeps the per-pass-rendezvous kernel.
     static const bool want_2p = [] {
+        // Two-phase router: 3 barriers instead of 32. Bit-identical; default ON.
+        // SPARKINFER_K3_ROUTER_2P=0 restores the per-pass-rendezvous kernel.
         const char* e = std::getenv("SPARKINFER_K3_ROUTER_2P");
-        return e && e[0] == '1';
+        return !(e && e[0] == '0');
     }();
     if (want_reg && n_tokens == 1 && top_k == kTopK && n_expert <= kNV * BLOCK) {
         // No s_sel: the biased scores live in registers.

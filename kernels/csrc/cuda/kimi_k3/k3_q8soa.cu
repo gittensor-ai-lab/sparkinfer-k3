@@ -16,7 +16,7 @@
 // graph capture) and registers the SoA pair against the original device
 // pointer, so call sites need no plumbing: they ask "is there an SoA view of
 // this pointer" and fall through to the shipped path when there is not.
-// SPARKINFER_K3_Q8SOA=1 opts in; default OFF until measured.
+// SPARKINFER_K3_Q8SOA=0 restores the AoS path; default ON (bit-identical).
 
 #include "sparkinfer/kernels/kimi_k3.h"
 #include "sparkinfer/kernels/kimi_k3_fast.h"
@@ -71,8 +71,10 @@ std::unordered_map<const void*, SoaView> g_soa;
 
 bool q8soa_enabled() {
     static const bool on = [] {
+        // Default ON: load-time SoA repack cuts Q8_0 proj issue stalls (17→3 mem
+        // ops/block) with the same dp4a order. =0 restores AoS on one binary.
         const char* e = std::getenv("SPARKINFER_K3_Q8SOA");
-        return e && e[0] == '1';
+        return !(e && e[0] == '0');
     }();
     return on;
 }
@@ -198,6 +200,9 @@ bool k3_q8soa_register(const void* wdata, int wtype, const long ne[4]) {
     }
     std::lock_guard<std::mutex> lk(g_soa_mu);
     g_soa[wdata] = SoaView{d, qs, nbpr};
+    // Mirror into the fused4/pipe TU so a later k3_proj_q8soa_fused4 can resolve
+    // without a second device copy.
+    k3_q8soa_cache_view(wdata, d, qs, nbpr);
     return true;
 }
 
@@ -222,6 +227,14 @@ bool k3_proj_q8soa(float* y, const void* q8_act, const void* wdata,
     // 128 from blocks_per_row (proj_block_for), so this launcher mirrors that
     // rule EXACTLY. BLOCK=256 here is what T1 caught as *** DIFFERS *** on
     // 2026-08-04 — a $0.30 catch of a $35/hr mistake.
+    // Soft-pipe first when enabled (default ON with SoA); declines cleanly when
+    // the weight was never cached into the xfuse TU. Dual-stride is opt-in
+    // (SPARKINFER_K3_Q8SOA_DUAL=1) and tried before pipe when set. Weight-prefetch
+    // (WPIPE, default ON) sits between dual and act-pipe.
+    if (k3_proj_q8soa_dual(y, q8_act, wdata, N, K, stream)) return true;
+    if (k3_proj_q8soa_wpipe(y, q8_act, wdata, N, K, stream)) return true;
+    if (k3_proj_q8soa_pipe(y, q8_act, wdata, N, K, stream)) return true;
+
     const int TB = nbpr <= 32 ? 32 : (nbpr <= 64 ? 64 : 128);
     const int rows = k3_proj_rows_for_budget(N, TB, 16);
     const unsigned grid = (unsigned)((N + rows - 1) / rows);
