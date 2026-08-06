@@ -1671,8 +1671,11 @@ class CiWorkflowTest(unittest.TestCase):
                              f"{f.name} now carries {n_tok} rows -- top-1 is no longer a "
                              f"boolean, so revisit the 0.95 bar and the docs that call it "
                              f"pass/fail")
+        # The correctness-gate prose lives in CONTRIBUTING and docs/technical.md; the
+        # README links to them rather than restating the bars. Assert wherever the claim
+        # is actually made, so moving it between docs cannot quietly drop it.
         for doc, needle in ((("CONTRIBUTING.md"), "top-1 is pass/fail"),
-                            (("README.md"), "effectively pass/fail")):
+                            (("docs/technical.md"), "effectively pass/fail")):
             self.assertIn(needle, (ROOT / doc).read_text(),
                           f"{doc} must not present the bar as a graded tolerance")
 
@@ -1680,11 +1683,16 @@ class CiWorkflowTest(unittest.TestCase):
         """README said 'KL <= 0.20' in two places. That is label.py's shared default, which is
         the Qwen track's; K3 pins 0.05 in the harness and in eval-label.yml. Quoting 0.20
         tells a K3 contributor their PR has 4x the parity headroom it really has."""
-        readme = (ROOT / "README.md").read_text()
-        self.assertNotIn("KL <= 0.20", readme)
-        self.assertNotIn("KL ≤ 0.20", readme)
-        self.assertIn("KL ≤ 0.05", readme)
-        self.assertIn("KL <= 0.05", readme)
+        # Checked across every doc that quotes a bar, not just the README: the numbers
+        # moved to docs/technical.md when the README was cut down, and a guard bound to
+        # one file would have gone green while the wrong bar sat in another.
+        docs = {d: (ROOT / d).read_text()
+                for d in ("README.md", "docs/technical.md", "CONTRIBUTING.md")}
+        for name, body in docs.items():
+            self.assertNotIn("KL <= 0.20", body, name)
+            self.assertNotIn("KL ≤ 0.20", body, name)
+        joined = "\n".join(docs.values())
+        self.assertIn("KL ≤ 0.05", joined)
 
     def test_decode_is_guarded_at_128k_even_though_prefill_is_scored(self):
         """Prefill and decode share kernels, so batching the prompt WILL move decode. The
