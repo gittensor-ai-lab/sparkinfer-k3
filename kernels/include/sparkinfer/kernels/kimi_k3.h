@@ -138,7 +138,9 @@ void kda_gate_out_f32(float* out, const float* o, const float* norm_w,
 void attn_res_mix_f32(float* out, const float* ckpts, const float* cur,
                       const float* score_w, int n_embd, int n_ckpt,
                       float eps, cudaStream_t stream, float* scores = nullptr,
-                      const float* cur_b = nullptr, float* sum_out = nullptr);
+                      const float* cur_b = nullptr, float* sum_out = nullptr,
+                      int n_rows = 1, int64_t act_row_stride = 0,
+                      int64_t bank_row_stride = 0, int64_t score_row_stride = 0);
 
 // ---------------------------------------------------------------------------
 // 6. KDA causal short conv, decode step
@@ -452,6 +454,9 @@ void moe_expert_ffn_iq1s_f32(float* out, float* scratch,
 bool k3_moe_iq1s_mma_quantize_rows(signed char* q, float* scale, const float* x,
                                    int rows, int cols, cudaStream_t stream = nullptr);
 
+// Upload this translation unit's packed IQ1_S lattice before graph capture begins.
+bool k3_moe_iq1s_mma_prepare();
+
 // C[M,N] = A[M,K] @ W[N,K]^T, W the native GGUF IQ1_S [N,K] blocks, A int8 with the
 // per-32 scales `sa` above ([M][K/32]). C is f32 (K3 is f32 end to end) and COMPACT — row m of C
 // is the m'th row of this expert's group.
@@ -495,6 +500,43 @@ bool k3_moe_iq1s_mma_gemm(float* C, const signed char* A, const float* sa,
 bool k3_proj_q8_mma_gemm(float* C, const signed char* A, const float* sa,
                          const void* W, int M, int N, int K,
                          cudaStream_t stream = nullptr);
+
+bool k3_moe_iq1s_mma_grouped(float* C, const signed char* A, const float* sa,
+                             const void* W, const int* rows,
+                             const int* expert_bounds, int n_experts,
+                             int max_rows_per_expert, int N, int K,
+                             cudaStream_t stream = nullptr);
+
+bool k3_moe_iq1s_mma_pairs(float* C, const signed char* A, const float* sa,
+                           const void* W, const int* ids, int pairs,
+                           int activation_top_k, int expert_begin,
+                           int n_local_experts, int N, int K,
+                           cudaStream_t stream = nullptr);
+
+bool k3_moe_build_expert_csr(int* rows, int* slots, int* inverse,
+                             int* expert_bounds, const int* ids,
+                             int T, int top_k, int expert_begin,
+                             int n_local_experts, cudaStream_t stream = nullptr);
+
+bool k3_moe_situ_compact(float* h, const float* gate, const float* up,
+                         const int* inverse, int T, int top_k, int ffn,
+                         float situ_beta, float situ_linear_beta,
+                         cudaStream_t stream = nullptr);
+
+bool k3_moe_combine_compact(float* out, const float* down,
+                            const int* inverse, const float* weights,
+                            int T, int latent, int top_k,
+                            cudaStream_t stream = nullptr);
+
+bool k3_moe_situ_pairs(float* h, const float* gate, const float* up,
+                       const int* ids, int pairs, int ffn,
+                       int expert_begin, int n_local_experts,
+                       float situ_beta, float situ_linear_beta,
+                       cudaStream_t stream = nullptr);
+bool k3_moe_combine_pairs(float* out, const float* down, const int* ids,
+                          const float* weights, int T, int latent, int top_k,
+                          int expert_begin, int n_local_experts,
+                          cudaStream_t stream = nullptr);
 
 // BATCHED expert FFN — the consumer that gives the GEMM above an M.
 //
@@ -662,6 +704,9 @@ void mla_decode_attn_f32(float* out, const float* q, const float* k_cache,
 // The single derivation of `splits`, shared by the launcher above and the driver's
 // graph-invalidation check so the two can never disagree about the live plan.
 int k3_mla_decode_plan(int n_head, int kv_lora, int n_ctx);
+void k3_mla_set_split_pin(int splits);
+int  k3_mla_get_split_pin();
+int  k3_mla_split_suggest(int n_head, int key_length, int kv_lora, int n_ctx);
 
 // Allocate the MLA split scratch up front. An allocation inside a stream capture fails
 // the CAPTURE, not the allocation, so this must be called before the first capture.
@@ -797,6 +842,8 @@ bool k3_proj_f32_x4(float* y0, float* y1, float* y2, float* y3, const float* x,
 // and produced top1 0.0 at a faster ms/token: the guard tracked the pointer the scratch
 // came from, never whether the bytes behind it still matched.
 bool k3_quantize_act_f32(void* q8_out, const float* x, int K, cudaStream_t stream);
+bool k3_quantize_act_rows_f32(void* q8_out, const float* x, int K, int n_rows,
+                              int64_t row_stride, cudaStream_t stream);
 bool k3_proj_q8act_f32(float* y, const void* q8_act, const void* W, int wtype,
                        int N, int K, cudaStream_t stream);
 

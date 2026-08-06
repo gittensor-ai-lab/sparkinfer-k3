@@ -442,7 +442,13 @@ bool kimi_k3_forward_layer(KimiK3Forward& fwd, int layer, const float* hidden_in
 // `All` runs all three back to back and is what kimi_k3_forward_layer calls, so the
 // tp_size 1 path is unchanged. Running All must be bit-identical to running the
 // three phases in sequence — asserted by kimi_k3_tp_phase_check.
-enum class K3LayerPhase { All = 0, Attn = 1, FfnPartial = 2, FfnFinish = 3 };
+enum class K3LayerPhase {
+    All = 0,
+    Attn = 1,
+    FfnPrepare = 2, // residual combine + FFN mix/norm, no partial and no collective
+    FfnPartial = 3,
+    FfnFinish = 4
+};
 
 bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase phase,
                                 const float* hidden_in, float* hidden_out);

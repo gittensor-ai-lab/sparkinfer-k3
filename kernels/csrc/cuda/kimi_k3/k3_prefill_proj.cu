@@ -91,7 +91,8 @@ template <int BLOCK, int ROWS, int TOKS>
 __global__ void prefill_proj_q8_kernel(float* __restrict__ y,
                                        const BlockQ8_0* __restrict__ x,
                                        const BlockQ8_0* __restrict__ W,
-                                       int blocks_per_row, int n_rows, int n_tok) {
+                                       int blocks_per_row, int n_rows, int n_tok,
+                                       int64_t y_row_stride) {
     k3_pdl_sync();
     constexpr int NWARP = BLOCK / 32;
     const int n0   = blockIdx.x * ROWS;
@@ -173,7 +174,7 @@ __global__ void prefill_proj_q8_kernel(float* __restrict__ y,
             float s = 0.0f;
 #pragma unroll
             for (int w = 0; w < NWARP; ++w) s += shm[(w * ROWS + r) * TOKS + t];
-            y[(size_t)tt * n_rows + nn] = s;
+            y[(int64_t)tt * y_row_stride + nn] = s;
         }
     }
 }
@@ -231,7 +232,8 @@ int k3_prefill_proj_token_tile(int N, int K, int n_tok) {
 }
 
 bool k3_prefill_proj_q8act(float* y, const void* q8_acts, const void* W, int wtype,
-                           int N, int K, int n_tok, cudaStream_t stream) {
+                           int N, int K, int n_tok, cudaStream_t stream,
+                           int64_t y_row_stride) {
     static const bool want = [] {
         const char* e = std::getenv("SPARKINFER_K3_PREFILL_PROJ");
         return !(e && e[0] == '0');
@@ -239,6 +241,8 @@ bool k3_prefill_proj_q8act(float* y, const void* q8_acts, const void* W, int wty
     if (!want) return false;
     if (!y || !q8_acts || !W || wtype != 8) return false;
     if (N <= 0 || K <= 0 || n_tok <= 0 || K % 32 != 0) return false;
+    if (y_row_stride == 0) y_row_stride = N;
+    if (y_row_stride < N) return false;
 
     const int nb   = K / 32;
     const int TB   = block_for(nb);
@@ -256,7 +260,7 @@ bool k3_prefill_proj_q8act(float* y, const void* q8_acts, const void* W, int wty
 
 #define K3_PF_LAUNCH(BS, R, TK)                                                       \
     prefill_proj_q8_kernel<BS, R, TK><<<grid, BS, 0, stream>>>(                       \
-        y, (const BlockQ8_0*)q8_acts, (const BlockQ8_0*)W, nb, N, n_tok)
+        y, (const BlockQ8_0*)q8_acts, (const BlockQ8_0*)W, nb, N, n_tok, y_row_stride)
 
     switch (TB * 100 + rows * 10 + (toks == 8 ? 8 : toks)) {
         case 32 * 100 + 4 * 10 + 1: K3_PF_LAUNCH(32,  4, 1); break;

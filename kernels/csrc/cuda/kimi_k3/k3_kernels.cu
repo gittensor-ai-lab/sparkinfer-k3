@@ -518,8 +518,15 @@ __global__ void attn_res_score_kernel(float* __restrict__ scores,
                                       const float* __restrict__ cur,
                                       const float* __restrict__ cur_b,
                                       const float* __restrict__ score_w,
-                                      int n_embd, int n_ckpt, float eps) {
+                                      int n_embd, int n_ckpt, float eps,
+                                      int64_t act_stride, int64_t bank_stride,
+                                      int64_t score_stride) {
     k3_pdl_sync();
+    const int row = (int)blockIdx.y;
+    scores += (int64_t)row * score_stride;
+    ckpts += (int64_t)row * bank_stride;
+    cur += (int64_t)row * act_stride;
+    if (cur_b) cur_b += (int64_t)row * act_stride;
     // Two reduction buffers so the second block_sum cannot race the first's broadcast.
     __shared__ float shm[2 * (BLOCK / 32 + 1)];
     // blockIdx.x in [0, n_ckpt]: the last block scores the current stream, which is
@@ -578,8 +585,17 @@ __global__ void attn_res_apply_kernel(float* __restrict__ out,
                                       const float* __restrict__ cur_b,
                                       float* __restrict__ sum_out,
                                       const float* __restrict__ scores,
-                                      int n_embd, int n_ckpt) {
+                                      int n_embd, int n_ckpt,
+                                      int64_t act_stride, int64_t bank_stride,
+                                      int64_t score_stride) {
     k3_pdl_sync();
+    const int row = (int)blockIdx.y;
+    out += (int64_t)row * act_stride;
+    ckpts += (int64_t)row * bank_stride;
+    cur += (int64_t)row * act_stride;
+    if (cur_b) cur_b += (int64_t)row * act_stride;
+    if (sum_out) sum_out += (int64_t)row * act_stride;
+    scores += (int64_t)row * score_stride;
     extern __shared__ float p[];              // n_ckpt + 1 softmax weights
 
     // THE SOFTMAX PROLOGUE WAS A SERIAL DEPENDENT WALK IN THREAD 0, IN EVERY BLOCK.
@@ -1898,6 +1914,33 @@ static inline int k3_sm_count(int dev) {
                    ? prop.multiProcessorCount : -1;
     }
     return cache[dev] > 0 ? cache[dev] : 0;
+}
+
+// A graph records grid geometry, while the live causal bound remains in d_pos. Pinning
+// only the former makes a whole ingestion chunk replay-safe without letting token b see
+// any row beyond its own prefix. Keep the graded <=4096 window on the historical
+// un-split arithmetic even if a caller accidentally leaves a pin engaged.
+static int g_k3_mla_split_pin = 0;
+
+static inline int k3_mla_split_pin_at(int n_ctx) {
+    return (g_k3_mla_split_pin > 0 && n_ctx > kMlaSplitMinCtx)
+         ? g_k3_mla_split_pin : 0;
+}
+
+static bool k3_mla_reach_fill() {
+    static const bool on = [] {
+        const char* e = std::getenv("SPARKINFER_K3_MLA_FILL");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+
+static bool k3_mla_partial_fill() {
+    static const bool on = [] {
+        const char* e = std::getenv("SPARKINFER_K3_MLA_FILL_PARTIAL");
+        return !(e && e[0] == '0');
+    }();
+    return on;
 }
 
 // The latent KV cache element type is a template parameter on all three decode
@@ -3628,23 +3671,44 @@ void kda_gate_out_f32(float* out, const float* o, const float* norm_w,
 void attn_res_mix_f32(float* out, const float* ckpts, const float* cur,
                       const float* score_w, int n_embd, int n_ckpt,
                       float eps, cudaStream_t stream, float* scores,
-                      const float* cur_b, float* sum_out) {
-    if (n_embd <= 0) return;
+                      const float* cur_b, float* sum_out,
+                      int n_rows, int64_t act_stride,
+                      int64_t bank_stride, int64_t score_stride) {
+    if (n_embd <= 0 || n_rows <= 0) return;
+    if (act_stride == 0) act_stride = n_embd;
+    if (bank_stride == 0) bank_stride = (int64_t)std::max(n_ckpt, 1) * n_embd;
+    if (score_stride == 0) score_stride = n_ckpt + 1;
     if (n_ckpt <= 0) {
         // Layer 0 / nothing banked: the reference returns cur unchanged. With a
         // residual pair in flight the sum still has to be materialised — same two
         // launches the unfused path used, so this branch never regresses.
-        if (cur_b && sum_out) {
-            k3_add_f32(sum_out, cur, cur_b, n_embd, stream);
-            cudaMemcpyAsync(out, sum_out, (size_t)n_embd * sizeof(float),
+        if (cur_b && sum_out && act_stride == n_embd) {
+            const int64_t count = (int64_t)n_rows * n_embd;
+            k3_add_f32(sum_out, cur, cur_b, count, stream);
+            cudaMemcpyAsync(out, sum_out, (size_t)count * sizeof(float),
                             cudaMemcpyDeviceToDevice, stream);
             return;
         }
+        if (cur_b && sum_out) {
+            for (int r = 0; r < n_rows; ++r)
+                k3_add_f32(sum_out + (int64_t)r * act_stride,
+                           cur + (int64_t)r * act_stride,
+                           cur_b + (int64_t)r * act_stride, n_embd, stream);
+            cudaMemcpy2DAsync(out, (size_t)act_stride * sizeof(float), sum_out,
+                              (size_t)act_stride * sizeof(float),
+                              (size_t)n_embd * sizeof(float), n_rows,
+                              cudaMemcpyDeviceToDevice, stream);
+            return;
+        }
         if (sum_out)
-            cudaMemcpyAsync(sum_out, cur, (size_t)n_embd * sizeof(float),
-                            cudaMemcpyDeviceToDevice, stream);
-        cudaMemcpyAsync(out, cur, (size_t)n_embd * sizeof(float),
-                        cudaMemcpyDeviceToDevice, stream);
+            cudaMemcpy2DAsync(sum_out, (size_t)act_stride * sizeof(float), cur,
+                              (size_t)act_stride * sizeof(float),
+                              (size_t)n_embd * sizeof(float), n_rows,
+                              cudaMemcpyDeviceToDevice, stream);
+        cudaMemcpy2DAsync(out, (size_t)act_stride * sizeof(float), cur,
+                          (size_t)act_stride * sizeof(float),
+                          (size_t)n_embd * sizeof(float), n_rows,
+                          cudaMemcpyDeviceToDevice, stream);
         return;
     }
     constexpr int B = 256;
@@ -3655,7 +3719,10 @@ void attn_res_mix_f32(float* out, const float* ckpts, const float* cur,
     // times — need no change.
     float* sc = scores;
     const bool owned = (sc == nullptr);
-    if (owned) cudaMallocAsync(&sc, (size_t)(n_ckpt + 1) * sizeof(float), stream);
+    if (owned) {
+        score_stride = n_ckpt + 1;
+        cudaMallocAsync(&sc, (size_t)n_rows * score_stride * sizeof(float), stream);
+    }
 
     static const bool res_1pass = [] {
         const char* e = std::getenv("SPARKINFER_K3_RES_1PASS");
@@ -3679,20 +3746,25 @@ void attn_res_mix_f32(float* out, const float* ckpts, const float* cur,
     constexpr int SB = 1024;
     if (res_wide && n_embd >= SB) {
         if (res_1pass)
-            k3_pdl_launch((unsigned)(n_ckpt + 1), SB, 0, stream, attn_res_score_kernel<SB, true>,
-                sc, ckpts, cur, cur_b, score_w, n_embd, n_ckpt, eps);
+            k3_pdl_launch(dim3((unsigned)(n_ckpt + 1), (unsigned)n_rows), SB, 0, stream,
+                attn_res_score_kernel<SB, true>, sc, ckpts, cur, cur_b, score_w,
+                n_embd, n_ckpt, eps, act_stride, bank_stride, score_stride);
         else
-            k3_pdl_launch((unsigned)(n_ckpt + 1), SB, 0, stream, attn_res_score_kernel<SB, false>,
-                sc, ckpts, cur, cur_b, score_w, n_embd, n_ckpt, eps);
+            k3_pdl_launch(dim3((unsigned)(n_ckpt + 1), (unsigned)n_rows), SB, 0, stream,
+                attn_res_score_kernel<SB, false>, sc, ckpts, cur, cur_b, score_w,
+                n_embd, n_ckpt, eps, act_stride, bank_stride, score_stride);
     } else if (res_1pass)
-        k3_pdl_launch((unsigned)(n_ckpt + 1), B, 0, stream, attn_res_score_kernel<B, true>,
-            sc, ckpts, cur, cur_b, score_w, n_embd, n_ckpt, eps);
+        k3_pdl_launch(dim3((unsigned)(n_ckpt + 1), (unsigned)n_rows), B, 0, stream,
+            attn_res_score_kernel<B, true>, sc, ckpts, cur, cur_b, score_w,
+            n_embd, n_ckpt, eps, act_stride, bank_stride, score_stride);
     else
-        k3_pdl_launch((unsigned)(n_ckpt + 1), B, 0, stream, attn_res_score_kernel<B, false>,
-            sc, ckpts, cur, cur_b, score_w, n_embd, n_ckpt, eps);
-    k3_pdl_launch((unsigned)((n_embd + B - 1) / B), B,
-                              (size_t)(n_ckpt + 1) * sizeof(float), stream, attn_res_apply_kernel<B>,
-        out, ckpts, cur, cur_b, sum_out, sc, n_embd, n_ckpt);
+        k3_pdl_launch(dim3((unsigned)(n_ckpt + 1), (unsigned)n_rows), B, 0, stream,
+            attn_res_score_kernel<B, false>, sc, ckpts, cur, cur_b, score_w,
+            n_embd, n_ckpt, eps, act_stride, bank_stride, score_stride);
+    k3_pdl_launch(dim3((unsigned)((n_embd + B - 1) / B), (unsigned)n_rows), B,
+                      (size_t)(n_ckpt + 1) * sizeof(float), stream,
+                      attn_res_apply_kernel<B>, out, ckpts, cur, cur_b, sum_out, sc,
+                      n_embd, n_ckpt, act_stride, bank_stride, score_stride);
 
     if (owned) cudaFreeAsync(sc, stream);
 }
@@ -3883,8 +3955,8 @@ void moe_router_noaux_tc_f32(float* out_w, int* out_ids, const float* logits,
 // One launch path for both quant types. The two front doors below differ only in the
 // table they prime and the block layout they name; duplicating the grid arithmetic
 // across them is the same drift the block_dot overloads exist to prevent.
-template <typename Blk>
-static void moe_expert_ffn_launch(float* out, float* scratch,
+template <int DOWN_WARPS, typename Blk>
+static void moe_expert_ffn_launch_w(float* out, float* scratch,
                                   const float* x, const int* ids, const float* w,
                                   const void* gate_exps, const void* up_exps,
                                   const void* down_exps,
@@ -3892,7 +3964,7 @@ static void moe_expert_ffn_launch(float* out, float* scratch,
                                   float situ_beta, float situ_linear_beta,
                                   cudaStream_t stream,
                                   int expert_begin, int n_local_experts) {
-    constexpr int WARPS = 8;                       // 256-thread CTAs
+    constexpr int GATE_WARPS = 8;
     const int lb_active = situ_linear_beta > 0.0f ? 1 : 0;
     // n_local <= 0 means "this rank holds every expert" — the tp_size 1 case, where
     // the band test must never reject. INT_MAX makes it a no-op rather than a branch.
@@ -3916,7 +3988,7 @@ static void moe_expert_ffn_launch(float* out, float* scratch,
     // so the bases alone decide it.
     const bool xvec = ((((uintptr_t)x) | ((uintptr_t)scratch)) & 15u) == 0;
 
-    const dim3 g1((unsigned)((ffn + WARPS - 1) / WARPS), (unsigned)top_k);
+    const dim3 g1((unsigned)((ffn + GATE_WARPS - 1) / GATE_WARPS), (unsigned)top_k);
     // partial[top_k] + the staged ids/w epilogue operands (see the kernel).
     const size_t dshm = (size_t)top_k * (2 * sizeof(float) + sizeof(int));
     const float inv_lb = lb_active ? 1.0f / situ_linear_beta : 1.0f;
@@ -3942,50 +4014,71 @@ static void moe_expert_ffn_launch(float* out, float* scratch,
             return e && e[0] == '1';
         }();
         if (gpack && gsmem) {
-            k3_pdl_launch(g1, WARPS * 32, sizeof(uint16_t) * SPARKINFER_IQ1S_NGRID,
-                stream, moe_gate_up_situ_kernel<WARPS, true, Blk, true, true>,
+            k3_pdl_launch(g1, GATE_WARPS * 32, sizeof(uint16_t) * SPARKINFER_IQ1S_NGRID,
+                stream, moe_gate_up_situ_kernel<GATE_WARPS, true, Blk, true, true>,
                 scratch, x, ids, (const Blk*)gate_exps, (const Blk*)up_exps, latent, ffn,
                 situ_beta, 1.0f / situ_beta, situ_linear_beta, inv_lb, lb_active,
                 expert_begin, n_local, w, k3_moe_weps_host());
             if (rebal)
-                k3_pdl_launch((unsigned)latent, WARPS * 32, dshm, stream, moe_down_combine_kernel<WARPS, true, Blk, true, true>,
+                k3_pdl_launch((unsigned)latent, DOWN_WARPS * 32, dshm, stream, moe_down_combine_kernel<DOWN_WARPS, true, Blk, true, true>,
                     out, scratch, ids, w, (const Blk*)down_exps, latent, ffn, top_k,
                     expert_begin, n_local, k3_moe_weps_host());
                 else
-                k3_pdl_launch((unsigned)latent, WARPS * 32, dshm, stream, moe_down_combine_kernel<WARPS, true, Blk, true>,
+                k3_pdl_launch((unsigned)latent, DOWN_WARPS * 32, dshm, stream, moe_down_combine_kernel<DOWN_WARPS, true, Blk, true>,
                     out, scratch, ids, w, (const Blk*)down_exps, latent, ffn, top_k,
                     expert_begin, n_local, k3_moe_weps_host());
         } else if (gpack) {
-            k3_pdl_launch(g1, WARPS * 32, 0, stream, moe_gate_up_situ_kernel<WARPS, true, Blk, true>,
+            k3_pdl_launch(g1, GATE_WARPS * 32, 0, stream, moe_gate_up_situ_kernel<GATE_WARPS, true, Blk, true>,
                 scratch, x, ids, (const Blk*)gate_exps, (const Blk*)up_exps, latent, ffn,
                 situ_beta, 1.0f / situ_beta, situ_linear_beta, inv_lb, lb_active,
                 expert_begin, n_local, w, k3_moe_weps_host());
             if (rebal)
-                k3_pdl_launch((unsigned)latent, WARPS * 32, dshm, stream, moe_down_combine_kernel<WARPS, true, Blk, true, true>,
+                k3_pdl_launch((unsigned)latent, DOWN_WARPS * 32, dshm, stream, moe_down_combine_kernel<DOWN_WARPS, true, Blk, true, true>,
                     out, scratch, ids, w, (const Blk*)down_exps, latent, ffn, top_k,
                     expert_begin, n_local, k3_moe_weps_host());
                 else
-                k3_pdl_launch((unsigned)latent, WARPS * 32, dshm, stream, moe_down_combine_kernel<WARPS, true, Blk, true>,
+                k3_pdl_launch((unsigned)latent, DOWN_WARPS * 32, dshm, stream, moe_down_combine_kernel<DOWN_WARPS, true, Blk, true>,
                     out, scratch, ids, w, (const Blk*)down_exps, latent, ffn, top_k,
                     expert_begin, n_local, k3_moe_weps_host());
         } else {
-        k3_pdl_launch(g1, WARPS * 32, 0, stream, moe_gate_up_situ_kernel<WARPS, true, Blk>, 
+        k3_pdl_launch(g1, GATE_WARPS * 32, 0, stream, moe_gate_up_situ_kernel<GATE_WARPS, true, Blk>,
             scratch, x, ids, (const Blk*)gate_exps, (const Blk*)up_exps, latent, ffn,
             situ_beta, 1.0f / situ_beta, situ_linear_beta, inv_lb, lb_active,
             expert_begin, n_local, w, k3_moe_weps_host());
-        k3_pdl_launch((unsigned)latent, WARPS * 32, dshm, stream, moe_down_combine_kernel<WARPS, true, Blk>, 
+        k3_pdl_launch((unsigned)latent, DOWN_WARPS * 32, dshm, stream, moe_down_combine_kernel<DOWN_WARPS, true, Blk>,
                 out, scratch, ids, w, (const Blk*)down_exps, latent, ffn, top_k,
                 expert_begin, n_local, k3_moe_weps_host());
         }
     } else {
-        k3_pdl_launch(g1, WARPS * 32, 0, stream, moe_gate_up_situ_kernel<WARPS, false, Blk>, 
+        k3_pdl_launch(g1, GATE_WARPS * 32, 0, stream, moe_gate_up_situ_kernel<GATE_WARPS, false, Blk>,
             scratch, x, ids, (const Blk*)gate_exps, (const Blk*)up_exps, latent, ffn,
             situ_beta, 1.0f / situ_beta, situ_linear_beta, inv_lb, lb_active,
             expert_begin, n_local, w, k3_moe_weps_host());
-        k3_pdl_launch((unsigned)latent, WARPS * 32, dshm, stream, moe_down_combine_kernel<WARPS, false, Blk>, 
+        k3_pdl_launch((unsigned)latent, DOWN_WARPS * 32, dshm, stream, moe_down_combine_kernel<DOWN_WARPS, false, Blk>,
                 out, scratch, ids, w, (const Blk*)down_exps, latent, ffn, top_k,
                 expert_begin, n_local, k3_moe_weps_host());
     }
+}
+
+template <typename Blk>
+static void moe_expert_ffn_launch(float* out, float* scratch,
+                                  const float* x, const int* ids, const float* w,
+                                  const void* gate_exps, const void* up_exps,
+                                  const void* down_exps,
+                                  int latent, int ffn, int top_k,
+                                  float situ_beta, float situ_linear_beta,
+                                  cudaStream_t stream,
+                                  int expert_begin, int n_local_experts) {
+    static const int down_warps = [] {
+        const char* e = std::getenv("SPARKINFER_K3_MOE_DOWN_WARPS");
+        return e && std::atoi(e) == 8 ? 8 : 4;
+    }();
+#define K3_MOE_WCALL(DW) moe_expert_ffn_launch_w<DW, Blk>(                         \
+        out, scratch, x, ids, w, gate_exps, up_exps, down_exps, latent, ffn,       \
+        top_k, situ_beta, situ_linear_beta, stream, expert_begin, n_local_experts)
+    if (down_warps == 8) K3_MOE_WCALL(8);
+    else K3_MOE_WCALL(4);
+#undef K3_MOE_WCALL
 }
 
 void moe_expert_ffn_iq2xs_f32(float* out, float* scratch,
@@ -4184,10 +4277,54 @@ void mla_absorb_q_f32(float* out, const float* q_nope, const float* q_pe,
 int k3_mla_decode_plan(int n_head, int kv_lora, int n_ctx) {
     if (n_head <= 0 || kv_lora <= 0 || n_ctx <= 0) return 1;
     int dev = 0;
+    const int pin = k3_mla_split_pin_at(n_ctx);
+    if (pin > 0) {
+        if (pin == 1 || !k3_mla_split_scratch(n_head, kv_lora, &dev)) return 1;
+        return std::min(pin, k3_mla_max_splits(n_head));
+    }
     if (n_ctx < kMlaSplitMinCtx) return 1;
     if (!k3_mla_split_scratch(n_head, kv_lora, &dev)) return 1;
     return std::min(k3_mla_max_splits(n_head),
                     (n_ctx + kMlaSplitMinCtx - 1) / kMlaSplitMinCtx);
+}
+
+void k3_mla_set_split_pin(int splits) {
+    g_k3_mla_split_pin = splits > 0 ? splits : 0;
+}
+
+int k3_mla_get_split_pin() { return g_k3_mla_split_pin; }
+
+int k3_mla_split_suggest(int n_head, int key_length, int kv_lora, int n_ctx) {
+    if (n_head <= 0 || key_length <= 0 || kv_lora <= 0 || n_ctx <= 0) return 1;
+    constexpr int BLOCK = 256;
+    int dev = 0;
+    int splits = (n_ctx >= kMlaSplitMinCtx &&
+                  k3_mla_split_scratch(n_head, kv_lora, &dev))
+        ? std::min(k3_mla_max_splits(n_head),
+                   (n_ctx + kMlaSplitMinCtx - 1) / kMlaSplitMinCtx)
+        : 1;
+    if (splits <= 1) return 1;
+
+    const int rslots = (kv_lora + BLOCK - 1) / BLOCK;
+    const int hpb = k3_mla_heads_per_block(n_head, key_length);
+    if (hpb > 1 && rslots <= kMlaMaxRSlots) {
+        const int groups = n_head / hpb;
+        const int sm = k3_sm_count(dev);
+        if (sm > 0) {
+            const int fill = (kMlaBlocksPerSm * sm + groups - 1) / groups;
+            int min_slice = k3_mla_min_slice_len(hpb, key_length, kv_lora);
+            int by_len = std::max(1, n_ctx / min_slice);
+            if (k3_mla_reach_fill()) {
+                int ms = min_slice;
+                while (ms > kMlaCtxTile && n_ctx / ms < fill) ms -= kMlaCtxTile;
+                if (k3_mla_partial_fill() || n_ctx / ms >= fill)
+                    by_len = std::max(1, n_ctx / ms);
+            }
+            splits = std::max(splits, std::min(fill, by_len));
+            splits = std::min(std::max(splits, 1), k3_mla_max_splits(n_head));
+        }
+    }
+    return splits;
 }
 
 // Allocate the split scratch BEFORE any capture begins.
@@ -4267,7 +4404,11 @@ static void mla_decode_attn_launch(float* out, const float* q, const KV* k_cache
     // pass and the extra global round trip cost more than the parallelism buys, and the
     // un-split kernel is also the one the numeric test pins bit-for-bit.
     int dev = 0;
-    int splits = (n_ctx >= kMlaSplitMinCtx && k3_mla_split_scratch(n_head, kv_lora, &dev))
+    const int split_pin = k3_mla_split_pin_at(n_ctx);
+    int splits = split_pin > 0
+               ? ((split_pin > 1 && k3_mla_split_scratch(n_head, kv_lora, &dev))
+                    ? std::min(split_pin, k3_mla_max_splits(n_head)) : 1)
+               : (n_ctx >= kMlaSplitMinCtx && k3_mla_split_scratch(n_head, kv_lora, &dev))
                ? std::min(k3_mla_max_splits(n_head), (n_ctx + kMlaSplitMinCtx - 1) / kMlaSplitMinCtx)
                : 1;
     if (splits <= 1) {
@@ -4304,7 +4445,7 @@ static void mla_decode_attn_launch(float* out, const float* q, const KV* k_cache
         // 264 the constant quietly became the binding term and cost 4%.
         const int groups = n_head / hpb;
         const int sm     = k3_sm_count(dev);
-        if (sm > 0) {
+        if (sm > 0 && split_pin <= 0) {
             const int fill = (kMlaBlocksPerSm * sm + groups - 1) / groups;
             int min_slice  = k3_mla_min_slice_len(hpb, key_length, kv_lora);
             int by_len     = std::max(1, n_ctx / min_slice);
@@ -4340,10 +4481,6 @@ static void mla_decode_attn_launch(float* out, const float* q, const KV* k_cache
             //
             // SPARKINFER_K3_MLA_FILL=0 restores the shipped split count on the SAME
             // binary. Default ON: the harness scores a default build.
-            static const bool reach_fill = [] {
-                const char* e = std::getenv("SPARKINFER_K3_MLA_FILL");
-                return !(e && e[0] == '0');
-            }();
             // TAKE THE PARALLELISM YOU CAN REACH, NOT ONLY THE PARALLELISM THAT REACHES
             // THE TARGET.
             //
@@ -4371,14 +4508,10 @@ static void mla_decode_attn_launch(float* out, const float* q, const KV* k_cache
             // LATENCY-bound at these grid sizes, not traffic-bound, which is the trade.
             // SPARKINFER_K3_MLA_FILL_PARTIAL=0 restores the all-or-nothing form on one
             // binary so the two can be measured against each other.
-            static const bool partial_fill = [] {
-                const char* e = std::getenv("SPARKINFER_K3_MLA_FILL_PARTIAL");
-                return !(e && e[0] == '0');
-            }();
-            if (reach_fill) {
+            if (k3_mla_reach_fill()) {
                 int ms = min_slice;
                 while (ms > kMlaCtxTile && n_ctx / ms < fill) ms -= kMlaCtxTile;
-                if (partial_fill || n_ctx / ms >= fill) {
+                if (k3_mla_partial_fill() || n_ctx / ms >= fill) {
                     min_slice = ms;
                     by_len    = std::max(1, n_ctx / ms);
                 }
@@ -4911,6 +5044,21 @@ bool k3_quantize_act_f32(void* q8_out, const float* x, int K, cudaStream_t strea
     const int nb = K / 32;
     constexpr int QT = 128;
     k3_quantize_q8_0(q8_out, x, nb, stream);
+    return true;
+}
+
+bool k3_quantize_act_rows_f32(void* q8_out, const float* x, int K, int n_rows,
+                              int64_t row_stride, cudaStream_t stream) {
+    if (!q8_out || !x || K <= 0 || (K % 32) != 0 || n_rows <= 0) return false;
+    if (row_stride == 0) row_stride = K;
+    // k3_quantize_q8_0 already assigns one independent CTA to each 32-value block.
+    // Tight rows are therefore exactly the single-row launch with a larger block count:
+    // no reduction or scale crosses a row boundary. Padded rows need a gather-aware
+    // kernel and deliberately decline here.
+    if (row_stride != K) return false;
+    const int64_t blocks = (int64_t)(K / 32) * n_rows;
+    if (blocks > INT_MAX) return false;
+    k3_quantize_q8_0(q8_out, x, (int)blocks, stream);
     return true;
 }
 

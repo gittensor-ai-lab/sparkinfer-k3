@@ -1437,6 +1437,10 @@ bool k3_prefill_pool_init(KimiK3TP& p, int want_tile) {
     for (std::size_t r = 0; r < p.ranks.size() && ok; ++r) {
         KimiK3TPRank& R = p.ranks[r];
         if (cudaSetDevice(R.device) != cudaSuccess) { ok = false; break; }
+        // The grouped IQ1_S kernel owns a TU-local lattice symbol. Its first-use upload
+        // is synchronous and illegal during capture, so prime it while the pool is
+        // created, before any tile graph can begin.
+        if (!k3k::k3_moe_iq1s_mma_prepare()) { ok = false; break; }
         if (!k3_prefill_tile_alloc(cfg, T, qkv, R.state.max_ckpt, pool->tiles[r])) {
             ok = false; break;
         }
@@ -1544,8 +1548,12 @@ static bool k3_tp_prefill_tile(KimiK3TP& p, const int* ids, int T) {
     // positions — so a tile straddling a kMlaSplitMinCtx boundary would need two
     // different grids inside ONE recorded graph, which a graph cannot express. Such a
     // tile runs eagerly; there are a handful of them in a 32k prompt.
-    const int plan_lo = k3k::k3_mla_decode_plan(cfg.n_q_heads, cfg.kv_lora_rank, base + 1);
-    const int plan_hi = k3k::k3_mla_decode_plan(cfg.n_q_heads, cfg.kv_lora_rank, base + T);
+    const int rank_mla_heads = p.ranks[0].weights.mla.n_heads > 0
+        ? p.ranks[0].weights.mla.n_heads : cfg.n_q_heads;
+    const int plan_lo = k3k::k3_mla_decode_plan(
+        rank_mla_heads, cfg.kv_lora_rank, base + 1);
+    const int plan_hi = k3k::k3_mla_decode_plan(
+        rank_mla_heads, cfg.kv_lora_rank, base + T);
     const bool plan_uniform = (plan_lo == plan_hi);
     // THE TILE-WIDE REDUCE MUST GO THROUGH THE COLLECTIVE'S OWNED BUFFERS, and capture
     // is what makes that a hard requirement rather than a preference.
@@ -1667,6 +1675,12 @@ static bool k3_tp_prefill_tile(KimiK3TP& p, const int* ids, int T) {
                     return true;
                 })) return false;
             tile_filled = true;
+            for (const auto& tl : pool.tiles)
+                tile_filled = tile_filled && tl.layer == layer;
+            // Deferral is legal only when this driver owns a contiguous reduction
+            // input for every row. Otherwise the scalar phase must write attn_out.
+            if (!attn_reduce || !tile_filled)
+                for (auto& tl : pool.tiles) tl.kda_out_layer = -1;
         }
         if (!tile_filled)
             for (auto& t : pool.tiles) t.layer = -1;
@@ -1800,11 +1814,89 @@ static bool k3_tp_prefill_tile(KimiK3TP& p, const int* ids, int T) {
                 })) return false;
             save_ckpt(t);
         }
+        // KDA gate outputs were deliberately left QKV-wide during the serial recurrent
+        // pass. Stream attn_output.weight once for the whole tile and land the H-wide
+        // rows directly in the collective-owned input that the scalar path targeted.
+        if (attn_reduce && cfg.is_kda_layer(layer) && tile_filled) {
+            if (!issue_all([&](int r) {
+                    KimiK3TPRank& R = p.ranks[(size_t)r];
+                    K3PrefillTile& tl = pool.tiles[(size_t)r];
+                    float* dst = (float*)p.coll->reduce_in_slot(r, slot_attn);
+                    return k3_prefill_finish_kda_output(
+                        tl, R.weights.layers[(size_t)layer], cfg, layer, T,
+                        dst, H, R.stream);
+                })) return false;
+        }
         if (attn_reduce && !reduce_tile(w_attn, slot_attn)) {
             std::fprintf(stderr, "[k3-prefill] attention all-reduce failed at layer %d\n",
                          layer);
             return false;
         }
+
+        // Independent FFN tile path: consume the collective's contiguous attention
+        // rows, batch residual/norm plus replicated projections, and leave expert
+        // arithmetic to the existing exact per-token dispatcher for now.
+        static const bool want_ffn_tile = [] {
+            const char* e = std::getenv("SPARKINFER_K3_PREFILL_FFN_BATCH");
+            return e && e[0] == '1';
+        }();
+        bool ffn_tile_batch = false;
+        if (want_ffn_tile && is_moe && attn_reduce && tp_size > 1) {
+            std::vector<unsigned char> ready((size_t)tp_size, 0);
+            bool uniform = true;
+            for (int r = 0; r < tp_size; ++r)
+                for (int t = 1; t < T; ++t)
+                    uniform = uniform &&
+                        ckpt[(size_t)r][(size_t)t] == ckpt[(size_t)r][0];
+            if (uniform && !issue_all([&](int r) {
+                    KimiK3TPRank& R = p.ranks[(size_t)r];
+                    K3PrefillTile& tl = pool.tiles[(size_t)r];
+                    const float* src = (const float*)p.coll->reduce_out(r);
+                    if (!src || cudaMemcpyAsync(tl.attn_out, src,
+                            (size_t)T * H * sizeof(float),
+                            cudaMemcpyDeviceToDevice, R.stream) != cudaSuccess)
+                        return false;
+                    if (!k3_prefill_prepare_ffn(
+                            tl, R.weights.layers[(size_t)layer], cfg, layer, T,
+                            pool.banks[(size_t)r],
+                            (int64_t)R.state.max_ckpt * H,
+                            ckpt[(size_t)r][0], R.stream))
+                        return true;
+                    const KimiK3LayerWeights& L = R.weights.layers[(size_t)layer];
+                    if (!k3_prefill_fill_routed_down(tl, L, cfg, layer, T, R.stream))
+                        return true;
+                    const int expert_begin = R.weights.shard.expert_band.offset;
+                    const int n_local = R.weights.shard.tp_size > 1
+                        ? R.weights.shard.expert_band.extent : 0;
+                    const int moe_ffn_rank = (int)L.ffn_gate_exps.rank_ne[1];
+                    ready[(size_t)r] = k3_prefill_dispatch_experts(
+                        tl, L, cfg, layer, T, moe_ffn_rank,
+                        expert_begin, n_local, R.stream) ? 1 : 0;
+                    return true;
+                })) return false;
+            ffn_tile_batch = uniform;
+            for (unsigned char v : ready) ffn_tile_batch = ffn_tile_batch && v;
+            if (!ffn_tile_batch)
+                for (auto& tl : pool.tiles) {
+                    tl.ffn_layer = -1;
+                    tl.expert_layer = -1;
+                }
+        }
+
+        // Seed the collective's latent prefix with the grouped local-expert result.
+        // The scalar partial phase below still handles its bookkeeping/debug path, but
+        // sees expert_layer and therefore does not dispatch the same experts again.
+        if (ffn_tile_batch && !issue_all([&](int r) {
+                KimiK3TPRank& R = p.ranks[(size_t)r];
+                K3PrefillTile& tl = pool.tiles[(size_t)r];
+                float* dst = (float*)p.coll->reduce_in_slot(r, slot_moe);
+                if (!dst) return false;
+                return cudaMemcpy2DAsync(
+                    dst, (size_t)w_moe * sizeof(float),
+                    tl.expert_out, (size_t)cfg.expert_latent * sizeof(float),
+                    (size_t)cfg.expert_latent * sizeof(float), T,
+                    cudaMemcpyDeviceToDevice, R.stream) == cudaSuccess;
+            })) return false;
 
         // ---- pass 2: every token's FFN partial --------------------------------------
         // Reads its attention sum out of reduce_out and writes its MoE partial into the
@@ -1825,6 +1917,18 @@ static bool k3_tp_prefill_tile(KimiK3TP& p, const int* ids, int T) {
                 })) return false;
             save_ckpt(t);
         }
+        if (ffn_tile_batch && !issue_all([&](int r) {
+                KimiK3TPRank& R = p.ranks[(size_t)r];
+                K3PrefillTile& tl = pool.tiles[(size_t)r];
+                float* dst = (float*)p.coll->reduce_in_slot(r, slot_moe);
+                if (!dst) return false;
+                return cudaMemcpy2DAsync(
+                    dst + cfg.expert_latent, (size_t)w_moe * sizeof(float),
+                    tl.moe_fused + cfg.expert_latent,
+                    (size_t)w_moe * sizeof(float),
+                    (size_t)H * sizeof(float), T,
+                    cudaMemcpyDeviceToDevice, R.stream) == cudaSuccess;
+            })) return false;
         // The leading dense layer's FFN partial is replicated, never reduced, which is
         // why this is gated on is_moe exactly as the token-major loop was.
         if (is_moe && tp_size > 1 && !reduce_tile(w_moe, slot_moe)) {
@@ -1833,12 +1937,24 @@ static bool k3_tp_prefill_tile(KimiK3TP& p, const int* ids, int T) {
             return false;
         }
 
+        if (ffn_tile_batch && !issue_all([&](int r) {
+                KimiK3TPRank& R = p.ranks[(size_t)r];
+                K3PrefillTile& tl = pool.tiles[(size_t)r];
+                const float* src = (const float*)p.coll->reduce_out(r);
+                if (!src || cudaMemcpyAsync(tl.moe_fused, src,
+                        (size_t)T * w_moe * sizeof(float),
+                        cudaMemcpyDeviceToDevice, R.stream) != cudaSuccess)
+                    return false;
+                return k3_prefill_finish_ffn(
+                    tl, R.weights.layers[(size_t)layer], cfg, T, R.stream);
+            })) return false;
+
         // ---- pass 3: every token's FFN finish ---------------------------------------
         //
         // NOTE the absence of the token driver's std::swap(R.x, R.x_next). The tile's
         // pair is swapped ONCE PER LAYER, below, after all T tokens have used it —
         // swapping here would hand token t+1 the buffer token t is still reading.
-        for (int t = 0; t < T; ++t) {
+        for (int t = 0; !ffn_tile_batch && t < T; ++t) {
             set_tok(t);
             if (!issue_all([&](int r) {
                     KimiK3TPRank& R = p.ranks[(size_t)r];
@@ -1852,6 +1968,12 @@ static bool k3_tp_prefill_tile(KimiK3TP& p, const int* ids, int T) {
                                                        tl.x_next + (size_t)t * H);
                 })) return false;
             save_ckpt(t);
+        }
+        for (auto& tl : pool.tiles) {
+            tl.ffn_norm_layer = -1;
+            tl.ffn_layer = -1;
+            tl.expert_layer = -1;
+            tl.attn_layer = -1;
         }
         // One swap for the whole tile, after every token has finished the layer.
         for (auto& tl : pool.tiles) k3_prefill_tile_swap(tl);
@@ -2013,6 +2135,21 @@ bool kimi_k3_tp_prefill(KimiK3TP& p, const int* ids, int n_ids, float* out_logit
     const int T = (want_tile && p.prefill) ? p.prefill->tile : 0;
     const int n_tiled = T > 0 ? ((n_ids - 1) / T) * T : 0;
 
+    struct MlaSplitPinScope {
+        int previous = 0;
+        explicit MlaSplitPinScope(int pin)
+            : previous(k3k::k3_mla_get_split_pin()) {
+            k3k::k3_mla_set_split_pin(pin);
+        }
+        ~MlaSplitPinScope() { k3k::k3_mla_set_split_pin(previous); }
+    };
+    const int rank_mla_heads = p.ranks[0].weights.mla.n_heads > 0
+        ? p.ranks[0].weights.mla.n_heads : p.cfg.n_q_heads;
+    const int deepest_ctx = p.ranks[0].state.position + n_tiled;
+    const int pin = n_tiled > 0 ? k3k::k3_mla_split_suggest(
+        rank_mla_heads, p.cfg.key_length, p.cfg.kv_lora_rank, deepest_ctx) : 0;
+    {
+    MlaSplitPinScope split_scope(pin);
     for (int i = 0; i < n_tiled; i += T) {
         // No fallback once a tile has started: it has already written KV rows and
         // advanced the KDA recurrence, so re-running those tokens per-token would
@@ -2022,6 +2159,7 @@ bool kimi_k3_tp_prefill(KimiK3TP& p, const int* ids, int n_ids, float* out_logit
                                  "already part-written, so there is no fallback\n", i);
             return false;
         }
+    }
     }
     for (int i = n_tiled; i < n_ids; ++i)
         if (!kimi_k3_tp_forward_token(p, ids[i], out_logits)) return false;

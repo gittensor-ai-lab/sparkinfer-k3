@@ -138,6 +138,9 @@ bool k3_moe_router_fast(float* out_w, int* out_ids, const float* logits,
 // Declines on SPARKINFER_K3_ADD3=0.
 bool k3_add3_f32(float* out, float* out_ab, const float* a, const float* b,
                  const float* c, int64_t n, cudaStream_t stream);
+bool k3_add3_rows_f32(float* out, float* out_ab, const float* a,
+                      const float* b, int64_t b_row_stride, const float* c,
+                      int rows, int cols, cudaStream_t stream);
 
 }  // namespace k3
 }  // namespace kernels
