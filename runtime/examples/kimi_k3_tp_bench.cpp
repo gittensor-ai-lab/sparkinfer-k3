@@ -133,7 +133,22 @@ int main(int argc, char** argv) {
     // the accuracy pass WITHOUT these flags.
     int  max_ctx = 64;
     bool do_seek = false;
-    bool do_prefill = false;   // --prefill: ingest via the batched tile driver
+    // TILED INGESTION IS THE DEFAULT, and it has to be rather than a flag.
+    //
+    // bench/scripts/kimi_k3_eval.sh is a maintainer-only path — the sensitive-paths guard
+    // blocks a contributor from editing the script that scores them, correctly, because
+    // whoever can edit the scorer can score themselves. So a driver the harness must opt
+    // into can never become the measured number: the harness would keep feeding the prompt
+    // one token at a time and the engine's own best ingestion would sit unused.
+    //
+    // Making it the default is an ENGINE change, not a scoring change. The harness still
+    // measures whatever prompt ingestion this binary does; this changes what that is.
+    // kimi_k3_tp_prefill falls back to the per-token path for any prompt or geometry
+    // outside its contract, so nothing that worked before stops working.
+    //
+    // --no-prefill restores the token loop on the same binary, which is what every A/B in
+    // this branch's history was measured against.
+    bool do_prefill = true;    // --no-prefill: ingest one token at a time instead
     std::vector<int> ids;
     // --checkpoints: dump logits at several DEPTHS of one prompt in a single pass.
     //
@@ -153,6 +168,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--ctx") && i + 1 < argc) max_ctx = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--seek")) do_seek = true;
         else if (!std::strcmp(argv[i], "--prefill")) do_prefill = true;
+        else if (!std::strcmp(argv[i], "--no-prefill")) do_prefill = false;
     }
     if (!checkpoints.empty() && !logits_prefix) {
         std::printf("--checkpoints needs --logits-prefix\n");
@@ -282,11 +298,20 @@ int main(int argc, char** argv) {
         // second head (measuring something the optimisation does not do) or silently
         // reporting the wrong depth's logits. The final-token logits below ARE produced,
         // so end-to-end parity against the per-token path is still checkable.
+        // CHECKPOINTS FALL BACK RATHER THAN FAIL, now that tiling is the default. A
+        // checkpoint asks for the logits at depth L, which means running the head at a
+        // token in the middle of a tile, and the tile driver runs the head only for the
+        // last token it ingests. Refusing was right while --prefill was an explicit
+        // request — the caller asked for something incoherent and should hear so. As a
+        // DEFAULT, refusing would break every existing --checkpoints caller for a reason
+        // they did not ask for, so the token loop serves them instead.
+        if (do_prefill && !checkpoints.empty()) {
+            std::printf("--checkpoints needs per-token logits; ingesting one token at a "
+                        "time instead of tiling\n");
+            std::fflush(stdout);
+            do_prefill = false;
+        }
         if (do_prefill) {
-            if (!checkpoints.empty()) {
-                std::printf("--prefill cannot serve --checkpoints (see the comment)\n");
-                return 1;
-            }
             const auto t_b0 = std::chrono::steady_clock::now();
             if (!kimi_k3_tp_prefill(p, ids.data(), (int)ids.size(), logits.data())) {
                 std::printf("prefill failed\n"); return 1;

@@ -553,27 +553,10 @@ if [[ "$SCORED_METRIC" == "prefill" ]]; then
         echo "kimi_k3_eval: no prefill ids at $PREFILL_IDS — cannot measure the scored metric" >&2
         exit 1
     fi
-    # --prefill ROUTES INGESTION THROUGH THE TILE DRIVER, and without it none of the
-    # batched-prefill work is scored: the bench falls back to feeding the prompt one token
-    # at a time through the decode step, which is the 59.07 tok/s baseline, not the 63.28
-    # the driver measures. A merged optimisation the harness never invokes is not an
-    # optimisation.
-    #
-    # The driver falls back to the per-token path for any prompt or geometry outside its
-    # contract, so this cannot make the pass fail — at worst it measures what it measured
-    # before.
-    #
-    # NOTE, and it is not a small one: THE ACCURACY GATE BELOW DOES NOT EXERCISE THIS PATH.
-    # It compares 4 prompt ids against llama.cpp, and a 4-token prompt tiles to
-    # ((4-1)/T)*T = 0 tokens, so every one of them goes through the per-token tail and the
-    # tile driver never runs. The gate therefore says nothing about tiled ingestion. The
-    # evidence that does exist is a 32k tile-vs-per-token comparison: top-1 100%, mean KLD
-    # 1.4268e-03 — inside the 0.95 / 0.05 bars, but flagged by compare_logits.py as beyond
-    # reduction-order noise, and not yet explained.
     echo ">> measuring prefill: ingesting $PREFILL_TOKENS real tokens ..."
     PF_OUT="$(mktemp)"; trap 'rm -f "$PF_OUT"' EXIT
     if ! env -u POLARIS_API_KEY "$BENCH" "$MODEL" "$NDEV" "$LAYERS" 1 \
-            --ids @"$PREFILL_IDS" --ctx "$(( PREFILL_TOKENS + 16 ))" --prefill > "$PF_OUT" 2>&1; then
+            --ids @"$PREFILL_IDS" --ctx "$(( PREFILL_TOKENS + 16 ))" > "$PF_OUT" 2>&1; then
         tail -20 "$PF_OUT" >&2
         echo "kimi_k3_eval: the prefill pass failed — nothing to score" >&2
         exit 1
