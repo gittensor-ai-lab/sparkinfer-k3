@@ -879,6 +879,25 @@ struct KimiK3Forward::Scratch {
     void* moe_batch_ws = nullptr;
     size_t moe_batch_ws_bytes = 0;
 
+    // CSR + grouped IQ1_S MMA scratch for the scored chunk MoE path. Graph-safe:
+    // fixed launch shapes from (n_tok, n_local), no host sync, no cudaMallocAsync.
+    // Capacity is pairs = cap*top_k for the compact CSR tensors; max_rows = cap.
+    // nullptr declines to moe_expert_ffn_batch (the dp4a regroup #148 ships).
+    signed char* moe_mma_xq = nullptr;     // [cap][latent]
+    float*       moe_mma_xscale = nullptr; // [cap][latent/32]
+    int*         moe_mma_rows = nullptr;   // [pairs]
+    int*         moe_mma_slots = nullptr;  // [pairs]
+    int*         moe_mma_inverse = nullptr;// [pairs]
+    int*         moe_mma_bounds = nullptr; // [n_experts + 1]
+    float*       moe_mma_gate = nullptr;   // [pairs][moe_ffn]
+    float*       moe_mma_up = nullptr;     // [pairs][moe_ffn]
+    float*       moe_mma_situ = nullptr;   // [pairs][moe_ffn]
+    signed char* moe_mma_hq = nullptr;     // [pairs][moe_ffn]
+    float*       moe_mma_hscale = nullptr; // [pairs][moe_ffn/32]
+    float*       moe_mma_down = nullptr;   // [pairs][latent]
+    float*       moe_mma_out = nullptr;    // [cap][latent] compact combine dest
+    int          moe_mma_n_experts_cap = 0;
+
     // ---- DAG LANES -------------------------------------------------------
     //
     // The capture is one linear chain per rank, but a layer is not a chain. On an
@@ -1253,6 +1272,46 @@ bool kimi_k3_forward_alloc_scratch(const KimiK3Config& cfg, KimiK3Forward& fwd) 
         if (nb > 0 && alloc_bytes(s.moe_batch_ws, nb)) s.moe_batch_ws_bytes = nb;
     }
 
+    // CSR + grouped IQ1_S MMA scratch. Only useful at cap > 1 (the scored chunk
+    // path); at cap == 1 decode never enters it. Allocation failure just leaves
+    // the pointers null and the dispatch declines to the dp4a batch path.
+    if (cap > 1 && cfg.expert_latent % 256 == 0 && cfg.moe_ffn % 256 == 0) {
+        const size_t pairs = (size_t)cap * (size_t)cfg.top_k;
+        const size_t latent = (size_t)cfg.expert_latent;
+        const size_t ffn = (size_t)cfg.moe_ffn;
+        const size_t n_exp = (size_t)cfg.n_experts;
+        bool mma_ok = true;
+        mma_ok = mma_ok && alloc_bytes((void*&)s.moe_mma_xq, (size_t)cap * latent);
+        mma_ok = mma_ok && alloc_f(s.moe_mma_xscale, (size_t)cap * (latent / 32));
+        mma_ok = mma_ok && alloc_i(s.moe_mma_rows, pairs);
+        mma_ok = mma_ok && alloc_i(s.moe_mma_slots, pairs);
+        mma_ok = mma_ok && alloc_i(s.moe_mma_inverse, pairs);
+        mma_ok = mma_ok && alloc_i(s.moe_mma_bounds, n_exp + 1);
+        mma_ok = mma_ok && alloc_f(s.moe_mma_gate, pairs * ffn);
+        mma_ok = mma_ok && alloc_f(s.moe_mma_up, pairs * ffn);
+        mma_ok = mma_ok && alloc_f(s.moe_mma_situ, pairs * ffn);
+        mma_ok = mma_ok && alloc_bytes((void*&)s.moe_mma_hq, pairs * ffn);
+        mma_ok = mma_ok && alloc_f(s.moe_mma_hscale, pairs * (ffn / 32));
+        mma_ok = mma_ok && alloc_f(s.moe_mma_down, pairs * latent);
+        mma_ok = mma_ok && alloc_f(s.moe_mma_out, (size_t)cap * latent);
+        if (mma_ok) {
+            s.moe_mma_n_experts_cap = cfg.n_experts;
+            // Lattice upload is synchronous and illegal during capture — prime it
+            // once here, before any chunk graph can begin.
+            if (!k3k::k3_moe_iq1s_mma_prepare()) mma_ok = false;
+        }
+        if (!mma_ok) {
+            s.moe_mma_xq = nullptr; s.moe_mma_xscale = nullptr;
+            s.moe_mma_rows = nullptr; s.moe_mma_slots = nullptr;
+            s.moe_mma_inverse = nullptr; s.moe_mma_bounds = nullptr;
+            s.moe_mma_gate = nullptr; s.moe_mma_up = nullptr;
+            s.moe_mma_situ = nullptr; s.moe_mma_hq = nullptr;
+            s.moe_mma_hscale = nullptr; s.moe_mma_down = nullptr;
+            s.moe_mma_out = nullptr;
+            s.moe_mma_n_experts_cap = 0;
+        }
+    }
+
     if (!ok) { kimi_k3_forward_free_scratch(fwd); return false; }
 
     // ---- DAG lanes ----
@@ -1378,12 +1437,12 @@ static bool k3_kda_qkvg_batch_enabled() {
 // whenever its batched kernel declines. At n_rows == 1 every one of these is the call the
 // per-token path makes today.
 //
-// Default OFF. The scored build must not move under an unmeasured scheduling change —
-// this is measured on one binary against the same binary with the gate off.
+// Default ON. The scored build at B=64 is what makes the occupancy win real
+// (12 → 768 blocks on decay_gate); =0 restores the per-token chain on one binary.
 static bool k3_kda_pre_batch_enabled() {
     static const bool on = [] {
         const char* e = std::getenv("SPARKINFER_K3_KDA_PRE_BATCH");
-        return e && e[0] == '1';
+        return !(e && e[0] == '0');
     }();
     return on;
 }
@@ -1872,7 +1931,9 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
 
     auto proj_once = [&](Lane ln, float* y, const float* x, const KimiK3Tensor& W,
                          int N, int K) {
-        if (ggml_qact_proj) {
+        // Q8-act paths only know Q8_0 weights. Current HF UD-IQ1_S keeps most dense
+        // projections as Q6_K (type 14); those must take the f32-act on-read GEMV.
+        if (ggml_qact_proj && W.type == 8) {
             // SoA-FIRST, restored deliberately: the SoA kernel now carries the
             // one-barrier stash/fold verbatim (P2), so the epilogue confound that
             // poisoned the first A/B is gone — enabling Q8SOA now changes ONLY the
@@ -3295,6 +3356,77 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             // tile's reuse back into a recompute silently, at no correctness cost and
             // full expert cost.
             bool moe_done = experts_prepared;
+            // Prefer CSR + grouped IQ1_S MMA on the scored chunk path. One launch per
+            // local expert with BM from max_rows (= n_tok); graph-safe (no host sync).
+            // Declines to the dp4a moe_expert_ffn_batch below. SPARKINFER_K3_MOE_MMA=0
+            // restores the #148 path on one binary.
+            if (!moe_done && n_tok > 1 && !ggml_qact_moe &&
+                L.ffn_gate_exps.type == 19 && L.ffn_up_exps.type == 19 &&
+                L.ffn_down_exps.type == 19 && s.moe_mma_xq && s.moe_mma_out &&
+                s.moe_mma_bounds &&
+                moe_ffn_rank > 0 && moe_ffn_rank <= cfg.moe_ffn) {
+                static const bool want_mma = [] {
+                    const char* e = std::getenv("SPARKINFER_K3_MOE_MMA");
+                    return !(e && e[0] == '0');
+                }();
+                // n_local_exp == 0 means "whole model" (tp=1); the banded form is
+                // what the scored 8-way path uses.
+                const int n_mma = n_local_exp > 0 ? n_local_exp : cfg.n_experts;
+                const int begin_mma = n_local_exp > 0 ? expert_begin : 0;
+                if (want_mma && n_mma > 0 && n_mma <= s.moe_mma_n_experts_cap) {
+                    const int P = n_tok * cfg.top_k;
+                    const bool ok_mma =
+                        k3k::k3_moe_iq1s_mma_quantize_rows(
+                            s.moe_mma_xq, s.moe_mma_xscale, routed_down_src,
+                            n_tok, cfg.expert_latent, stream) &&
+                        k3k::k3_moe_build_expert_csr(
+                            s.moe_mma_rows, s.moe_mma_slots, s.moe_mma_inverse,
+                            s.moe_mma_bounds, router_ids_src, n_tok, cfg.top_k,
+                            begin_mma, n_mma, stream) &&
+                        k3k::k3_moe_iq1s_mma_grouped(
+                            s.moe_mma_gate, s.moe_mma_xq, s.moe_mma_xscale,
+                            L.ffn_gate_exps.data, s.moe_mma_rows, s.moe_mma_bounds,
+                            n_mma, n_tok, moe_ffn_rank, cfg.expert_latent,
+                            stream) &&
+                        k3k::k3_moe_iq1s_mma_grouped(
+                            s.moe_mma_up, s.moe_mma_xq, s.moe_mma_xscale,
+                            L.ffn_up_exps.data, s.moe_mma_rows, s.moe_mma_bounds,
+                            n_mma, n_tok, moe_ffn_rank, cfg.expert_latent,
+                            stream) &&
+                        k3k::k3_moe_situ_compact(
+                            s.moe_mma_situ, s.moe_mma_gate, s.moe_mma_up,
+                            s.moe_mma_inverse, n_tok, cfg.top_k, moe_ffn_rank,
+                            cfg.situ_beta, cfg.situ_linear_beta, stream) &&
+                        k3k::k3_moe_iq1s_mma_quantize_rows(
+                            s.moe_mma_hq, s.moe_mma_hscale, s.moe_mma_situ,
+                            P, moe_ffn_rank, stream) &&
+                        k3k::k3_moe_iq1s_mma_grouped(
+                            s.moe_mma_down, s.moe_mma_hq, s.moe_mma_hscale,
+                            L.ffn_down_exps.data, /*rows=*/nullptr, s.moe_mma_bounds,
+                            n_mma, n_tok, cfg.expert_latent, moe_ffn_rank,
+                            stream) &&
+                        k3k::k3_moe_combine_compact(
+                            s.moe_mma_out, s.moe_mma_down, s.moe_mma_inverse,
+                            router_w_src, n_tok, cfg.expert_latent, cfg.top_k,
+                            stream);
+                    if (ok_mma) {
+                        // Compact [n_tok][latent] -> fused [n_tok][moe_row] partial.
+                        if (moe_row == cfg.expert_latent) {
+                            moe_done = cudaMemcpyAsync(
+                                s.moe_out, s.moe_mma_out,
+                                (size_t)n_tok * cfg.expert_latent * sizeof(float),
+                                cudaMemcpyDeviceToDevice, stream) == cudaSuccess;
+                        } else {
+                            moe_done = cudaMemcpy2DAsync(
+                                s.moe_out, (size_t)moe_row * sizeof(float),
+                                s.moe_mma_out,
+                                (size_t)cfg.expert_latent * sizeof(float),
+                                (size_t)cfg.expert_latent * sizeof(float), n_tok,
+                                cudaMemcpyDeviceToDevice, stream) == cudaSuccess;
+                        }
+                    }
+                }
+            }
             if (!moe_done && n_tok > 1 && !ggml_qact_moe) {
                 moe_done = k3k::moe_expert_ffn_batch_f32_by_type(
                     s.moe_out, moe_row,
@@ -3305,7 +3437,8 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
                     cfg.expert_latent, moe_ffn_rank, cfg.top_k, n_tok, cfg.situ_beta,
                     cfg.situ_linear_beta, L.ffn_gate_exps.type, stream,
                     expert_begin, n_local_exp, cfg.n_experts,
-                    s.moe_batch_ws, s.moe_batch_ws_bytes);
+                    s.moe_batch_ws, s.moe_batch_ws_bytes,
+                    L.ffn_up_exps.type, L.ffn_down_exps.type);
             }
             // s.moe_q8 (the q8k staging) and the slab-zero invariant both hold per row:
             // the loop is straight-line on ONE stream, so token b's dispatch completes
@@ -3320,7 +3453,8 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
                     L.ffn_gate_exps.data, L.ffn_up_exps.data, L.ffn_down_exps.data,
                     cfg.expert_latent, moe_ffn_rank, cfg.top_k, cfg.situ_beta,
                     cfg.situ_linear_beta, L.ffn_gate_exps.type, stream,
-                    expert_begin, n_local_exp, ggml_qact_moe ? s.moe_q8 : nullptr);
+                    expert_begin, n_local_exp, ggml_qact_moe ? s.moe_q8 : nullptr,
+                    L.ffn_up_exps.type, L.ffn_down_exps.type);
                 if (!moe_ok) return false;
             }
             // This rank's PARTIAL expert sum: it legitimately differs per rank and

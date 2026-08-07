@@ -324,34 +324,73 @@ bool k3_prefill_dispatch_experts(K3PrefillTile& t, const KimiK3LayerWeights& L,
         !t.expert_hscale || !t.expert_down || !t.expert_out)
         return false;
 
+    // Default: CSR + grouped MMA. One launch per local expert with BM from
+    // max_rows (= n_tok). SPARKINFER_K3_PREFILL_MOE_PAIRS=1 restores the M=1
+    // pairs path #136 first wired.
+    static const bool want_pairs = [] {
+        const char* e = std::getenv("SPARKINFER_K3_PREFILL_MOE_PAIRS");
+        return e && e[0] == '1';
+    }();
+
     const int P = n_tok * cfg.top_k;
     if (!k3k::k3_moe_iq1s_mma_quantize_rows(
             t.expert_xq, t.expert_xscale, t.routed_down,
-            n_tok, cfg.expert_latent, stream) ||
-        !k3k::k3_moe_iq1s_mma_pairs(
-            t.expert_gate, t.expert_xq, t.expert_xscale, L.ffn_gate_exps.data,
-            t.router_ids, P, cfg.top_k, expert_begin, n_local_experts,
-            moe_ffn_rank, cfg.expert_latent, stream) ||
-        !k3k::k3_moe_iq1s_mma_pairs(
-            t.expert_up, t.expert_xq, t.expert_xscale, L.ffn_up_exps.data,
-            t.router_ids, P, cfg.top_k, expert_begin, n_local_experts,
-            moe_ffn_rank, cfg.expert_latent, stream) ||
-        !k3k::k3_moe_situ_pairs(
-            t.expert_situ, t.expert_gate, t.expert_up, t.router_ids,
-            P, moe_ffn_rank, expert_begin, n_local_experts, cfg.situ_beta,
-            cfg.situ_linear_beta, stream) ||
-        !k3k::k3_moe_iq1s_mma_quantize_rows(
-            t.expert_hq, t.expert_hscale, t.expert_situ,
-            P, moe_ffn_rank, stream) ||
-        !k3k::k3_moe_iq1s_mma_pairs(
-            t.expert_down, t.expert_hq, t.expert_hscale, L.ffn_down_exps.data,
-            t.router_ids, P, 1, expert_begin, n_local_experts,
-            cfg.expert_latent, moe_ffn_rank, stream) ||
-        !k3k::k3_moe_combine_pairs(
-            t.expert_out, t.expert_down, t.router_ids, t.router_w,
-            n_tok, cfg.expert_latent, cfg.top_k, expert_begin,
-            n_local_experts, stream))
+            n_tok, cfg.expert_latent, stream))
         return false;
+
+    if (!want_pairs) {
+        if (!k3k::k3_moe_build_expert_csr(
+                t.expert_rows, t.expert_slots, t.expert_inverse, t.expert_bounds,
+                t.router_ids, n_tok, cfg.top_k, expert_begin, n_local_experts,
+                stream) ||
+            !k3k::k3_moe_iq1s_mma_grouped(
+                t.expert_gate, t.expert_xq, t.expert_xscale, L.ffn_gate_exps.data,
+                t.expert_rows, t.expert_bounds, n_local_experts, n_tok,
+                moe_ffn_rank, cfg.expert_latent, stream) ||
+            !k3k::k3_moe_iq1s_mma_grouped(
+                t.expert_up, t.expert_xq, t.expert_xscale, L.ffn_up_exps.data,
+                t.expert_rows, t.expert_bounds, n_local_experts, n_tok,
+                moe_ffn_rank, cfg.expert_latent, stream) ||
+            !k3k::k3_moe_situ_compact(
+                t.expert_situ, t.expert_gate, t.expert_up, t.expert_inverse,
+                n_tok, cfg.top_k, moe_ffn_rank, cfg.situ_beta,
+                cfg.situ_linear_beta, stream) ||
+            !k3k::k3_moe_iq1s_mma_quantize_rows(
+                t.expert_hq, t.expert_hscale, t.expert_situ,
+                P, moe_ffn_rank, stream) ||
+            !k3k::k3_moe_iq1s_mma_grouped(
+                t.expert_down, t.expert_hq, t.expert_hscale, L.ffn_down_exps.data,
+                /*rows=*/nullptr, t.expert_bounds, n_local_experts, n_tok,
+                cfg.expert_latent, moe_ffn_rank, stream) ||
+            !k3k::k3_moe_combine_compact(
+                t.expert_out, t.expert_down, t.expert_inverse, t.router_w,
+                n_tok, cfg.expert_latent, cfg.top_k, stream))
+            return false;
+    } else if (!k3k::k3_moe_iq1s_mma_pairs(
+                   t.expert_gate, t.expert_xq, t.expert_xscale, L.ffn_gate_exps.data,
+                   t.router_ids, P, cfg.top_k, expert_begin, n_local_experts,
+                   moe_ffn_rank, cfg.expert_latent, stream) ||
+               !k3k::k3_moe_iq1s_mma_pairs(
+                   t.expert_up, t.expert_xq, t.expert_xscale, L.ffn_up_exps.data,
+                   t.router_ids, P, cfg.top_k, expert_begin, n_local_experts,
+                   moe_ffn_rank, cfg.expert_latent, stream) ||
+               !k3k::k3_moe_situ_pairs(
+                   t.expert_situ, t.expert_gate, t.expert_up, t.router_ids,
+                   P, moe_ffn_rank, expert_begin, n_local_experts, cfg.situ_beta,
+                   cfg.situ_linear_beta, stream) ||
+               !k3k::k3_moe_iq1s_mma_quantize_rows(
+                   t.expert_hq, t.expert_hscale, t.expert_situ,
+                   P, moe_ffn_rank, stream) ||
+               !k3k::k3_moe_iq1s_mma_pairs(
+                   t.expert_down, t.expert_hq, t.expert_hscale, L.ffn_down_exps.data,
+                   t.router_ids, P, 1, expert_begin, n_local_experts,
+                   cfg.expert_latent, moe_ffn_rank, stream) ||
+               !k3k::k3_moe_combine_pairs(
+                   t.expert_out, t.expert_down, t.router_ids, t.router_w,
+                   n_tok, cfg.expert_latent, cfg.top_k, expert_begin,
+                   n_local_experts, stream)) {
+        return false;
+    }
     t.expert_layer = layer;
     return true;
 }
