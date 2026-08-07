@@ -65,15 +65,37 @@ struct K3PrefillTile {
     float* k      = nullptr;   // [tile][qkv] KDA attn_k
     float* v      = nullptr;   // [tile][qkv] KDA attn_v
     float* g      = nullptr;   // [tile][qkv] KDA ssm_g
-
-    // MLA tile staging. Unlike the KDA projection reuse above, these buffers bridge
-    // two explicit runtime phases: prepare writes every token's absorbed query and
-    // gate, the tiled attention fills mla_out, then finish applies o_proj.
-    float* mla_query = nullptr; // [tile][n_q_heads][key_length]
-    float* mla_gate  = nullptr; // [tile][n_q_heads][value_length_mla]
-    float* mla_out   = nullptr; // [tile][n_q_heads][value_length_mla]
-    void*  mla_workspace = nullptr;
-    size_t mla_workspace_bytes = 0;
+    float* kda_gate_out = nullptr; // [tile][qkv] deferred KDA output-proj input
+    float* normed2 = nullptr;  // [tile][H] FFN-normalized activation
+    float* routed_down = nullptr; // [tile][expert_latent]
+    float* router_logits = nullptr; // [tile][n_experts]
+    float* router_w = nullptr;      // [tile][top_k]
+    int*   router_ids = nullptr;    // [tile][top_k]
+    float* shexp_gate = nullptr;    // [tile][moe_ffn*n_shared] capacity
+    float* shexp_up = nullptr;      // [tile][moe_ffn*n_shared] capacity
+    float* shexp_situ = nullptr;    // [tile][moe_ffn*n_shared] capacity
+    float* moe_normed = nullptr;    // [tile][expert_latent]
+    float* routed_up = nullptr;     // [tile][H]
+    float* attn_out = nullptr; // [tile][H] full attention result after TP reduction
+    // Per-token TP partials kept adjacent so one collective can reduce the whole
+    // MoE tile. Each row fuses routed latent and shared-expert hidden exactly like
+    // the decode scratch exposed by kimi_k3_partial_buffer(FfnPartial).
+    float* moe_fused = nullptr; // [tile][expert_latent + H]
+    // Device-only grouped expert dispatch scratch. Capacity is tile*top_k pairs;
+    // expert_bounds makes the fixed worst-case launch graph-safe without a host sync.
+    signed char* expert_xq = nullptr;
+    float* expert_xscale = nullptr;
+    int* expert_rows = nullptr;
+    int* expert_slots = nullptr;
+    int* expert_inverse = nullptr;
+    int* expert_bounds = nullptr;
+    float* expert_gate = nullptr;
+    float* expert_up = nullptr;
+    float* expert_situ = nullptr;
+    signed char* expert_hq = nullptr;
+    float* expert_hscale = nullptr;
+    float* expert_down = nullptr;
+    float* expert_out = nullptr;
     // Softmax scratch for attn_res_mix, [max_ckpt + 1]. Owned so the mix never falls
     // back to the cudaMallocAsync/cudaFreeAsync pair it uses when handed nullptr —
     // which is not merely slow here but uncapturable, and a tile is the unit a graph
@@ -88,6 +110,11 @@ struct K3PrefillTile {
     // that was filled for a different layer — the failure mode would be fluent, wrong
     // output rather than a crash, which is the one this project keeps refusing to ship.
     int layer = -1;
+    int ffn_norm_layer = -1;
+    int ffn_layer = -1;
+    int expert_layer = -1;
+    int attn_layer = -1;
+    int kda_out_layer = -1;
 };
 
 bool k3_prefill_tile_alloc(const KimiK3Config& cfg, int tile, int qkv, int max_ckpt,
@@ -133,5 +160,38 @@ bool k3_prefill_fill_qkvg(K3PrefillTile& t, const KimiK3LayerWeights& L,
                           const KimiK3Config& cfg, int layer, int n_tok,
                           float* const* banks, const int* n_ckpt,
                           cudaStream_t stream);
+
+// Project all deferred KDA gate-output rows directly into a strided collective input.
+bool k3_prefill_finish_kda_output(K3PrefillTile& t, const KimiK3LayerWeights& L,
+                                  const KimiK3Config& cfg, int layer, int n_tok,
+                                  float* dst, int64_t dst_row_stride,
+                                  cudaStream_t stream);
+
+// Batch the replicated router and routed-down projections after every token in the tile
+// has completed attention and FFN preparation, then select top-k for every row. The
+// consumer aliases the three rows directly.
+bool k3_prefill_fill_routed_down(K3PrefillTile& t, const KimiK3LayerWeights& L,
+                                 const KimiK3Config& cfg, int layer, int n_tok,
+                                 cudaStream_t stream);
+
+bool k3_prefill_dispatch_experts(K3PrefillTile& t, const KimiK3LayerWeights& L,
+                                 const KimiK3Config& cfg, int layer, int n_tok,
+                                 int moe_ffn_rank, int expert_begin,
+                                 int n_local_experts, cudaStream_t stream);
+
+// Batch phase 2a (attention residual combine, residual mix, FFN norm) over the tile.
+// `banks` is the base of [tile][bank_stride] checkpoint storage and every token must
+// enter the layer with the same n_ckpt, as the model's layer-indexed bank schedule does.
+bool k3_prefill_prepare_ffn(K3PrefillTile& t, const KimiK3LayerWeights& L,
+                            const KimiK3Config& cfg, int layer, int n_tok,
+                            const float* banks, int64_t bank_stride, int n_ckpt,
+                            cudaStream_t stream);
+
+// Batch phase 3 after the tile-wide MoE collective: routed norm/up and the final
+// shared-expert plus residual fold. Writes x_next in place and leaves routed_up as the
+// same debug-visible intermediate the scalar phase calls ffn_out.
+bool k3_prefill_finish_ffn(K3PrefillTile& t, const KimiK3LayerWeights& L,
+                           const KimiK3Config& cfg, int n_tok,
+                           cudaStream_t stream);
 
 }  // namespace sparkinfer

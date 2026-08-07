@@ -234,11 +234,24 @@ KIMI_K3_H200X8_IQ1S_LLAMA_32K_PP="${KIMI_K3_H200X8_IQ1S_LLAMA_32K_PP:-143.88}"
 # +25.4%, +24.5% and +5.3% which are -4.6%, -5.3% and -19.8% against the real number. Only
 # #133 measured main itself, and landed within 0.23% of the bot (53.14 vs 53.02).
 #
+# 69.02 -> 98.80 on 2026-08-06 with #148, the first BATCHED prompt ingestion: the layer
+# loop moves outside the token loop and a chunk of tokens goes through the kernels
+# together, so each weight tile is read once and spent on the whole chunk instead of once
+# per token. Same-binary against its own per-token walk, 32,768 real tokens: 69.41 ->
+# 99.68 tok/s, output bit-identical at every chunk width.
+#
+# #148's ORIGINAL 169.72 tok/s was not real and is recorded here because the number is in
+# the log. It was measured with two defects live -- a gate documented default-off but read
+# opt-out, and the activation/bank strides transposed at all three attn_res_mix_f32 call
+# sites -- and the corrupted walk was FASTER because it was reading the wrong rows. The
+# transposition hid below 13 layers, where max_ckpt is 1 and the two strides are equal.
+# 98.80 is what the same change does once it computes the right answer.
+#
 # A seeded frontier is a claim about main that nobody measured. If one is unavoidable,
 # measure the CURRENT head, and say which commit -- see the notice reconcile_lock now emits
 # when a measured frontier overshoots its pin.
-# frontier: measured by eval/k3_eval_bot.py on main @ e1999272830f (h200x8, UD-IQ1_S). Do not hand-edit — the bot rewrites this each round.
-KIMI_K3_H200X8_IQ1S_SPARKINFER_32K_PP="${KIMI_K3_H200X8_IQ1S_SPARKINFER_32K_PP:-59.59}"
+# frontier: measured by eval/k3_eval_bot.py on main @ 2a6c66f9cb1d (h200x8, UD-IQ1_S). Do not hand-edit — the bot rewrites this each round.
+KIMI_K3_H200X8_IQ1S_SPARKINFER_32K_PP="${KIMI_K3_H200X8_IQ1S_SPARKINFER_32K_PP:-98.80}"
 
 KIMI_K3_H200X8_LLAMA_128="${KIMI_K3_H200X8_LLAMA_128:-0}"
 KIMI_K3_H200X8_LLAMA_512="${KIMI_K3_H200X8_LLAMA_512:-0}"

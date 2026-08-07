@@ -282,7 +282,10 @@ void moe_iq1s_mma_kernel(float* __restrict__ C,
                          const float* __restrict__ sa,
                          const BlockIQ1S* __restrict__ W,
                          const int* __restrict__ rows,
-                         int M, int N, int K) {
+                         const int* __restrict__ expert_bounds,
+                         const int* __restrict__ pair_ids,
+                         int pair_top_k, int expert_begin, int n_local,
+                         int M, int N, int K, size_t expert_w_stride) {
     k3_pdl_sync();
     constexpr int kBM     = BM;
     constexpr int kWarps  = MmaCfg<BM>::warps;
@@ -306,6 +309,19 @@ void moe_iq1s_mma_kernel(float* __restrict__ C,
                   sizeof(Sgrid) <= 48 * 1024,
                   "static shared exceeds the 48 KB per-block limit");
 
+    const int expert = (int)blockIdx.z;
+    int row_base = expert_bounds ? expert_bounds[expert] : 0;
+    if (expert_bounds) {
+        M = expert_bounds[expert + 1] - row_base;
+        W += (size_t)expert * expert_w_stride;
+    } else if (pair_ids) {
+        const int p = expert;
+        const int local = pair_ids[p] - expert_begin;
+        if (local < 0 || local >= n_local) return;
+        row_base = p;
+        M = 1;
+        W += (size_t)local * expert_w_stride;
+    }
     const int tid  = threadIdx.x;
     const int warp = tid >> 5;
     const int lane = tid & 31;
@@ -317,6 +333,10 @@ void moe_iq1s_mma_kernel(float* __restrict__ C,
     const int n0   = blockIdx.x * kBN;
     const int blk_per_row = K / kQK;
     const int nk   = K / kBK;
+
+    // Uniform for the whole CTA. This is safe before any __syncthreads and prevents
+    // the fixed graph grid from decoding weights for empty experts or unused M tiles.
+    if (m0 >= M) return;
 
     // The lattice gather is divergent across the warp, which is exactly the access the
     // constant unit serialises one address per cycle. 4 KB in shared costs one staging
@@ -341,7 +361,9 @@ void moe_iq1s_mma_kernel(float* __restrict__ C,
             const int r = s / (kBK / 16), c = (s % (kBK / 16)) << 4;
             const int gk = k0 + c;
             signed char* dst = &As[buf][r][swz(c, r)];
-            const int src_row = (m0 + r < M) ? (rows ? rows[m0 + r] : m0 + r) : -1;
+            const int src_row = (m0 + r < M)
+                ? (pair_ids ? row_base / pair_top_k
+                            : (rows ? rows[row_base + m0 + r] : row_base + m0 + r)) : -1;
             if (src_row >= 0 && gk < K)
                 *reinterpret_cast<uint4*>(dst) =
                     *reinterpret_cast<const uint4*>(A + (size_t)src_row * K + gk);
@@ -353,7 +375,9 @@ void moe_iq1s_mma_kernel(float* __restrict__ C,
         // operand contributes nothing rather than a stale scale.
         for (int u = tid; u < kBM * (kBK / kSub); u += kThreads) {
             const int r = u >> 1, half = u & 1;
-            const int src_row = (m0 + r < M) ? (rows ? rows[m0 + r] : m0 + r) : -1;
+            const int src_row = (m0 + r < M)
+                ? (pair_ids ? row_base / pair_top_k
+                            : (rows ? rows[row_base + m0 + r] : row_base + m0 + r)) : -1;
             const int kb = (k0 + half * kSub) / kSub;
             Asc[buf][half][r] = (src_row >= 0) ? sa[(size_t)src_row * (K / kSub) + kb] : 0.0f;
         }
@@ -498,7 +522,8 @@ void moe_iq1s_mma_kernel(float* __restrict__ C,
             for (int e = 0; e < 4; ++e) {
                 const int gm = m0 + i * 16 + grp + (e >> 1) * 8;
                 const int gn = n0 + warp * (kBN / kWarps) + j * 8 + tig * 2 + (e & 1);
-                if (gm < M && gn < N) C[(size_t)gm * N + gn] = accf[i][j][e];
+                if (gm < M && gn < N)
+                    C[(size_t)(row_base + gm) * N + gn] = accf[i][j][e];
             }
         }
     }
@@ -512,6 +537,10 @@ bool k3_moe_iq1s_mma_quantize_rows(signed char* q, float* scale, const float* x,
     k3_pdl_launch((unsigned)rows, 32, 0, stream, quantize_rows_i8_f32_kernel,
                   x, q, scale, rows, cols);
     return true;
+}
+
+bool k3_moe_iq1s_mma_prepare() {
+    return ensure_grid_uploaded();
 }
 
 bool k3_moe_iq1s_mma_gemm(float* C, const signed char* A, const float* sa,
@@ -530,10 +559,63 @@ bool k3_moe_iq1s_mma_gemm(float* C, const signed char* A, const float* sa,
         constexpr int BM = decltype(tag)::value;
         dim3 grid((unsigned)((N + kBN - 1) / kBN), (unsigned)((M + BM - 1) / BM));
         k3_pdl_launch(grid, MmaCfg<BM>::warps * 32, 0, stream, moe_iq1s_mma_kernel<BM>,
-                      C, A, sa, reinterpret_cast<const BlockIQ1S*>(W), rows, M, N, K);
+                      C, A, sa, reinterpret_cast<const BlockIQ1S*>(W), rows, nullptr,
+                      nullptr, 1, 0, 0,
+                      M, N, K, (size_t)0);
     };
     if (M <= kMSwitch) go(std::integral_constant<int, 32>{});
     else               go(std::integral_constant<int, 128>{});
+    return true;
+}
+
+bool k3_moe_iq1s_mma_grouped(float* C, const signed char* A, const float* sa,
+                             const void* W, const int* rows,
+                             const int* expert_bounds, int n_experts,
+                             int max_rows_per_expert, int N, int K,
+                             cudaStream_t stream) {
+    // rows may be null for an already compact CSR activation (the grouped down
+    // projection); in that form row_base+m is the source row by construction.
+    if (!C || !A || !sa || !W || !expert_bounds) return false;
+    if (n_experts <= 0 || max_rows_per_expert <= 0 || N <= 0 || K <= 0 ||
+        (K % kQK) != 0) return false;
+    if (!ensure_grid_uploaded()) return false;
+
+    // One expert can receive at most one slot from each token because top-k IDs are
+    // unique. Select BM from that device-independent upper bound; live counts never
+    // affect launch construction, which is what makes this form graph-capturable.
+    const auto go = [&](auto tag) {
+        constexpr int BM = decltype(tag)::value;
+        dim3 grid((unsigned)((N + kBN - 1) / kBN),
+                  (unsigned)((max_rows_per_expert + BM - 1) / BM),
+                  (unsigned)n_experts);
+        const size_t w_stride = (size_t)N * (K / kQK);
+        k3_pdl_launch(grid, MmaCfg<BM>::warps * 32, 0, stream,
+                      moe_iq1s_mma_kernel<BM>, C, A, sa,
+                      reinterpret_cast<const BlockIQ1S*>(W), rows, expert_bounds,
+                      nullptr, 1, 0, 0,
+                      max_rows_per_expert, N, K, w_stride);
+    };
+    if (max_rows_per_expert <= kMSwitch) go(std::integral_constant<int, 32>{});
+    else                                 go(std::integral_constant<int, 128>{});
+    return true;
+}
+
+bool k3_moe_iq1s_mma_pairs(float* C, const signed char* A, const float* sa,
+                           const void* W, const int* ids, int pairs,
+                           int activation_top_k, int expert_begin,
+                           int n_local_experts, int N, int K,
+                           cudaStream_t stream) {
+    if (!C || !A || !sa || !W || !ids || pairs <= 0 || activation_top_k <= 0 ||
+        n_local_experts <= 0 || N <= 0 || K <= 0 || (K % kQK) != 0)
+        return false;
+    if (!ensure_grid_uploaded()) return false;
+    dim3 grid((unsigned)((N + kBN - 1) / kBN), 1u, (unsigned)pairs);
+    const size_t stride = (size_t)N * (K / kQK);
+    k3_pdl_launch(grid, MmaCfg<32>::warps * 32, 0, stream,
+                  moe_iq1s_mma_kernel<32>, C, A, sa,
+                  reinterpret_cast<const BlockIQ1S*>(W), nullptr, nullptr,
+                  ids, activation_top_k, expert_begin, n_local_experts,
+                  1, N, K, stride);
     return true;
 }
 
