@@ -10,6 +10,7 @@
 
 #include "sparkinfer/kernels/kimi_k3.h"
 #include "sparkinfer/kernels/iq2xs_tables.h"
+#include "sparkinfer/kernels/iq2xxs_tables.h"
 #include <climits>   // INT_MAX — the "no expert band" sentinel
 #include "sparkinfer/kernels/iq1s_tables.h"
 #include "k3_pdl.cuh"
@@ -769,12 +770,20 @@ __global__ void kda_conv_step_kernel(float* __restrict__ out, float* __restrict_
 __device__ uint64_t c_iq2xs_grid[512];
 __device__ uint8_t  c_ksigns_iq2xs[128];
 __device__ uint8_t  c_kmask_iq2xs[8];
+__device__ uint64_t c_iq2xxs_grid[256];
 
 struct BlockIQ2XS {          // 74 bytes, matches ggml block_iq2_xs exactly
     uint16_t d;              // fp16 bits
     uint16_t qs[32];
     uint8_t  scales[8];
 };
+
+// 66 bytes, matches ggml block_iq2_xxs (d + qs[QK_K/8]).
+struct BlockIQ2XXS {
+    uint16_t d;
+    uint16_t qs[32];
+} __attribute__((packed));
+static_assert(sizeof(BlockIQ2XXS) == 66, "bad block_iq2_xxs layout");
 
 // 50 bytes, matches ggml block_iq1_s exactly (ggml-common.h asserts
 // sizeof(ggml_half) + QK_K/8 + QK_K/16). IQ1_S is the UD-IQ1_S target's expert type.
@@ -972,6 +981,47 @@ __device__ __forceinline__ float block_dot(const BlockIQ2XS& b,
         const uint8_t* grid = (const uint8_t*)&c_iq2xs_grid[q & 511];
         const uint8_t signs = c_ksigns_iq2xs[q >> 9];
         const float* xv = x + l * 8;
+        if (XVEC) {
+            const float4* xv4 = (const float4*)xv;
+            const float4 xa = xv4[0], xb = xv4[1];
+            const float xs[8] = { xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w };
+        #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const uint8_t gj = (uint8_t)((gw >> (8 * j)) & 0xffu);
+                const float wv = db * (float)gj * ((signs & c_kmask_iq2xs[j]) ? -1.0f : 1.0f);
+                acc += wv * xs[j];
+            }
+        } else {
+        #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const float wv = db * (float)grid[j] * ((signs & c_kmask_iq2xs[j]) ? -1.0f : 1.0f);
+                acc += wv * xv[j];
+            }
+        }
+    }
+    return acc;
+}
+
+// IQ2_XXS: scales+signs packed in qs[4*ib32 + 2/3] (see ggml dequantize_row_iq2_xxs).
+template <bool XVEC, bool GPACK = false, bool GS = false>
+__device__ __forceinline__ float block_dot(const BlockIQ2XXS& b,
+                                           const float* __restrict__ x,
+                                           int lane, int nlanes) {
+    const float d = __half2float(__ushort_as_half(b.d));
+    float acc = 0.0f;
+    // 8 sub-blocks of 32 values; each holds 4 groups of 8. Spread groups over lanes.
+    for (int g = lane; g < 32; g += nlanes) {
+        const int ib32 = g >> 2;   // 0..7
+        const int l = g & 3;       // 0..3 within sub-block
+        uint32_t aux32[2];
+        aux32[0] = (uint32_t)b.qs[4 * ib32 + 0] | ((uint32_t)b.qs[4 * ib32 + 1] << 16);
+        aux32[1] = (uint32_t)b.qs[4 * ib32 + 2] | ((uint32_t)b.qs[4 * ib32 + 3] << 16);
+        const uint8_t* aux8 = (const uint8_t*)aux32;
+        const float db = d * (0.5f + (float)(aux32[1] >> 28)) * 0.25f;
+        const uint64_t gw = c_iq2xxs_grid[aux8[l]];
+        const uint8_t* grid = (const uint8_t*)&c_iq2xxs_grid[aux8[l]];
+        const uint8_t signs = c_ksigns_iq2xs[(aux32[1] >> (7 * l)) & 127];
+        const float* xv = x + g * 8;
         if (XVEC) {
             const float4* xv4 = (const float4*)xv;
             const float4 xa = xv4[0], xb = xv4[1];
@@ -1583,6 +1633,39 @@ __device__ __forceinline__ void block_dot_rows(const BlockIQ2XS& b,
     const uint16_t q = b.qs[lane];
     const uint64_t gw = c_iq2xs_grid[q & 511];
     const uint8_t signs = c_ksigns_iq2xs[q >> 9];
+#pragma unroll
+    for (int r = 0; r < NR; ++r) {
+        if (r < nrows) {
+            const float4* xv4 = (const float4*)(xr[r] + boff + lane * 8);
+            const float4 xa = xv4[0], xb = xv4[1];
+            const float xs[8] = { xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w };
+            float s = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const uint8_t gj = (uint8_t)((gw >> (8 * j)) & 0xffu);
+                const float wv = db * (float)gj * ((signs & c_kmask_iq2xs[j]) ? -1.0f : 1.0f);
+                s += wv * xs[j];
+            }
+            acc[r] += s;
+        }
+    }
+}
+
+// IQ2_XXS counterpart for the grouped (NR-row) path. GPACK ignored.
+template <int NR, bool GPACK>
+__device__ __forceinline__ void block_dot_rows(const BlockIQ2XXS& b,
+                                               const float* (&xr)[NR],
+                                               int boff, int nrows, int lane,
+                                               float (&acc)[NR]) {
+    const int ib32 = lane >> 2, l = lane & 3;
+    const float d = __half2float(__ushort_as_half(b.d));
+    uint32_t aux32[2];
+    aux32[0] = (uint32_t)b.qs[4 * ib32 + 0] | ((uint32_t)b.qs[4 * ib32 + 1] << 16);
+    aux32[1] = (uint32_t)b.qs[4 * ib32 + 2] | ((uint32_t)b.qs[4 * ib32 + 3] << 16);
+    const uint8_t* aux8 = (const uint8_t*)aux32;
+    const float db = d * (0.5f + (float)(aux32[1] >> 28)) * 0.25f;
+    const uint64_t gw = c_iq2xxs_grid[aux8[l]];
+    const uint8_t signs = c_ksigns_iq2xs[(aux32[1] >> (7 * l)) & 127];
 #pragma unroll
     for (int r = 0; r < NR; ++r) {
         if (r < nrows) {
@@ -3525,6 +3608,94 @@ __global__ void proj_q8_0_kernel(float* __restrict__ y, const float* __restrict_
     if (threadIdx.x == 0) y[n] = acc;
 }
 
+// f32-activation × Q6_K on-read GEMV. One warp per output row; K % 256 == 0.
+// Decoder matches gemv_q_kernel / dequant_q6_k_kernel (ggml byte-exact).
+//
+// Two launches: the smem-staged form when K floats fit the default shared carveout,
+// and a global-read form for the dense-FFN down (K=33792 → 132 KiB) that would
+// otherwise fail the launch with cudaErrorInvalidValue.
+__global__ void proj_q6_k_n_kernel(float* __restrict__ y, const float* __restrict__ x,
+                                   const unsigned char* __restrict__ W, int N, int K) {
+    k3_pdl_sync();
+    constexpr int WPB = 4;
+    extern __shared__ float s_x_q6[];
+    for (int i = threadIdx.x; i < K; i += blockDim.x) s_x_q6[i] = x[i];
+    __syncthreads();
+
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const int n = (int)blockIdx.x * WPB + warp;
+    if (n >= N) return;
+    const int nblk = K / 256;
+    const unsigned char* base = W + (size_t)n * nblk * 210;
+    float acc = 0.f;
+    for (int blk = 0; blk < nblk; blk++) {
+        const unsigned char* b = base + (size_t)blk * 210;
+        const float* sx = s_x_q6 + blk * 256;
+        const unsigned char* ql = b;
+        const unsigned char* qh = b + 128;
+        const signed char* sc = (const signed char*)(b + 192);
+        __half h; *((unsigned short*)&h) = *(const unsigned short*)(b + 208);
+        const float d = __half2float(h);
+#pragma unroll
+        for (int nn = 0; nn < 2; nn++) {
+            const unsigned char* qln = ql + nn * 64;
+            const unsigned char* qhn = qh + nn * 32;
+            const signed char* scn = sc + nn * 8;
+            const int is = lane / 16;
+            const int q1 = (int)((qln[lane] & 0xF) | (((qhn[lane] >> 0) & 3) << 4)) - 32;
+            const int q2 = (int)((qln[lane + 32] & 0xF) | (((qhn[lane] >> 2) & 3) << 4)) - 32;
+            const int q3 = (int)((qln[lane] >> 4) | (((qhn[lane] >> 4) & 3) << 4)) - 32;
+            const int q4 = (int)((qln[lane + 32] >> 4) | (((qhn[lane] >> 6) & 3) << 4)) - 32;
+            acc += d * scn[is + 0] * q1 * sx[nn * 128 + lane];
+            acc += d * scn[is + 2] * q2 * sx[nn * 128 + lane + 32];
+            acc += d * scn[is + 4] * q3 * sx[nn * 128 + lane + 64];
+            acc += d * scn[is + 6] * q4 * sx[nn * 128 + lane + 96];
+        }
+    }
+#pragma unroll
+    for (int m = 16; m > 0; m >>= 1) acc += __shfl_xor_sync(0xffffffff, acc, m);
+    if (lane == 0) y[n] = acc;
+}
+
+__global__ void proj_q6_k_n_nosmem_kernel(float* __restrict__ y, const float* __restrict__ x,
+                                          const unsigned char* __restrict__ W, int N, int K) {
+    k3_pdl_sync();
+    constexpr int WPB = 4;
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const int n = (int)blockIdx.x * WPB + warp;
+    if (n >= N) return;
+    const int nblk = K / 256;
+    const unsigned char* base = W + (size_t)n * nblk * 210;
+    float acc = 0.f;
+    for (int blk = 0; blk < nblk; blk++) {
+        const unsigned char* b = base + (size_t)blk * 210;
+        const float* sx = x + blk * 256;
+        const unsigned char* ql = b;
+        const unsigned char* qh = b + 128;
+        const signed char* sc = (const signed char*)(b + 192);
+        __half h; *((unsigned short*)&h) = *(const unsigned short*)(b + 208);
+        const float d = __half2float(h);
+#pragma unroll
+        for (int nn = 0; nn < 2; nn++) {
+            const unsigned char* qln = ql + nn * 64;
+            const unsigned char* qhn = qh + nn * 32;
+            const signed char* scn = sc + nn * 8;
+            const int is = lane / 16;
+            const int q1 = (int)((qln[lane] & 0xF) | (((qhn[lane] >> 0) & 3) << 4)) - 32;
+            const int q2 = (int)((qln[lane + 32] & 0xF) | (((qhn[lane] >> 2) & 3) << 4)) - 32;
+            const int q3 = (int)((qln[lane] >> 4) | (((qhn[lane] >> 4) & 3) << 4)) - 32;
+            const int q4 = (int)((qln[lane + 32] >> 4) | (((qhn[lane] >> 6) & 3) << 4)) - 32;
+            acc += d * scn[is + 0] * q1 * sx[nn * 128 + lane];
+            acc += d * scn[is + 2] * q2 * sx[nn * 128 + lane + 32];
+            acc += d * scn[is + 4] * q3 * sx[nn * 128 + lane + 64];
+            acc += d * scn[is + 6] * q4 * sx[nn * 128 + lane + 96];
+        }
+    }
+#pragma unroll
+    for (int m = 16; m > 0; m >>= 1) acc += __shfl_xor_sync(0xffffffff, acc, m);
+    if (lane == 0) y[n] = acc;
+}
+
 // Same dot product, but ROWS output rows per thread block.
 //
 // WHY. The single-row kernel gives every output row its own block, and every block
@@ -4056,6 +4227,36 @@ __global__ void dequant_q8_0_kernel(float* __restrict__ out,
     float* dst = out + b * 32;
 #pragma unroll
     for (int j = 0; j < 32; ++j) dst[j] = (float)blocks[b].qs[j] * d;
+}
+
+// Q6_K: 210 B / 256 values. Same decoder as dequant_gguf.cu / gemv_q (ggml byte-exact).
+__global__ void dequant_q6_k_kernel(float* __restrict__ out,
+                                    const unsigned char* __restrict__ src,
+                                    int64_t n_blocks) {
+    k3_pdl_sync();
+    const int64_t b = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
+    if (b >= n_blocks) return;
+    const unsigned char* blk = src + b * 210;
+    const unsigned char* ql = blk;
+    const unsigned char* qh = blk + 128;
+    const signed char* sc = (const signed char*)(blk + 192);
+    __half h; *((unsigned short*)&h) = *(const unsigned short*)(blk + 208);
+    const float d = __half2float(h);
+    float* yy = out + b * 256;
+    for (int n = 0; n < 256; n += 128) {
+        for (int l = 0; l < 32; l++) {
+            const int is = l / 16;
+            const int q1 = (int)((ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+            const int q2 = (int)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+            const int q3 = (int)((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+            const int q4 = (int)((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+            yy[l]      = d * sc[is + 0] * q1;
+            yy[l + 32] = d * sc[is + 2] * q2;
+            yy[l + 64] = d * sc[is + 4] * q3;
+            yy[l + 96] = d * sc[is + 6] * q4;
+        }
+        ql += 64; qh += 32; sc += 8; yy += 128;
+    }
 }
 
 __global__ void dequant_f32_passthrough_kernel(float* __restrict__ out,
@@ -4608,6 +4809,16 @@ static void ensure_iq2xs_tables() {
     if (dev >= 0) ready[dev] = true;
 }
 
+static void ensure_iq2xxs_tables() {
+    // Signs/masks are shared with IQ2_XS; grid is the XXS lattice.
+    ensure_iq2xs_tables();
+    static bool ready[kMaxTableDevices] = {false};
+    const int dev = current_device_index();
+    if (dev >= 0 && ready[dev]) return;
+    cudaMemcpyToSymbol(c_iq2xxs_grid, h_iq2xxs_grid, sizeof(h_iq2xxs_grid));
+    if (dev >= 0) ready[dev] = true;
+}
+
 // The SAME lattice at 2 bytes per codepoint instead of 8. Every byte of every
 // entry is in {0x00, 0x01, 0xff} (the header's tripwire), i.e. {0, 1, -1} — two
 // bits each in two's complement. Why it can pay: the 11-bit index is fully
@@ -4655,6 +4866,7 @@ static void ensure_iq1s_tables() {
 // with each device current, so the in-capture call hits its `ready[dev]` early return.
 void k3_prewarm_quant_tables() {
     ensure_iq2xs_tables();
+    ensure_iq2xxs_tables();
     ensure_iq1s_tables();
     // WEPS engagement counting, opt-in and uploaded here because this function runs
     // once per device BEFORE any capture — the same synchronous-copy-legality window
@@ -4720,7 +4932,7 @@ void moe_router_noaux_tc_f32(float* out_w, int* out_ids, const float* logits,
 // One launch path for both quant types. The two front doors below differ only in the
 // table they prime and the block layout they name; duplicating the grid arithmetic
 // across them is the same drift the block_dot overloads exist to prevent.
-template <int DOWN_WARPS, typename Blk>
+template <int DOWN_WARPS, typename GateBlk, typename DownBlk = GateBlk>
 static void moe_expert_ffn_launch_w(float* out, float* scratch,
                                   const float* x, const int* ids, const float* w,
                                   const void* gate_exps, const void* up_exps,
@@ -4780,52 +4992,52 @@ static void moe_expert_ffn_launch_w(float* out, float* scratch,
         }();
         if (gpack && gsmem) {
             k3_pdl_launch(g1, GATE_WARPS * 32, sizeof(uint16_t) * SPARKINFER_IQ1S_NGRID,
-                stream, moe_gate_up_situ_kernel<GATE_WARPS, true, Blk, true, true>,
-                scratch, x, ids, (const Blk*)gate_exps, (const Blk*)up_exps, latent, ffn,
+                stream, moe_gate_up_situ_kernel<GATE_WARPS, true, GateBlk, true, true>,
+                scratch, x, ids, (const GateBlk*)gate_exps, (const GateBlk*)up_exps, latent, ffn,
                 situ_beta, 1.0f / situ_beta, situ_linear_beta, inv_lb, lb_active,
                 expert_begin, n_local, w, k3_moe_weps_host());
             if (rebal)
-                k3_pdl_launch((unsigned)latent, DOWN_WARPS * 32, dshm, stream, moe_down_combine_kernel<DOWN_WARPS, true, Blk, true, true>,
-                    out, scratch, ids, w, (const Blk*)down_exps, latent, ffn, top_k,
+                k3_pdl_launch((unsigned)latent, DOWN_WARPS * 32, dshm, stream, moe_down_combine_kernel<DOWN_WARPS, true, DownBlk, true, true>,
+                    out, scratch, ids, w, (const DownBlk*)down_exps, latent, ffn, top_k,
                     expert_begin, n_local, k3_moe_weps_host());
                 else
-                k3_pdl_launch((unsigned)latent, DOWN_WARPS * 32, dshm, stream, moe_down_combine_kernel<DOWN_WARPS, true, Blk, true>,
-                    out, scratch, ids, w, (const Blk*)down_exps, latent, ffn, top_k,
+                k3_pdl_launch((unsigned)latent, DOWN_WARPS * 32, dshm, stream, moe_down_combine_kernel<DOWN_WARPS, true, DownBlk, true>,
+                    out, scratch, ids, w, (const DownBlk*)down_exps, latent, ffn, top_k,
                     expert_begin, n_local, k3_moe_weps_host());
         } else if (gpack) {
-            k3_pdl_launch(g1, GATE_WARPS * 32, 0, stream, moe_gate_up_situ_kernel<GATE_WARPS, true, Blk, true>,
-                scratch, x, ids, (const Blk*)gate_exps, (const Blk*)up_exps, latent, ffn,
+            k3_pdl_launch(g1, GATE_WARPS * 32, 0, stream, moe_gate_up_situ_kernel<GATE_WARPS, true, GateBlk, true>,
+                scratch, x, ids, (const GateBlk*)gate_exps, (const GateBlk*)up_exps, latent, ffn,
                 situ_beta, 1.0f / situ_beta, situ_linear_beta, inv_lb, lb_active,
                 expert_begin, n_local, w, k3_moe_weps_host());
             if (rebal)
-                k3_pdl_launch((unsigned)latent, DOWN_WARPS * 32, dshm, stream, moe_down_combine_kernel<DOWN_WARPS, true, Blk, true, true>,
-                    out, scratch, ids, w, (const Blk*)down_exps, latent, ffn, top_k,
+                k3_pdl_launch((unsigned)latent, DOWN_WARPS * 32, dshm, stream, moe_down_combine_kernel<DOWN_WARPS, true, DownBlk, true, true>,
+                    out, scratch, ids, w, (const DownBlk*)down_exps, latent, ffn, top_k,
                     expert_begin, n_local, k3_moe_weps_host());
                 else
-                k3_pdl_launch((unsigned)latent, DOWN_WARPS * 32, dshm, stream, moe_down_combine_kernel<DOWN_WARPS, true, Blk, true>,
-                    out, scratch, ids, w, (const Blk*)down_exps, latent, ffn, top_k,
+                k3_pdl_launch((unsigned)latent, DOWN_WARPS * 32, dshm, stream, moe_down_combine_kernel<DOWN_WARPS, true, DownBlk, true>,
+                    out, scratch, ids, w, (const DownBlk*)down_exps, latent, ffn, top_k,
                     expert_begin, n_local, k3_moe_weps_host());
         } else {
-        k3_pdl_launch(g1, GATE_WARPS * 32, 0, stream, moe_gate_up_situ_kernel<GATE_WARPS, true, Blk>,
-            scratch, x, ids, (const Blk*)gate_exps, (const Blk*)up_exps, latent, ffn,
+        k3_pdl_launch(g1, GATE_WARPS * 32, 0, stream, moe_gate_up_situ_kernel<GATE_WARPS, true, GateBlk>,
+            scratch, x, ids, (const GateBlk*)gate_exps, (const GateBlk*)up_exps, latent, ffn,
             situ_beta, 1.0f / situ_beta, situ_linear_beta, inv_lb, lb_active,
             expert_begin, n_local, w, k3_moe_weps_host());
-        k3_pdl_launch((unsigned)latent, DOWN_WARPS * 32, dshm, stream, moe_down_combine_kernel<DOWN_WARPS, true, Blk>,
-                out, scratch, ids, w, (const Blk*)down_exps, latent, ffn, top_k,
+        k3_pdl_launch((unsigned)latent, DOWN_WARPS * 32, dshm, stream, moe_down_combine_kernel<DOWN_WARPS, true, DownBlk>,
+                out, scratch, ids, w, (const DownBlk*)down_exps, latent, ffn, top_k,
                 expert_begin, n_local, k3_moe_weps_host());
         }
     } else {
-        k3_pdl_launch(g1, GATE_WARPS * 32, 0, stream, moe_gate_up_situ_kernel<GATE_WARPS, false, Blk>,
-            scratch, x, ids, (const Blk*)gate_exps, (const Blk*)up_exps, latent, ffn,
+        k3_pdl_launch(g1, GATE_WARPS * 32, 0, stream, moe_gate_up_situ_kernel<GATE_WARPS, false, GateBlk>,
+            scratch, x, ids, (const GateBlk*)gate_exps, (const GateBlk*)up_exps, latent, ffn,
             situ_beta, 1.0f / situ_beta, situ_linear_beta, inv_lb, lb_active,
             expert_begin, n_local, w, k3_moe_weps_host());
-        k3_pdl_launch((unsigned)latent, DOWN_WARPS * 32, dshm, stream, moe_down_combine_kernel<DOWN_WARPS, false, Blk>,
-                out, scratch, ids, w, (const Blk*)down_exps, latent, ffn, top_k,
+        k3_pdl_launch((unsigned)latent, DOWN_WARPS * 32, dshm, stream, moe_down_combine_kernel<DOWN_WARPS, false, DownBlk>,
+                out, scratch, ids, w, (const DownBlk*)down_exps, latent, ffn, top_k,
                 expert_begin, n_local, k3_moe_weps_host());
     }
 }
 
-template <typename Blk>
+template <typename GateBlk, typename DownBlk = GateBlk>
 static void moe_expert_ffn_launch(float* out, float* scratch,
                                   const float* x, const int* ids, const float* w,
                                   const void* gate_exps, const void* up_exps,
@@ -4838,7 +5050,7 @@ static void moe_expert_ffn_launch(float* out, float* scratch,
         const char* e = std::getenv("SPARKINFER_K3_MOE_DOWN_WARPS");
         return e && std::atoi(e) == 8 ? 8 : 4;
     }();
-#define K3_MOE_WCALL(DW) moe_expert_ffn_launch_w<DW, Blk>(                         \
+#define K3_MOE_WCALL(DW) moe_expert_ffn_launch_w<DW, GateBlk, DownBlk>(            \
         out, scratch, x, ids, w, gate_exps, up_exps, down_exps, latent, ffn,       \
         top_k, situ_beta, situ_linear_beta, stream, expert_begin, n_local_experts)
     if (down_warps == 8) K3_MOE_WCALL(8);
@@ -4922,6 +5134,15 @@ bool dequant_f32_by_type(float* out, const void* src, int64_t n, int ggml_type,
                 out, (const BlockQ8_0*)src, n_blocks);
             return true;
         }
+        case 14: {  // Q6_K — current HF UD-IQ1_S embd / absorbed MLA
+            if (n <= 0 || n % 256 != 0) return false;
+            const int64_t n_blocks = n / 256;
+            const int T = 256;
+            const int64_t blocks = (n_blocks + T - 1) / T;
+            k3_pdl_launch((unsigned)blocks, T, 0, stream, dequant_q6_k_kernel,
+                out, (const unsigned char*)src, n_blocks);
+            return true;
+        }
         case 17: dequant_iq2_xs_f32(out, src, n, stream); return true;   // IQ2_XS
         case 19: dequant_iq1_s_f32(out, src, n, stream);  return true;   // IQ1_S
         default: return false;
@@ -4936,8 +5157,14 @@ bool moe_expert_ffn_f32_by_type(float* out, float* scratch,
                                 float situ_beta, float situ_linear_beta,
                                 int ggml_type, cudaStream_t stream,
                                 int expert_begin, int n_local_experts,
-                                void* q8k_scratch) {
+                                void* q8k_scratch,
+                                int up_type, int down_type) {
+    if (up_type < 0) up_type = ggml_type;
+    if (down_type < 0) down_type = ggml_type;
+    if (ggml_type != up_type) return false;
     if (q8k_scratch) {
+        // q8k path is same-type only (existing contract).
+        if (down_type != ggml_type) return false;
         if (latent <= 0 || ffn <= 0 || top_k <= 0 ||
             latent % 256 != 0 || ffn % 256 != 0)
             return false;
@@ -4985,22 +5212,30 @@ bool moe_expert_ffn_f32_by_type(float* out, float* scratch,
         }
         return true;
     }
-    switch (ggml_type) {
-        case 17:
-            moe_expert_ffn_iq2xs_f32(out, scratch, x, ids, w, gate_exps, up_exps,
-                                     down_exps, latent, ffn, top_k, situ_beta,
-                                     situ_linear_beta, stream,
-                                     expert_begin, n_local_experts);
-            return true;
-        case 19:
-            moe_expert_ffn_iq1s_f32(out, scratch, x, ids, w, gate_exps, up_exps,
-                                    down_exps, latent, ffn, top_k, situ_beta,
-                                    situ_linear_beta, stream,
-                                    expert_begin, n_local_experts);
-            return true;
-        default:
-            return false;
-    }
+    if (latent <= 0 || ffn <= 0 || top_k <= 0) return false;
+    if (latent % 256 || ffn % 256) return false;
+    auto run = [&](auto tag_g, auto tag_d) {
+        using GateBlk = typename decltype(tag_g)::type;
+        using DownBlk = typename decltype(tag_d)::type;
+        moe_expert_ffn_launch<GateBlk, DownBlk>(
+            out, scratch, x, ids, w, gate_exps, up_exps, down_exps,
+            latent, ffn, top_k, situ_beta, situ_linear_beta, stream,
+            expert_begin, n_local_experts);
+    };
+    struct T17 { using type = BlockIQ2XS; };
+    struct T19 { using type = BlockIQ1S; };
+    struct T16 { using type = BlockIQ2XXS; };
+    if (ggml_type == 16 || down_type == 16) ensure_iq2xxs_tables();
+    if (ggml_type == 17 || down_type == 17) ensure_iq2xs_tables();
+    if (ggml_type == 19 || down_type == 19) ensure_iq1s_tables();
+    if (ggml_type == 16 && down_type == 16) { run(T16{}, T16{}); return true; }
+    if (ggml_type == 16 && down_type == 19) { run(T16{}, T19{}); return true; }
+    if (ggml_type == 19 && down_type == 16) { run(T19{}, T16{}); return true; }
+    if (ggml_type == 17 && down_type == 17) { run(T17{}, T17{}); return true; }
+    if (ggml_type == 19 && down_type == 19) { run(T19{}, T19{}); return true; }
+    if (ggml_type == 17 && down_type == 19) { run(T17{}, T19{}); return true; }
+    if (ggml_type == 19 && down_type == 17) { run(T19{}, T17{}); return true; }
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -5049,7 +5284,7 @@ size_t k3_moe_batch_ws_bytes(int n_tok, int top_k, int n_expert_slots) {
             2 * (size_t)n_tok * (size_t)top_k) * sizeof(int);
 }
 
-template <typename Blk>
+template <typename GateBlk, typename DownBlk = GateBlk>
 static void moe_batch_launch(float* out, int64_t out_stride,
                              float* scratch, int64_t scratch_stride,
                              const float* x, int64_t x_stride,
@@ -5092,15 +5327,15 @@ static void moe_batch_launch(float* out, int64_t out_stride,
     const dim3 g1((unsigned)((ffn + WARPS - 1) / WARPS), (unsigned)n_slots);
     if (gpack) {
         k3_pdl_launch(g1, WARPS * 32, 0, stream,
-            moe_gate_up_grouped_kernel<WARPS, kMoeBatchRows, Blk, true>,
+            moe_gate_up_grouped_kernel<WARPS, kMoeBatchRows, GateBlk, true>,
             scratch, scratch_stride, x, x_stride, d_tok, d_slot, d_off,
-            (const Blk*)gate_exps, (const Blk*)up_exps, latent, ffn,
+            (const GateBlk*)gate_exps, (const GateBlk*)up_exps, latent, ffn,
             situ_beta, 1.0f / situ_beta, situ_linear_beta, inv_lb, lb_active);
     } else {
         k3_pdl_launch(g1, WARPS * 32, 0, stream,
-            moe_gate_up_grouped_kernel<WARPS, kMoeBatchRows, Blk, false>,
+            moe_gate_up_grouped_kernel<WARPS, kMoeBatchRows, GateBlk, false>,
             scratch, scratch_stride, x, x_stride, d_tok, d_slot, d_off,
-            (const Blk*)gate_exps, (const Blk*)up_exps, latent, ffn,
+            (const GateBlk*)gate_exps, (const GateBlk*)up_exps, latent, ffn,
             situ_beta, 1.0f / situ_beta, situ_linear_beta, inv_lb, lb_active);
     }
 
@@ -5115,15 +5350,15 @@ static void moe_batch_launch(float* out, int64_t out_stride,
     const dim3 g2((unsigned)latent, (unsigned)n_tok);
     if (gpack) {
         k3_pdl_launch(g2, WARPS * 32, dshm, stream,
-            moe_down_combine_batch_kernel<WARPS, true, Blk, true>,
+            moe_down_combine_batch_kernel<WARPS, true, DownBlk, true>,
             out, out_stride, scratch, scratch_stride, ids, w,
-            (const Blk*)down_exps, latent, ffn, top_k, expert_begin,
+            (const DownBlk*)down_exps, latent, ffn, top_k, expert_begin,
             n_slots, weps);
     } else {
         k3_pdl_launch(g2, WARPS * 32, dshm, stream,
-            moe_down_combine_batch_kernel<WARPS, true, Blk, false>,
+            moe_down_combine_batch_kernel<WARPS, true, DownBlk, false>,
             out, out_stride, scratch, scratch_stride, ids, w,
-            (const Blk*)down_exps, latent, ffn, top_k, expert_begin,
+            (const DownBlk*)down_exps, latent, ffn, top_k, expert_begin,
             n_slots, weps);
     }
 }
@@ -5142,12 +5377,18 @@ bool moe_expert_ffn_batch_f32_by_type(float* out, int64_t out_row_stride,
                                       int ggml_type, cudaStream_t stream,
                                       int expert_begin, int n_local_experts,
                                       int n_expert_total,
-                                      void* ws, size_t ws_bytes) {
+                                      void* ws, size_t ws_bytes,
+                                      int up_type, int down_type) {
+    if (up_type < 0) up_type = ggml_type;
+    if (down_type < 0) down_type = ggml_type;
     if (!k3_moe_batch_on()) return false;
     if (n_tok < k3_moe_batch_min_tok()) return false;
     if (latent <= 0 || ffn <= 0 || top_k <= 0) return false;
     if (latent % 256 || ffn % 256) return false;
-    if (ggml_type != 17 && ggml_type != 19) return false;
+    if (ggml_type != up_type) return false;  // gate/up must match
+    const bool ok_t = (ggml_type == 17 || ggml_type == 19 || ggml_type == 16) &&
+                      (down_type == 17 || down_type == 19 || down_type == 16);
+    if (!ok_t) return false;
     if (!ws) return false;
 
     // The bucket count is the rank's OWN expert count: its band under tp > 1, the
@@ -5170,21 +5411,31 @@ bool moe_expert_ffn_batch_f32_by_type(float* out, int64_t out_row_stride,
         return !(e && e[0] == '0');
     }();
 
-    if (ggml_type == 17) {
-        ensure_iq2xs_tables();
-        moe_batch_launch<BlockIQ2XS>(out, out_row_stride, scratch, scratch_row_stride,
-                                     x, x_row_stride, ids, w, gate_exps, up_exps,
-                                     down_exps, latent, ffn, top_k, n_tok, situ_beta,
-                                     situ_linear_beta, stream, expert_begin, n_slots,
-                                     gpack, (int*)ws);
-    } else {
-        ensure_iq1s_tables();
-        moe_batch_launch<BlockIQ1S>(out, out_row_stride, scratch, scratch_row_stride,
-                                    x, x_row_stride, ids, w, gate_exps, up_exps,
-                                    down_exps, latent, ffn, top_k, n_tok, situ_beta,
-                                    situ_linear_beta, stream, expert_begin, n_slots,
-                                    gpack, (int*)ws);
-    }
+    auto run = [&](auto tag_g, auto tag_d, bool use_gpack) {
+        using GateBlk = typename decltype(tag_g)::type;
+        using DownBlk = typename decltype(tag_d)::type;
+        moe_batch_launch<GateBlk, DownBlk>(
+            out, out_row_stride, scratch, scratch_row_stride,
+            x, x_row_stride, ids, w, gate_exps, up_exps,
+            down_exps, latent, ffn, top_k, n_tok, situ_beta,
+            situ_linear_beta, stream, expert_begin, n_slots,
+            use_gpack, (int*)ws);
+    };
+    // Helper tags so the lambda can name the block types without a nested template.
+    struct T17 { using type = BlockIQ2XS; };
+    struct T19 { using type = BlockIQ1S; };
+    struct T16 { using type = BlockIQ2XXS; };
+    if (ggml_type == 16) ensure_iq2xxs_tables();
+    if (ggml_type == 17 || down_type == 17) ensure_iq2xs_tables();
+    if (ggml_type == 19 || down_type == 19) ensure_iq1s_tables();
+    if (ggml_type == 16 && down_type == 16) { run(T16{}, T16{}, false); }
+    else if (ggml_type == 16 && down_type == 19) { run(T16{}, T19{}, false); }
+    else if (ggml_type == 19 && down_type == 16) { run(T19{}, T16{}, gpack); }
+    else if (ggml_type == 17 && down_type == 17) { run(T17{}, T17{}, gpack); }
+    else if (ggml_type == 19 && down_type == 19) { run(T19{}, T19{}, gpack); }
+    else if (ggml_type == 17 && down_type == 19) { run(T17{}, T19{}, gpack); }
+    else if (ggml_type == 19 && down_type == 17) { run(T19{}, T17{}, gpack); }
+    else return false;
     return true;
 }
 
@@ -6004,6 +6255,21 @@ bool k3_proj_f32(float* y, const float* x, const void* W, int wtype,
                             y, x, (const BlockQ8_0*)W, nb);
                         break;
                 }
+            }
+            return true;
+        }
+        case 14: {  // Q6_K — current HF UD-IQ1_S dense projections
+            if (K % 256 != 0) return false;
+            constexpr int WPB = 4;
+            const unsigned grid = (unsigned)((N + WPB - 1) / WPB);
+            const size_t shm = (size_t)K * sizeof(float);
+            // Dense FFN down is K=33792 → 132 KiB smem; default carveout refuses it.
+            if (shm <= 48u * 1024u) {
+                k3_pdl_launch(grid, WPB * 32, shm, stream, proj_q6_k_n_kernel,
+                    y, x, (const unsigned char*)W, N, K);
+            } else {
+                k3_pdl_launch(grid, WPB * 32, 0, stream, proj_q6_k_n_nosmem_kernel,
+                    y, x, (const unsigned char*)W, N, K);
             }
             return true;
         }

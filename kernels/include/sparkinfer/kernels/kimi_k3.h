@@ -651,7 +651,8 @@ bool moe_expert_ffn_f32_by_type(float* out, float* scratch,
                                 float situ_beta, float situ_linear_beta,
                                 int ggml_type, cudaStream_t stream,
                                 int expert_begin = 0, int n_local_experts = 0,
-                                void* q8k_scratch = nullptr);
+                                void* q8k_scratch = nullptr,
+                                int up_type = -1, int down_type = -1);
 
 // ---------------------------------------------------------------------------
 // The SAME dispatch over n_tok tokens in one pair of launches, with the (token,
@@ -697,7 +698,8 @@ bool moe_expert_ffn_batch_f32_by_type(float* out, int64_t out_row_stride,
                                       int ggml_type, cudaStream_t stream,
                                       int expert_begin, int n_local_experts,
                                       int n_expert_total,
-                                      void* ws, size_t ws_bytes);
+                                      void* ws, size_t ws_bytes,
+                                      int up_type = -1, int down_type = -1);
 
 // Bytes the counting sort needs for a chunk of n_tok tokens over n_expert_slots
 // local experts. Integer only — the activations are never copied, the sorted index

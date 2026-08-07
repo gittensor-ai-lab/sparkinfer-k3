@@ -122,8 +122,9 @@ bool embed_token(const KimiK3Weights& w, const KimiK3Config& cfg, int token_id,
                  float* x, cudaStream_t stream) {
     if (!w.token_embd.ok()) return false;
     long row_bytes = 0;
-    if (w.token_embd.type == 0)      row_bytes = (long)cfg.hidden * sizeof(float);
-    else if (w.token_embd.type == 8) row_bytes = (long)(cfg.hidden / 32) * 34;
+    if (w.token_embd.type == 0)       row_bytes = (long)cfg.hidden * sizeof(float);
+    else if (w.token_embd.type == 8)  row_bytes = (long)(cfg.hidden / 32) * 34;
+    else if (w.token_embd.type == 14) row_bytes = (long)(cfg.hidden / 256) * 210;  // Q6_K
     else return false;
     const char* base = (const char*)w.token_embd.data + (size_t)token_id * row_bytes;
     return k3k::dequant_f32_by_type(x, base, cfg.hidden, w.token_embd.type, stream);
@@ -1921,9 +1922,10 @@ static bool k3_tp_prefill_tile(KimiK3TP& p, const int* ids, int T) {
         // Independent FFN tile path: consume the collective's contiguous attention
         // rows, batch residual/norm plus replicated projections, and leave expert
         // arithmetic to the existing exact per-token dispatcher for now.
+        // Default ON; SPARKINFER_K3_PREFILL_FFN_BATCH=0 restores the serial path.
         static const bool want_ffn_tile = [] {
             const char* e = std::getenv("SPARKINFER_K3_PREFILL_FFN_BATCH");
-            return e && e[0] == '1';
+            return !(e && e[0] == '0');
         }();
         bool ffn_tile_batch = false;
         if (want_ffn_tile && is_moe && attn_reduce && tp_size > 1) {
