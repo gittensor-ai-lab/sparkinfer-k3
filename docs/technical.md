@@ -94,12 +94,12 @@ Each of these is a seam, not a rewrite:
 
 | knob | what it changes | where |
 |---|---|---|
-| `ShardPolicy` | `ExpertsOnly` (experts banded, attention replicated) vs `Full` | [`kimi_k3.h`](runtime/include/sparkinfer/models/kimi_k3.h) |
-| `SPARKINFER_TP_BACKEND` | `nccl` \| `peer` \| `multimem` — all three validated on 8× H200 | [`collective.h`](runtime/include/sparkinfer/tp/collective.h) |
-| shard rules | per-tensor Row / Col / Expert / Replicate, 230 CPU tests | [`weight_plan.cpp`](runtime/src/tp/weight_plan.cpp) |
-| expert bands | contiguous today; strided would trade load balance for locality | [`shard.cpp`](runtime/src/tp/shard.cpp) |
-| reduce points | `K3LayerPhase` — move a collective by moving one call | [`kimi_k3_tp.cpp`](runtime/src/models/kimi_k3_tp.cpp) |
-| dtype | f32 today (K3's residual stream is f32 by design); bf16 path exists | [`collective.h`](runtime/include/sparkinfer/tp/collective.h) |
+| `ShardPolicy` | `ExpertsOnly` (experts banded, attention replicated) vs `Full` | [`kimi_k3.h`](../runtime/include/sparkinfer/models/kimi_k3.h) |
+| `SPARKINFER_TP_BACKEND` | `nccl` \| `peer` \| `multimem` — all three validated on 8× H200 | [`collective.h`](../runtime/include/sparkinfer/tp/collective.h) |
+| shard rules | per-tensor Row / Col / Expert / Replicate, 230 CPU tests | [`weight_plan.cpp`](../runtime/src/tp/weight_plan.cpp) |
+| expert bands | contiguous today; strided would trade load balance for locality | [`shard.cpp`](../runtime/src/tp/shard.cpp) |
+| reduce points | `K3LayerPhase` — move a collective by moving one call | [`kimi_k3_tp.cpp`](../runtime/src/models/kimi_k3_tp.cpp) |
+| dtype | f32 today (K3's residual stream is f32 by design); bf16 path exists | [`collective.h`](../runtime/include/sparkinfer/tp/collective.h) |
 
 The shard math is **CUDA-free and unit-tested without a GPU** — 4972 checks on
 `shard.cpp`, 230 on `weight_plan.cpp`, 44 on backend selection. TP bugs do not live in
@@ -131,7 +131,7 @@ would shard weights the executor still indexes at full width. That is the next l
 | Extras | Cross-layer residual attention, `block_size 12` |
 | Vision | MoonViT-3d — 27 layers, 1024 wide, **non-square fused QKV** (1536 ≠ n_embd), patch 14 |
 
-Three traps that produce silently wrong output rather than an error — all encoded in [`bench/configs/models/kimi_k3.yaml`](bench/configs/models/kimi_k3.yaml):
+Three traps that produce silently wrong output rather than an error — all encoded in [`bench/configs/models/kimi_k3.yaml`](../bench/configs/models/kimi_k3.yaml):
 
 - **`full_attn_layers` is 1-indexed.** The converter tests `(il + 1) in full_attn_layers`. Off by one and you get garbage, not a crash.
 - **MLA is stored as MQA.** `head_count_kv = 1`, `key_length = kv_lora + qk_rope = 576`; per-layer `head_count_kv == 0` is what marks a KDA layer.
@@ -143,7 +143,7 @@ Three traps that produce silently wrong output rather than an error — all enco
 
 Every other model in the SparkInfer family is benchmarked against `ggml-org/llama.cpp` at a pinned commit. Kimi K3 cannot be.
 
-**Upstream llama.cpp cannot load this model at all.** It asserts `n_expert <= LLAMA_MAX_EXPERTS`, and upstream's cap is 512. K3 has 896. There is no upstream number to compare against, so the reference is [`unslothai/llama.cpp`](https://github.com/unslothai/llama.cpp) PR #48, pinned in [`bench/scripts/reference.lock`](bench/scripts/reference.lock).
+**Upstream llama.cpp cannot load this model at all.** It asserts `n_expert <= LLAMA_MAX_EXPERTS`, and upstream's cap is 512. K3 has 896. There is no upstream number to compare against, so the reference is [`unslothai/llama.cpp`](https://github.com/unslothai/llama.cpp) PR #48, pinned in [`bench/scripts/reference.lock`](../bench/scripts/reference.lock).
 
 Four things in that fork are load-bearing, not cosmetic:
 
@@ -178,7 +178,7 @@ UD-Q2_K_XL is the accuracy knee and remains what the project is ultimately judge
 But the *default* is what runs when nobody passes a flag, and defaulting to an 802 GiB
 download that is on no machine means every fresh invocation dies before it does
 anything. UD-IQ1_S is what is resident, what the llama.cpp reference was measured on,
-and what [`bench/refdata/`](bench/refdata)'s reference logits were captured against.
+and what [`bench/refdata/`](../bench/refdata)'s reference logits were captured against.
 `PRIMARY_QUANT=UD-Q2_K_XL` switches to the target.
 
 The reference.lock slots carry the quant in their **name**
@@ -221,7 +221,7 @@ against it too. One command produces both plus the tier:
 bench/scripts/kimi_k3_eval.sh --node h200x8 --frontier <merged best>
 ```
 
-It emits the `RESULT_JSON` contract [`bench/scripts/label.py`](bench/scripts/label.py)
+It emits the `RESULT_JSON` contract [`bench/scripts/label.py`](../bench/scripts/label.py)
 already scores for the other models, so K3 needs no second scoring path:
 
 - **Correctness gate first.** top-1 ≥ 0.95 and KL ≤ 0.05 against the captured reference,
@@ -235,7 +235,7 @@ already scores for the other models, so K3 needs no second scoring path:
   2.2×) the frontier binds, so `XL` costs a real 18% over main.
 
 A node run posts its verdict to a PR with `/eval RESULT_JSON {...}`;
-[`.github/workflows/eval-label.yml`](.github/workflows/eval-label.yml) **re-derives** the
+[`.github/workflows/eval-label.yml`](../.github/workflows/eval-label.yml) **re-derives** the
 tier from the reported measurements rather than trusting the reported label, and honours
 the command only from maintainers.
 
@@ -245,16 +245,16 @@ the command only from maintainers.
 
 | Path | What |
 |---|---|
-| [`bench/`](bench) | **the baseline** — K3 harness, arch/target configs, eval + accuracy scripts |
-| [`docs/`](docs) | [`kimi-k3-baseline.md`](docs/kimi-k3-baseline.md) — how to run it, and every trap in the arch |
-| [`kernels/`](kernels) | CUDA kernels — flash-decode, decode GEMV, fused MoE FFN, GEMM, RMSNorm, RoPE, GGUF dequant |
-| [`runtime/`](runtime) | scheduler, paged KV cache, CUDA-graph decode, native GGUF loading, model forward |
-| [`moe/`](moe) | sync-free MoE router + expert dispatch |
-| [`server/`](server) | OpenAI-compatible HTTP API (`BUILD_SERVER=ON`) |
+| [`bench/`](../bench) | **the baseline** — K3 harness, arch/target configs, eval + accuracy scripts |
+| [`docs/`](../docs) | [`kimi-k3-baseline.md`](kimi-k3-baseline.md) — how to run it, and every trap in the arch |
+| [`kernels/`](../kernels) | CUDA kernels — flash-decode, decode GEMV, fused MoE FFN, GEMM, RMSNorm, RoPE, GGUF dequant |
+| [`runtime/`](../runtime) | scheduler, paged KV cache, CUDA-graph decode, native GGUF loading, model forward |
+| [`moe/`](../moe) | sync-free MoE router + expert dispatch |
+| [`server/`](../server) | OpenAI-compatible HTTP API (`BUILD_SERVER=ON`) |
 
 `kernels/` and `runtime/` now carry a native K3 path (KDA + MLA decode, latent MoE, `situ`, cross-layer residual, expert-parallel dispatch). `moe/` and `server/` are still Qwen-shaped.
 
-**Scoring is speedup-only.** SN74 pays verified marginal speedups labeled **XL / L / M / S / XS**. Sub-2% gains are never aggregated across contexts. See [`.gittensor/weights.json`](.gittensor/weights.json).
+**Scoring is speedup-only.** SN74 pays verified marginal speedups labeled **XL / L / M / S / XS**. Sub-2% gains are never aggregated across contexts. See [`.gittensor/weights.json`](../.gittensor/weights.json).
 
 ---
 
@@ -308,4 +308,4 @@ Two reference-server flags are mandatory, not tuning:
 - `--no-context-shift` — K3 is a hybrid recurrent arch; llama.cpp cannot context-shift or restore slots for it, and a long eval dies mid-run without it.
 - `--no-jinja` — the gate posts raw token ids; a chat template would prepend tokens the candidate never saw.
 
-Details: [`eval/`](eval) · **[EVAL-TRUST.md](EVAL-TRUST.md)** (Polaris TDX receipts, reproducible from source today).
+Details: [`eval/`](../eval) · **[EVAL-TRUST.md](../EVAL-TRUST.md)** (Polaris TDX receipts, reproducible from source today).
