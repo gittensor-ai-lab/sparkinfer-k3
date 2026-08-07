@@ -23,6 +23,15 @@ add_executable(tp_weight_plan_cpu_test tp_weight_plan_cpu_test.cpp
 set_target_properties(tp_weight_plan_cpu_test PROPERTIES CXX_STANDARD 17)
 add_test(NAME tp_weight_plan_cpu_test COMMAND tp_weight_plan_cpu_test)
 
+# Expected TP collective count. Header-only and CUDA-free, so it runs anywhere: the number
+# it pins is a correctness gate (kimi_k3_tp_check fails a run whose count does not match),
+# and the previous copy of this arithmetic lived only in that example, where it went stale
+# against the default shard policy and failed on unmodified main — see issue #75.
+add_executable(kimi_k3_tp_collectives_cpu_test kimi_k3_tp_collectives_cpu_test.cpp)
+set_target_properties(kimi_k3_tp_collectives_cpu_test PROPERTIES CXX_STANDARD 17)
+target_include_directories(kimi_k3_tp_collectives_cpu_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
+add_test(NAME kimi_k3_tp_collectives_cpu_test COMMAND kimi_k3_tp_collectives_cpu_test)
+
 add_executable(decode_layer_cpu_test decode_layer_cpu_test.cpp)
 set_target_properties(decode_layer_cpu_test PROPERTIES CXX_STANDARD 17)
 add_test(NAME decode_layer_cpu_test COMMAND decode_layer_cpu_test)

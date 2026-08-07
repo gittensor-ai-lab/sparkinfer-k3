@@ -24,6 +24,7 @@
 #include "sparkinfer/models/kimi_k3_config.h"
 #include "sparkinfer/models/kimi_k3_gguf_manifest.h"
 #include "sparkinfer/models/kimi_k3_tp.h"
+#include "sparkinfer/models/kimi_k3_tp_collectives.h"
 
 #include <cuda_runtime.h>
 
@@ -51,6 +52,17 @@ struct Trace {
     std::vector<std::string> name;
     std::vector<double> l1;
 };
+
+const char* policy_name(KimiK3Weights::ShardPolicy p) {
+    switch (p) {
+        case KimiK3Weights::ShardPolicy::ExpertsOnly:    return "ExpertsOnly";
+        case KimiK3Weights::ShardPolicy::ExpertsAndKda:  return "ExpertsAndKda";
+        case KimiK3Weights::ShardPolicy::ExpertsAndMla:  return "ExpertsAndMla";
+        case KimiK3Weights::ShardPolicy::ExpertsAndAttn: return "ExpertsAndAttn";
+        case KimiK3Weights::ShardPolicy::Full:           return "Full";
+    }
+    return "?";
+}
 
 KimiK3DebugFn make_tracer(Trace* tr) {
     return [tr](const char* tag, int layer, const float* dev, int64_t n) {
@@ -145,6 +157,7 @@ int main(int argc, char** argv) {
 
     // ---- reference: tp_size 1 ----
     std::vector<std::vector<float>> ref(n_tokens);
+    long ref_collectives = 0;
     {
         std::vector<int> devs = {0};
         KimiK3TP one;
@@ -158,13 +171,19 @@ int main(int argc, char** argv) {
                 std::printf("tp=1 token %d failed\n", t); return 1;
             }
         }
-        std::printf("reference (tp=1): %ld collectives\n", one.n_collectives);
+        ref_collectives = one.n_collectives;
+        std::printf("reference (tp=1): %ld collectives\n", ref_collectives);
         kimi_k3_tp_free(one);
     }
 
     // ---- candidate: tp_size N ----
     std::vector<std::vector<float>> got(n_tokens);
     long collectives = 0;
+    // Read off the built ranks rather than re-parsing SPARKINFER_K3_SHARD_* here. The
+    // expected count has to follow the policy the runtime ACTUALLY chose — duplicating the
+    // env-var reading is how the old formula came to describe a policy that was no longer
+    // the default. Captured before the free below, which invalidates `many`.
+    KimiK3Weights::ShardPolicy policy = KimiK3Weights::ShardPolicy::ExpertsOnly;
     {
         std::vector<int> devs;
         for (int i = 0; i < tp_size; ++i) devs.push_back(i);
@@ -180,19 +199,36 @@ int main(int argc, char** argv) {
             }
         }
         collectives = many.n_collectives;
+        policy      = many.ranks[0].weights.policy;
         kimi_k3_tp_free(many);
     }
 
-    // One collective per MoE layer per token; the leading dense layer has none.
-    const long want_coll = (long)(cfg.n_layers - cfg.leading_dense) * n_tokens;
-    std::printf("candidate (tp=%d): %ld collectives (expected %ld = %d MoE layers x %d tokens)\n",
-                tp_size, collectives, want_coll, cfg.n_layers - cfg.leading_dense, n_tokens);
+    // One collective per MoE layer per token, PLUS one per layer whose attention band is
+    // sharded — which under the default policy is every layer. Derived from the policy the
+    // ranks were built with, so disabling a band with SPARKINFER_K3_SHARD_{KDA,MLA}=0
+    // adjusts the expectation instead of failing the run.
+    const KimiK3CollectiveCount want =
+        kimi_k3_expected_collectives(cfg, tp_size,
+                                     KimiK3Weights::shards_kda(policy),
+                                     KimiK3Weights::shards_mla(policy));
+    const long want_coll = want.per_token() * n_tokens;
+    std::printf("candidate (tp=%d, %s): %ld collectives "
+                "(expected %ld = (%ld attention + %ld MoE) x %d tokens)\n",
+                tp_size, policy_name(policy), collectives, want_coll,
+                want.attn, want.moe, n_tokens);
 
-    int failures = 0;
+    int count_failures = 0, failures = 0;
     if (collectives != want_coll) {
         std::printf("  FAIL: collective count is wrong — a missing reduce leaves a partial "
-                    "expert sum, an extra one multiplies a complete tensor\n");
-        ++failures;
+                    "sum, an extra one multiplies a complete tensor\n");
+        ++count_failures;
+    }
+    // Not vacuous: every reduce site is guarded by tp_size > 1, so a single-rank run that
+    // reduces anything has summed a complete tensor into itself.
+    if (ref_collectives != 0) {
+        std::printf("  FAIL: the tp=1 reference issued %ld collectives, expected 0\n",
+                    ref_collectives);
+        ++count_failures;
     }
 
     for (int t = 0; t < n_tokens; ++t) {
@@ -239,8 +275,14 @@ int main(int argc, char** argv) {
         if (shown == 0) std::printf("  every checkpoint agrees to 1e-6 relative\n");
     }
 
-    std::printf("\n%s: tp=%d %s the single-GPU decode over %d token(s)\n",
-                failures ? "FAIL" : "PASS", tp_size,
-                failures ? "DIVERGES from" : "reproduces", n_tokens);
-    return failures ? 1 : 0;
+    // Report the two failure modes as the different things they are. A wrong collective
+    // count with matching logits is a bookkeeping fault — a policy the count does not
+    // describe — and saying "DIVERGES" there sends the reader after a numerical bug that
+    // is not present. Either one still exits non-zero.
+    std::printf("\n%s: tp=%d %s the single-GPU decode over %d token(s)%s\n",
+                (failures || count_failures) ? "FAIL" : "PASS", tp_size,
+                failures ? "DIVERGES from" : "reproduces", n_tokens,
+                (count_failures && !failures)
+                    ? " — but the collective count is wrong (see above)" : "");
+    return (failures || count_failures) ? 1 : 0;
 }
