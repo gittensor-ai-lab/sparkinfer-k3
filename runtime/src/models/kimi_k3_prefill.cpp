@@ -5,6 +5,7 @@
 #include "sparkinfer/kernels/kimi_k3.h"
 #include "sparkinfer/kernels/kimi_k3_fast.h"
 #include "sparkinfer/kernels/kimi_k3_prefill.h"
+#include "sparkinfer/kernels/k3_mla_prefill_attention.h"
 
 #include <cstdio>
 #include <cstddef>

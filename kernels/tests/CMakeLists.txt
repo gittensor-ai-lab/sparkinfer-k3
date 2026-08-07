@@ -100,6 +100,15 @@ add_executable(k3_prefill_order_cpu_test k3_prefill_order_cpu_test.cpp)
 set_target_properties(k3_prefill_order_cpu_test PROPERTIES CXX_STANDARD 17)
 add_test(NAME k3_prefill_order_cpu_test COMMAND k3_prefill_order_cpu_test)
 
+add_executable(k3_mla_prefill_attention_cpu_test k3_mla_prefill_attention_cpu_test.cpp)
+set_target_properties(k3_mla_prefill_attention_cpu_test PROPERTIES CXX_STANDARD 17)
+add_test(NAME k3_mla_prefill_attention_cpu_test COMMAND k3_mla_prefill_attention_cpu_test)
+
+add_executable(k3_mla_prefill_attention_gpu_test k3_mla_prefill_attention_gpu_test.cu)
+target_link_libraries(k3_mla_prefill_attention_gpu_test PRIVATE si_k3)
+target_include_directories(k3_mla_prefill_attention_gpu_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
+add_test(NAME k3_mla_prefill_attention_gpu_test COMMAND k3_mla_prefill_attention_gpu_test)
+
 foreach(k3t k3_kda_step_gpu_test k3_mla_absorb_gpu_test
             k3_proj_1bar_gpu_test k3_moe_iq1s_mma_gpu_test
             k3_moe_batched_iq1s_gpu_test k3_kda_chunk_prefill_gpu_test
