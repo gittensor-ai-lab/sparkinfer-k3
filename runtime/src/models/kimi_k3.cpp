@@ -3,9 +3,11 @@
 
 #include "sparkinfer/kernels/kimi_k3.h"
 #include "sparkinfer/kernels/kimi_k3_fast.h"
+#include "sparkinfer/kernels/k3_mla_prefill_attention.h"
 #include "sparkinfer/models/kimi_k3_gguf_manifest.h"
 #include "sparkinfer/tp/weight_residency.h"   // plan_tensor_residency for the sharded loader
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -841,6 +843,12 @@ struct KimiK3Forward::Scratch {
     float* absorbed_q = nullptr;   // [qh*key_length]
     float* mla_attn_out = nullptr; // [qh*value_length_mla]
     float* gate_proj_out = nullptr;   // [qh*value_length_mla]
+    // Chunk-native MLA attention partials.  The workspace is reused by every MLA
+    // layer and holds (max, denominator, compressed latent) for each
+    // (token, local head, context split).  Keeping it here makes the fast path
+    // graph-capturable and avoids a per-layer cudaMalloc.
+    void* mla_prefill_ws = nullptr;
+    size_t mla_prefill_ws_bytes = 0;
 
     // FFN / MoE
     float* router_logits = nullptr;   // [n_experts]
@@ -1147,6 +1155,14 @@ bool kimi_k3_forward_alloc_scratch(const KimiK3Config& cfg, KimiK3Forward& fwd) 
     ok &= alloc_f(s.absorbed_q, (size_t)qh * cfg.key_length * cap);
     ok &= alloc_f(s.mla_attn_out, (size_t)qh * cfg.value_length_mla * cap);
     ok &= alloc_f(s.gate_proj_out, (size_t)qh * cfg.value_length_mla * cap);
+    {
+        const int local_mla_heads =
+            fwd.w && fwd.w->mla.n_heads > 0 ? fwd.w->mla.n_heads : qh;
+        const size_t nb = k3k::k3_mla_prefill_attention_workspace_bytes(
+            cap, local_mla_heads, cfg.kv_lora_rank, 32);
+        if (nb > 0 && alloc_bytes(s.mla_prefill_ws, nb))
+            s.mla_prefill_ws_bytes = nb;
+    }
 
     // ROUTER, BATCHED. Both router kernels already index blockIdx.x as the token and
     // stride logits by n_expert and out_w/out_ids by top_k, so these three only had to
@@ -2951,29 +2967,46 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
             }
 
             const float mla_scale = 1.0f / std::sqrt((float)cfg.key_length_mla);
-            // ---- THE ONE PER-TOKEN LAUNCH LEFT IN A BATCHED MLA ATTN PHASE ----
+            // ---- CHUNK-NATIVE CAUSAL MLA ATTENTION -------------------------------
+            // The token loop remains below as the exact-arithmetic control.  The fast
+            // arm deliberately uses one split plan for the chunk, so it reassociates
+            // online softmax and must pass the graded KLD gate rather than claiming
+            // bit identity.  Causality remains per query: token b ends at
+            // st.position+b inclusive even though later KV rows are already stored.
+            // The production prefill driver carries a 64-token chunk through this
+            // call.  The old loop below launched decode attention 64 times and each
+            // launch fetched the same compressed KV prefix once per query.  The
+            // chunk-native kernel stages a cache row once for two queries and four
+            // local heads, then merges context-split online-softmax partials.
             //
-            // THE ATTENTION KERNEL ITSELF IS NOT BATCHED, AND THAT IS A BIT-IDENTITY
-            // DECISION, NOT AN EFFORT ONE. mla_decode_attn_launch derives `splits` from
-            // n_ctx, and the refinement is continuous in it (`by_len = n_ctx / min_slice`
-            // plus the reach-fill relaxation). One grid for the chunk means ONE split
-            // count for tokens sitting at a_tok different depths, and the split count is
-            // the partition of an online-softmax reduction — changing it re-associates
-            // the running max/exp-sum and moves the last bits. There is a pin
-            // (k3_mla_set_split_pin) that would make one count legal for the chunk, but
-            // pinning is exactly the arithmetic change this phase is not allowed to make.
-            //
-            // It is also the launch with the least to gain. Everything above streams a
-            // WEIGHT per token and amortises; this one streams the KV CACHE, whose bytes
-            // are proportional to each token's own prefix and do not amortise across
-            // tokens at all.
-            //
-            //   * host length picks the launch plan only, and token b sits b positions
-            //     deeper than token 0: st.position is TOKEN 0's position.
-            //   * device length is what the kernel attends over, and is st.d_pos[b].
-            // At a_tok == 1 this loop runs once with b == 0 and is the call this site
-            // has always made.
-            for (int b = 0; b < a_tok; ++b) {
+            // A/B is same-binary: =0 restores the exact per-token launch loop.  A
+            // launch refusal also falls back before any output is consumed.
+            static const bool want_chunk_mla = [] {
+                const char* e = std::getenv("SPARKINFER_K3_MLA_CHUNK_ATTN");
+                return !(e && e[0] == '0');
+            }();
+            bool chunk_mla = false;
+            if (want_chunk_mla && a_tok > 1 && s.mla_prefill_ws &&
+                s.mla_prefill_ws_bytes > 0) {
+                const int context = st.position + a_tok;
+                // Roughly one 1k-row slice keeps enough CTAs resident at 32k without
+                // paying thousands of empty partial blocks near the start of a prompt.
+                const int splits = std::max(1, std::min(32, (context + 1023) / 1024));
+                chunk_mla = st.kv_f16
+                    ? k3k::k3_mla_prefill_attention_split_kvf16(
+                          s.mla_attn_out, s.mla_prefill_ws, s.mla_prefill_ws_bytes,
+                          s.absorbed_q, st.mla_kv_cache[mla_ord],
+                          (const float*)L.attn_v_b.data, nullptr, st.position, a_tok,
+                          context, qh, cfg.key_length, cfg.kv_lora_rank,
+                          cfg.value_length_mla, splits, mla_scale, stream)
+                    : k3k::k3_mla_prefill_attention_split_f32(
+                          s.mla_attn_out, s.mla_prefill_ws, s.mla_prefill_ws_bytes,
+                          s.absorbed_q, st.mla_kv_cache[mla_ord],
+                          (const float*)L.attn_v_b.data, nullptr, st.position, a_tok,
+                          context, qh, cfg.key_length, cfg.kv_lora_rank,
+                          cfg.value_length_mla, splits, mla_scale, stream);
+            }
+            if (!chunk_mla) for (int b = 0; b < a_tok; ++b) {
                 float* out_b       = s.mla_attn_out + (int64_t)b * mlaout_row;
                 const float* q_b   = s.absorbed_q   + (int64_t)b * absq_row;
                 const int* pos_b   = st.d_pos + b;
