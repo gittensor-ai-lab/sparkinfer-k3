@@ -20,7 +20,7 @@ name: copycat-guard
 on:
   pull_request_target:
     # ready_for_review so a PR opened as a draft is still scanned once it is real.
-    types: [opened, ready_for_review]
+    types: [opened, reopened, ready_for_review, synchronize]
 
 permissions:
   contents: write          # push policy files
@@ -56,20 +56,22 @@ jobs:
           fi
 
       - uses: actions/checkout@v4
-        if: steps.key.outputs.have_key == 'true'
         with:
           ref: main
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Run copycat guard
-        if: steps.key.outputs.have_key == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           YUNWEI_API_KEY: ${{ secrets.YUNWEI_API_KEY }}
+          # Left EMPTY on purpose when the repo variable is unset: _llm_provider() falls
+          # through to autodetect and picks the provider whose key is actually present.
+          # Forcing 'openai' here selected a provider with no key and silently disabled
+          # the judge. Same for the model -- hardcoding gpt-4o-mini overrode the yunwei
+          # provider default (deepseek-v4-pro), which is the configured judge.
           COPYCAT_LLM_PROVIDER: ${{ vars.COPYCAT_LLM_PROVIDER }}
-          COPYCAT_LLM_PROVIDER: openai
-          COPYCAT_LLM_MODEL: gpt-4o-mini
+          COPYCAT_LLM_MODEL: ${{ vars.COPYCAT_LLM_MODEL }}
           PR_NUM: ${{ github.event.pull_request.number }}
         run: |
           PR_NUM="$PR_NUM" python3 eval/copycat_guard.py

@@ -46,14 +46,46 @@ K3's harness is `kimi_k3_*`.
 
 **Accuracy gate, and it runs FIRST.** `kimi_k3_eval.sh` compares your build's logits
 against the captured llama.cpp reference (`bench/refdata/`) on identical weights and
-identical token ids. `label.py` REJECTs below **top-1 0.90** or **mean KL 0.05** no matter
+identical token ids. `label.py` REJECTs below **top-1 0.95** or **mean KL 0.05** no matter
 how fast the run was — a speedup that erodes parity is not a speedup worth taking.
 
-Current measured parity on `main`: **top-1 100%, mean KLD 4.05e-03**. Note that KLD is
-~400x the 1e-5 same-implementation bar, from a known and accepted cause (K3 keeps f32
-activations where ggml quantizes them before a quantized mat-vec). Do not go hunting it
-as a bug; do not make it worse. If `compute-sanitizer` is available, your kernels
-must be clean (0 errors).
+In practice **top-1 is pass/fail, not a 5% tolerance.** Each probe dumps one logit row, so
+top-1 is `argmax_ref == argmax_ours` — a boolean — and the suite takes the worst depth. Any
+bar in (0, 1] behaves the same, and all 48 top-1 values in the sealed log are exactly `1.0`.
+Treat it as *the argmax must match at every depth*, and treat **KL as the graded gate**: it
+sums over all 163,840 vocab entries, so it moves long before an argmax flips (merged runs sit
+at 0.004–0.008 against the 0.05 bar).
+
+**It is measured at seven context depths.** The evaluator probes 4, 128, 256, 512, 1024,
+2048 and 4096 tokens — nested prefixes of one document — and takes the **worst**
+depth, not the average. Until 2026-08-04 the gate was a single 4-token prompt graded on
+one next-token distribution, which could not distinguish "correct" from "correct only
+while the KV cache is nearly empty". If your change touches the KV cache, attention,
+routing or the LM head, expect the deep probes to be the ones that catch it.
+
+References at 8192, 16384 and 32768 are also committed and can be switched on with
+`K3_PARITY_DEPTHS`; they are off by default because the deep pass runs through the decode
+path one token at a time, so 32768 costs 812 s per measured build against 136 s for 4096.
+Ingestion runs at decode speed (42.80 tok/s measured) — see #119.
+
+Two consequences for you:
+
+- A regression at one depth fails the gate even if the other nine are perfect.
+- Parity is also **ratcheted against `main` measured in the same round, per depth**, and
+  reported on every PR. **Below the 0.05 bar a ratio is never a regression** — it is
+  annotated so drift is visible, but it does not block a merge. `accuracy-regression` is
+  applied only when a depth is both ≥2.0x main **and** at or over the bar, at which point
+  `label.py` REJECTs on the absolute value anyway.
+
+Note that KLD is ~400x the 1e-5 same-implementation bar, from a known and accepted cause
+(K3 keeps f32 activations where ggml quantizes them before a quantized mat-vec). Do not go
+hunting it as a bug; do not make it worse. If `compute-sanitizer` is available, your
+kernels must be clean (0 errors).
+
+**What the gate still does not prove.** 4096 is not the 131,072 you are scored at. The
+reference must come from llama.cpp and capture cost grows with depth, so the untested gap
+is "everything past 4k" — 32k with the opt-in depths on — not "nothing". See
+`bench/refdata/README.md`.
 
 ## How rewards work (SN74 on Gittensor)
 
@@ -99,15 +131,69 @@ per-subsystem budget**. **Two different denominators, and mixing them up is expe
 
 - **Significance gate — % over the frontier.** The gain must beat **2% of the current
   frontier**, or the label is `none` (inside measurement noise).
-- **Tier — % of the llama.cpp reference, NOT the frontier.** Past the gate the tier is
-  `delta / llama_ref`, where `llama_ref` is pinned in `bench/scripts/reference.lock`
-  (**16.7026 tok/s** for `h200x8` / `UD-IQ1_S` **at the scored 128k context**):
-  `XS` <3.5%, `S` 3.5–6%, `M` 6–10%, `L` 10–18%, `XL` >18%. Any verified gain that clears
-  the gate floors at `XS`.
+- **Tier — the WORSE of two bases, so it can never exceed your measured speedup.** Past the
+  gate the tier is `min(delta / llama_ref, delta / frontier)`, where `llama_ref` is pinned in
+  `bench/scripts/reference.lock` (**18.4435 tok/s** for `h200x8` / `UD-IQ1_S` **at the scored
+  128k context**): `XS` <3.5%, `S` 3.5–6%, `M` 6–10%, `L` 10–18%, `XL` >18%. Any verified
+  gain that clears the gate floors at `XS`.
 
-### The scored context is 128k
+  **On the current scored metric (prefill @32k) the llama term is disabled** and the tier is
+  `delta / frontier` — see [The scored metric is PREFILL at 32k](#the-scored-metric-is-prefill-at-32k-from-2026-08-05)
+  for why. Everything below describes the anchor as it applies to decode.
 
-Everything above is measured at **ctx 131,072**, not at short context. Until 2026-08-01 it
+  Both halves matter. While the frontier is **below** llama.cpp the llama term is smaller, so
+  an un-optimized baseline cannot mint `XL`s from low-hanging fruit. Once the frontier is
+  **past** llama.cpp — which K3 now is, at 2.2× — the frontier term is smaller, so a tier
+  costs the full percentage over the *current best*. In practice that means **`XL` needs 18%
+  over main**, not 18% of a reference main already beat.
+
+  This changed on 2026-08-04. Tier credit used to be capped at *twice* the measured gain,
+  which was invisible until the frontier passed 2× llama.cpp and then became the whole rule —
+  `XL` was costing 9%. The K3 ladder was re-scored from the sealed receipts; see #122.
+
+### The scored metric is PREFILL at 32k (from 2026-08-05)
+
+**The tier is earned on prompt ingestion of 32,768 tokens.** Decode at 131,072 is still
+measured every round, but as a **regression guard**, not the tier basis: if your PR drops
+decode more than **1%** below the pinned frontier, the round refuses to score it.
+
+Decode was the right thing to score while sparkinfer was 18× behind llama.cpp there. It is
+now 3.08× ahead, and the untouched gap is ingestion:
+
+| @ 32k | tok/s | |
+|---|--:|---|
+| llama.cpp | **143.88** | batches the prompt |
+| sparkinfer | **98.80** | **1.46× behind** — it batches the prompt too, since #148 |
+
+Prompt ingestion was one forward per token until #148 landed batched ingestion on
+2026-08-06 (69.02 → 98.80 at 32k). The gap to llama.cpp is now 1.46×, not 3.57×, and what
+is left is the batching's own efficiency rather than its absence.
+
+Two consequences worth knowing before you start:
+
+- **The llama anchor is OFF here, so the tier is `delta / frontier`.** The bands are the
+  same percentages you would read off decode: `S` +3.5%, `M` +6%, `L` +10%, `XL` +18% over
+  the current prefill frontier.
+
+  The anchor is off because 143.88 is not a mature version of what we do — llama.cpp
+  **batches** the prompt and sparkinfer walks it token by token, so `delta / 143.88` sizes a
+  gain against the feature we have not built rather than against the work in the PR. And
+  because the buckets are fractions of the reference, leaving it on made a tier cost **2.7×
+  more on prefill than on decode** (`L` = +27.1% over the frontier vs +10.0%) purely because
+  llama's two metrics are 7.8× apart — 18.44 decode against 143.88 prefill. Nothing about
+  prefill work is 2.7× harder; that number came from llama.cpp's shape, not from ours.
+
+  `pct_of_llama` is still recorded on every run, and `reference.lock` still pins 143.88 — it
+  stopped being the tier basis, not the target. **This flips back the round after batched
+  prefill (#137) lands**, because at that point the two engines are doing the same thing and
+  the anchor means what it says again.
+- **Decode and prefill share kernels.** Batching the prompt will move decode. The 1% guard
+  bounds how far, and it is a refusal rather than a tier — a prefill gain bought by giving
+  decode back has not moved the engine forward, it has moved work around.
+
+### The decode guard is measured at 128k
+
+Everything about decode is measured at **ctx 131,072**, not at short context. Until 2026-08-01 it
 was not: `kimi_k3_tp_bench` hardcoded `max_ctx=64`, so the `reference.lock` slot said 128,
 this guide said 128k, and the hardware saw 64. Every tier awarded before that came from the
 last of those three.
@@ -117,27 +203,33 @@ same weights:
 
 | | ctx 64 | ctx 131,072 | lost |
 |---|--:|--:|--:|
-| llama.cpp | 18.20 | 16.70 | −8% |
-| sparkinfer | 10.34 | 1.00 | **−90%** |
+| llama.cpp | 18.32 | 18.44 | ~0% |
+| sparkinfer, as first measured | 10.34 | 1.00 | **−90%** |
 
-llama.cpp keeps a compressed MLA cache (`kv_lora` 512, f16); sparkinfer reduces over 576
-f32 per token in a kernel with one block per head. Scoring at 64 hid a **16.5×** gap behind
-a 1.8× one — and pointed the incentive at a context nobody runs.
+llama.cpp keeps a compressed MLA cache (`kv_lora` 512, f16) and holds its rate essentially
+flat with depth; sparkinfer reduced over 576 f32 per token in a kernel with one block per
+head. Scoring at 64 hid an **18×** gap behind a 1.8× one — and pointed the incentive at a
+context nobody runs.
 
-**So the headroom is in long-context attention.** With the frontier at **1.00 tok/s** and
-the basis at 16.7026, the bands work out as:
+**That headroom has largely been taken.** The frontier is now **29.97 tok/s** — past
+llama.cpp rather than behind it — so with the basis at 18.4435 the bands are absolute
+tok/s, and they no longer look brutal:
 
 | tier | gain over the frontier |
 |---|--:|
-| `XS` | +0.02 tok/s (the 2% significance gate) |
-| `S` | +0.60 (+60%) |
-| `M` | +1.01 (+101%) |
-| `L` | +1.68 (+168%) |
-| `XL` | +3.02 (+302%) |
+| `XS` | +0.60 tok/s (the 2% significance gate, which now binds first) |
+| `S` | +0.65 (+2.2%) |
+| `M` | +1.11 (+3.7%) |
+| `L` | +1.84 (+6.2%) |
+| `XL` | +3.32 (+11.1%) |
 
-Those look brutal as percentages and are not: sparkinfer at 128k sits at **6% of
-llama.cpp** and roughly **150× off the HBM bandwidth roofline**, so an `XL` is asking for
-work that is demonstrably on the table, not a miracle. Anchoring to llama.cpp is what stops
+Note the gate, not the tier, is what a small PR has to clear first: 2% of a 29.97 frontier
+is 0.60 tok/s, which is above the `S` and comparable to the `M` threshold. A real but small
+win now scores `none` — see #71, twice.
+
+sparkinfer at 128k now sits at **163% of llama.cpp**, and the remaining headroom is against
+the HBM bandwidth roofline rather than against llama.cpp — so an `XL` is still asking for
+work that is on the table, but the low-hanging fruit is gone. Anchoring to llama.cpp is what stops
 an immature frontier minting `XL`s from low-hanging fruit, and means the same tok/s of real
 work earns the same tier however fast the frontier already is. The verdict JSON reports both
 — `pct_over_frontier` is the honest measured speedup, `pct_of_llama` is the tier basis, and

@@ -47,6 +47,14 @@
 # contributor able to edit them can hand themselves top1=1.0 / kl=0.0.
 /bench/refdata/                      @ai-hpc
 
+# …and the tools that MINT that answer key. They do not run during an evaluation, so
+# editing one cannot change the editor's own score — but a quiet change to how references
+# are captured lands silently at the next regeneration and moves the ground truth every
+# future PR is measured against.
+/bench/scripts/dump_ref_logits.cpp   @ai-hpc
+/bench/scripts/dump_ref_logits.sh    @ai-hpc
+/bench/scripts/capture_parity_refs.sh @ai-hpc
+
 # The PR-evaluation pipeline inherited from sparkinfer
 /eval/                               @ai-hpc
 

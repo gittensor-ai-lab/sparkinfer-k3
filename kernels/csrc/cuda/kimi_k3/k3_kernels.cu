@@ -12,6 +12,8 @@
 #include "sparkinfer/kernels/iq2xs_tables.h"
 #include <climits>   // INT_MAX — the "no expert band" sentinel
 #include "sparkinfer/kernels/iq1s_tables.h"
+#include "k3_pdl.cuh"
+#include "sparkinfer/kernels/kimi_k3_fast.h"
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -51,23 +53,61 @@ __device__ __forceinline__ float block_sum(float v, float* shm) {
 }
 
 
+// WEPS engagement counter. A KL of 0 or a speed delta is UNATTRIBUTABLE unless
+// we can prove the gate actually fired — this branch has already been burned by a
+// verification that silently never ran the kernel under test.
+//
+// The count flag exists so the SCORED build never pays for the counting: at high
+// skip rates the two atomicAdds are up to ~1.3M same-address RMWs per token, which
+// is measurement overhead masquerading as the thing being measured. It is uploaded
+// per device by k3_prewarm_quant_tables (pre-capture, synchronous-copy-legal), so
+// the kernels read a flag that is constant for the whole run.
+__device__ unsigned long long g_k3_weps_skips = 0;
+__device__ int g_k3_weps_count = 0;
+
+// Depth gate for the weight threshold. MEASURED WHY IT EXISTS: with the threshold
+// live at every depth, the checkpoint dumps diverged at every graded prefix and
+// ctx2048's KL hit 1.1e-1 — over the absolute accuracy bar, not a ratchet nuance.
+// At shallow depth the router's renormalised distribution is CONCENTRATED, and a
+// sub-threshold expert still carries real mass; by ctx4096 the same comparison
+// reads 8.2e-4. So the threshold engages only past g_k3_weps_min_pos, where the
+// distribution has flattened and the dropped terms are the near-irrelevant tail.
+// Bound once per device, pre-capture; the position pointer is the same device
+// mirror the MLA kernels read, advanced once per token, so the gate cannot flip
+// between a layer's gate/up pass and its down combine.
+__device__ const int* g_k3_weps_pos = nullptr;
+__device__ int g_k3_weps_min_pos = 0;
+
+__device__ inline bool k3_weps_depth_live() {
+    return g_k3_weps_pos == nullptr || *g_k3_weps_pos >= g_k3_weps_min_pos;
+}
+
 // ---------------------------------------------------------------------------
 // 1. situ
 // ---------------------------------------------------------------------------
 
+// ROW AXIS (blockIdx.y). n rows of `n` elements, each row `row_stride` apart. The x
+// axis, the block size and the thread-to-element map inside a row are untouched: block
+// (bx, r) does exactly what block bx did on row r's buffers. Elementwise, so there is
+// no reduction to re-partition.
 __global__ void situ_kernel(float* __restrict__ out, const float* __restrict__ gate,
                             const float* __restrict__ up, int64_t n,
                             float beta, float inv_beta, float lb, float inv_lb,
-                            int lb_active) {
+                            int lb_active, int64_t row_stride) {
+    k3_pdl_sync();
+    const int64_t roff = (int64_t)blockIdx.y * row_stride;
+    float* __restrict__ o_r = out + roff;
+    const float* __restrict__ gate_r = gate + roff;
+    const float* __restrict__ up_r = up + roff;
     const int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
     if (i >= n) return;
-    const float g = gate[i];
-    const float u = up[i];
+    const float g = gate_r[i];
+    const float u = up_r[i];
     // gate branch: BOTH scaled-tanh and sigmoid.
     float a = beta * tanhf(g * inv_beta) * sigmoidf_(g);
     // up branch: scaled-tanh only, and only when linear_beta > 0.
     const float ub = lb_active ? (lb * tanhf(u * inv_lb)) : u;
-    out[i] = a * ub;
+    o_r[i] = a * ub;
 }
 
 // ---------------------------------------------------------------------------
@@ -114,6 +154,7 @@ __global__ void kda_decode_step_smem_kernel(float* __restrict__ out,
                                             const float* __restrict__ g,
                                             const float* __restrict__ beta,
                                             int head_dim) {
+    k3_pdl_sync();
     constexpr int IC = 32;                  // state columns staged per chunk
     const int SP = IC + 1;                  // padded row stride, kills bank conflicts
     const int h = blockIdx.x;
@@ -187,6 +228,123 @@ __global__ void kda_decode_step_smem_kernel(float* __restrict__ out,
     if (j < head_dim) out[(size_t)h * head_dim + j] = o;
 }
 
+// Value-tiled KDA decode step. Same arithmetic as kda_decode_step_smem_kernel, same
+// stored layout, same accumulation order — it only adds a SECOND grid axis.
+//
+// WHY: the grid was `n_head`, and #63 head-sharded KDA, so n_head went 96 -> 12 at tp=8.
+// That is 12 blocks on a 132-SM H200 — 9% of the device — for 11.8% of all GPU kernel
+// time (nsys, ctx 131072). The kernel moves ~3.1 MB per launch and takes 87 us against a
+// ~0.9 us bandwidth floor, with a 982 ns stddev: it is not bandwidth-bound or contended,
+// it is starved of blocks. #63 budgeted the MLA split cap for exactly this reason
+// (kMlaSplitBudget) and left the kernel beside it at one block per head.
+//
+// WHY THIS DECOMPOSITION IS LEGAL: every step is column-local. For a state column j the
+// decay, sk[j] = sum_i S[i][j]*k[i], d[j], the rank-1 update and o[j] all touch only
+// column j plus the per-head vectors k/q/g, which are read-only and shared. So columns
+// split across blocks with NO extra reduction and NO duplicated state traffic — a block
+// reads exactly its own BV rows of the j-major buffer.
+//
+// This is also what the reference implementations do: FLA's fused_recurrent_gated_delta_rule
+// (the kernel vLLM ships for decode) launches grid = (cdiv(V, BV) * N * HV) with BV = 32,
+// one program per sequence, value head, and 32-wide VALUE TILE. BV = 32 here is theirs.
+//
+// ONE THREAD PER COLUMN, deliberately, even though it makes the block 32 threads wide.
+// It keeps each thread accumulating i in increasing order across and within chunks, so
+// this stays BIT-IDENTICAL to the kernel it replaces. Splitting the i-reduction across
+// R threads would parallelise further but turns a sequential sum into a tree, and a
+// change that moves the logits is a different change that has to be argued separately.
+template <int BV>
+__global__ void kda_decode_step_vt_kernel(float* __restrict__ out,
+                                          float* __restrict__ state,
+                                          const float* __restrict__ q,
+                                          const float* __restrict__ k,
+                                          const float* __restrict__ v,
+                                          const float* __restrict__ g,
+                                          const float* __restrict__ beta,
+                                          int head_dim) {
+    k3_pdl_sync();
+    constexpr int IC = 32;
+    const int SP = IC + 1;
+    const int h  = blockIdx.x;
+    const int j0 = blockIdx.y * BV;      // this block's value tile
+    const int jl = threadIdx.x;          // column within the tile
+    const int j  = j0 + jl;
+
+    float* S = state + (size_t)h * head_dim * head_dim;
+    const float* qh = q + (size_t)h * head_dim;
+    const float* kh = k + (size_t)h * head_dim;
+    const float* vh = v + (size_t)h * head_dim;
+    const float* gh = g + (size_t)h * head_dim;
+    const float  b  = beta[h];
+
+    extern __shared__ float smem[];
+    float* s_k  = smem;                  // full head_dim: every column needs every i
+    float* s_q  = s_k + head_dim;
+    float* s_ge = s_q + head_dim;
+    float* s_T  = s_ge + head_dim;       // BV rows of SP
+
+    // Cooperative over BV threads, not head_dim — the tile is narrower than the vectors.
+    for (int t = jl; t < head_dim; t += BV) {
+        s_k[t]  = kh[t];
+        s_q[t]  = qh[t];
+        s_ge[t] = __expf(gh[t]);
+    }
+    __syncthreads();
+
+    // Step 1 + 2: decay by exp(g[i]) and sk = sum_i S[i][j]*k[i].
+    //
+    // THE DECAYED STATE IS NOT WRITTEN BACK HERE. The staged kernel stored S*exp(g) to
+    // global at the end of this pass and re-read it in the next one; pass 2 below simply
+    // recomputes the product from the untouched S. That drops a full write of the state
+    // per launch — a quarter of this kernel's global traffic — plus one staging loop and
+    // one barrier per chunk, and the recomputed multiply is free next to the load it
+    // replaces.
+    //
+    // __fmul_rn, not `*`, and that is load-bearing. The old pass 1 stored the product to
+    // shared, which forced it to be materialised as a rounded f32. Here it feeds an add
+    // directly, so nvcc (--fmad=true by default) would happily contract it into an fma
+    // and skip the intermediate rounding — giving a different result in the last bits and
+    // silently costing the bit-identity this whole change is claiming.
+    float sk = 0.0f;
+    for (int i0 = 0; i0 < head_dim; i0 += IC) {
+        for (int t = jl; t < BV * IC; t += BV)
+            s_T[(t / IC) * SP + (t % IC)] =
+                S[(size_t)(j0 + t / IC) * head_dim + i0 + (t % IC)];
+        __syncthreads();
+        for (int c = 0; c < IC; ++c)
+            sk += __fmul_rn(s_T[jl * SP + c], s_ge[i0 + c]) * s_k[i0 + c];
+        __syncthreads();
+    }
+
+    // Step 3: d = beta * (v[j] - sk). Column-local, so it stays in a register — the
+    // staged kernel routed this through shared only because it had a wider block.
+    const float d_j = b * (vh[j] - sk);
+
+    // Step 4 + 5: rank-1 update, then o = sum_i S[i][j]*q[i].
+    float o = 0.0f;
+    for (int i0 = 0; i0 < head_dim; i0 += IC) {
+        for (int t = jl; t < BV * IC; t += BV)
+            s_T[(t / IC) * SP + (t % IC)] =
+                S[(size_t)(j0 + t / IC) * head_dim + i0 + (t % IC)];
+        __syncthreads();
+        for (int c = 0; c < IC; ++c) {
+            // S here is the ORIGINAL state, because pass 1 no longer wrote its decayed
+            // copy — so the decay is reapplied, to exactly the same operands with exactly
+            // the same rounding, and the sum below sees the identical f32 the staged
+            // kernel read back from global.
+            const float sv = __fmul_rn(s_T[jl * SP + c], s_ge[i0 + c]) + s_k[i0 + c] * d_j;
+            s_T[jl * SP + c] = sv;
+            o += sv * s_q[i0 + c];
+        }
+        __syncthreads();
+        for (int t = jl; t < BV * IC; t += BV)
+            S[(size_t)(j0 + t / IC) * head_dim + i0 + (t % IC)] =
+                s_T[(t / IC) * SP + (t % IC)];
+        __syncthreads();
+    }
+    out[(size_t)h * head_dim + j] = o;
+}
+
 template <int BLOCK>
 __global__ void kda_decode_step_kernel(float* __restrict__ out, float* __restrict__ state,
                                        const float* __restrict__ q,
@@ -195,6 +353,7 @@ __global__ void kda_decode_step_kernel(float* __restrict__ out, float* __restric
                                        const float* __restrict__ g,
                                        const float* __restrict__ beta,
                                        int head_dim) {
+    k3_pdl_sync();
     const int h = blockIdx.x;
     const int j = threadIdx.x;
     if (j >= head_dim) return;
@@ -278,15 +437,21 @@ __global__ void kda_decode_step_kernel(float* __restrict__ out, float* __restric
 // 3. KDA output gating
 // ---------------------------------------------------------------------------
 
+// ROW AXIS (blockIdx.y). Block (h, r) is block h over row r's o/g2/out. norm_w is a
+// LEARNED WEIGHT shared by every row and is deliberately not offset. The per-(head,row)
+// reduction is still one BLOCK-thread block over head_dim with the same stride, so the
+// sum of squares keeps its partition and its fold order exactly.
 template <int BLOCK>
 __global__ void kda_gate_out_kernel(float* __restrict__ out, const float* __restrict__ o,
                                     const float* __restrict__ norm_w,
                                     const float* __restrict__ g2,
-                                    int head_dim, float eps) {
+                                    int head_dim, float eps, int64_t row_stride) {
+    k3_pdl_sync();
     const int h = blockIdx.x;
-    const float* oh = o + (size_t)h * head_dim;
-    const float* gh = g2 + (size_t)h * head_dim;
-    float* dst = out + (size_t)h * head_dim;
+    const int64_t roff = (int64_t)blockIdx.y * row_stride;
+    const float* oh = o + roff + (size_t)h * head_dim;
+    const float* gh = g2 + roff + (size_t)h * head_dim;
+    float* dst = out + roff + (size_t)h * head_dim;
 
     __shared__ float shm[BLOCK / 32 + 1];
 
@@ -339,54 +504,210 @@ __global__ void kda_gate_out_kernel(float* __restrict__ out, const float* __rest
 // into a CUDA graph, which stream-ordered allocation inside the captured region
 // complicates; it is not the reason for the change, but it is not an accident.
 
-template <int BLOCK>
+// ONE PASS OVER `src`, NOT TWO — the normaliser factors straight out of the dot.
+//
+// The scale is a constant across d, so
+//
+//     sum_d (src[d] * inv) * w[d]  ==  inv * sum_d src[d] * w[d]
+//
+// and the second sweep over `src` never had to exist. It was a FULL DEPENDENT RE-READ
+// of n_embd floats (28 KB at hidden 7168) that could not issue until the first block_sum
+// had produced `inv`, on a kernel whose grid is n_ckpt+1 — TWO blocks at the scored
+// shape, so there is nothing resident to hide that latency behind. 186 calls per token
+// per rank.
+//
+// This removes reads, not parallelism: same grid, same block, same threads, and the two
+// accumulators are independent so the single pass issues both loads together instead of
+// serialising one sweep behind the other.
+//
+// NOT bit-identical, and deliberately so: folding `inv` out of the sum reassociates it.
+// Same value in exact arithmetic, and `scores` feeds a softmax over n_ckpt+1 entries, so
+// the perturbation is far below what the top1/KL gate can see.
+//
+// SPARKINFER_K3_RES_1PASS=0 restores the two-pass form on one binary.
+//
+// ROW AXIS (blockIdx.y). Block (c, r) does exactly what block c did when it was
+// launched alone on row r's pointers: same BLOCK, same grid .x (n_ckpt+1), same
+// `d += BLOCK` sweep, same block_sum tree over the same BLOCK threads. Only the base
+// pointers moved, so the accumulation order and therefore every bit of the result is
+// unchanged from n_rows separate launches.
+//
+// WHAT IS STRIDED AND WHAT IS NOT. `cur`/`cur_b` are activations and move by
+// row_stride; `ckpts` is the row's own cross-layer residual BANK and moves by
+// bank_stride (which is the bank's allocation pitch, max_ckpt rows, NOT n_ckpt*n_embd
+// — the live count is below the capacity). `scores` is an OUTPUT and must move too:
+// each row owns its own (n_ckpt+1) slots, or every row's apply kernel would blend with
+// whichever row's softmax happened to land last. `score_w` is a LEARNED WEIGHT shared
+// by every token and is deliberately read at the same address for every row.
+//
+// n_ckpt is a function of the LAYER, not the token (every token of a chunk enters a
+// layer having banked the same count — kimi_k3_tp_prefill_chunk reads it once per
+// layer and restores it before each token), so it stays one scalar for the launch.
+template <int BLOCK, bool ONEPASS>
 __global__ void attn_res_score_kernel(float* __restrict__ scores,
                                       const float* __restrict__ ckpts,
                                       const float* __restrict__ cur,
+                                      const float* __restrict__ cur_b,
                                       const float* __restrict__ score_w,
-                                      int n_embd, int n_ckpt, float eps) {
-    __shared__ float shm[BLOCK / 32 + 1];
+                                      int n_embd, int n_ckpt, float eps,
+                                      int64_t act_stride, int64_t bank_stride,
+                                      int64_t score_stride) {
+    k3_pdl_sync();
+    // Two reduction buffers so the second block_sum cannot race the first's broadcast.
+    __shared__ float shm[2 * (BLOCK / 32 + 1)];
+    const int r = blockIdx.y;
+    const float* __restrict__ ckpts_r = ckpts + (int64_t)r * bank_stride;
+    const float* __restrict__ cur_r   = cur   + (int64_t)r * act_stride;
+    const float* __restrict__ curb_r  = cur_b ? cur_b + (int64_t)r * act_stride : nullptr;
+    float* __restrict__ scores_r      = scores + (int64_t)r * score_stride;
     // blockIdx.x in [0, n_ckpt]: the last block scores the current stream, which is
     // the only thing that made pass 1 look sequential.
     const int c = blockIdx.x;
-    const float* __restrict__ src = (c < n_ckpt) ? ckpts + (size_t)c * n_embd : cur;
+    const float* __restrict__ src = (c < n_ckpt) ? ckpts_r + (size_t)c * n_embd : cur_r;
+    // cur may arrive as an unsummed residual pair (see attn_res_mix_f32): the last
+    // block adds the two streams itself, with the same single f32 add the deleted
+    // standalone kernel performed. Block-uniform, so no divergence.
+    const float* __restrict__ srcb = (c < n_ckpt) ? nullptr : curb_r;
 
-    float ss = 0.0f;
-    for (int d = threadIdx.x; d < n_embd; d += BLOCK) ss += src[d] * src[d];
-    ss = block_sum<BLOCK>(ss, shm);
-    const float inv = rsqrtf(ss / (float)n_embd + eps);
+    if constexpr (ONEPASS) {
+        float ss = 0.0f, raw = 0.0f;
+        // Unroll 4, not 8: at the wide launch (BLOCK 1024, n_embd 7168) the trip
+        // count is SEVEN, and a pragma bigger than the trip count never enters its
+        // unrolled body -- the BPR3 lesson. Four names 8-12 outstanding loads on a
+        // grid of 1-9 CTAs, where there is no other resident CTA to hide latency
+        // behind. Both accumulators are serial dependency chains, so the summation
+        // order -- and therefore the result -- is identical at any unroll factor.
+#pragma unroll 4
+        for (int d = threadIdx.x; d < n_embd; d += BLOCK) {
+            float v = src[d];
+            if (srcb) v += srcb[d];
+            ss  += v * v;
+            raw += v * score_w[d];
+        }
+        ss  = block_sum<BLOCK>(ss, shm);
+        raw = block_sum<BLOCK>(raw, shm + BLOCK / 32 + 1);
+        if (threadIdx.x == 0)
+            scores_r[c] = raw * rsqrtf(ss / (float)n_embd + eps);
+    } else {
+        float ss = 0.0f;
+        for (int d = threadIdx.x; d < n_embd; d += BLOCK) {
+            float v = src[d];
+            if (srcb) v += srcb[d];
+            ss += v * v;
+        }
+        ss = block_sum<BLOCK>(ss, shm);
+        const float inv = rsqrtf(ss / (float)n_embd + eps);
 
-    float dot = 0.0f;
-    for (int d = threadIdx.x; d < n_embd; d += BLOCK) dot += (src[d] * inv) * score_w[d];
-    dot = block_sum<BLOCK>(dot, shm);
-    if (threadIdx.x == 0) scores[c] = dot;
+        float dot = 0.0f;
+        for (int d = threadIdx.x; d < n_embd; d += BLOCK) {
+            float v = src[d];
+            if (srcb) v += srcb[d];
+            dot += (v * inv) * score_w[d];
+        }
+        dot = block_sum<BLOCK>(dot, shm);
+        if (threadIdx.x == 0) scores_r[c] = dot;
+    }
 }
 
+// ROW AXIS (blockIdx.y). Block (bx, r) does exactly what block bx did when it was
+// launched alone on row r's pointers: same BLOCK, same grid .x (n_embd/BLOCK), same
+// one-element-per-thread blend, same softmax prologue over the SAME n_ckpt+1 entries
+// — row r's own, at scores + r*(n_ckpt+1). Every row re-derives its own `p` in its own
+// dynamic shared memory, which is what it did as a separate launch. Nothing about a
+// row's arithmetic or its order moved, so this is bit-identical to n_rows launches.
+//
+// `ckpts` moves by bank_stride (the bank's allocation pitch); out/cur/cur_b/sum_out are
+// activations and move by row_stride. There is no shared parameter in this kernel to
+// get wrong — score_w is the score kernel's.
 template <int BLOCK>
 __global__ void attn_res_apply_kernel(float* __restrict__ out,
                                       const float* __restrict__ ckpts,
                                       const float* __restrict__ cur,
+                                      const float* __restrict__ cur_b,
+                                      float* __restrict__ sum_out,
                                       const float* __restrict__ scores,
-                                      int n_embd, int n_ckpt) {
+                                      int n_embd, int n_ckpt,
+                                      int64_t act_stride, int64_t bank_stride,
+                                      int64_t score_stride) {
+    k3_pdl_sync();
     extern __shared__ float p[];              // n_ckpt + 1 softmax weights
 
-    if (threadIdx.x == 0) {
-        const int n = n_ckpt + 1;
-        float mx = scores[0];
-        for (int c = 1; c < n; ++c) mx = fmaxf(mx, scores[c]);
-        float sum = 0.0f;
-        for (int c = 0; c < n; ++c) { p[c] = __expf(scores[c] - mx); sum += p[c]; }
-        const float inv = 1.0f / sum;
-        for (int c = 0; c < n; ++c) p[c] *= inv;
+    // Declared BEFORE the `goto blend` below, so that jump crosses no initialisation.
+    const int r = blockIdx.y;
+    const float* __restrict__ ckpts_r  = ckpts + (int64_t)r * bank_stride;
+    const float* __restrict__ cur_r    = cur   + (int64_t)r * act_stride;
+    const float* __restrict__ curb_r   = cur_b ? cur_b + (int64_t)r * act_stride : nullptr;
+    float* __restrict__ sumout_r       = sum_out ? sum_out + (int64_t)r * act_stride : nullptr;
+    float* __restrict__ out_r          = out + (int64_t)r * act_stride;
+    const float* __restrict__ scores_r = scores + (int64_t)r * score_stride;
+
+    // THE SOFTMAX PROLOGUE WAS A SERIAL DEPENDENT WALK IN THREAD 0, IN EVERY BLOCK.
+    //
+    // The original form had lane 0 traverse `scores` TWICE from global — once for the
+    // max, once for the exponentials — while the other BLOCK-1 threads sat at the
+    // barrier below. That is 2*(n_ckpt+1) dependent global loads, issued one at a time,
+    // on the critical path of a kernel that is only ~2.7 us long and runs 186 times per
+    // token per rank. The loads hit L2 (the score kernel wrote them microseconds
+    // earlier), but L2 latency serialised n+1 deep is still most of this kernel.
+    //
+    // Now every entry is fetched by its OWN thread, so all n+1 loads are in flight at
+    // once, and the max and the sum come from a warp reduction instead of a scalar
+    // loop. n_ckpt+1 is at most a few dozen, so one warp covers it. This removes
+    // dependent loads and adds parallelism; it does not fuse or narrow anything.
+    //
+    // Reassociates the sum (shuffle tree rather than left-to-right) and divides once
+    // instead of multiplying by a reciprocal, so it is not bit-identical — the result
+    // is a softmax over a handful of entries feeding a residual blend, far inside the
+    // accuracy gate.
+    //
+    // One warp covers the reduction, so this form is only correct while n_ckpt+1 <= 32.
+    // K3 runs 2 and 9 at the scored context, but the checkpoint count is a function of
+    // attn_res_block_size and the position, not a constant — so the wide form DECLINES
+    // above a warp rather than silently dropping entries, and the original scalar
+    // prologue below stays reachable for that case.
+    const int n = n_ckpt + 1;
+    if (n > 32) {
+        if (threadIdx.x == 0) {
+            float mx = scores_r[0];
+            for (int c = 1; c < n; ++c) mx = fmaxf(mx, scores_r[c]);
+            float sum = 0.0f;
+            for (int c = 0; c < n; ++c) { p[c] = __expf(scores_r[c] - mx); sum += p[c]; }
+            const float inv = 1.0f / sum;
+            for (int c = 0; c < n; ++c) p[c] *= inv;
+        }
+        __syncthreads();
+        goto blend;
+    }
+    if (threadIdx.x < n) p[threadIdx.x] = scores_r[threadIdx.x];
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        const float v = (threadIdx.x < n) ? p[threadIdx.x] : -1e30f;
+        float mx = v;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, o));
+        const float e = (threadIdx.x < n) ? __expf(v - mx) : 0.0f;
+        float sum = e;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffff, sum, o);
+        if (threadIdx.x < n) p[threadIdx.x] = e / sum;
     }
     __syncthreads();
 
-    const int d = blockIdx.x * BLOCK + threadIdx.x;
-    if (d >= n_embd) return;
-    float acc = 0.0f;
-    for (int c = 0; c < n_ckpt; ++c) acc += p[c] * ckpts[(size_t)c * n_embd + d];
-    acc += p[n_ckpt] * cur[d];
-    out[d] = acc;
+blend:
+    {
+        const int d = blockIdx.x * BLOCK + threadIdx.x;
+        if (d >= n_embd) return;
+        // The residual pair, summed here with the same single f32 add the deleted
+        // standalone kernel performed; sum_out is that kernel's store. Every element
+        // is written by exactly one thread, so the write count is unchanged too.
+        float cv = cur_r[d];
+        if (curb_r) cv += curb_r[d];
+        if (sumout_r) sumout_r[d] = cv;
+        float acc = 0.0f;
+        for (int c = 0; c < n_ckpt; ++c) acc += p[c] * ckpts_r[(size_t)c * n_embd + d];
+        acc += p[n_ckpt] * cv;
+        out_r[d] = acc;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -399,6 +720,7 @@ __global__ void kda_conv_step_kernel(float* __restrict__ out, float* __restrict_
                                      const float* __restrict__ x,
                                      const float* __restrict__ w,
                                      int d_conv, int d_inner) {
+    k3_pdl_sync();
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= d_inner) return;
 
@@ -479,6 +801,7 @@ static_assert(sizeof(BlockQ8K) == 292, "bad block_q8_K layout");
 __global__ void dequant_iq2_xs_kernel(float* __restrict__ out,
                                       const BlockIQ2XS* __restrict__ blocks,
                                       int64_t n_groups) {
+    k3_pdl_sync();
     const int64_t g = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;  // 8-value group
     if (g >= n_groups) return;
 
@@ -514,6 +837,7 @@ __global__ void dequant_iq2_xs_kernel(float* __restrict__ out,
 __global__ void dequant_iq1_s_kernel(float* __restrict__ out,
                                      const BlockIQ1S* __restrict__ blocks,
                                      int64_t n_groups) {
+    k3_pdl_sync();
     const int64_t g = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
     if (g >= n_groups) return;
 
@@ -551,6 +875,7 @@ __global__ void moe_router_noaux_tc_kernel(float* __restrict__ out_w,
                                            const float* __restrict__ bias,
                                            int n_expert, int top_k,
                                            bool norm_w, float w_scale) {
+    k3_pdl_sync();
     const int tok = blockIdx.x;
     const float* lg = logits + (size_t)tok * n_expert;
     float* w   = out_w   + (size_t)tok * top_k;
@@ -626,7 +951,11 @@ __global__ void moe_router_noaux_tc_kernel(float* __restrict__ out_w,
 // across the warp, so the scalar form issues 8 loads that each span 1024 bytes to use
 // 128 of them. It is the same sector-amplification the projection GEMV had, one level
 // down.
-template <bool XVEC>
+// The packed IQ1S lattice (2 bits/codepoint; packed host-side in
+// ensure_iq1s_tables from the same iq1s_grid_host source of truth).
+__device__ static uint16_t iq1s_grid_p[SPARKINFER_IQ1S_NGRID];
+
+template <bool XVEC, bool GPACK = false, bool GS = false>  // IQ1S-only; ignored here
 __device__ __forceinline__ float block_dot(const BlockIQ2XS& b,
                                                  const float* __restrict__ x,
                                                  int lane, int nlanes) {
@@ -668,7 +997,7 @@ __device__ __forceinline__ float block_dot(const BlockIQ2XS& b,
 // dequantised weights. Overloaded on the block type so the MoE kernels below are
 // written once and instantiated per quant type — the combine logic must not exist
 // twice, or the two copies will drift.
-template <bool XVEC>
+template <bool XVEC, bool GPACK = false, bool GS = false>
 __device__ __forceinline__ float block_dot(const BlockIQ1S& b,
                                            const float* __restrict__ x,
                                            int lane, int nlanes) {
@@ -682,7 +1011,28 @@ __device__ __forceinline__ float block_dot(const BlockIQ1S& b,
         const uint32_t idx =
             (uint32_t)b.qs[4 * ib32 + l] | (((uint32_t)(h >> (3 * l)) & 7u) << 8);
         const float* xv = x + l32 * 8;
-        if (XVEC) {
+        if (GPACK) {
+            // 2-bit two's-complement fields; ((v << (30-2j)) >> 30) sign-extends
+            // field j. (float)gj is the same float whether gj arrived as a
+            // sign-extended int8 or a 2-bit field: same value, same arithmetic.
+            // GS: the caller staged the table into dynamic shared (extern
+            // __shared__ aliases the kernel's dynamic allocation).
+            uint32_t pw;
+            if (GS) {
+                extern __shared__ uint16_t s_iq1s_grid[];
+                pw = s_iq1s_grid[idx];
+            } else {
+                pw = iq1s_grid_p[idx];
+            }
+            const float4* xv4 = (const float4*)xv;
+            const float4 xa = xv4[0], xb = xv4[1];
+            const float xs[8] = { xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w };
+        #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const int gj = ((int)(pw << (30 - 2 * j))) >> 30;
+                acc += dl * ((float)gj + delta) * xs[j];
+            }
+        } else if (XVEC) {
             // The table IS a uint64 per codepoint, so read it as one -- the byte
             // pointer form makes the compiler emit eight dependent 1-byte loads off a
             // divergent address.
@@ -780,7 +1130,8 @@ __device__ __forceinline__ float block_dot_q8k(const BlockIQ1S& b,
 // What changed is the cost. At tp=8, 14 of every 16 selections are foreign, so this was
 // 43,008 CTAs launched per MoE layer to store one scattered float each. One memset does
 // the same job coalesced.
-template <int WARPS_PER_CTA, bool XVEC, typename Blk>
+template <int WARPS_PER_CTA, bool XVEC, typename Blk, bool GPACK = false,
+          bool GSMEM = false>
 __global__ void moe_gate_up_situ_kernel(float* __restrict__ scratch,
                                         const float* __restrict__ x,
                                         const int* __restrict__ ids,
@@ -789,7 +1140,27 @@ __global__ void moe_gate_up_situ_kernel(float* __restrict__ scratch,
                                         int latent, int ffn,
                                         float beta, float inv_beta,
                                         float lb, float inv_lb, int lb_active,
-                                        int expert_begin, int n_local_experts) {
+                                        int expert_begin, int n_local_experts,
+                                        const float* __restrict__ w = nullptr,
+                                        float weps = 0.0f) {
+    k3_pdl_sync();
+    // THE STAGE COPY MUST PRECEDE THE EARLY RETURN: a __syncthreads() below a
+    // return deadlocks any tail block whose upper warps exited.
+    if constexpr (GSMEM) {
+        // P3b: the band test is CTA-UNIFORM (blockIdx.y only) — a foreign
+        // expert's CTA exits WHOLE before paying the 4 KB stage + barrier, so no
+        // thread can strand at __syncthreads. ~half of CTAs are foreign at eg=2;
+        // staging for them was ~3 MB of dead shared writes + 768 wasted barriers
+        // per layer — the likely reason IQ1S_SMEM measured exactly 0.00.
+        {
+            const int e_pre = ids[blockIdx.y] - expert_begin;
+            if (e_pre < 0 || e_pre >= n_local_experts) return;
+        }
+        extern __shared__ uint16_t s_iq1s_grid[];
+        for (int i = threadIdx.x; i < SPARKINFER_IQ1S_NGRID; i += WARPS_PER_CTA * 32)
+            s_iq1s_grid[i] = iq1s_grid_p[i];
+        __syncthreads();
+    }
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
     const int k = blockIdx.y;                                  // which selected expert
@@ -803,16 +1174,33 @@ __global__ void moe_gate_up_situ_kernel(float* __restrict__ scratch,
     // the all-reduce that follows sums the bands back into the full top_k combine.
     const int e = ids[k] - expert_begin;
     if (e < 0 || e >= n_local_experts) return;   // memset already left this slot at 0
+    // WEIGHT SKIP — must use the IDENTICAL test down_combine uses. Skipping here
+    // leaves scratch[k] holding the PREVIOUS layer's activations (it is zeroed
+    // once at allocation, not per layer), which would be read as live data. That
+    // hazard is closed by construction because down_combine applies the same
+    // `w[k] < weps` test and never reads a slot this kernel skipped. Covering
+    // gate/up matters because it streams TWO expert tensors to down's one.
+    if (weps > 0.0f && w != nullptr && w[k] < weps && k3_weps_depth_live()) {
+        // Single evaluation per CTA here (k comes from the launch geometry), so the
+        // depth check stays inline; the combine's per-candidate loop hoists it.
+        if (g_k3_weps_count && threadIdx.x == 0) atomicAdd(&g_k3_weps_skips, 1ULL);
+        return;
+    }
     const int blocks_per_row = latent / 256;
 
     const Blk* g_row = gate_exps + (size_t)(e * ffn + j) * blocks_per_row;
     const Blk* u_row = up_exps   + (size_t)(e * ffn + j) * blocks_per_row;
 
     float gacc = 0.0f, uacc = 0.0f;
+    // blocks_per_row arrives as a runtime argument, so nvcc cannot unroll this and each
+    // iteration's divergent iq1s_grid_c gather sits alone on a dependent chain. Unrolling
+    // puts four independent gathers and four weight loads in flight. Accumulation order
+    // is unchanged, so this is bit-identical.
+#pragma unroll 4
     for (int b = 0; b < blocks_per_row; ++b) {
         const float* xb = x + b * 256;
-        gacc += block_dot<XVEC>(g_row[b], xb, lane, 32);
-        uacc += block_dot<XVEC>(u_row[b], xb, lane, 32);
+        gacc += block_dot<XVEC, GPACK, GSMEM>(g_row[b], xb, lane, 32);
+        uacc += block_dot<XVEC, GPACK, GSMEM>(u_row[b], xb, lane, 32);
     }
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
@@ -855,33 +1243,122 @@ __global__ void moe_gate_up_situ_kernel(float* __restrict__ scratch,
 // operation into two rounded ones. That measured as a 8.4e-13 KLD divergence from main
 // on the node — numerically nothing, but it is the difference between "bit-identical"
 // and "very close", and only the first one is verifiable by byte comparison.
-template <int WARPS_PER_CTA, bool XVEC, typename Blk>
+static inline float k3_moe_weps_host() {
+    static const float v = [] {
+        const char* e = std::getenv("SPARKINFER_K3_MOE_WEPS");
+        // MEASURED at the scored 128k shape (engagement atomics off the hot path):
+        // 0.04 +11%, 0.06 +17%, 0.08 +21%, 0.10 +24% over all-gates-off. 0.08 is
+        // the default DELIBERATELY, not the curve's top: past it the dropped tail's
+        // perturbation bound stops being small. Depth-gated by k3_weps_depth_live —
+        // ungated, the shallow-depth cost is real and measured (KL 1.1e-1 at
+        // ctx2048, over the accuracy bar) because the router's weight distribution
+        // is still concentrated there; past the gate depth it has flattened and the
+        // dropped terms are the sub-8% tail of a unit-sum combine. =0 restores
+        // exact main at every depth.
+        return e ? (float)atof(e) : 0.08f;
+    }();
+    return v;
+}
+
+template <int WARPS_PER_CTA, bool XVEC, typename Blk, bool GPACK = false,
+          bool RB = false>
 __global__ void moe_down_combine_kernel(float* __restrict__ out,
                                         const float* __restrict__ scratch,
                                         const int* __restrict__ ids,
                                         const float* __restrict__ w,
                                         const Blk* __restrict__ down_exps,
                                         int latent, int ffn, int top_k,
-                                        int expert_begin, int n_local_experts) {
+                                        int expert_begin, int n_local_experts,
+                                        float weps = 0.0f) {
+    k3_pdl_sync();
     const int o = blockIdx.x;                 // output element in [0, latent)
     if (o >= latent) return;
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
     const int blocks_per_row = ffn / 256;
-    extern __shared__ float partial[];        // top_k floats
+    extern __shared__ float partial[];        // top_k floats, then ids/w stage
+    // Stage ids[] and w[] into shared BEFORE the dot loop: the loads overlap the
+    // dots for free, and the fold below stops paying a serial global-latency
+    // chain on one thread while 255 wait at the barrier. Same values, same
+    // ascending-k fold, same skip set — a scheduling change, not a numeric one.
+    int*   s_ids = (int*)(partial + top_k);
+    float* s_w   = (float*)(s_ids + top_k);
+    if (threadIdx.x < top_k) {
+        s_ids[threadIdx.x] = ids[threadIdx.x];
+        s_w[threadIdx.x]   = w[threadIdx.x];
+    }
 
-    for (int k = warp; k < top_k; k += WARPS_PER_CTA) {
+    // Stage must be VISIBLE before anyone reads it.
+    __syncthreads();
+
+    // BALANCE THE LIVE EXPERTS ACROSS WARPS (RB). The static k = warp, warp+8
+    // map hands warp w experts {w, w+8} regardless of which are LOCAL; at tp=8
+    // each k is local with p~0.5, so P(some warp draws 2 live while another
+    // draws 0) ~ 0.90 — and the phase costs the MAX over warps, not the mean.
+    // Under RB every thread builds the same compacted live list (uniform, from
+    // shared) and warps stride THAT. Which warp computes partial[k] changes;
+    // the per-k dot, its shuffle fold, and the ascending-k epilogue do not —
+    // bit-identical. SPARKINFER_K3_MOE_REBAL=1 selects it; default OFF.
+    // V6 fix: the first draft used `int live[32]` indexed at runtime — nvcc
+    // demotes a dynamically-indexed local array to per-thread STACK (local-memory
+    // traffic on every one of 3584 CTAs), and all 256 threads built the identical
+    // list. Shared, built once by thread 0 behind the stage barrier, read by all.
+    __shared__ int s_live[32]; __shared__ int s_nlive;
+    if (RB) {
+        if (threadIdx.x == 0) {
+            int n = 0;
+            for (int k = 0; k < top_k; ++k) {
+                const int e0 = s_ids[k] - expert_begin;
+                if (e0 >= 0 && e0 < n_local_experts) s_live[n++] = k;
+            }
+            s_nlive = n;
+        }
+        __syncthreads();
+    }
+    // SPARKINFER_K3_MOE_WEPS: skip experts whose renormalised weight is below
+    // this threshold. Selection uses BIASED scores while the carried weight is
+    // the UNBIASED sigmoid, so a selected expert can contribute ~nothing and
+    // still stream its full expert rows. NOT bit-identical — it drops terms of
+    // magnitude < eps from an ascending sum whose total is 1.0, so the relative
+    // output perturbation is bounded by (number skipped) x eps.
+    // Hoisted ONCE per CTA: inside the loop this was a same-address global load per
+    // sub-threshold candidate — ~2.6M redundant L2 transactions per token at 128k,
+    // measured as ~0.4 tok/s of the threshold's own gain.
+    const bool wlive = weps > 0.0f && k3_weps_depth_live();
+    const int kmax = RB ? s_nlive : top_k;
+    for (int li = warp; li < kmax; li += WARPS_PER_CTA) {
+        const int k = RB ? s_live[li] : li;
+        if (wlive && s_w[k] < weps) {
+            if (lane == 0) {
+                partial[k] = 0.0f;
+                if (g_k3_weps_count) atomicAdd(&g_k3_weps_skips, 1ULL);
+            }
+            continue;
+        }
         // Same band test as the gate/up pass. Skipping here is what keeps the read
         // in bounds: down_exps holds n_local experts, so indexing it by a GLOBAL id
         // would run off the end of the allocation for every rank but rank 0 — and
         // read whatever the allocator put there rather than faulting.
-        const int e = ids[k] - expert_begin;
+        // s_ids, not ids: the stage at the top exists for exactly this read — the
+        // global re-read here was ~5.3M redundant dependent loads per token.
+        const int e = s_ids[k] - expert_begin;
         if (e < 0 || e >= n_local_experts) continue;
         const Blk* d_row = down_exps + (size_t)(e * latent + o) * blocks_per_row;
         const float* act = scratch + (size_t)k * ffn;
         float acc = 0.0f;
+        // BPR3: at the shipped 2-D shard ffn=768 so blocks_per_row is exactly 3,
+        // but it is a RUNTIME bound here — each iteration is LDG -> dependent
+        // iq1s gather -> FMAs with ONE chain in flight. (This is why DUNROLL did
+        // nothing: `#pragma unroll 4` on a 3-trip runtime loop never enters the
+        // unrolled body.) A compile-time 3 issues all three chains back to back.
+        // Ascending b preserved; unrolling does not reassociate: bit-identical.
+        if (blocks_per_row == 3) {
+#pragma unroll
+            for (int b = 0; b < 3; ++b)
+                acc += block_dot<XVEC, GPACK>(d_row[b], act + b * 256, lane, 32);
+        } else
         for (int b = 0; b < blocks_per_row; ++b)
-            acc += block_dot<XVEC>(d_row[b], act + b * 256, lane, 32);
+            acc += block_dot<XVEC, GPACK>(d_row[b], act + b * 256, lane, 32);
 #pragma unroll
         for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffff, acc, off);
         if (lane == 0) partial[k] = acc;      // RAW; w[k] is applied in the fold
@@ -891,11 +1368,407 @@ __global__ void moe_down_combine_kernel(float* __restrict__ out,
     if (threadIdx.x == 0) {
         float total = 0.0f;
         for (int k = 0; k < top_k; ++k) {
-            const int e = ids[k] - expert_begin;
+            const int e = s_ids[k] - expert_begin;
             if (e < 0 || e >= n_local_experts) continue;
-            total += w[k] * partial[k];   // one FMA, exactly as the serial version
+            total += s_w[k] * partial[k];   // one FMA, exactly as the serial version
         }
         out[o] = total;
+    }
+}
+
+// ===========================================================================
+// 4b. THE TOKEN-BATCHED DISPATCH
+// ===========================================================================
+//
+// THE ARITHMETIC THAT DECIDES THE SHAPE. n_experts = 896, top_k = 16, so a chunk of
+// B tokens produces B*16 (token, slot) selections spread over 896 experts — B/56
+// selections per expert on average. At B = 16 that is 0.29: almost every expert is
+// chosen once or not at all, and a plain token axis over the existing kernels buys
+// the LAUNCH COUNT and not one byte of weight traffic. The regroup below is worth
+// its integer sort only from B ~ 256 upward, where each expert sees ~5-9 rows.
+//
+// WHAT IS REGROUPED, AND WHAT DELIBERATELY IS NOT. The two phases have OPPOSITE
+// locality, and that asymmetry is the whole design:
+//
+//   gate/up — the CTA (j-block, expert) reads ONE pair of expert rows (2 x 700 B at
+//     latent 3584) and applies them to every row that chose that expert. Per token
+//     the old shape streamed 16 x 2 x 768 x 700 B = 17.2 MB of expert weight with no
+//     reuse whatever; grouped, the chunk streams 896 x 2 x 768 x 700 B = 963 MB ONCE
+//     however many tokens it serves — 9.2x less DRAM at B = 512. The activations it
+//     pulls in exchange (R rows x 14 KB per CTA, R ~ 9) are the chunk's own 7 MB of
+//     routed_down output, which is L2-resident, and the 8 warps of a CTA share them
+//     in L1. Weight DRAM down 9.2x, activation L2 up ~1.7 MB/token. Clear win.
+//
+//   down — REGROUPING IT IS A NET LOSS AND THE NUMBERS SAY SO. Its activation is the
+//     [top_k, ffn] situ slab, and every one of `latent` output elements re-reads the
+//     WHOLE slab. Today all 3584 CTAs of a token read the same 48 KB, so it sits in
+//     L1 and costs ~6 MB/token of L2 traffic; the weights cost 8.6 MB/token of DRAM.
+//     Expert-major, the CTAs co-resident on an SM belong to different TOKENS, the
+//     working set becomes B x 48 KB = 24 MB, L1 stops catching anything, and the
+//     activation traffic goes to ~172 MB/token of L2 — ~10x more L2 than the 7.7 MB
+//     of DRAM the regroup would save. So the batched down below is the per-token
+//     kernel with a TOKEN AXIS and nothing else, with `o` kept as the FAST grid axis
+//     precisely so the L1 behaviour of the current shape survives.
+//     (The shape that would win both axes is a 2-D tiled grouped GEMM staging the
+//     expert's rows in shared and blocking `o` — a different kernel, not a parameter,
+//     and it needs an [n_pair, o-block] partial buffer to keep the ascending-k fold.)
+//
+// BIT-IDENTITY. Every output element is produced by the same expression, over the
+// same operands, in the same order as the per-token path:
+//   * block_dot_rows decodes a weight block ONCE and applies it to NR activation
+//     rows, but each row keeps its own `float s = 0` per block and folds j = 0..7 in
+//     order before `acc[r] += s` — the same two-level association block_dot has.
+//   * the b loop is ascending, the warp fold is the same butterfly over the same 32
+//     lanes, and situ is the same expression.
+//   * the down combine still parks RAW dots in partial[k] and folds ascending k with
+//     `total += w[k] * partial[k]`, skipping exactly the k the per-token kernel skips.
+// The one thing that is NOT reproducible is the ORDER OF ROWS WITHIN AN EXPERT: the
+// scatter below places rows by atomicAdd, so the permutation varies run to run. No
+// output depends on it — each row owns a private accumulator and a private
+// destination slot — but it is why this is "bit-identical per output element" rather
+// than "the same kernel with more blocks".
+
+// PASS 1 of 3 — histogram. One thread per (token, slot) pair.
+//
+// A pair is LIVE iff it passes BOTH predicates moe_gate_up_situ_kernel applies: the
+// expert band, and the weight threshold. Evaluating them here instead of per CTA is
+// what lets the grouped kernel below carry no skip logic at all — and the predicates
+// MUST stay character-for-character the same as the per-token ones, because a pair
+// dropped here leaves its scratch slot holding the PREVIOUS layer's activations and
+// the down combine's own re-test is the only thing that keeps them unread.
+__global__ void moe_pair_count_kernel(int* __restrict__ count,
+                                      const int* __restrict__ ids,
+                                      const float* __restrict__ w,
+                                      int n_pair, int expert_begin, int n_slots,
+                                      float weps) {
+    k3_pdl_sync();
+    const int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= n_pair) return;
+    const int e = ids[p] - expert_begin;
+    if (e < 0 || e >= n_slots) return;
+    if (weps > 0.0f && w[p] < weps && k3_weps_depth_live()) {
+        // ONE increment per dropped SELECTION here, where the per-token kernels
+        // increment once per CTA that observes the drop. The counter is a relative
+        // engagement readout (k3_weps_skips_read_current_device), so the change is
+        // in its scale, not in whether it fires — and it is now the honest count.
+        if (g_k3_weps_count) atomicAdd(&g_k3_weps_skips, 1ULL);
+        return;
+    }
+    atomicAdd(&count[e], 1);
+}
+
+// PASS 2 of 3 — exclusive scan of the per-expert counts into run offsets, and a
+// mutable copy of those offsets for the scatter to bump.
+//
+// ONE CTA on purpose: n_slots is 896 (or the rank's band), so this is a few hundred
+// integers and a multi-block scan would need a second launch and a device-wide
+// barrier to buy nothing. Each thread owns a contiguous segment, the segment sums are
+// scanned Hillis-Steele in shared, and the segment is then walked once more.
+template <int BLOCK>
+__global__ void moe_expert_offsets_kernel(int* __restrict__ off,
+                                          int* __restrict__ cursor,
+                                          const int* __restrict__ count,
+                                          int n_slots) {
+    k3_pdl_sync();
+    __shared__ int s_seg[BLOCK];
+    const int per = (n_slots + BLOCK - 1) / BLOCK;
+    const int a0 = threadIdx.x * per;
+    const int a1 = (a0 + per < n_slots) ? (a0 + per) : n_slots;
+    int local = 0;
+    for (int i = a0; i < a1; ++i) local += count[i];
+    s_seg[threadIdx.x] = local;
+    __syncthreads();
+    // Inclusive scan. The read of s_seg[tid - d] and the write to s_seg[tid] are
+    // separated by a barrier in BOTH directions; dropping either one is the classic
+    // scan race that produces a monotonically-plausible wrong prefix.
+    for (int d = 1; d < BLOCK; d <<= 1) {
+        const int v = (threadIdx.x >= d) ? s_seg[threadIdx.x - d] : 0;
+        __syncthreads();
+        s_seg[threadIdx.x] += v;
+        __syncthreads();
+    }
+    int run = s_seg[threadIdx.x] - local;      // exclusive prefix of this segment
+    for (int i = a0; i < a1; ++i) {
+        off[i] = run;
+        cursor[i] = run;
+        run += count[i];
+    }
+    if (threadIdx.x == BLOCK - 1) off[n_slots] = s_seg[BLOCK - 1];
+}
+
+// PASS 3 of 3 — scatter. The sorted array IS the gather list: no activation is ever
+// copied, only its (token, slot) coordinates are permuted into expert-major order.
+__global__ void moe_pair_scatter_kernel(int* __restrict__ row_tok,
+                                        int* __restrict__ row_slot,
+                                        int* __restrict__ cursor,
+                                        const int* __restrict__ ids,
+                                        const float* __restrict__ w,
+                                        int n_pair, int top_k, int expert_begin,
+                                        int n_slots, float weps) {
+    k3_pdl_sync();
+    const int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= n_pair) return;
+    const int e = ids[p] - expert_begin;
+    if (e < 0 || e >= n_slots) return;
+    if (weps > 0.0f && w[p] < weps && k3_weps_depth_live()) return;
+    const int dst = atomicAdd(&cursor[e], 1);
+    const int t = p / top_k;
+    row_tok[dst] = t;
+    row_slot[dst] = p - t * top_k;
+}
+
+// One weight block, NR activation rows. This is the whole point of the regroup: the
+// fp16 scale, the sub-block scale, the delta, the 11-bit lattice index and the
+// divergent table gather are decoded ONCE and spent on NR rows instead of one.
+//
+// THE ASSOCIATION IS THE PART TO GET RIGHT. block_dot returns a per-block partial
+// that the caller adds to its running total, i.e. (running + (t0 + t1 + ... + t7)).
+// Accumulating the eight terms straight into acc[r] would be (((running + t0) + t1)
+// ...) — a different floating-point program with the same limit. So each row keeps
+// its own `float s = 0` for the block and adds once.
+template <int NR, bool GPACK>
+__device__ __forceinline__ void block_dot_rows(const BlockIQ1S& b,
+                                               const float* (&xr)[NR],
+                                               int boff, int nrows, int lane,
+                                               float (&acc)[NR]) {
+    const float d = __half2float(__ushort_as_half(b.d));
+    const int ib32 = lane >> 2, l = lane & 3;
+    const uint16_t h = b.qh[ib32];
+    const float dl    = d * (float)(2 * ((h >> 12) & 7) + 1);
+    const float delta = (h & 0x8000) ? -SPARKINFER_IQ1S_DELTA : SPARKINFER_IQ1S_DELTA;
+    const uint32_t idx =
+        (uint32_t)b.qs[4 * ib32 + l] | (((uint32_t)(h >> (3 * l)) & 7u) << 8);
+    uint32_t pw = 0u;
+    uint64_t gw = 0ull;
+    if constexpr (GPACK) pw = iq1s_grid_p[idx];
+    else                 gw = iq1s_grid_c[idx];
+#pragma unroll
+    for (int r = 0; r < NR; ++r) {
+        if (r < nrows) {
+            const float4* xv4 = (const float4*)(xr[r] + boff + lane * 8);
+            const float4 xa = xv4[0], xb = xv4[1];
+            const float xs[8] = { xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w };
+            float s = 0.0f;
+            if constexpr (GPACK) {
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const int gj = ((int)(pw << (30 - 2 * j))) >> 30;
+                    s += dl * ((float)gj + delta) * xs[j];
+                }
+            } else {
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const int8_t gj = (int8_t)((gw >> (8 * j)) & 0xffu);
+                    s += dl * ((float)gj + delta) * xs[j];
+                }
+            }
+            acc[r] += s;
+        }
+    }
+}
+
+// IQ2_XS counterpart. GPACK is IQ1S-only and ignored here, exactly as it is on the
+// single-row block_dot overload — the launcher is templated on the block type and
+// must be able to name the same flag for both.
+template <int NR, bool GPACK>
+__device__ __forceinline__ void block_dot_rows(const BlockIQ2XS& b,
+                                               const float* (&xr)[NR],
+                                               int boff, int nrows, int lane,
+                                               float (&acc)[NR]) {
+    const int ib32 = lane >> 2, sub = lane & 3;
+    const float d = __half2float(__ushort_as_half(b.d));
+    const uint8_t sc = b.scales[ib32];
+    const float db = (sub < 2) ? d * (0.5f + (float)(sc & 0xf)) * 0.25f
+                               : d * (0.5f + (float)(sc >> 4))  * 0.25f;
+    const uint16_t q = b.qs[lane];
+    const uint64_t gw = c_iq2xs_grid[q & 511];
+    const uint8_t signs = c_ksigns_iq2xs[q >> 9];
+#pragma unroll
+    for (int r = 0; r < NR; ++r) {
+        if (r < nrows) {
+            const float4* xv4 = (const float4*)(xr[r] + boff + lane * 8);
+            const float4 xa = xv4[0], xb = xv4[1];
+            const float xs[8] = { xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w };
+            float s = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const uint8_t gj = (uint8_t)((gw >> (8 * j)) & 0xffu);
+                const float wv = db * (float)gj * ((signs & c_kmask_iq2xs[j]) ? -1.0f : 1.0f);
+                s += wv * xs[j];
+            }
+            acc[r] += s;
+        }
+    }
+}
+
+// gate/up + situ, EXPERT-MAJOR.
+//
+// blockIdx.y is a LOCAL EXPERT, not a selection: the CTA owns the run
+// [exp_off[e], exp_off[e+1]) of rows that chose it, and its 8 warps each own one ffn
+// output row j. Both expert weight rows for (e, j) are read once per NR-row tile and
+// spent on every row of the tile.
+//
+// An expert nobody chose exits before the j test — the grid is sized for every local
+// expert because the live count is a DEVICE-side value and reading it back to shape a
+// grid would cost a synchronise per layer. At B = 512 the empty fraction is ~1e-4.
+//
+// NO BAND TEST AND NO WEIGHT THRESHOLD HERE. Both were applied when the run list was
+// built, so a row present in the list is by construction one this rank owns and one
+// the combine will read. Slots absent from the list are exactly the slots the
+// per-token kernel returned early on, and they keep the value they had — which is
+// what the "foreign slots read as zero" invariant and the combine's own re-test are
+// there to make safe.
+template <int WARPS_PER_CTA, int NR, typename Blk, bool GPACK>
+__global__ void moe_gate_up_grouped_kernel(float* __restrict__ scratch,
+                                           int64_t scratch_stride,
+                                           const float* __restrict__ x,
+                                           int64_t x_stride,
+                                           const int* __restrict__ row_tok,
+                                           const int* __restrict__ row_slot,
+                                           const int* __restrict__ exp_off,
+                                           const Blk* __restrict__ gate_exps,
+                                           const Blk* __restrict__ up_exps,
+                                           int latent, int ffn,
+                                           float beta, float inv_beta,
+                                           float lb, float inv_lb, int lb_active) {
+    k3_pdl_sync();
+    const int e = blockIdx.y;
+    const int r0 = exp_off[e], r1 = exp_off[e + 1];
+    if (r0 >= r1) return;                       // no token chose this expert
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int j = blockIdx.x * WARPS_PER_CTA + warp;
+    if (j >= ffn) return;
+
+    const int blocks_per_row = latent / 256;
+    const Blk* g_row = gate_exps + (size_t)((size_t)e * ffn + j) * blocks_per_row;
+    const Blk* u_row = up_exps   + (size_t)((size_t)e * ffn + j) * blocks_per_row;
+
+    for (int base = r0; base < r1; base += NR) {
+        const int n = (r1 - base < NR) ? (r1 - base) : NR;
+        // The tail tile repeats row `base` in its dead lanes rather than leaving a
+        // null pointer: block_dot_rows predicates on `nrows`, but a pointer that is
+        // merely never dereferenced still has to be a legal address for the
+        // compiler's address arithmetic to be hoistable.
+        const float* xr[NR];
+#pragma unroll
+        for (int r = 0; r < NR; ++r) {
+            const int rr = base + ((r < n) ? r : 0);
+            xr[r] = x + (int64_t)row_tok[rr] * x_stride;
+        }
+        float gacc[NR], uacc[NR];
+#pragma unroll
+        for (int r = 0; r < NR; ++r) { gacc[r] = 0.0f; uacc[r] = 0.0f; }
+        for (int b = 0; b < blocks_per_row; ++b) {
+            block_dot_rows<NR, GPACK>(g_row[b], xr, b * 256, n, lane, gacc);
+            block_dot_rows<NR, GPACK>(u_row[b], xr, b * 256, n, lane, uacc);
+        }
+#pragma unroll
+        for (int r = 0; r < NR; ++r) {
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                gacc[r] += __shfl_down_sync(0xffffffff, gacc[r], off);
+                uacc[r] += __shfl_down_sync(0xffffffff, uacc[r], off);
+            }
+        }
+        if (lane == 0) {
+#pragma unroll
+            for (int r = 0; r < NR; ++r) {
+                if (r < n) {
+                    const int rr = base + r;
+                    const float a  = beta * tanhf(gacc[r] * inv_beta) * sigmoidf_(gacc[r]);
+                    const float ub = lb_active ? (lb * tanhf(uacc[r] * inv_lb)) : uacc[r];
+                    scratch[(int64_t)row_tok[rr] * scratch_stride +
+                            (int64_t)row_slot[rr] * ffn + j] = a * ub;
+                }
+            }
+        }
+    }
+}
+
+// down GEMV + weighted combine, TOKEN-BATCHED.
+//
+// This is moe_down_combine_kernel with a token axis and nothing else. It is a COPY
+// rather than a blockIdx.y added to the original because the original is on the
+// decode path and the requirement there is that its generated code not move at all;
+// the two must be read together, and the invariants that matter — RAW partials, the
+// ascending-k fold, the identical band and threshold skips — are restated below so a
+// reviewer can check them side by side.
+//
+// `o` IS THE FAST AXIS AND THAT IS LOAD-BEARING (see the section header): the CTAs
+// resident on an SM at any instant then all belong to ONE token and share its 48 KB
+// situ slab in L1. Making the token the fast axis would amortise the expert weights
+// 9x and cost ~10x more L2 traffic on the activations.
+//
+// SPARKINFER_K3_MOE_REBAL has no effect here: the live-expert rebalance is default
+// off, and its only benefit is smoothing warp imbalance within one token's combine.
+template <int WARPS_PER_CTA, bool XVEC, typename Blk, bool GPACK = false>
+__global__ void moe_down_combine_batch_kernel(float* __restrict__ out,
+                                              int64_t out_stride,
+                                              const float* __restrict__ scratch,
+                                              int64_t scratch_stride,
+                                              const int* __restrict__ ids,
+                                              const float* __restrict__ w,
+                                              const Blk* __restrict__ down_exps,
+                                              int latent, int ffn, int top_k,
+                                              int expert_begin, int n_local_experts,
+                                              float weps) {
+    k3_pdl_sync();
+    const int o = blockIdx.x;
+    if (o >= latent) return;
+    const int t = blockIdx.y;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int blocks_per_row = ffn / 256;
+
+    const int*   ids_t = ids + (int64_t)t * top_k;
+    const float* w_t   = w   + (int64_t)t * top_k;
+    const float* scr_t = scratch + (int64_t)t * scratch_stride;
+
+    extern __shared__ float bpartial[];        // top_k floats, then the ids/w stage
+    int*   s_ids = (int*)(bpartial + top_k);
+    float* s_w   = (float*)(s_ids + top_k);
+    if (threadIdx.x < top_k) {
+        s_ids[threadIdx.x] = ids_t[threadIdx.x];
+        s_w[threadIdx.x]   = w_t[threadIdx.x];
+    }
+    __syncthreads();
+
+    const bool wlive = weps > 0.0f && k3_weps_depth_live();
+    for (int k = warp; k < top_k; k += WARPS_PER_CTA) {
+        if (wlive && s_w[k] < weps) {
+            if (lane == 0) {
+                bpartial[k] = 0.0f;
+                if (g_k3_weps_count) atomicAdd(&g_k3_weps_skips, 1ULL);
+            }
+            continue;
+        }
+        const int e = s_ids[k] - expert_begin;
+        if (e < 0 || e >= n_local_experts) continue;
+        const Blk* d_row = down_exps + (size_t)((size_t)e * latent + o) * blocks_per_row;
+        const float* act = scr_t + (size_t)k * ffn;
+        float acc = 0.0f;
+        if (blocks_per_row == 3) {
+#pragma unroll
+            for (int b = 0; b < 3; ++b)
+                acc += block_dot<XVEC, GPACK>(d_row[b], act + b * 256, lane, 32);
+        } else
+        for (int b = 0; b < blocks_per_row; ++b)
+            acc += block_dot<XVEC, GPACK>(d_row[b], act + b * 256, lane, 32);
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffff, acc, off);
+        if (lane == 0) bpartial[k] = acc;      // RAW; w[k] is applied in the fold
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        float total = 0.0f;
+        for (int k = 0; k < top_k; ++k) {
+            const int e = s_ids[k] - expert_begin;
+            if (e < 0 || e >= n_local_experts) continue;
+            total += s_w[k] * bpartial[k];   // one FMA, exactly as the serial version
+        }
+        out[(int64_t)t * out_stride + o] = total;
     }
 }
 
@@ -909,6 +1782,7 @@ __global__ void moe_gate_up_situ_q8k_kernel(float* __restrict__ scratch,
                                             float beta, float inv_beta,
                                             float lb, float inv_lb, int lb_active,
                                             int expert_begin, int n_local_experts) {
+    k3_pdl_sync();
     const int k = blockIdx.y;
     const int j = blockIdx.x;
     if (j >= ffn) return;
@@ -940,6 +1814,7 @@ __global__ void moe_down_combine_q8k_kernel(float* __restrict__ out,
                                             const Blk* __restrict__ down_exps,
                                             int latent, int ffn, int top_k,
                                             int expert_begin, int n_local_experts) {
+    k3_pdl_sync();
     const int o = blockIdx.x;
     if (o >= latent) return;
     const int blocks_per_row = ffn / 256;
@@ -961,43 +1836,63 @@ __global__ void moe_down_combine_q8k_kernel(float* __restrict__ out,
 // 5. MLA output gate
 // ---------------------------------------------------------------------------
 
+// ROW AXIS (blockIdx.y): block (bx, r) does what block bx did, on row r. Elementwise.
 __global__ void mla_gate_out_kernel(float* __restrict__ out,
                                     const float* __restrict__ attn_out,
-                                    const float* __restrict__ gate_proj, int64_t n) {
+                                    const float* __restrict__ gate_proj, int64_t n,
+                                    int64_t row_stride) {
+    k3_pdl_sync();
+    const int64_t roff = (int64_t)blockIdx.y * row_stride;
+    float* __restrict__ o_r = out + roff;
+    const float* __restrict__ a_r = attn_out + roff;
+    const float* __restrict__ g_r = gate_proj + roff;
     const int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
     if (i >= n) return;
-    out[i] = attn_out[i] * sigmoidf_(gate_proj[i]);
+    o_r[i] = a_r[i] * sigmoidf_(g_r[i]);
 }
 
 // ---------------------------------------------------------------------------
 // 7. KDA decay gate (lower_bound form)
 // ---------------------------------------------------------------------------
 // One block per head; head_dim threads. A[h] broadcasts across the head_dim channels.
+//
+// ROW AXIS (blockIdx.y): block (h, r) is block h over row r's g_raw/out. A is a
+// per-head PARAMETER shared by every row and is not offset. One thread still owns
+// exactly one (head, channel), so nothing is reduced and nothing is re-partitioned.
 
 __global__ void kda_decay_gate_kernel(float* __restrict__ out,
                                       const float* __restrict__ g_raw,
                                       const float* __restrict__ A,
-                                      int head_dim, float lower_bound) {
+                                      int head_dim, float lower_bound,
+                                      int64_t row_stride) {
+    k3_pdl_sync();
     const int h = blockIdx.x;
     const int d = threadIdx.x;
     if (d >= head_dim) return;
+    const int64_t roff = (int64_t)blockIdx.y * row_stride;
     const float Ah = A[h];
-    const float gr = g_raw[(size_t)h * head_dim + d];
+    const float gr = g_raw[roff + (size_t)h * head_dim + d];
     // g = lb * sigmoid(-(A * g_raw))
-    out[(size_t)h * head_dim + d] = lower_bound * sigmoidf_(-(Ah * gr));
+    out[roff + (size_t)h * head_dim + d] = lower_bound * sigmoidf_(-(Ah * gr));
 }
 
 // ---------------------------------------------------------------------------
 // 8. L2-norm over heads (+ optional scale)
 // ---------------------------------------------------------------------------
 
+// ROW AXIS (blockIdx.y): block (h, r) is block h over row r. The reduction stays one
+// BLOCK-thread block per (head, row) with the same `d += BLOCK` stride and the same
+// block_sum tree, so ss and inv are bit-identical to the single-row launch.
 template <int BLOCK>
 __global__ void l2_norm_heads_kernel(float* __restrict__ out,
                                      const float* __restrict__ x,
-                                     int head_dim, float scale, float eps) {
+                                     int head_dim, float scale, float eps,
+                                     int64_t row_stride) {
+    k3_pdl_sync();
     const int h = blockIdx.x;
-    const float* xh = x + (size_t)h * head_dim;
-    float* oh = out + (size_t)h * head_dim;
+    const int64_t roff = (int64_t)blockIdx.y * row_stride;
+    const float* xh = x + roff + (size_t)h * head_dim;
+    float* oh = out + roff + (size_t)h * head_dim;
 
     float ss = 0.0f;
     for (int d = threadIdx.x; d < head_dim; d += BLOCK)
@@ -1008,6 +1903,80 @@ __global__ void l2_norm_heads_kernel(float* __restrict__ out,
 
     for (int d = threadIdx.x; d < head_dim; d += BLOCK)
         oh[d] = xh[d] * inv;
+}
+
+// KDA short-conv x3 + the q/k L2 norms, in ONE launch.
+//
+// Five dependent launches per KDA layer, on all 69 of them, for ~330 KB of work: three
+// convs at (d_inner/256) = 6 blocks each, then two l2_norm_heads at n_head = 12 blocks
+// on a 132-SM part. The three convs are mutually independent (separate state, weight,
+// input and output pointers), and the L2 norm for q and k reduces over exactly the
+// head_dim channels the matching conv just wrote — so the whole group is one kernel
+// with grid (n_head, 3).
+//
+// BIT-IDENTICAL, and the mapping is what makes it so:
+//   * the conv is per-channel and untouched — same window order, same wc[d_conv-1] on
+//     the current sample, same silu after, same left-shift of the history.
+//   * l2_norm_heads_kernel<128> strides `for (d = threadIdx.x; d < head_dim; d += BLOCK)`
+//     at BLOCK = 128 and K3's kda_head_dim = 128, so it already ran exactly one element
+//     per thread over one head. This keeps that: thread d owns channel d of head h, and
+//     block_sum<BLOCK> folds the same 128 partials through the same tree.
+//   * v is written without a norm, exactly as before.
+// Threads past head_dim contribute +0.0f to the reduction, which is what the strided
+// loop did for them too.
+template <int BLOCK>
+__global__ void kda_conv_l2_fused_kernel(float* __restrict__ out_q,
+                                         float* __restrict__ out_k,
+                                         float* __restrict__ out_v,
+                                         float* __restrict__ st_q,
+                                         float* __restrict__ st_k,
+                                         float* __restrict__ st_v,
+                                         const float* __restrict__ x_q,
+                                         const float* __restrict__ x_k,
+                                         const float* __restrict__ x_v,
+                                         const float* __restrict__ w_q,
+                                         const float* __restrict__ w_k,
+                                         const float* __restrict__ w_v,
+                                         int d_conv, int head_dim,
+                                         float q_scale, float eps) {
+    k3_pdl_sync();
+    const int h  = blockIdx.x;
+    const int sl = blockIdx.y;            // 0 = q, 1 = k, 2 = v
+    const int d  = threadIdx.x;
+
+    float* out        = (sl == 0) ? out_q : (sl == 1) ? out_k : out_v;
+    float* state      = (sl == 0) ? st_q  : (sl == 1) ? st_k  : st_v;
+    const float* x    = (sl == 0) ? x_q   : (sl == 1) ? x_k   : x_v;
+    const float* wgt  = (sl == 0) ? w_q   : (sl == 1) ? w_k   : w_v;
+
+    const int c = h * head_dim + d;       // global channel
+
+    float v = 0.0f;
+    if (d < head_dim) {
+        float* st       = state + (size_t)c * (d_conv - 1);
+        const float* wc = wgt + (size_t)c * d_conv;
+        float acc = 0.0f;
+#pragma unroll 4
+        for (int t = 0; t < d_conv - 1; ++t) acc += st[t] * wc[t];
+        const float xc = x[c];
+        acc += xc * wc[d_conv - 1];
+        v = acc * sigmoidf_(acc);         // silu AFTER the convolution
+#pragma unroll 4
+        for (int t = 0; t < d_conv - 2; ++t) st[t] = st[t + 1];
+        st[d_conv - 2] = xc;
+    }
+
+    if (sl == 2) {                        // v is not normalised
+        if (d < head_dim) out[c] = v;
+        return;
+    }
+
+    // block_sum contains __syncthreads(), so every thread must reach it.
+    __shared__ float shm[BLOCK / 32 + 1];
+    const float ss  = block_sum<BLOCK>(v * v, shm);
+    const float sc  = (sl == 0) ? q_scale : 1.0f;
+    const float inv = sc * rsqrtf(ss + eps);
+    if (d < head_dim) out[c] = v * inv;
 }
 
 // ---------------------------------------------------------------------------
@@ -1022,6 +1991,7 @@ __global__ void mla_absorb_q_kernel(float* __restrict__ out,
                                     const float* __restrict__ q_pe,
                                     const float* __restrict__ wk_b,
                                     int qk_nope, int kv_lora, int rope_dim) {
+    k3_pdl_sync();
     const int h = blockIdx.y;
     const int r = blockIdx.x;   // kv_lora index
     if (r >= kv_lora) return;
@@ -1114,6 +2084,132 @@ constexpr int kMlaCtxTile = 128;
 // Context-split tunables. kMlaSplitMinCtx is the slice length below which splitting is
 // not worth the combine pass.
 constexpr int kMlaSplitMinCtx = 4096;
+
+// The slice floor above is a DECODE tuning: decode always runs at a long context, so
+// the question there is only "how many slices", never "should we split at all". Prompt
+// ingestion is the opposite regime — most of a prefill happens BELOW 4096, where this
+// constant pins splits to 1 and the grid collapses to (n_head/hpb, 1). At the sharded
+// head count that is 1 group x 1 slice, and the kernel walks the whole context on a
+// handful of CTAs while the other ~120 SMs idle. MEASURED on the depth curve: the
+// marginal cost per prompt token nearly doubles from 16.96 ms at ctx~0 to 33.23 ms
+// across 2048-4096 — all of it inside the splits=1 band, and ~300x off what the KV
+// read alone would cost at HBM rate.
+//
+// SPARKINFER_K3_MLA_SPLIT_MIN lowers the floor so the split machinery engages at prompt
+// depths. It is read once, host-side, in the two plan functions; the kernels are
+// unchanged and take `splits` as an argument exactly as they already do.
+// SCOPED, NOT GLOBAL, and that is the whole safety argument. Lowering this floor
+// process-wide would change three things we must not touch: the 128k decode number
+// (the round's hard guard at 56.25 tok/s), the parity probes at ctx4..4096 (which
+// run through the decode path and are graded byte-for-byte against main), and the
+// graph's captured_plan identity. So the floor is a value the INGESTION path opts
+// into around its own work and restores afterwards; every other caller — decode,
+// parity, the pipeline entry — sees the shipped 4096 and is bit-identical to main.
+//
+// MEASURED at ctx 4096 on 8xH200, prefill tok/s: 4096 -> 36.89, 2048 -> 50.45,
+// 1024 -> 54.96, 512 -> 57.43. The default is decode tuning; ingestion spends most
+// of its life below it, where splits pin to 1 and the grid collapses.
+// The storage stays here (internal), but the two entry points must have EXTERNAL
+// linkage to satisfy the declaration in kimi_k3.h — defining them inside this
+// translation unit's anonymous namespace made them internal, and the runtime's
+// link step failed on the mismatch. Closing and reopening the anonymous namespace
+// around them puts the definitions at namespace-k3 scope where the header expects.
+static int g_k3_mla_split_min_scope = 0;
+
+// PINNED SPLITS — a scoped override of the derived slice COUNT, for a caller that is
+// about to CUDA-graph-capture a region whose tokens do not all sit at the same depth.
+//
+// The floor above is a knob on the DERIVATION; this is a knob on the RESULT, and the
+// difference is the whole reason it exists. `splits` sizes the grid (n_head/hpb, splits)
+// and a captured graph cannot resize a grid, so every launch a recording is replayed
+// for must want the SAME number. The floor cannot deliver that: the launcher refines
+// the floor's answer with `by_len = n_ctx / min_slice`, which moves continuously with
+// n_ctx, so two tokens of one ingestion chunk — or the same token slot on a later
+// chunk — legitimately land on different counts. Bucketing n_ctx harder would not fix
+// it either; the refinement reads the raw length, not the bucket.
+//
+// So the caller computes one count for the whole region and pins it. What the pin does
+// NOT touch is `n_ctx`: the kernels still read the live length from `*d_pos` and still
+// derive their slice bounds as chunk = ceil(n_ctx/splits), t_beg = sp*chunk,
+// t_end = min(n_ctx, t_beg + chunk). That partition covers [0, n_ctx) exactly for ANY
+// splits >= 1 — the last non-empty slice always ends at n_ctx because splits*chunk >=
+// n_ctx by construction — and the slices past the end come out empty, which both split
+// kernels already write as (m = -1e30, l = 0, acc = 0) and the combine already merges
+// as an exact zero. A token with a shorter prefix therefore gets shorter (or empty)
+// slices and the right answer, not a truncated one.
+//
+// TOLERANCE-CLASS, NOT BIT-IDENTICAL. For any token whose natural count differs from
+// the pin, the online-softmax merge reassociates over a different set of partials —
+// the same terms, a different tree. That is the same class of change as the split path
+// itself (see mla_decode_attn_split_kernel's header) and it is acceptable only OUTSIDE
+// the graded parity window, so the pin carries the same depth gate the split floor
+// carries (k3_mla_split_pin_at / kMlaGradedWindow, mirroring k3_mla_split_min_ctx_at).
+// Callers are expected to engage it only above ctx 4096.
+//
+// 0 = unpinned and is the default. At 0 nothing below reads it beyond one comparison,
+// so decode, the parity probes and the shipped 128k guard are byte-identical to main.
+// The storage and linkage note for the pair below is the one above: the entry points
+// must have EXTERNAL linkage to satisfy kimi_k3.h, so they are defined in the reopened
+// namespace-k3 scope, not in the anonymous namespace.
+static int g_k3_mla_split_pin = 0;
+}  // namespace (anonymous) — reopened immediately below
+
+void k3_mla_set_split_min(int v) { g_k3_mla_split_min_scope = (v >= kMlaCtxTile) ? v : 0; }
+int  k3_mla_get_split_min() { return g_k3_mla_split_min_scope; }
+
+// Clamped against the per-device scratch and the split budget at the USE site, not
+// here: both limits are functions of n_head, which this entry point does not have.
+// Storing the raw request keeps the pin meaningful across a change of head count and
+// keeps this setter total — no value can make it fail, only be capped later.
+void k3_mla_set_split_pin(int splits) { g_k3_mla_split_pin = (splits > 0) ? splits : 0; }
+int  k3_mla_get_split_pin() { return g_k3_mla_split_pin; }
+
+namespace {
+
+// The scoped floor is honoured only BEYOND the parity window. Parity is graded at
+// ctx4..4096 and those probes are themselves an --ids ingestion, so a floor that
+// applied at every depth would move the graded logits — measured at ctx2048 as
+// KL 9.5e-4, about 2.2x main's, which is accuracy-regression territory. Gating on
+// depth keeps every graded probe on the shipped path (byte-identical) while the
+// 87.5% of a 32k prompt that sits above the window gets the shorter slice. Same
+// shape of argument as the depth-gated expert threshold in #127.
+static constexpr int kMlaGradedWindow = 4096;
+
+static inline int k3_mla_split_min_ctx_at(int n_ctx) {
+    if (g_k3_mla_split_min_scope >= kMlaCtxTile && n_ctx > kMlaGradedWindow)
+        return g_k3_mla_split_min_scope;
+    static const int v = [] {
+        const char* e = std::getenv("SPARKINFER_K3_MLA_SPLIT_MIN");
+        const int n = e ? std::atoi(e) : 0;
+        return (n >= kMlaCtxTile) ? n : kMlaSplitMinCtx;
+    }();
+    return v;
+}
+
+// The pin, gated on depth exactly as the floor above is and for the same reason: it
+// reassociates the merge, so it must not reach a probe that is graded byte-for-byte.
+// Same shape, deliberately — one window constant, one strict `>` comparison, one
+// early return of the unpinned answer.
+//
+// The gate is per-token, which puts a requirement on the CALLER that the floor does
+// not have: a region captured as one graph must have EVERY token on the same side of
+// the window, or the first tokens run unpinned (splits derived, typically 1 below the
+// window) and the rest run pinned, which is two grids under one recording. Engage the
+// pin only for a region whose SHORTEST prefix already clears kMlaGradedWindow.
+static inline int k3_mla_split_pin_at(int n_ctx) {
+    return (g_k3_mla_split_pin > 0 && n_ctx > kMlaGradedWindow) ? g_k3_mla_split_pin : 0;
+}
+
+static inline int k3_mla_split_min_ctx() {
+    if (g_k3_mla_split_min_scope >= kMlaCtxTile) return g_k3_mla_split_min_scope;
+    static const int v = [] {
+        const char* e = std::getenv("SPARKINFER_K3_MLA_SPLIT_MIN");
+        const int n = e ? std::atoi(e) : 0;
+        // Below one context tile there is nothing to slice.
+        return (n >= kMlaCtxTile) ? n : kMlaSplitMinCtx;
+    }();
+    return v;
+}
 constexpr int kMlaMaxSplits   = 64;
 
 // THE SPLIT CAP IS A BUDGET ON n_head * splits, NOT A CONSTANT ON splits.
@@ -1236,6 +2332,7 @@ constexpr int kMlaTokensPerWarp = 4;
 // Each slot is touched by exactly one rank thread (a rank owns its device for the whole
 // run), so the slots need no lock; the array itself is only ever read by index.
 static constexpr int kMlaMaxDevices = 16;
+static float* g_mla_merged  [kMlaMaxDevices] = {nullptr};
 static float* g_mla_part_acc[kMlaMaxDevices] = {nullptr};
 static float* g_mla_part_ml [kMlaMaxDevices] = {nullptr};
 static size_t g_mla_part_cap[kMlaMaxDevices] = {0};
@@ -1259,6 +2356,15 @@ static bool k3_mla_split_scratch(int n_head, int kv_lora, int* dev_out) {
     if (cudaMalloc((void**)&g_mla_part_ml[dev],
                    (size_t)n_head * ms * 2 * sizeof(float)) != cudaSuccess) {
         cudaFree(g_mla_part_acc[dev]); g_mla_part_acc[dev] = nullptr; return false;
+    }
+    // Merged latent, one row per head. Allocated on the SAME path as the partials so it
+    // is covered by the same pre-warm and can never cudaMalloc inside a stream capture.
+    cudaFree(g_mla_merged[dev]); g_mla_merged[dev] = nullptr;
+    if (cudaMalloc((void**)&g_mla_merged[dev],
+                   (size_t)n_head * (size_t)kv_lora * sizeof(float)) != cudaSuccess) {
+        cudaFree(g_mla_part_acc[dev]); g_mla_part_acc[dev] = nullptr;
+        cudaFree(g_mla_part_ml [dev]); g_mla_part_ml [dev] = nullptr;
+        return false;
     }
     g_mla_part_cap[dev] = need;
     return true;
@@ -1392,13 +2498,49 @@ static inline int k3_sm_count(int dev) {
     return cache[dev] > 0 ? cache[dev] : 0;
 }
 
-template <int BLOCK>
+static bool k3_mla_reach_fill() {
+    static const bool on = [] {
+        const char* e = std::getenv("SPARKINFER_K3_MLA_FILL");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+
+static bool k3_mla_partial_fill() {
+    static const bool on = [] {
+        const char* e = std::getenv("SPARKINFER_K3_MLA_FILL_PARTIAL");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+
+// The latent KV cache element type is a template parameter on all three decode
+// kernels, deduced from the k_cache argument so no launch site names it. f32 is
+// the historical layout; __half is the one that matters: the cache is the single
+// largest byte item a decode token moves (24 MLA layers x ctx x 576 floats,
+// replicated on every rank — 13.7 GB/token/rank at 128k), and llama.cpp's own
+// default type_k is F16, so the f32 cache paid 2x the reference's KV traffic to
+// be MORE precise than the thing the output is scored against. Conversion is
+// in-register on load; arithmetic stays f32 throughout.
+static __device__ __forceinline__ float kv_ld(const float* p) { return *p; }
+static __device__ __forceinline__ float kv_ld(const __half* p) { return __half2float(*p); }
+
+template <int BLOCK, typename KV>
 __global__ void mla_decode_attn_kernel(float* __restrict__ out,
                                        const float* __restrict__ q,
-                                       const float* __restrict__ k_cache,
+                                       const KV* __restrict__ k_cache,
                                        const float* __restrict__ wv_b,
                                        int key_length, int kv_lora, int v_dim,
-                                       int n_ctx, float scale) {
+                                       const int* __restrict__ d_pos, float scale) {
+    k3_pdl_sync();
+    // LENGTH COMES FROM DEVICE MEMORY, NOT FROM A KERNEL ARGUMENT.
+    //
+    // A captured graph freezes its arguments. Passing position+1 by value meant every
+    // replay attended over the context length that happened to be live at CAPTURE time —
+    // right on the first replay and wrong on every one after it, which is the failure
+    // mode that looks like a correct model slowly going insane. n_ctx is only ever a loop
+    // bound here, so reading it from memory costs one load and changes no arithmetic.
+    const int n_ctx = *d_pos + 1;   // d_pos is the ROW INDEX; the length is one more
     constexpr int NWARP = BLOCK / 32;
     const int h    = blockIdx.x;
     const int lane = threadIdx.x & 31;
@@ -1427,9 +2569,9 @@ __global__ void mla_decode_attn_kernel(float* __restrict__ out,
 
         // --- score the tile: one warp per token, lanes stride over d ---
         for (int t = warp; t < tn; t += NWARP) {
-            const float* kt = k_cache + (size_t)(t0 + t) * key_length;
+            const KV* kt = k_cache + (size_t)(t0 + t) * key_length;
             float s = 0.0f;
-            for (int d = lane; d < key_length; d += 32) s += s_q[d] * kt[d];
+            for (int d = lane; d < key_length; d += 32) s += s_q[d] * kv_ld(kt + d);
 #pragma unroll
             for (int off = 16; off > 0; off >>= 1)
                 s += __shfl_down_sync(0xffffffff, s, off);
@@ -1462,7 +2604,7 @@ __global__ void mla_decode_attn_kernel(float* __restrict__ out,
         for (int r = threadIdx.x; r < kv_lora; r += BLOCK) {
             float a = s_acc[r] * corr;
             for (int t = 0; t < tn; ++t)
-                a += s_p[t] * k_cache[(size_t)(t0 + t) * key_length + r];
+                a += s_p[t] * kv_ld(k_cache + (size_t)(t0 + t) * key_length + r);
             s_acc[r] = a;
         }
         __syncthreads();
@@ -1520,6 +2662,48 @@ __device__ __forceinline__ int get_int_b2(const int8_t* __restrict__ qs, int i32
     return x32;
 }
 
+// The same four bytes, assembled from 32-BIT loads instead of two 16-bit ones.
+//
+// WHY IT CAN BE FASTER. The uint16 pair above costs two memory instructions per
+// int32, so a 32-weight block costs 16 loads for qs plus one for d = 17. This
+// version loads the ALIGNED word containing the bytes and, when qs is offset by
+// 2, splices the two neighbouring words with __funnelshift_r. Consecutive i32
+// share their words -- iteration i reads words [k, k+1] and iteration i+1 reads
+// [k+1, k+2] -- so an unrolled loop over one block touches 9 distinct words
+// instead of 16, and nvcc's CSE collapses the repeats. The measured projection
+// GEMVs sit at 0.7-1.9 TB/s against 4.8 available while issuing ~9 L1 wavefronts
+// per instruction, which is the signature of an ISSUE-bound loop rather than a
+// bandwidth-bound one: instruction count is the lever, not bytes.
+//
+// BIT-IDENTICAL BY CONSTRUCTION. It returns the same 32 bits: little-endian byte
+// order is guaranteed on every CUDA target, __funnelshift_r((lo, hi), s) yields
+// exactly the bytes at the requested address, and the caller's dp4a order and
+// accumulator are untouched. Nothing is reassociated.
+//
+// THE OVER-READ IS THE RISK, and it is why this is gated. When qs is 2-byte
+// offset the top word read can reach at most 2 bytes past the final block of a
+// tensor. Blocks are contiguous, so only the very last block of an allocation is
+// exposed, and cudaMalloc's 512-byte granularity covers it in practice -- but
+// "in practice" is not proof, so compute-sanitizer must be clean before this
+// ever defaults on.
+__device__ __forceinline__ int get_int_b2_wide(const int8_t* __restrict__ qs, int i32) {
+    const uintptr_t a = (uintptr_t)(qs + 4 * i32);
+    const uint32_t* __restrict__ w = (const uint32_t*)(a & ~(uintptr_t)3);
+    const int sh = (int)(a & 3u) * 8;
+    // sh is 0 or 16 and is UNIFORM across the whole tensor, so the branch is not
+    // divergent: alignof(BlockQ8_0) is 2, and every block starts at 34b.
+    return sh ? (int)__funnelshift_r(w[0], w[1], sh) : (int)w[0];
+}
+
+// SPARKINFER_K3_B2WIDE=1 selects it. DEFAULT OFF, and it stays off until it is
+// measured: three changes on this branch were written default-ON while still
+// unmeasured and all three shipped regressions. Gated rather than swapped so the
+// A/B runs on ONE binary.
+__device__ __forceinline__ int get_int_b2_sel(const int8_t* __restrict__ qs, int i32,
+                                              bool wide) {
+    return wide ? get_int_b2_wide(qs, i32) : get_int_b2(qs, i32);
+}
+
 // CPU-reference-compatible activation conversion. One CUDA thread deliberately
 // owns one quant block: these vectors are tiny (at most 33,792 values in K3), and
 // the serial max scan preserves ggml's first-maximum sign rule exactly. Parallel
@@ -1528,6 +2712,7 @@ __device__ __forceinline__ int get_int_b2(const int8_t* __restrict__ qs, int i32
 // deceptively close.
 __global__ void quantize_q8_0_kernel(BlockQ8_0* __restrict__ out,
                                      const float* __restrict__ x, int n_blocks) {
+    k3_pdl_sync();
     const int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= n_blocks) return;
     const float* xb = x + (size_t)b * 32;
@@ -1545,6 +2730,7 @@ __global__ void quantize_q8_0_kernel(BlockQ8_0* __restrict__ out,
 __global__ void quantize_q8_k_kernel(BlockQ8K* __restrict__ out,
                                      const float* __restrict__ x,
                                      int blocks_per_row, int n_rows) {
+    k3_pdl_sync();
     const int bi = blockIdx.x * blockDim.x + threadIdx.x;
     const int n_blocks = blocks_per_row * n_rows;
     if (bi >= n_blocks) return;
@@ -1599,13 +2785,19 @@ __global__ void quantize_q8_k_kernel(BlockQ8K* __restrict__ out,
 // NOT bit-identical to the single-block version: summing per-slice partials reassociates
 // the same terms. The parity gate is top-1 >= 0.90 / KL <= 0.20 and the reference here is
 // float64, so this is checked on tolerance, like the online-softmax rewrite it builds on.
-template <int BLOCK>
+template <int BLOCK, typename KV>
 __global__ void mla_decode_attn_split_kernel(float* __restrict__ part_acc,
                                              float* __restrict__ part_ml,
                                              const float* __restrict__ q,
-                                             const float* __restrict__ k_cache,
+                                             const KV* __restrict__ k_cache,
                                              int key_length, int kv_lora,
-                                             int n_ctx, float scale, int splits) {
+                                             const int* __restrict__ d_pos,
+                                             float scale, int splits) {
+    k3_pdl_sync();
+    // Device-read length; see mla_decode_attn_kernel. `splits` stays a launch-time
+    // constant because it sizes the GRID, which a captured graph cannot change — the
+    // driver re-captures instead when the plan moves (k3_mla_decode_plan).
+    const int n_ctx = *d_pos + 1;   // d_pos is the ROW INDEX; the length is one more
     constexpr int NWARP = BLOCK / 32;
     const int h    = blockIdx.x;
     const int sp   = blockIdx.y;
@@ -1635,9 +2827,9 @@ __global__ void mla_decode_attn_split_kernel(float* __restrict__ part_acc,
         const int tn = min(kMlaCtxTile, t_end - t0);
 
         for (int t = warp; t < tn; t += NWARP) {
-            const float* kt = k_cache + (size_t)(t0 + t) * key_length;
+            const KV* kt = k_cache + (size_t)(t0 + t) * key_length;
             float sdot = 0.0f;
-            for (int d = lane; d < key_length; d += 32) sdot += s_q[d] * kt[d];
+            for (int d = lane; d < key_length; d += 32) sdot += s_q[d] * kv_ld(kt + d);
 #pragma unroll
             for (int off = 16; off > 0; off >>= 1)
                 sdot += __shfl_down_sync(0xffffffff, sdot, off);
@@ -1665,7 +2857,7 @@ __global__ void mla_decode_attn_split_kernel(float* __restrict__ part_acc,
         for (int r = threadIdx.x; r < kv_lora; r += BLOCK) {
             float a = s_acc[r] * corr;
             for (int t = 0; t < tn; ++t)
-                a += s_p[t] * k_cache[(size_t)(t0 + t) * key_length + r];
+                a += s_p[t] * kv_ld(k_cache + (size_t)(t0 + t) * key_length + r);
             s_acc[r] = a;
         }
         __syncthreads();
@@ -1709,13 +2901,75 @@ __global__ void mla_decode_attn_split_kernel(float* __restrict__ part_acc,
 // tile still runs in increasing t. cpu_reference_test models THIS schedule against a
 // float64 two-pass reference; kimi_k3_numeric_test pins it on the device at a context
 // long enough to take this path.
-template <int BLOCK, int HPB, int RSLOTS, int TPW = kMlaTokensPerWarp>
+// UT and UD ARE THE MEMORY-LEVEL-PARALLELISM KNOB, and they are the reason this kernel
+// runs at 14% of the card's bandwidth.
+//
+// At the scored shape the grid is 255 blocks of 256 threads at 128 registers, i.e. two
+// resident blocks per SM and 16 of 64 warps. The kernel moves 151 MB per call in 215 us
+// = 677 GB/s aggregate, which is ~5.1 GB/s per SM, or one 128 B line per ~44 SM-cycles.
+// Against an HBM latency near 600 cycles that is roughly ONE outstanding load per warp:
+// the kernel is not bandwidth-bound and not issue-bound, it is latency-exposed because
+// too few requests are in flight. The two unroll factors are what put them there —
+//
+//     UD  score  d-loop    TPW    * UD = 4*UD loads outstanding per warp
+//     UT  latent t-loop    RSLOTS * UT = 2*UT loads outstanding per thread
+//
+// and both were last chosen when a cache row was TWICE as wide, before #86 made
+// k_cache __half. Halving the bytes per element halved the bytes each outstanding load
+// carries, so the depth that saturated the old row no longer saturates this one.
+//
+// MEASURED at the scored shape (ctx 131,039, one H200, no weights, the kernel alone,
+// best of 3 interleaved passes, every arm verified BIT-IDENTICAL to the shipped one):
+//
+//   UT  UD   regs   ms      vs shipped
+//    4   2   128    0.223   1.000x   <- shipped
+//    8   2   127    0.223   1.001x
+//   16   2   128    0.216   1.030x
+//    4   6   128    0.194   1.145x
+//    8   3   128    0.209   1.065x
+//    8   6   128    0.191   1.169x   <- taken
+//   16   6   157    0.242   0.922x   <- over the register cliff
+//   32   6   162    0.241   0.926x   <- over the register cliff
+//    4   7   136    0.324   0.689x   <- over the register cliff
+//
+// THE CLIFF IS THE WHOLE CONSTRAINT. 65536/(128*256) is exactly 2.0 blocks per SM, so
+// 129 registers is one block and half the occupancy — the table above prices that at
+// 8-31% and the file's own HPB note prices it at 10%. (8, 6) is the deepest pair that
+// still fits 128 registers with no spill; every deeper pair measured here loses. That
+// is also why this is a template parameter and not a bigger literal: the shape that
+// tolerates the depth is the shape it was measured at, and every OTHER instantiation
+// keeps the shipped (4, 2).
+//
+// Unrolling changes issue order, never arithmetic order, so this is bit-identical by
+// construction rather than by tolerance — and the bench asserts it word-for-word.
+// LSP (SPARKINFER_K3_MLA_LSPLIT=1) restructures the LATENT pass only. The MLA
+// kernel's LSU/shared pipe runs ~56% busy while the memory pipe sits ~14%, so
+// the lever is LSU instruction-cycles, not bytes. Two counted effects:
+//   * p-broadcasts halve: s_p[hh*tile+t] is uniform across the block (a 32-way
+//     broadcast, 4 useful bytes/cycle, HPB per token per thread). Splitting the
+//     warps into two head groups of HPB/2 takes 12 -> 6.
+//   * kv loads widen: each thread takes TWO consecutive r as one __half2, so a
+//     latent kv request carries 128 B/warp instead of 64 B. Two groups re-read
+//     the same rows; request count is unchanged and the second group hits L1.
+// BIT-IDENTICAL: every acc still sums p[hh]*k[t][r] over ascending t into the
+// same accumulator — only which THREAD owns which (r, head) changes, and the
+// partial write lands the same values at the same addresses. acc is
+// REINTERPRETED (RSLOTS*HPB floats either way), not resized. The "__half2
+// reassociates" dead-end is about the SCORE pass (a dot over d); here the
+// loaded axis IS the output axis and nothing sums across the pair.
+template <int BLOCK, int HPB, int RSLOTS, typename KV, int TPW = kMlaTokensPerWarp,
+          int UT = 4, int UD = 2, bool LSP = false, bool PVT = false,
+          int KLENT = 0, bool QT = false>
 __global__ void mla_decode_attn_hbatch_kernel(float* __restrict__ part_acc,
                                               float* __restrict__ part_ml,
                                               const float* __restrict__ q,
-                                              const float* __restrict__ k_cache,
+                                              const KV* __restrict__ k_cache,
                                               int key_length, int kv_lora,
-                                              int n_ctx, float scale, int splits) {
+                                              const int* __restrict__ d_pos,
+                                              float scale, int splits) {
+    k3_pdl_sync();
+    // Device-read length; see mla_decode_attn_kernel.
+    const int n_ctx = *d_pos + 1;   // d_pos is the ROW INDEX; the length is one more
     constexpr int NWARP = BLOCK / 32;
     const int h0   = blockIdx.x * HPB;
     const int sp   = blockIdx.y;
@@ -1727,18 +2981,57 @@ __global__ void mla_decode_attn_hbatch_kernel(float* __restrict__ part_acc,
     const int t_end = min(n_ctx, t_beg + chunk);
 
     extern __shared__ float smem[];
+    // KLENT (compile-time key_length; instantiated at 576): the 12 per-head s_q
+    // row bases become immediate LDS offsets instead of held registers — UD=7
+    // was priced at 136 regs vs the 128 cliff, and the freed ~8-12 registers are
+    // that gap. Constants do not round: bit-identical. ptxas -v is the falsifier.
+    const int klen = KLENT ? KLENT : key_length;
     float* s_q = smem;                                        // HPB * key_length
-    float* s_p = s_q + (size_t)HPB * key_length;              // HPB * kMlaCtxTile
+    float* s_p = s_q + (size_t)HPB * klen;                    // HPB * kMlaCtxTile
     float* s_m = s_p + (size_t)HPB * kMlaCtxTile;             // HPB  running max
+    // PVT (SPARKINFER_K3_MLA_PVT=1): t-major s_p. Head-major spaces one token's
+    // HPB probabilities kMlaCtxTile floats apart, so the latent pass pays HPB
+    // uniform broadcast LDS.32 per token per thread — on the pipe measured ~56%
+    // busy. t-major packs them adjacent (stride HPB=12, base t*48 B, 16-aligned)
+    // so they arrive as 3 LDS.128. Same allocation, same values, same
+    // accumulation order — an address relabeling, bit-identical by construction.
+    // The cost lands in phase 2 (lane stride HPB -> 4-way bank conflict on a
+    // <=128-element per-head pass) — priced and accepted: phase 3 touches every
+    // probability BLOCK times, phase 2 only ~3 times.
+    auto s_p_idx = [&](int hh, int t) -> int {
+        return PVT ? (t * HPB + hh) : (hh * kMlaCtxTile + t);
+    };
     float* s_l = s_m + HPB;                                   // HPB  running exp-sum
     float* s_c = s_l + HPB;                                   // HPB  this tile's rescale
 
-    for (int i = threadIdx.x; i < HPB * key_length; i += BLOCK)
-        s_q[i] = q[(size_t)(h0 + i / key_length) * key_length + (i % key_length)];
+    // (h0 + i/key_length)*key_length + (i%key_length) is identically h0*key_length + i,
+    // so the 32-bit div AND mod per element were computing the identity — 27 iterations
+    // of both, per thread, per block, on a 256-block grid, every MLA layer. Same
+    // addresses, same values, now a contiguous copy.
+    if constexpr (QT) {
+        // P5 (SPARKINFER_K3_MLA_QT=1): store q d-MAJOR. In the score loop each
+        // lane owns one d and reads all HPB heads at it — head-major spaces those
+        // 12 values klen*4 B apart (12 scalar LDS); d-major packs them into 48
+        // contiguous bytes at a 16-aligned base (d*48) -> 3 LDS.128, and lane L's
+        // word 12L hits banks 0,12,24,4,... — a perfect 32-bank partition, no
+        // conflicts. One-time transposed store amortised over ~497 tokens/block.
+        // Same values into the same qv in the same FMA order: bit-identical.
+        for (int i = threadIdx.x; i < HPB * klen; i += BLOCK) {
+            const int hh = i / klen, d = i % klen;
+            s_q[(size_t)d * HPB + hh] = q[(size_t)h0 * klen + i];
+        }
+    } else {
+    for (int i = threadIdx.x; i < HPB * klen; i += BLOCK)
+        s_q[i] = q[(size_t)h0 * klen + i];
+    }
     if (threadIdx.x < HPB) { s_m[threadIdx.x] = -1e30f; s_l[threadIdx.x] = 0.0f; }
 
     // Latent accumulators: RSLOTS r-values x HPB heads, in registers.
     float acc[RSLOTS][HPB];
+    // LSP head-group ids: group g owns heads [g*HPB/2,(g+1)*HPB/2), its BLOCK/2
+    // threads cover every r as RSLOTS pair-slots of two consecutive r. Free when off.
+    const int lsp_lt = (int)threadIdx.x & (BLOCK / 2 - 1);
+    const int lsp_h0 = ((int)threadIdx.x / (BLOCK / 2)) * (HPB / 2);
 #pragma unroll
     for (int u = 0; u < RSLOTS; ++u)
 #pragma unroll
@@ -1764,21 +3057,37 @@ __global__ void mla_decode_attn_hbatch_kernel(float* __restrict__ part_acc,
             // The tail duplicates the last row rather than branching: the extra lanes
             // compute a score that is never stored, and every load stays in bounds.
             const int tc = min(TPW, tn - tb);
-            const float* kt[TPW];
+            const KV* kt[TPW];
 #pragma unroll
             for (int tt = 0; tt < TPW; ++tt)
-                kt[tt] = k_cache + (size_t)(t0 + tb + min(tt, tc - 1)) * key_length;
+                kt[tt] = k_cache + (size_t)(t0 + tb + min(tt, tc - 1)) * klen;
 
-#pragma unroll 2
-            for (int d = lane; d < key_length; d += 32) {
+#pragma unroll UD
+            for (int d = lane; d < klen; d += 32) {
                 float kv[TPW];
 #pragma unroll
-                for (int tt = 0; tt < TPW; ++tt) kv[tt] = kt[tt][d];
+                for (int tt = 0; tt < TPW; ++tt) kv[tt] = kv_ld(kt[tt] + d);
+                if constexpr (QT) {
+                    float qh_[HPB];
+                    const float4* qp = (const float4*)(s_q + (size_t)d * HPB);
+#pragma unroll
+                    for (int j = 0; j < HPB / 4; ++j) {
+                        const float4 v4 = qp[j];
+                        qh_[4*j+0]=v4.x; qh_[4*j+1]=v4.y;
+                        qh_[4*j+2]=v4.z; qh_[4*j+3]=v4.w;
+                    }
+#pragma unroll
+                    for (int hh = 0; hh < HPB; ++hh) {
+#pragma unroll
+                        for (int tt = 0; tt < TPW; ++tt) s[hh][tt] += qh_[hh] * kv[tt];
+                    }
+                } else {
 #pragma unroll
                 for (int hh = 0; hh < HPB; ++hh) {
-                    const float qv = s_q[hh * key_length + d];
+                    const float qv = s_q[hh * klen + d];
 #pragma unroll
                     for (int tt = 0; tt < TPW; ++tt) s[hh][tt] += qv * kv[tt];
+                }
                 }
             }
 #pragma unroll
@@ -1789,7 +3098,7 @@ __global__ void mla_decode_attn_hbatch_kernel(float* __restrict__ part_acc,
 #pragma unroll
                     for (int off = 16; off > 0; off >>= 1)
                         v += __shfl_down_sync(0xffffffff, v, off);
-                    if (lane == 0 && tt < tc) s_p[hh * kMlaCtxTile + tb + tt] = v * scale;
+                    if (lane == 0 && tt < tc) s_p[s_p_idx(hh, tb + tt)] = v * scale;
                 }
         }
         __syncthreads();
@@ -1800,13 +3109,14 @@ __global__ void mla_decode_attn_hbatch_kernel(float* __restrict__ part_acc,
         // __syncwarp so no lane can observe this tile's write in place of the running
         // value it is supposed to fold into.
         for (int hh = warp; hh < HPB; hh += NWARP) {
-            float* pr = s_p + hh * kMlaCtxTile;
+            float* pr = s_p + (PVT ? hh : hh * kMlaCtxTile);
+            const int ps = PVT ? HPB : 1;
             const float m_prev = s_m[hh];
             const float l_prev = s_l[hh];
             __syncwarp();
 
             float tm = -1e30f;
-            for (int t = lane; t < tn; t += 32) tm = fmaxf(tm, pr[t]);
+            for (int t = lane; t < tn; t += 32) tm = fmaxf(tm, pr[t * ps]);
 #pragma unroll
             for (int off = 16; off > 0; off >>= 1)
                 tm = fmaxf(tm, __shfl_down_sync(0xffffffff, tm, off));
@@ -1819,8 +3129,8 @@ __global__ void mla_decode_attn_hbatch_kernel(float* __restrict__ part_acc,
 
             float ls = 0.0f;
             for (int t = lane; t < tn; t += 32) {
-                const float e = __expf(pr[t] - m_new);
-                pr[t] = e;
+                const float e = __expf(pr[t * ps] - m_new);
+                pr[t * ps] = e;
                 ls += e;
             }
 #pragma unroll
@@ -1838,31 +3148,109 @@ __global__ void mla_decode_attn_hbatch_kernel(float* __restrict__ part_acc,
         // One k_cache[t][r] load feeds HPB fused multiply-adds. RSLOTS is small and
         // both inner loops are fully unrolled, so acc stays in registers: a runtime
         // index here would spill the whole array to local memory and undo the point.
+        if constexpr (LSP) {
+#pragma unroll
+            for (int u = 0; u < RSLOTS; ++u)
+#pragma unroll
+                for (int e = 0; e < 2; ++e)
+#pragma unroll
+                    for (int hh = 0; hh < HPB / 2; ++hh)
+                        acc[u][e * (HPB / 2) + hh] *= s_c[lsp_h0 + hh];
+        } else {
 #pragma unroll
         for (int u = 0; u < RSLOTS; ++u)
 #pragma unroll
             for (int hh = 0; hh < HPB; ++hh) acc[u][hh] *= s_c[hh];
+        }
 
-#pragma unroll 4
+        if constexpr (LSP) {
+        constexpr int HG = HPB / 2;
+#pragma unroll UT
         for (int t = 0; t < tn; ++t) {
-            const float* kt = k_cache + (size_t)(t0 + t) * key_length;
+            const KV* kt = k_cache + (size_t)(t0 + t) * klen;
+            float p[HG];
+            if constexpr (PVT) {
+                // P6: the group's HG=6 probabilities are 24 contiguous bytes at
+                // t*48 + lsp_h0*4. Group 0 (base 16-aligned): float4 + float2.
+                // Group 1 (base 24 mod 16 = 8): float2 + float4. Both are 2
+                // uniform wide LDS instead of 6 scalar broadcasts — identical
+                // values in identical order, bit-identical by construction.
+                const float* pb = s_p + (size_t)t * HPB + lsp_h0;
+                if ((lsp_h0 & 3) == 0) {
+                    const float4 a = *(const float4*)pb;
+                    const float2 b = *(const float2*)(pb + 4);
+                    p[0]=a.x; p[1]=a.y; p[2]=a.z; p[3]=a.w; p[4]=b.x; p[5]=b.y;
+                } else {
+                    const float2 a = *(const float2*)pb;
+                    const float4 b = *(const float4*)(pb + 2);
+                    p[0]=a.x; p[1]=a.y; p[2]=b.x; p[3]=b.y; p[4]=b.z; p[5]=b.w;
+                }
+            } else {
+#pragma unroll
+            for (int hh = 0; hh < HG; ++hh) p[hh] = s_p[s_p_idx(lsp_h0 + hh, t)];
+            }
+#pragma unroll
+            for (int u = 0; u < RSLOTS; ++u) {
+                const int r = 2 * lsp_lt + u * BLOCK;
+                if (r + 1 < kv_lora) {
+                    // Rows are key_length*2 B apart and r is even: always 4-aligned.
+                    const __half2 kv2 = *(const __half2*)(kt + r);
+                    const float k0 = __low2float(kv2), k1 = __high2float(kv2);
+#pragma unroll
+                    for (int hh = 0; hh < HG; ++hh) {
+                        acc[u][hh]      += p[hh] * k0;
+                        acc[u][HG + hh] += p[hh] * k1;
+                    }
+                }
+            }
+        }
+        } else {
+#pragma unroll UT
+        for (int t = 0; t < tn; ++t) {
+            const KV* kt = k_cache + (size_t)(t0 + t) * klen;
             float p[HPB];
+            if constexpr (PVT) {
+                // 12 adjacent floats at a 16-aligned base: 3 uniform LDS.128.
+                const float4* pv = (const float4*)(s_p + (size_t)t * HPB);
+#pragma unroll
+                for (int j = 0; j < HPB / 4; ++j) {
+                    const float4 v4 = pv[j];
+                    p[4*j+0] = v4.x; p[4*j+1] = v4.y;
+                    p[4*j+2] = v4.z; p[4*j+3] = v4.w;
+                }
+            } else {
 #pragma unroll
             for (int hh = 0; hh < HPB; ++hh) p[hh] = s_p[hh * kMlaCtxTile + t];
+            }
 #pragma unroll
             for (int u = 0; u < RSLOTS; ++u) {
                 const int r = threadIdx.x + u * BLOCK;
                 if (r < kv_lora) {
-                    const float kv = kt[r];
+                    const float kv = kv_ld(kt + r);
 #pragma unroll
                     for (int hh = 0; hh < HPB; ++hh) acc[u][hh] += p[hh] * kv;
                 }
             }
         }
+        }
         __syncthreads();
     }
 
     // UNNORMALISED partials, one (head, slice) row each — the combine applies 1/l.
+    if constexpr (LSP) {
+        constexpr int HG = HPB / 2;
+#pragma unroll
+        for (int u = 0; u < RSLOTS; ++u) {
+            const int r = 2 * lsp_lt + u * BLOCK;
+            if (r + 1 < kv_lora)
+#pragma unroll
+                for (int hh = 0; hh < HG; ++hh) {
+                    float* pa = part_acc + ((size_t)(h0 + lsp_h0 + hh) * splits + sp) * kv_lora;
+                    pa[r]     = acc[u][hh];
+                    pa[r + 1] = acc[u][HG + hh];
+                }
+        }
+    } else {
 #pragma unroll
     for (int u = 0; u < RSLOTS; ++u) {
         const int r = threadIdx.x + u * BLOCK;
@@ -1870,6 +3258,7 @@ __global__ void mla_decode_attn_hbatch_kernel(float* __restrict__ part_acc,
 #pragma unroll
             for (int hh = 0; hh < HPB; ++hh)
                 part_acc[((size_t)(h0 + hh) * splits + sp) * kv_lora + r] = acc[u][hh];
+    }
     }
     if (threadIdx.x < HPB) {
         // An empty slice (n_ctx < splits) must contribute nothing: l = 0 and a very
@@ -1887,6 +3276,7 @@ __global__ void mla_decode_combine_kernel(float* __restrict__ out,
                                           const float* __restrict__ part_ml,
                                           const float* __restrict__ wv_b,
                                           int kv_lora, int v_dim, int splits) {
+    k3_pdl_sync();
     constexpr int NWARP = BLOCK / 32;
     const int h    = blockIdx.x;
     const int lane = threadIdx.x & 31;
@@ -1943,9 +3333,170 @@ __global__ void mla_decode_combine_kernel(float* __restrict__ out,
     }
 }
 
+// WIDE COMBINE. mla_decode_combine_kernel above runs grid = n_head = 12 blocks on a
+// 132-SM part -- about 9% of the machine -- and its thread 0 walks O(splits) serially
+// while the other BLOCK-1 threads wait at the barrier (the comment on that walk already
+// flags it as the term that bites first). Splitting merge from projection lets BOTH
+// fill the grid: 12 -> n_head*RChunks and n_head*VChunks blocks.
+//
+// The single-kernel form was the right call BEFORE: two kernels means a second launch,
+// and at 93 layers plus ~185 collectives per token that mattered. Once the decode is
+// captured as one CUDA graph that launch is a baked graph node and costs essentially
+// nothing, so the decomposition becomes free. This is downstream of the graph capture
+// in this same PR, not independent of it.
+//
+// SUMMATION ORDER IS UNCHANGED in both stages -- the slice sum still runs i ascending
+// and the projection dot still strides r by 32 across the warp -- so this is
+// bit-identical to the kernel it replaces, not a re-rounding of it.
+constexpr int kMlaCombineVChunks = 16;
+constexpr int kMlaCombineRChunks = 8;
+
+// PARSOFT: the slice-weight prologue, in parallel instead of in thread 0.
+//
+// This prologue is O(splits) SERIAL DEPENDENT GLOBAL LOADS run by lane 0 while the other
+// BLOCK-1 threads wait at the barrier — three passes over `part_ml` (max, then exp and
+// the l-accumulation), so at the scored shape that is ~790 loads issued one at a time.
+// It runs in EVERY block of the merge grid (n_head * kMlaCombineRChunks = 96) and 24
+// times per token per rank, and `splits` is exactly the axis the split heuristic has
+// been pushing UP — raising the slice count to fill the attention grid makes this
+// prologue longer in direct proportion, which is a real part of why attention-side
+// split gains do not reach the token.
+//
+// Every thread now walks its own stride of `part_ml`, so the loads are all in flight at
+// once, and the max and the l-sum come from block reductions. Same values, log-depth
+// instead of linear. This removes dependent loads and adds parallelism; it fuses
+// nothing and narrows nothing.
+//
+// `s_w[i]` is bit-identical (the max is order-independent and each weight is an exp of
+// the same difference). Only `l` reassociates, and it scales the whole merged row
+// uniformly — far inside the accuracy gate.
+template <int BLOCK, bool PARSOFT>
+__global__ void mla_decode_merge_kernel(float* __restrict__ merged,
+                                        const float* __restrict__ part_acc,
+                                        const float* __restrict__ part_ml,
+                                        int kv_lora, int splits) {
+    k3_pdl_sync();
+    const int h  = blockIdx.x;
+    const int rc = blockIdx.y;
+    extern __shared__ float smem[];
+    float* s_w = smem;                       // splits + 1, last slot holds 1/l
+    float* red = s_w + splits + 1;           // BLOCK/32 + 1, reductions (PARSOFT only)
+
+    const float* pml = part_ml + (size_t)h * splits * 2;
+    if constexpr (PARSOFT) {
+        float m = -1e30f;
+        for (int i = threadIdx.x; i < splits; i += BLOCK) m = fmaxf(m, pml[2 * i]);
+        m = block_max<BLOCK>(m, red);
+        __syncthreads();                     // `red` is reused by the sum below
+
+        float l = 0.0f;
+        for (int i = threadIdx.x; i < splits; i += BLOCK) {
+            const float w = __expf(pml[2 * i] - m);
+            s_w[i] = w;
+            l += pml[2 * i + 1] * w;
+        }
+        l = block_sum<BLOCK>(l, red);
+        if (threadIdx.x == 0) s_w[splits] = l > 0.0f ? 1.0f / l : 0.0f;
+    } else if (threadIdx.x == 0) {
+        float m = -1e30f;
+        for (int i = 0; i < splits; ++i) m = fmaxf(m, pml[2 * i]);
+        float l = 0.0f;
+        for (int i = 0; i < splits; ++i) {
+            const float w = __expf(pml[2 * i] - m);
+            s_w[i] = w;
+            l += pml[2 * i + 1] * w;
+        }
+        s_w[splits] = l > 0.0f ? 1.0f / l : 0.0f;
+    }
+    __syncthreads();
+    const float inv = s_w[splits];
+
+    const int per = (kv_lora + kMlaCombineRChunks - 1) / kMlaCombineRChunks;
+    const int r0  = rc * per;
+    const int r1  = min(kv_lora, r0 + per);
+    for (int r = r0 + (int)threadIdx.x; r < r1; r += BLOCK) {
+        float a = 0.0f;
+        for (int i = 0; i < splits; ++i)
+            a += part_acc[((size_t)h * splits + i) * kv_lora + r] * s_w[i];
+        merged[(size_t)h * kv_lora + r] = a * inv;
+    }
+}
+
+template <int BLOCK>
+__global__ void mla_decode_project_kernel(float* __restrict__ out,
+                                          const float* __restrict__ merged,
+                                          const float* __restrict__ wv_b,
+                                          int kv_lora, int v_dim) {
+    k3_pdl_sync();
+    constexpr int NWARP = BLOCK / 32;
+    const int h    = blockIdx.x;
+    const int vc   = blockIdx.y;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+
+    extern __shared__ float smem[];
+    float* s_acc = smem;                     // kv_lora
+    for (int r = (int)threadIdx.x; r < kv_lora; r += BLOCK)
+        s_acc[r] = merged[(size_t)h * kv_lora + r];
+    __syncthreads();
+
+    const int per = (v_dim + kMlaCombineVChunks - 1) / kMlaCombineVChunks;
+    const int v0  = vc * per;
+    const int v1  = min(v_dim, v0 + per);
+    const float* wh = wv_b + (size_t)h * (size_t)kv_lora * v_dim;
+    float* oh = out + (size_t)h * v_dim;
+    for (int v = v0 + warp; v < v1; v += NWARP) {
+        const float* wr = wh + (size_t)v * kv_lora;
+        float acc = 0.0f;
+        for (int r = lane; r < kv_lora; r += 32) acc += wr[r] * s_acc[r];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            acc += __shfl_down_sync(0xffffffff, acc, off);
+        if (lane == 0) oh[v] = acc;
+    }
+}
+
+// SPARKINFER_K3_MLA_WIDE_COMBINE=0 restores the single-kernel combine on one binary.
+static bool k3_mla_wide_combine() {
+    static const int v = [] {
+        const char* e = std::getenv("SPARKINFER_K3_MLA_WIDE_COMBINE");
+        return (e && std::atoi(e) == 0) ? 0 : 1;   // default ON
+    }();
+    return v != 0;
+}
+
+template <int BLOCK>
+static void k3_mla_launch_combine(float* out, int dev, const float* wv_b, int n_head,
+                                  int kv_lora, int v_dim, int splits, cudaStream_t stream) {
+    if (k3_mla_wide_combine() && g_mla_merged[dev] != nullptr) {
+        dim3 mg((unsigned)n_head, (unsigned)kMlaCombineRChunks);
+        // SPARKINFER_K3_MLA_MERGE_PAR=0 restores the thread-0 prologue on one binary.
+        static const bool merge_par = [] {
+            const char* e = std::getenv("SPARKINFER_K3_MLA_MERGE_PAR");
+            return !(e && e[0] == '0');
+        }();
+        // s_w (splits + 1) plus the block-reduction scratch the parallel prologue needs.
+        const size_t mshm = ((size_t)splits + 1 + BLOCK / 32 + 1) * sizeof(float);
+        if (merge_par)
+            k3_pdl_launch(mg, BLOCK, mshm, stream, mla_decode_merge_kernel<BLOCK, true>,
+                g_mla_merged[dev], g_mla_part_acc[dev], g_mla_part_ml[dev], kv_lora, splits);
+        else
+            k3_pdl_launch(mg, BLOCK, mshm, stream, mla_decode_merge_kernel<BLOCK, false>,
+                g_mla_merged[dev], g_mla_part_acc[dev], g_mla_part_ml[dev], kv_lora, splits);
+        dim3 pg((unsigned)n_head, (unsigned)kMlaCombineVChunks);
+        k3_pdl_launch(pg, BLOCK, (size_t)kv_lora * sizeof(float), stream, mla_decode_project_kernel<BLOCK>, 
+            out, g_mla_merged[dev], wv_b, kv_lora, v_dim);
+        return;
+    }
+    const size_t cshm = ((size_t)kv_lora + (size_t)splits + 1) * sizeof(float);
+    k3_pdl_launch((unsigned)n_head, BLOCK, cshm, stream, mla_decode_combine_kernel<BLOCK>, 
+        out, g_mla_part_acc[dev], g_mla_part_ml[dev], wv_b, kv_lora, v_dim, splits);
+}
+
 template <int BLOCK>
 __global__ void proj_q8_0_kernel(float* __restrict__ y, const float* __restrict__ x,
                                  const BlockQ8_0* __restrict__ W, int blocks_per_row) {
+    k3_pdl_sync();
     const int n = blockIdx.x;
     const BlockQ8_0* row = W + (size_t)n * blocks_per_row;
     __shared__ float shm[BLOCK / 32 + 1];
@@ -2000,6 +3551,7 @@ __global__ void proj_q8_0_multirow_kernel(float* __restrict__ y,
                                           const float* __restrict__ x,
                                           const BlockQ8_0* __restrict__ W,
                                           int blocks_per_row, int n_rows) {
+    k3_pdl_sync();
     const int n0 = blockIdx.x * ROWS;
     __shared__ float shm[BLOCK / 32 + 1];
 
@@ -2046,6 +3598,80 @@ __global__ void proj_q8_0_multirow_kernel(float* __restrict__ y,
     }
 }
 
+// The multirow kernel above, with the ONE-BARRIER epilogue the tier family proved
+// out (proj_q8_fused4_1bar_kernel): the per-row block_sum pays 2*ROWS __syncthreads
+// per CTA — 32 at ROWS 16 — where one stash + one barrier + a per-slot ascending-w
+// fold produces the SAME partials summed in the SAME order (block_sum's warp tree,
+// then w = 0..NWARP ascending), so the result is bit-identical, not re-rounded.
+// Activation loads widen to float4 — same values, same use order, fewer issue slots.
+// Serves the LM head (the one k3_proj_f32 caller left on the scored path at tp=8),
+// selected by SPARKINFER_K3_HEAD_1BAR so one binary A/Bs it.
+template <int BLOCK, int ROWS>
+__global__ void proj_q8_0_multirow_1bf_kernel(float* __restrict__ y,
+                                              const float* __restrict__ x,
+                                              const BlockQ8_0* __restrict__ W,
+                                              int blocks_per_row, int n_rows) {
+    k3_pdl_sync();
+    constexpr int NWARP = BLOCK / 32;
+    const int n0   = blockIdx.x * ROWS;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    __shared__ float shm1[NWARP * ROWS];
+
+    float acc[ROWS];
+#pragma unroll
+    for (int r = 0; r < ROWS; ++r) acc[r] = 0.0f;
+
+    for (int b = threadIdx.x; b < blocks_per_row; b += BLOCK) {
+        const float* xb = x + (size_t)b * 32;
+        float s[ROWS];
+#pragma unroll
+        for (int r = 0; r < ROWS; ++r) s[r] = 0.0f;
+
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            // One 16 B activation load, reused by every row in this block. The four
+            // lanes are consumed in the same x0..x3 order the scalar loads were.
+            const float4 xv = *(const float4*)(xb + 4 * i);
+            const float x0 = xv.x, x1 = xv.y, x2 = xv.z, x3 = xv.w;
+#pragma unroll
+            for (int r = 0; r < ROWS; ++r) {
+                if (n0 + r >= n_rows) continue;
+                const BlockQ8_0* row = W + (size_t)(n0 + r) * blocks_per_row;
+                const int wq = get_int_b2(row[b].qs, i);
+                s[r] += (float)(int8_t)(wq >>  0) * x0;
+                s[r] += (float)(int8_t)(wq >>  8) * x1;
+                s[r] += (float)(int8_t)(wq >> 16) * x2;
+                s[r] += (float)(int8_t)(wq >> 24) * x3;
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < ROWS; ++r) {
+            if (n0 + r >= n_rows) continue;
+            const BlockQ8_0* row = W + (size_t)(n0 + r) * blocks_per_row;
+            acc[r] += __half2float(__ushort_as_half(row[b].d)) * s[r];
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < ROWS; ++r) {
+        float v = acc[r];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            v += __shfl_down_sync(0xffffffff, v, off);
+        if (lane == 0) shm1[warp * ROWS + r] = v;
+    }
+
+    __syncthreads();   // the only one
+
+    if (threadIdx.x < ROWS && n0 + threadIdx.x < n_rows) {
+        float s = 0.0f;
+#pragma unroll
+        for (int w = 0; w < NWARP; ++w) s += shm1[w * ROWS + threadIdx.x];
+        y[n0 + threadIdx.x] = s;
+    }
+}
+
 // Four projections that share one activation, in one launch.
 //
 // K3's KDA block computes attn_q, attn_k, attn_v and ssm_g from the SAME normed hidden
@@ -2071,6 +3697,7 @@ __global__ void proj_q8_0_fused4_kernel(float* __restrict__ y0, float* __restric
                                         const BlockQ8_0* __restrict__ W2,
                                         const BlockQ8_0* __restrict__ W3,
                                         int blocks_per_row, int n_rows) {
+    k3_pdl_sync();
     const int n0 = blockIdx.x * ROWS;
     __shared__ float shm[BLOCK / 32 + 1];
 
@@ -2130,11 +3757,12 @@ __global__ void proj_q8_0_fused4_kernel(float* __restrict__ y0, float* __restric
         }
 }
 
-template <int BLOCK>
+template <int BLOCK, bool WIDE = false>
 __global__ void proj_q8_0_q8_0_kernel(float* __restrict__ y,
                                       const BlockQ8_0* __restrict__ x,
                                       const BlockQ8_0* __restrict__ W,
                                       int blocks_per_row) {
+    k3_pdl_sync();
     const int n = blockIdx.x;
     const BlockQ8_0* row = W + (size_t)n * blocks_per_row;
     __shared__ float shm[BLOCK / 32 + 1];
@@ -2154,7 +3782,8 @@ __global__ void proj_q8_0_q8_0_kernel(float* __restrict__ y,
         int sumi = 0;
 #pragma unroll
         for (int i = 0; i < 8; ++i)
-            sumi = __dp4a(get_int_b2(row[b].qs, i), get_int_b2(x[b].qs, i), sumi);
+            sumi = __dp4a(get_int_b2_sel(row[b].qs, i, WIDE),
+                          get_int_b2_sel(x[b].qs, i, WIDE), sumi);
         const float dw = __half2float(__ushort_as_half(row[b].d));
         const float dx = __half2float(__ushort_as_half(x[b].d));
         acc += (float)sumi * (dw * dx);
@@ -2199,6 +3828,7 @@ __global__ void proj_q8_0_q8_0_multirow_kernel(float* __restrict__ y,
                                                const BlockQ8_0* __restrict__ x,
                                                const BlockQ8_0* __restrict__ W,
                                                int blocks_per_row, int n_rows) {
+    k3_pdl_sync();
     const int n0 = blockIdx.x * ROWS;
     __shared__ float shm[BLOCK / 32 + 1];
 
@@ -2236,6 +3866,103 @@ __global__ void proj_q8_0_q8_0_multirow_kernel(float* __restrict__ y,
     }
 }
 
+// TOKEN-BATCHED Q8_0 x Q8_0 PROJECTION — the DUAL of the multirow kernel above.
+//
+// multirow amortises the ACTIVATION across ROWS output rows, because at decode the
+// activation re-read is half the traffic. Prompt ingestion has the opposite problem
+// and it is a much bigger one: there the ACTIVATION is what repeats cheaply and the
+// WEIGHT is what repeats expensively. Ingesting a 32k prompt one token at a time
+// streams every weight in the model 32,768 times over — MEASURED 15.2 GB per rank
+// per token, against a 7.6 KB activation.
+//
+//     KDA projection, N=12288 rows (1536 per rank at tp=8), K=7168
+//       weights, per token   1536 x 224 blocks x 34 B  =  11.7 MB
+//       activation, per token             224 x 34 B   =   7.6 KB   <- 1500x smaller
+//
+// Carrying TOKS prompt tokens through one launch reads that weight tile ONCE and
+// spends it TOKS times, so the dominant term divides by TOKS. The activation is
+// re-read ROWS times per block instead of once, which is free: it is 34 B per block
+// iteration and L1-resident by the second use.
+//
+// WHY BOTH AXES. ROWS still earns its keep — it is what keeps the weight block in
+// registers across TOKS uses without re-issuing the load — so the tile is ROWS x TOKS
+// and the register cost is acc[ROWS][TOKS] + the TOKS staged activations. ROWS 4 /
+// TOKS 4 is the shape that holds this in registers at BLOCK 128 without spilling;
+// the launcher picks smaller tiles when the grid would otherwise stop covering the
+// device.
+//
+// BIT-IDENTICAL to the single-token kernels, per output element. Each y[t][n] keeps
+// the same thread-to-block striding over b, the same i order inside the block, the
+// same int32 accumulation and the same block_sum. __dp4a is commutative in its two
+// vector operands (it is a sum of exact integer products), so feeding it the weight
+// first here and the activation first there cannot change a bit. Only which output
+// elements share a CUDA block changes.
+//
+// y is [n_tok, ldy] and the quantised activation is [n_tok, ldx] blocks, both token-
+// major, which is the layout a chunk driver already has to allocate for the residual.
+template <int BLOCK, int ROWS, int TOKS>
+__global__ void proj_q8_0_q8_0_tok_kernel(float* __restrict__ y, int ldy,
+                                          const BlockQ8_0* __restrict__ x, int ldx,
+                                          const BlockQ8_0* __restrict__ W,
+                                          int blocks_per_row, int n_rows, int n_tok) {
+    k3_pdl_sync();
+    const int n0 = blockIdx.x * ROWS;
+    const int t0 = blockIdx.y * TOKS;
+    __shared__ float shm[BLOCK / 32 + 1];
+
+    float acc[ROWS][TOKS];
+#pragma unroll
+    for (int r = 0; r < ROWS; ++r)
+#pragma unroll
+        for (int t = 0; t < TOKS; ++t) acc[r][t] = 0.0f;
+
+    for (int b = threadIdx.x; b < blocks_per_row; b += BLOCK) {
+        // Stage this block's activation for every token in the tile. Tokens past the
+        // end contribute zero products into accumulators whose stores are masked, so
+        // the tail chunk needs no separate kernel.
+        int xq[TOKS][8];
+        float dx[TOKS];
+#pragma unroll
+        for (int t = 0; t < TOKS; ++t) {
+            const bool live = (t0 + t) < n_tok;
+            const BlockQ8_0& xb = x[(size_t)(live ? t0 + t : 0) * ldx + b];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) xq[t][i] = live ? get_int_b2(xb.qs, i) : 0;
+            dx[t] = live ? __half2float(__ushort_as_half(xb.d)) : 0.0f;
+        }
+
+#pragma unroll
+        for (int r = 0; r < ROWS; ++r) {
+            if (n0 + r >= n_rows) continue;
+            // ONE weight block, held in registers and consumed by every token in the
+            // tile. This is the load the single-token path repeats TOKS times.
+            const BlockQ8_0& wb = W[(size_t)(n0 + r) * blocks_per_row + b];
+            int wq[8];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) wq[i] = get_int_b2(wb.qs, i);
+            const float dw = __half2float(__ushort_as_half(wb.d));
+#pragma unroll
+            for (int t = 0; t < TOKS; ++t) {
+                int sumi = 0;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) sumi = __dp4a(wq[i], xq[t][i], sumi);
+                acc[r][t] += (float)sumi * (dw * dx[t]);
+            }
+        }
+    }
+
+    // block_sum contains __syncthreads(), so every thread must reach every one of
+    // these; only the store is masked.
+#pragma unroll
+    for (int r = 0; r < ROWS; ++r)
+#pragma unroll
+        for (int t = 0; t < TOKS; ++t) {
+            const float v = block_sum<BLOCK>(acc[r][t], shm);
+            if (threadIdx.x == 0 && n0 + r < n_rows && t0 + t < n_tok)
+                y[(size_t)(t0 + t) * ldy + n0 + r] = v;
+        }
+}
+
 
 // Q8 ACTIVATION x FOUR Q8_0 WEIGHT MATRICES, one launch.
 //
@@ -2268,6 +3995,7 @@ __global__ void proj_q8_0_q8_0_fused4_kernel(float* __restrict__ y0,
                                              const BlockQ8_0* __restrict__ W2,
                                              const BlockQ8_0* __restrict__ W3,
                                              int blocks_per_row, int n_rows) {
+    k3_pdl_sync();
     const int n0 = blockIdx.x * ROWS;
     __shared__ float shm[BLOCK / 32 + 1];
 
@@ -2321,6 +4049,7 @@ __global__ void proj_q8_0_q8_0_fused4_kernel(float* __restrict__ y0,
 __global__ void dequant_q8_0_kernel(float* __restrict__ out,
                                     const BlockQ8_0* __restrict__ blocks,
                                     int64_t n_blocks) {
+    k3_pdl_sync();
     const int64_t b = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
     if (b >= n_blocks) return;
     const float d = __half2float(__ushort_as_half(blocks[b].d));
@@ -2332,6 +4061,7 @@ __global__ void dequant_q8_0_kernel(float* __restrict__ out,
 __global__ void dequant_f32_passthrough_kernel(float* __restrict__ out,
                                                const float* __restrict__ src,
                                                int64_t n) {
+    k3_pdl_sync();
     const int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
     if (i < n) out[i] = src[i];
 }
@@ -2339,37 +4069,274 @@ __global__ void dequant_f32_passthrough_kernel(float* __restrict__ out,
 template <int BLOCK>
 __global__ void proj_f32_kernel(float* __restrict__ y, const float* __restrict__ x,
                                 const float* __restrict__ W, int K) {
+    k3_pdl_sync();
     const int n = blockIdx.x;
     const float* row = W + (size_t)n * K;
     __shared__ float shm[BLOCK / 32 + 1];
 
+    // ISSUE EIGHT LOADS BEFORE THE FIRST FMA. These loads are perfectly coalesced
+    // (128 B/warp, one wavefront), so this kernel is not instruction-bound like the
+    // Q8_0 GEMVs -- it is DRAM-LATENCY-bound, and the only lever is how many loads
+    // are outstanding per warp. At the router shape (N=896, K=7168) the grid is
+    // 896x4 warps / 132 SM = 27.2 warps/SM; sustaining the measured 36.4 GB/s/SM at
+    // ~600 ns of latency needs ~21.8 KB in flight, i.e. ~6 outstanding loads per
+    // warp. The measured 2.15 TB/s back-solves to ~4 -- which is exactly what nvcc
+    // emits by default for a runtime-bounded loop with one serial accumulator,
+    // because it cannot prove the trip count. Naming the unroll lifts it to 8.
+    //
+    // BIT-IDENTICAL, unconditionally: `acc +=` is a serial dependency chain, so the
+    // summation order is identical at ANY unroll factor -- unrolling cannot
+    // reassociate what the data dependency already serialises. --use_fast_math is on
+    // (CMakeLists.txt:9), which enables FMA contraction and ftz but never
+    // reassociation, and both arms here contract the same way.
     float acc = 0.0f;
-    for (int k = threadIdx.x; k < K; k += BLOCK) acc += row[k] * x[k];
+    int k = threadIdx.x;
+    for (; k + 7 * BLOCK < K; k += 8 * BLOCK) {
+        float w[8], v[8];
+#pragma unroll
+        for (int u = 0; u < 8; ++u) { w[u] = row[k + u * BLOCK]; v[u] = x[k + u * BLOCK]; }
+#pragma unroll
+        for (int u = 0; u < 8; ++u) acc += w[u] * v[u];
+    }
+    for (; k < K; k += BLOCK) acc += row[k] * x[k];
     acc = block_sum<BLOCK>(acc, shm);
     if (threadIdx.x == 0) y[n] = acc;
 }
 
 
+// ROW AXIS (blockIdx.y). ALL THREE operands are row-major activations and all three are
+// offset — this entry point is the residual combine, not a broadcast bias add. A caller
+// whose `b` is a shared per-row-constant vector (the ssm_dt bias) must NOT batch through
+// here; k3_kda_decay_gate_dt is the entry point that treats dt_bias as shared.
 __global__ void add_f32_kernel(float* __restrict__ out, const float* __restrict__ a,
-                               const float* __restrict__ b, int64_t n) {
+                               const float* __restrict__ b, int64_t n,
+                               int64_t row_stride) {
+    k3_pdl_sync();
+    const int64_t roff = (int64_t)blockIdx.y * row_stride;
+    float* __restrict__ o_r = out + roff;
+    const float* __restrict__ a_r = a + roff;
+    const float* __restrict__ b_r = b + roff;
     const int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
-    if (i < n) out[i] = a[i] + b[i];
+    if (i < n) o_r[i] = a_r[i] + b_r[i];
 }
 
-__global__ void sigmoid_inplace_f32_kernel(float* __restrict__ x, int64_t n) {
+// ROW AXIS (blockIdx.y). Elementwise and in place; block (bx, r) touches only row r.
+__global__ void sigmoid_inplace_f32_kernel(float* __restrict__ x, int64_t n,
+                                           int64_t row_stride) {
+    k3_pdl_sync();
+    float* __restrict__ x_r = x + (int64_t)blockIdx.y * row_stride;
     const int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
-    if (i < n) x[i] = 1.0f / (1.0f + __expf(-x[i]));
+    if (i < n) x_r[i] = 1.0f / (1.0f + __expf(-x_r[i]));
 }
 
+// Writes this token's MLA K-cache row at a position only the DEVICE knows.
+//
+// Replaces a host-computed `mla_kv_cache + position * key_length` fed to two
+// cudaMemcpyAsync. Those bake the destination ADDRESS into a captured graph, so replay
+// would rewrite one row forever while the model read stale keys for every later token —
+// correct on replay 1, wrong from replay 2. Concatenation order (normed kv_cmpr, then RAW
+// k_pe) is exactly the two memcpys it replaces; this moves bytes and does no arithmetic,
+// so it is bit-identical by construction.
+//
+// TOKEN AXIS (blockIdx.y). Row r reads (kv_cmpr_normed + r*cmpr_stride) and
+// (kv_a_out + r*kva_stride) and writes the cache row named by d_pos[r] — the ONE place
+// on this path where the position is indexed rather than dereferenced, which is why the
+// caller's `d_pos` must be the CONTIGUOUS n_rows-long position vector the chunk driver
+// fills with k3_fill_pos_vec, base first. It moves bytes and does no arithmetic, so it
+// is bit-identical to n_rows separate launches by construction.
+//
+// WRITING EVERY TOKEN'S ROW BEFORE ANY TOKEN ATTENDS IS SAFE, and that is a property of
+// the attention kernels rather than of this one: each of them lengths its walk with its
+// OWN *d_pos + 1, so token b reads rows [0, pos_b] and never the rows this launch wrote
+// for the tokens after it. Causality here is enforced by the LENGTH, not by the order
+// the rows are stored in.
+__global__ void mla_kv_store_kernel(float* __restrict__ cache,
+                                    const float* __restrict__ kv_cmpr_normed,
+                                    const float* __restrict__ kv_a_out,
+                                    const int* __restrict__ d_pos,
+                                    int kv_lora, int rope_dim, int key_length,
+                                    int64_t cmpr_stride, int64_t kva_stride) {
+    k3_pdl_sync();
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= kv_lora + rope_dim) return;
+    const int r = blockIdx.y;
+    const float* __restrict__ cmpr_r = kv_cmpr_normed + (int64_t)r * cmpr_stride;
+    const float* __restrict__ kva_r  = kv_a_out       + (int64_t)r * kva_stride;
+    float* row = cache + (size_t)(d_pos[r]) * (size_t)key_length;
+    row[i] = (i < kv_lora) ? cmpr_r[i] : kva_r[i];
+}
+
+// Advance the device's view of the position, inside the captured region.
+// The host mirror still advances too — it is what picks the launch plan, which a graph
+// cannot change. k3_read_pos_f32 exists so a test can prove the two never drift.
+__global__ void bump_pos_kernel(int* __restrict__ p) { *p += 1; }
+
+// The same advance by an arbitrary signed step. A tile driver runs the layer loop
+// OUTSIDE the token loop, so within one layer the position walks base..base+T-1 and
+// then has to come back to base for the next layer — which is a -(T-1), not a bump.
+//
+// RELATIVE, and that is the whole reason this is not a `set`. A set would bake the
+// absolute position into the launch, and a captured graph replayed on the next tile
+// would rewind every token to the tile it was recorded at: fluent output, wrong KV
+// rows, invisible to timing. An add is the same instruction on every tile.
+__global__ void add_pos_kernel(int* __restrict__ p, int d) { *p += d; }
+
+// CHUNKED INGESTION'S POSITION VECTOR.
+//
+// Every kernel that needs the current position reads it as `*d_pos` — the KV store
+// for its row, the three MLA attention kernels for `n_ctx = *d_pos + 1`. A chunk
+// carries B tokens through a layer before any of them advances the position, so a
+// single device int cannot serve them: with one d_pos all B tokens write the SAME
+// KV row and all B attend over the SAME prefix, which is silently wrong and looks
+// like a speedup because it is less work.
+//
+// Rather than thread a per-token offset through ~20 launch sites, give the chunk B
+// positions and hand each token its OWN pointer. Nothing downstream changes: a token
+// still reads `*d_pos`, it just points one slot further along.
+//
+// This fills from the live base INSIDE the captured region, so replay N recomputes
+// base+0..base+B-1 against whatever the base then holds — the same property
+// bump_pos_kernel relies on, and the reason a recording stays valid for later chunks.
+__global__ void fill_pos_vec_kernel(int* __restrict__ out,
+                                    const int* __restrict__ base, int n) {
+    const int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b < n) out[b] = *base + b;
+}
+
+// Advance by a whole chunk in one launch instead of n bump_pos_kernel launches.
+__global__ void bump_pos_by_kernel(int* __restrict__ p, int n) { *p += n; }
+
+// Original single-block norm. Kept as the bit-identical reference path: the sum of
+// squares is partitioned across exactly 128 threads with stride 128, and the apply
+// walk matches. Widening the sum changes that partition and moves KL vs main past the
+// ratchet (#115 measured 4.63x at one depth) — so the wide kernel below freezes this
+// reduction and only widens the elementwise apply.
+//
+// ROW AXIS (blockIdx.y): row r gets its own block, reducing over row r's own n elements
+// with the same 128-thread stride-128 partition and the same block_sum tree. The learned
+// weight w is shared across rows and is NOT offset.
 template <int BLOCK>
 __global__ void rms_norm_kernel(float* __restrict__ out, const float* __restrict__ x,
-                                const float* __restrict__ w, int n, float eps) {
+                                const float* __restrict__ w, int n, float eps,
+                                int64_t out_stride, int64_t x_stride) {
+    k3_pdl_sync();
     __shared__ float shm[BLOCK / 32 + 1];
+    float* __restrict__ o_r = out + (int64_t)blockIdx.y * out_stride;
+    const float* __restrict__ x_r = x + (int64_t)blockIdx.y * x_stride;
     float acc = 0.0f;
-    for (int d = threadIdx.x; d < n; d += BLOCK) acc += x[d] * x[d];
+    for (int d = threadIdx.x; d < n; d += BLOCK) acc += x_r[d] * x_r[d];
     const float ss = block_sum<BLOCK>(acc, shm);
     const float inv = rsqrtf(ss / (float)n + eps);
-    for (int d = threadIdx.x; d < n; d += BLOCK) out[d] = x[d] * inv * w[d];
+    for (int d = threadIdx.x; d < n; d += BLOCK) o_r[d] = x_r[d] * inv * w[d];
+}
+
+// Wide apply, frozen reduction.
+//
+// WHY THE SUM STAYS ON 128 THREADS. Changing how many threads contribute to ss changes
+// the float32 association of the sum of squares, which changes inv, which changes every
+// output element by ~1e-7 relative — enough to push KL vs main over the 2x ratchet while
+// still clearing the absolute KL bar. The measured +2.8% at 128k on #115 came with
+// accuracy-regression for exactly that reason. The apply is elementwise once inv is
+// fixed, so widening it (more threads, float4 loads) cannot change a bit of the output
+// if the reduction matches rms_norm_kernel<128>.
+//
+// Idle threads above 128 contribute 0 to block_sum; x+0 is an IEEE identity, so the
+// longer warp-tree sum is bit-identical to the 4-warp one.
+//
+// SPAN_UNITS slices the apply across CTAs on top of the widening: the apply moves
+// three times the bytes of the reduction and cannot start until it lands, and a
+// single CTA — however wide — is one SM of 132. Every CTA recomputes the identical
+// frozen-128 reduction, so `inv` agrees bit-for-bit across the grid; CTA g then
+// writes only units [g*span, (g+1)*span), so each output element is still produced
+// by exactly one thread from the same product in the same order. span_units == the
+// full unit count with grid 1 is exactly the single-CTA form.
+//
+// UNROLL names the load count of the reduction sweep. `acc +=` is a serial
+// dependency chain, so summation order is identical at any unroll factor — the same
+// argument proj_f32_kernel relies on, and it matters more here because nothing else
+// is resident to cover the reduction's latency.
+//
+// n4 is the float4 count when vec4!=0; n is always the element count (the mean divisor).
+// A TOKEN AXIS ON gridDim.y, and it is deliberately an OFFSET rather than a second kernel.
+//
+// rms_norm_wide is 302 graph nodes per prefill token — 9% of a captured tile's graph, and
+// a captured tile is bound by its node count. Batching it over T tokens turns T launches
+// into one. The prefill module's header declined to batch the norms because doing it the
+// obvious way means copying rms_norm_block_for and block_sum into another file, and a
+// duplicated tier is exactly what produced the block_for defect the prefill CPU test now
+// pins. This avoids that entirely: same kernel, same block_for, same block_sum, same
+// reduction order, same span logic — only the base pointers move.
+//
+// Bit-identical to the single-row launch by construction. Every block already recomputes
+// the whole row's sum of squares, so nothing about a row's arithmetic depends on how many
+// other rows are in flight, and at gridDim.y == 1 blockIdx.y is 0 and the offset vanishes.
+//
+// ROW AXIS (blockIdx.y). The token axis is a SEPARATE grid dimension stacked on top of
+// the existing span_units spread — it does not touch it. span_units and gridDim.x are
+// computed from the per-row unit count exactly as before, so within a row the set of
+// CTAs, their slices and their frozen-128 reduction are identical to the single-row
+// launch; CTA (g, r) reduces row r's own n elements and writes row r's slice g. w is a
+// learned weight shared by every row and is NOT offset.
+//
+// TWO STRIDES, NOT ONE. The tile driver reads and writes buffers of the same row pitch
+// and would be served by a single row_stride; the chunk driver is not, because it norms
+// out of one token-major buffer into another with a different width. Separate
+// out_stride / x_stride is the superset — a same-pitch caller passes the value twice —
+// and it matches rms_norm_kernel directly above, so the two norms take their rows the
+// same way rather than one of them being the odd one out.
+//
+// out_stride / x_stride are in ELEMENTS, and the host gates vec4 on both being multiples
+// of 4 so the per-row base stays 16-byte aligned.
+template <int BLOCK, bool UNROLL>
+__global__ void rms_norm_wide_kernel(float* __restrict__ out, const float* __restrict__ x,
+                                     const float* __restrict__ w, int n, float eps,
+                                     int n4, int vec4, int span_units,
+                                     int64_t out_stride, int64_t x_stride) {
+    k3_pdl_sync();
+    __shared__ float shm[BLOCK / 32 + 1];
+    // Row this block serves. Zero-cost on the single-row path: at gridDim.y == 1
+    // blockIdx.y is 0 and both bases are the pointers the caller passed.
+    float* __restrict__ o_r = out + (int64_t)blockIdx.y * out_stride;
+    const float* __restrict__ x_r = x + (int64_t)blockIdx.y * x_stride;
+
+    float acc = 0.0f;
+    if (threadIdx.x < 128) {
+        int d = (int)threadIdx.x;
+        if (UNROLL) {
+            for (; d + 7 * 128 < n; d += 8 * 128) {
+                float v[8];
+#pragma unroll
+                for (int u = 0; u < 8; ++u) v[u] = x_r[d + u * 128];
+#pragma unroll
+                for (int u = 0; u < 8; ++u) acc += v[u] * v[u];
+            }
+        }
+        for (; d < n; d += 128) acc += x_r[d] * x_r[d];
+    }
+    const float ss = block_sum<BLOCK>(acc, shm);
+    const float inv = rsqrtf(ss / (float)n + eps);
+
+    const int units = vec4 ? n4 : n;
+    const int u0 = blockIdx.x * span_units;
+    const int u1 = min(u0 + span_units, units);
+    if (vec4) {
+        const float4* __restrict__ x4 = (const float4*)x_r;
+        const float4* __restrict__ w4 = (const float4*)w;
+        float4* __restrict__ o4 = (float4*)o_r;
+        for (int d = u0 + (int)threadIdx.x; d < u1; d += BLOCK) {
+            const float4 v = x4[d];
+            const float4 g = w4[d];
+            float4 r;
+            r.x = v.x * inv * g.x;
+            r.y = v.y * inv * g.y;
+            r.z = v.z * inv * g.z;
+            r.w = v.w * inv * g.w;
+            o4[d] = r;
+        }
+    } else {
+        for (int d = u0 + (int)threadIdx.x; d < u1; d += BLOCK)
+            o_r[d] = x_r[d] * inv * w[d];
+    }
 }
 
 }  // namespace
@@ -2377,14 +4344,17 @@ __global__ void rms_norm_kernel(float* __restrict__ out, const float* __restrict
 // ---------------------------------------------------------------------------
 
 void situ_f32(float* out, const float* gate, const float* up, int64_t n,
-              float beta, float linear_beta, cudaStream_t stream) {
-    if (n <= 0) return;
+              float beta, float linear_beta, cudaStream_t stream,
+              int n_rows, int64_t row_stride) {
+    if (n <= 0 || n_rows <= 0) return;
     const int T = 256;
     const int64_t blocks = (n + T - 1) / T;
     const int lb_active = linear_beta > 0.0f ? 1 : 0;
-    situ_kernel<<<(unsigned)blocks, T, 0, stream>>>(
+    // row_stride == 0 means contiguous rows of exactly n elements.
+    if (row_stride == 0) row_stride = n;
+    k3_pdl_launch(dim3((unsigned)blocks, (unsigned)n_rows), T, 0, stream, situ_kernel,
         out, gate, up, n, beta, 1.0f / beta, linear_beta,
-        lb_active ? 1.0f / linear_beta : 1.0f, lb_active);
+        lb_active ? 1.0f / linear_beta : 1.0f, lb_active, row_stride);
 }
 
 void kda_decode_step_f32(float* out, float* state,
@@ -2409,31 +4379,88 @@ void kda_decode_step_f32(float* out, float* state,
     constexpr int IC = 32, SMEM_BLOCK = 128;
     const size_t shm_staged =
         ((size_t)4 * head_dim + (size_t)head_dim * (IC + 1)) * sizeof(float);
-    if (head_dim == SMEM_BLOCK && head_dim % IC == 0) {
-        kda_decode_step_smem_kernel<SMEM_BLOCK><<<(unsigned)n_head, T, shm_staged, stream>>>(
+
+    // Value tiling. grid (n_head,) -> (n_head, head_dim/BV): see the kernel comment for
+    // why one block per head strands the device once KDA is head-sharded.
+    //
+    // SPARKINFER_K3_KDA_VT=0 restores the single-tile launch, which is how the two are
+    // A/B'd on ONE binary. It defaults ON because the eval harness runs a default build
+    // and an env-gated win scores as zero — the same trap that made #63's qact path and
+    // #67's fusion guard invisible until someone read the profile.
+    constexpr int BV = 32;
+    static const bool want_vt = [] {
+        const char* e = std::getenv("SPARKINFER_K3_KDA_VT");
+        return !(e && e[0] == '0');
+    }();
+    if (want_vt && head_dim == SMEM_BLOCK && head_dim % IC == 0 && head_dim % BV == 0) {
+        const size_t shm_vt =
+            ((size_t)3 * head_dim + (size_t)BV * (IC + 1)) * sizeof(float);
+        const dim3 grid((unsigned)n_head, (unsigned)(head_dim / BV));
+        k3_pdl_launch(grid, BV, shm_vt, stream, kda_decode_step_vt_kernel<BV>, 
             out, state, q, k, v, g, beta, head_dim);
         return;
     }
-    kda_decode_step_kernel<128><<<(unsigned)n_head, T, shm, stream>>>(
+    if (head_dim == SMEM_BLOCK && head_dim % IC == 0) {
+        k3_pdl_launch((unsigned)n_head, T, shm_staged, stream, kda_decode_step_smem_kernel<SMEM_BLOCK>, 
+            out, state, q, k, v, g, beta, head_dim);
+        return;
+    }
+    k3_pdl_launch((unsigned)n_head, T, shm, stream, kda_decode_step_kernel<128>, 
         out, state, q, k, v, g, beta, head_dim);
 }
 
 void kda_gate_out_f32(float* out, const float* o, const float* norm_w,
                       const float* g2, int head_dim, int n_head,
-                      float eps, cudaStream_t stream) {
-    if (head_dim <= 0 || n_head <= 0) return;
-    kda_gate_out_kernel<128><<<(unsigned)n_head, 128, 0, stream>>>(
-        out, o, norm_w, g2, head_dim, eps);
+                      float eps, cudaStream_t stream,
+                      int n_rows, int64_t row_stride) {
+    if (head_dim <= 0 || n_head <= 0 || n_rows <= 0) return;
+    if (row_stride == 0) row_stride = (int64_t)head_dim * n_head;
+    k3_pdl_launch(dim3((unsigned)n_head, (unsigned)n_rows), 128, 0, stream,
+        kda_gate_out_kernel<128>,
+        out, o, norm_w, g2, head_dim, eps, row_stride);
 }
 
 void attn_res_mix_f32(float* out, const float* ckpts, const float* cur,
                       const float* score_w, int n_embd, int n_ckpt,
-                      float eps, cudaStream_t stream, float* scores) {
-    if (n_embd <= 0) return;
+                      float eps, cudaStream_t stream, float* scores,
+                      const float* cur_b, float* sum_out,
+                      int n_rows, int64_t act_stride,
+                      int64_t bank_stride, int64_t score_stride) {
+    if (n_embd <= 0 || n_rows <= 0) return;
+    if (act_stride == 0) act_stride = n_embd;
+    if (bank_stride == 0) bank_stride = (int64_t)std::max(n_ckpt, 1) * n_embd;
+    if (score_stride == 0) score_stride = n_ckpt + 1;
     if (n_ckpt <= 0) {
-        // Layer 0 / nothing banked: the reference returns cur unchanged.
-        cudaMemcpyAsync(out, cur, (size_t)n_embd * sizeof(float),
-                        cudaMemcpyDeviceToDevice, stream);
+        // Layer 0 / nothing banked: the reference returns cur unchanged. With a
+        // residual pair in flight the sum still has to be materialised — same two
+        // launches the unfused path used, so this branch never regresses.
+        if (cur_b && sum_out && act_stride == n_embd) {
+            const int64_t count = (int64_t)n_rows * n_embd;
+            k3_add_f32(sum_out, cur, cur_b, count, stream);
+            cudaMemcpyAsync(out, sum_out, (size_t)count * sizeof(float),
+                            cudaMemcpyDeviceToDevice, stream);
+            return;
+        }
+        if (cur_b && sum_out) {
+            for (int r = 0; r < n_rows; ++r)
+                k3_add_f32(sum_out + (int64_t)r * act_stride,
+                           cur + (int64_t)r * act_stride,
+                           cur_b + (int64_t)r * act_stride, n_embd, stream);
+            cudaMemcpy2DAsync(out, (size_t)act_stride * sizeof(float), sum_out,
+                              (size_t)act_stride * sizeof(float),
+                              (size_t)n_embd * sizeof(float), n_rows,
+                              cudaMemcpyDeviceToDevice, stream);
+            return;
+        }
+        if (sum_out)
+            cudaMemcpy2DAsync(sum_out, (size_t)act_stride * sizeof(float), cur,
+                              (size_t)act_stride * sizeof(float),
+                              (size_t)n_embd * sizeof(float), n_rows,
+                              cudaMemcpyDeviceToDevice, stream);
+        cudaMemcpy2DAsync(out, (size_t)act_stride * sizeof(float), cur,
+                          (size_t)act_stride * sizeof(float),
+                          (size_t)n_embd * sizeof(float), n_rows,
+                          cudaMemcpyDeviceToDevice, stream);
         return;
     }
     constexpr int B = 256;
@@ -2442,17 +4469,95 @@ void attn_res_mix_f32(float* out, const float* ckpts, const float* cur,
     // old stream-ordered allocation so callers without scratch — the numeric test,
     // and the pipeline/TP entry points that mix once per token rather than 185
     // times — need no change.
+    //
+    // IT IS n_rows ROWS OF (n_ckpt + 1), NOT ONE. Each row's score kernel writes its own
+    // (n_ckpt+1) slots and its own apply kernel reads them back; sharing one row across
+    // the grid .y would have every token blended with whichever token's softmax landed
+    // last. That is silent — no NaN, no crash, and the weights are a softmax over a
+    // handful of near-equal scores so top-1 does not move — and at short context n_ckpt
+    // is 0 or 1, so a parity probe cannot see it. It only bites at depth.
     float* sc = scores;
     const bool owned = (sc == nullptr);
-    if (owned) cudaMallocAsync(&sc, (size_t)(n_ckpt + 1) * sizeof(float), stream);
+    if (owned) {
+        score_stride = n_ckpt + 1;
+        cudaMallocAsync(&sc, (size_t)n_rows * score_stride * sizeof(float), stream);
+    }
 
-    attn_res_score_kernel<B><<<(unsigned)(n_ckpt + 1), B, 0, stream>>>(
-        sc, ckpts, cur, score_w, n_embd, n_ckpt, eps);
-    attn_res_apply_kernel<B><<<(unsigned)((n_embd + B - 1) / B), B,
-                              (size_t)(n_ckpt + 1) * sizeof(float), stream>>>(
-        out, ckpts, cur, sc, n_embd, n_ckpt);
+    static const bool res_1pass = [] {
+        const char* e = std::getenv("SPARKINFER_K3_RES_1PASS");
+        return !(e && e[0] == '0');
+    }();
+    // THE SCORE GRID IS n_ckpt+1 — TWO BLOCKS AT THE SCORED CONTEXT.
+    //
+    // The blend below wants a NARROW block, because its grid is n_embd/B and 256 keeps
+    // that at 28 blocks. The score kernel is the opposite shape: its grid is fixed at
+    // the checkpoint count, so 256 threads is all the parallelism it ever gets, against
+    // a full n_embd sweep per block. Those are different constraints and they were
+    // sharing one constant. Giving the score its own width raises loads in flight 4x
+    // without touching the blend's grid — same arithmetic per thread, three more
+    // levels on the reduction tree.
+    //
+    // SPARKINFER_K3_RES_WIDE=0 restores the shared 256 on one binary.
+    static const bool res_wide = [] {
+        const char* e = std::getenv("SPARKINFER_K3_RES_WIDE");
+        return !(e && e[0] == '0');
+    }();
+    constexpr int SB = 1024;
+    // THE TOKEN ROW IS A NEW GRID .y ON BOTH LAUNCHES, and nothing else moves: the score
+    // grid .x is still n_ckpt+1, the blend grid .x is still ceil(n_embd/B), both block
+    // widths are unchanged, and the dynamic shared memory is still ONE row's softmax
+    // because each block computes its own. dim3(g, 1) is dim3(g), so at n_rows == 1 this
+    // is byte-for-byte the launch the decode path has always issued.
+    const dim3 sgrid((unsigned)(n_ckpt + 1), (unsigned)n_rows);
+    if (res_wide && n_embd >= SB) {
+        if (res_1pass)
+            k3_pdl_launch(dim3((unsigned)(n_ckpt + 1), (unsigned)n_rows), SB, 0, stream,
+                attn_res_score_kernel<SB, true>, sc, ckpts, cur, cur_b, score_w,
+                n_embd, n_ckpt, eps, act_stride, bank_stride, score_stride);
+        else
+            k3_pdl_launch(dim3((unsigned)(n_ckpt + 1), (unsigned)n_rows), SB, 0, stream,
+                attn_res_score_kernel<SB, false>, sc, ckpts, cur, cur_b, score_w,
+                n_embd, n_ckpt, eps, act_stride, bank_stride, score_stride);
+    } else if (res_1pass)
+        k3_pdl_launch(dim3((unsigned)(n_ckpt + 1), (unsigned)n_rows), B, 0, stream,
+            attn_res_score_kernel<B, true>, sc, ckpts, cur, cur_b, score_w,
+            n_embd, n_ckpt, eps, act_stride, bank_stride, score_stride);
+    else
+        k3_pdl_launch(dim3((unsigned)(n_ckpt + 1), (unsigned)n_rows), B, 0, stream,
+            attn_res_score_kernel<B, false>, sc, ckpts, cur, cur_b, score_w,
+            n_embd, n_ckpt, eps, act_stride, bank_stride, score_stride);
+    k3_pdl_launch(dim3((unsigned)((n_embd + B - 1) / B), (unsigned)n_rows), B,
+                      (size_t)(n_ckpt + 1) * sizeof(float), stream,
+                      attn_res_apply_kernel<B>, out, ckpts, cur, cur_b, sum_out, sc,
+                      n_embd, n_ckpt, act_stride, bank_stride, score_stride);
 
     if (owned) cudaFreeAsync(sc, stream);
+}
+
+bool k3_kda_conv_l2_fused(float* out_q, float* out_k, float* out_v,
+                          float* st_q, float* st_k, float* st_v,
+                          const float* x_q, const float* x_k, const float* x_v,
+                          const float* w_q, const float* w_k, const float* w_v,
+                          int d_conv, int head_dim, int n_head,
+                          float q_scale, float eps, cudaStream_t stream) {
+    // SPARKINFER_K3_KDACONV=0 restores the five separate launches on ONE binary, so
+    // this fold's contribution can be isolated from everything else in the same
+    // measurement session rather than inferred from a bundle.
+    static const bool want = [] {
+        const char* e = std::getenv("SPARKINFER_K3_KDACONV");
+        return !(e && e[0] == '0');
+    }();
+    if (!want) return false;
+    // One element per thread per head is what makes the reduction identical to the
+    // kernel this replaces; wider heads would need the strided form, so decline and
+    // let the caller keep the five-launch path.
+    constexpr int BLOCK = 128;
+    if (d_conv < 2 || head_dim <= 0 || head_dim > BLOCK || n_head <= 0) return false;
+    dim3 grid((unsigned)n_head, 3u);
+    k3_pdl_launch(grid, BLOCK, 0, stream, kda_conv_l2_fused_kernel<BLOCK>,
+        out_q, out_k, out_v, st_q, st_k, st_v, x_q, x_k, x_v, w_q, w_k, w_v,
+        d_conv, head_dim, q_scale, eps);
+    return true;
 }
 
 void kda_conv_step_f32(float* out, float* state, const float* x, const float* w,
@@ -2460,7 +4565,7 @@ void kda_conv_step_f32(float* out, float* state, const float* x, const float* w,
     if (d_conv < 2 || d_inner <= 0) return;
     const int T = 256;
     const int blocks = (d_inner + T - 1) / T;
-    kda_conv_step_kernel<<<(unsigned)blocks, T, 0, stream>>>(out, state, x, w, d_conv, d_inner);
+    k3_pdl_launch((unsigned)blocks, T, 0, stream, kda_conv_step_kernel, out, state, x, w, d_conv, d_inner);
 }
 
 // Upload the lattice/sign tables once. __device__ (NOT __constant__) is the right
@@ -2503,12 +4608,86 @@ static void ensure_iq2xs_tables() {
     if (dev >= 0) ready[dev] = true;
 }
 
+// The SAME lattice at 2 bytes per codepoint instead of 8. Every byte of every
+// entry is in {0x00, 0x01, 0xff} (the header's tripwire), i.e. {0, 1, -1} — two
+// bits each in two's complement. Why it can pay: the 11-bit index is fully
+// divergent across a warp, so a gather's L1 cost is the number of DISTINCT
+// 128 B lines touched. A 16 KB table spans 128 lines -> E[distinct] ~ 28.4 per
+// warp; a 4 KB table spans 32 -> ~20.4 (-28%), purely from intra-warp line
+// coincidence. It also halves the registers holding the grid word. Packed
+// HOST-SIDE from the same iq1s_grid_host, so the extracted table remains the
+// single source of truth and the tripwire survives.
 static void ensure_iq1s_tables() {
     static bool ready[kMaxTableDevices] = {false};
     const int dev = current_device_index();
     if (dev >= 0 && ready[dev]) return;
     cudaMemcpyToSymbol(iq1s_grid_c, iq1s_grid_host, sizeof(iq1s_grid_host));
+    static uint16_t packed[SPARKINFER_IQ1S_NGRID];
+    static bool packed_ready = false;
+    if (!packed_ready) {
+        for (int i = 0; i < SPARKINFER_IQ1S_NGRID; ++i) {
+            const uint64_t gw = iq1s_grid_host[i];
+            uint16_t v = 0;
+            for (int j = 0; j < 8; ++j) {
+                const int8_t gj = (int8_t)((gw >> (8 * j)) & 0xffu);
+                v |= (uint16_t)((uint16_t)gj & 3u) << (2 * j);
+            }
+            packed[i] = v;
+        }
+        packed_ready = true;
+    }
+    cudaMemcpyToSymbol(iq1s_grid_p, packed, sizeof(packed));
     if (dev >= 0) ready[dev] = true;
+}
+
+// UPLOAD THE LATTICE TABLES BEFORE ANY CAPTURE BEGINS.
+//
+// ensure_iq2xs_tables()/ensure_iq1s_tables() are lazy and per-device, and they upload with
+// cudaMemcpyToSymbol — the SYNCHRONOUS form, which is illegal inside a stream capture.
+// Under UD-IQ1_S that first upload lands on the first MoE layer (layer 0 is leading_dense
+// and has no IQ1_S expert weights), so a capture that recorded layer 0 cleanly was being
+// invalidated at layer 1 by a one-time initialisation that has nothing to do with the layer.
+//
+// The failure is also maximally misleading: cudaGetLastError reports "operation failed due
+// to a previous error during capture" from the NEXT launch, so it accuses the MoE dispatch.
+//
+// Same hazard class as k3_mla_prewarm_split_scratch, same answer: do it eagerly at init,
+// with each device current, so the in-capture call hits its `ready[dev]` early return.
+void k3_prewarm_quant_tables() {
+    ensure_iq2xs_tables();
+    ensure_iq1s_tables();
+    // WEPS engagement counting, opt-in and uploaded here because this function runs
+    // once per device BEFORE any capture — the same synchronous-copy-legality window
+    // the table uploads need. Default off: the scored path never pays the atomics.
+    static const int count = [] {
+        const char* e = std::getenv("SPARKINFER_K3_WEPS_COUNT");
+        return (e && e[0] == '1') ? 1 : 0;
+    }();
+    if (count)
+        cudaMemcpyToSymbol(g_k3_weps_count, &count, sizeof(int));
+}
+
+// Bind the depth gate on the CURRENT device. Called from state init, with the
+// rank's device current and before any capture — the same synchronous-copy window
+// the quant-table prewarm uses. Passing the d_pos the forward already maintains
+// keeps a single source of truth for the position.
+void k3_weps_bind_pos(const int* d_pos) {
+    static const int minp = [] {
+        const char* e = std::getenv("SPARKINFER_K3_WEPS_MINPOS");
+        return e ? atoi(e) : 16384;
+    }();
+    cudaMemcpyToSymbol(g_k3_weps_pos, &d_pos, sizeof(d_pos));
+    cudaMemcpyToSymbol(g_k3_weps_min_pos, &minp, sizeof(int));
+}
+
+// Engagement readout for the CURRENT device; the caller loops ranks. Reset-on-read
+// so consecutive probes (per-depth KL runs) need no separate clear call.
+unsigned long long k3_weps_skips_read_current_device() {
+    unsigned long long v = 0;
+    cudaMemcpyFromSymbol(&v, g_k3_weps_skips, sizeof(v));
+    const unsigned long long zero = 0;
+    cudaMemcpyToSymbol(g_k3_weps_skips, &zero, sizeof(zero));
+    return v;
 }
 
 void dequant_iq2_xs_f32(float* out, const void* src, int64_t n, cudaStream_t stream) {
@@ -2522,7 +4701,7 @@ void dequant_iq2_xs_f32(float* out, const void* src, int64_t n, cudaStream_t str
     const int64_t n_groups = n / 8;
     const int T = 256;
     const int64_t blocks = (n_groups + T - 1) / T;
-    dequant_iq2_xs_kernel<<<(unsigned)blocks, T, 0, stream>>>(
+    k3_pdl_launch((unsigned)blocks, T, 0, stream, dequant_iq2_xs_kernel, 
         out, (const BlockIQ2XS*)src, n_groups);
 }
 
@@ -2532,15 +4711,120 @@ void moe_router_noaux_tc_f32(float* out_w, int* out_ids, const float* logits,
                              cudaStream_t stream) {
     if (n_expert <= 0 || top_k <= 0 || n_tokens <= 0) return;
     if (top_k > n_expert) return;
-    const int T = 256;
     const size_t shm = (size_t)2 * n_expert * sizeof(float);
-    moe_router_noaux_tc_kernel<256><<<(unsigned)n_tokens, T, shm, stream>>>(
+    const int T = 256;
+    k3_pdl_launch((unsigned)n_tokens, T, shm, stream, moe_router_noaux_tc_kernel<256>,
         out_w, out_ids, logits, bias, n_expert, top_k, norm_w, w_scale);
 }
 
 // One launch path for both quant types. The two front doors below differ only in the
 // table they prime and the block layout they name; duplicating the grid arithmetic
 // across them is the same drift the block_dot overloads exist to prevent.
+template <int DOWN_WARPS, typename Blk>
+static void moe_expert_ffn_launch_w(float* out, float* scratch,
+                                  const float* x, const int* ids, const float* w,
+                                  const void* gate_exps, const void* up_exps,
+                                  const void* down_exps,
+                                  int latent, int ffn, int top_k,
+                                  float situ_beta, float situ_linear_beta,
+                                  cudaStream_t stream,
+                                  int expert_begin, int n_local_experts) {
+    constexpr int GATE_WARPS = 8;
+    const int lb_active = situ_linear_beta > 0.0f ? 1 : 0;
+    // n_local <= 0 means "this rank holds every expert" — the tp_size 1 case, where
+    // the band test must never reject. INT_MAX makes it a no-op rather than a branch.
+    const int n_local = n_local_experts > 0 ? n_local_experts : INT_MAX;
+
+    // The "foreign slots read as zero" invariant is now established ONCE, when the
+    // scratch is allocated (kimi_k3.cpp), not on every layer.
+    //
+    // It holds just as strongly there, and the reason is that the set of foreign slots
+    // never changes: a rank's expert band is fixed for the run, and moe_gate_up writes
+    // only its OWN slots. A slot foreign to this rank is therefore written by nobody,
+    // ever — so a single zeroing at allocation leaves it zero for the whole run, which
+    // is exactly what re-zeroing it 92 times a token was buying. (Owned slots are fully
+    // overwritten before they are read, so clearing them was never load-bearing either.)
+    //
+    // That removes 92 launches and ~18 MB of writes per token per rank from the critical
+    // path while keeping the guarantee moe_down_combine's band re-test relies on.
+
+    // float4 activation reads need 16-byte alignment. Both pointers are cudaMalloc
+    // bases in every K3 caller and the per-block offsets are multiples of 1024 bytes,
+    // so the bases alone decide it.
+    const bool xvec = ((((uintptr_t)x) | ((uintptr_t)scratch)) & 15u) == 0;
+
+    const dim3 g1((unsigned)((ffn + GATE_WARPS - 1) / GATE_WARPS), (unsigned)top_k);
+    // partial[top_k] + the staged ids/w epilogue operands (see the kernel).
+    const size_t dshm = (size_t)top_k * (2 * sizeof(float) + sizeof(int));
+    const float inv_lb = lb_active ? 1.0f / situ_linear_beta : 1.0f;
+
+    if (xvec) {
+        // SPARKINFER_K3_IQ1S_PACK=1 reads the lattice through the 4 KB packed
+        // table (see iq1s_grid_p). DEFAULT OFF until measured — same one-binary
+        // A/B convention as every other gate on this branch.
+        static const bool gpack = [] {
+            // MEASURED +0.72 tok/s (3 sessions). Default ON; =0 restores.
+            const char* e = std::getenv("SPARKINFER_K3_IQ1S_PACK");
+            return !(e && e[0] == '0');
+        }();
+        // SPARKINFER_K3_IQ1S_SMEM=1 additionally stages the packed table in
+        // shared (gate/up only: 224 gathers/CTA amortise the 4 KB copy ~14:1;
+        // down_combine's 24 do not). DEFAULT OFF until measured.
+        static const bool gsmem = [] {
+            const char* e = std::getenv("SPARKINFER_K3_IQ1S_SMEM");
+            return e && e[0] == '1';
+        }();
+        static const bool rebal = [] {
+            const char* e = std::getenv("SPARKINFER_K3_MOE_REBAL");
+            return e && e[0] == '1';
+        }();
+        if (gpack && gsmem) {
+            k3_pdl_launch(g1, GATE_WARPS * 32, sizeof(uint16_t) * SPARKINFER_IQ1S_NGRID,
+                stream, moe_gate_up_situ_kernel<GATE_WARPS, true, Blk, true, true>,
+                scratch, x, ids, (const Blk*)gate_exps, (const Blk*)up_exps, latent, ffn,
+                situ_beta, 1.0f / situ_beta, situ_linear_beta, inv_lb, lb_active,
+                expert_begin, n_local, w, k3_moe_weps_host());
+            if (rebal)
+                k3_pdl_launch((unsigned)latent, DOWN_WARPS * 32, dshm, stream, moe_down_combine_kernel<DOWN_WARPS, true, Blk, true, true>,
+                    out, scratch, ids, w, (const Blk*)down_exps, latent, ffn, top_k,
+                    expert_begin, n_local, k3_moe_weps_host());
+                else
+                k3_pdl_launch((unsigned)latent, DOWN_WARPS * 32, dshm, stream, moe_down_combine_kernel<DOWN_WARPS, true, Blk, true>,
+                    out, scratch, ids, w, (const Blk*)down_exps, latent, ffn, top_k,
+                    expert_begin, n_local, k3_moe_weps_host());
+        } else if (gpack) {
+            k3_pdl_launch(g1, GATE_WARPS * 32, 0, stream, moe_gate_up_situ_kernel<GATE_WARPS, true, Blk, true>,
+                scratch, x, ids, (const Blk*)gate_exps, (const Blk*)up_exps, latent, ffn,
+                situ_beta, 1.0f / situ_beta, situ_linear_beta, inv_lb, lb_active,
+                expert_begin, n_local, w, k3_moe_weps_host());
+            if (rebal)
+                k3_pdl_launch((unsigned)latent, DOWN_WARPS * 32, dshm, stream, moe_down_combine_kernel<DOWN_WARPS, true, Blk, true, true>,
+                    out, scratch, ids, w, (const Blk*)down_exps, latent, ffn, top_k,
+                    expert_begin, n_local, k3_moe_weps_host());
+                else
+                k3_pdl_launch((unsigned)latent, DOWN_WARPS * 32, dshm, stream, moe_down_combine_kernel<DOWN_WARPS, true, Blk, true>,
+                    out, scratch, ids, w, (const Blk*)down_exps, latent, ffn, top_k,
+                    expert_begin, n_local, k3_moe_weps_host());
+        } else {
+        k3_pdl_launch(g1, GATE_WARPS * 32, 0, stream, moe_gate_up_situ_kernel<GATE_WARPS, true, Blk>,
+            scratch, x, ids, (const Blk*)gate_exps, (const Blk*)up_exps, latent, ffn,
+            situ_beta, 1.0f / situ_beta, situ_linear_beta, inv_lb, lb_active,
+            expert_begin, n_local, w, k3_moe_weps_host());
+        k3_pdl_launch((unsigned)latent, DOWN_WARPS * 32, dshm, stream, moe_down_combine_kernel<DOWN_WARPS, true, Blk>,
+                out, scratch, ids, w, (const Blk*)down_exps, latent, ffn, top_k,
+                expert_begin, n_local, k3_moe_weps_host());
+        }
+    } else {
+        k3_pdl_launch(g1, GATE_WARPS * 32, 0, stream, moe_gate_up_situ_kernel<GATE_WARPS, false, Blk>,
+            scratch, x, ids, (const Blk*)gate_exps, (const Blk*)up_exps, latent, ffn,
+            situ_beta, 1.0f / situ_beta, situ_linear_beta, inv_lb, lb_active,
+            expert_begin, n_local, w, k3_moe_weps_host());
+        k3_pdl_launch((unsigned)latent, DOWN_WARPS * 32, dshm, stream, moe_down_combine_kernel<DOWN_WARPS, false, Blk>,
+                out, scratch, ids, w, (const Blk*)down_exps, latent, ffn, top_k,
+                expert_begin, n_local, k3_moe_weps_host());
+    }
+}
+
 template <typename Blk>
 static void moe_expert_ffn_launch(float* out, float* scratch,
                                   const float* x, const int* ids, const float* w,
@@ -2550,46 +4834,16 @@ static void moe_expert_ffn_launch(float* out, float* scratch,
                                   float situ_beta, float situ_linear_beta,
                                   cudaStream_t stream,
                                   int expert_begin, int n_local_experts) {
-    constexpr int WARPS = 8;                       // 256-thread CTAs
-    const int lb_active = situ_linear_beta > 0.0f ? 1 : 0;
-    // n_local <= 0 means "this rank holds every expert" — the tp_size 1 case, where
-    // the band test must never reject. INT_MAX makes it a no-op rather than a branch.
-    const int n_local = n_local_experts > 0 ? n_local_experts : INT_MAX;
-
-    // Holds the "foreign slots read as zero" invariant the gate/up kernel used to
-    // maintain per-CTA. Only a banded rank can leave a slot untouched; at tp_size 1
-    // every slot is written, so memsetting there would be pure added work.
-    if (n_local_experts > 0 || expert_begin != 0)
-        cudaMemsetAsync(scratch, 0, (size_t)top_k * ffn * sizeof(float), stream);
-
-    // float4 activation reads need 16-byte alignment. Both pointers are cudaMalloc
-    // bases in every K3 caller and the per-block offsets are multiples of 1024 bytes,
-    // so the bases alone decide it.
-    const bool xvec = ((((uintptr_t)x) | ((uintptr_t)scratch)) & 15u) == 0;
-
-    const dim3 g1((unsigned)((ffn + WARPS - 1) / WARPS), (unsigned)top_k);
-    const size_t dshm = (size_t)top_k * sizeof(float);
-    const float inv_lb = lb_active ? 1.0f / situ_linear_beta : 1.0f;
-
-    if (xvec) {
-        moe_gate_up_situ_kernel<WARPS, true, Blk><<<g1, WARPS * 32, 0, stream>>>(
-            scratch, x, ids, (const Blk*)gate_exps, (const Blk*)up_exps, latent, ffn,
-            situ_beta, 1.0f / situ_beta, situ_linear_beta, inv_lb, lb_active,
-            expert_begin, n_local);
-        moe_down_combine_kernel<WARPS, true, Blk>
-            <<<(unsigned)latent, WARPS * 32, dshm, stream>>>(
-                out, scratch, ids, w, (const Blk*)down_exps, latent, ffn, top_k,
-                expert_begin, n_local);
-    } else {
-        moe_gate_up_situ_kernel<WARPS, false, Blk><<<g1, WARPS * 32, 0, stream>>>(
-            scratch, x, ids, (const Blk*)gate_exps, (const Blk*)up_exps, latent, ffn,
-            situ_beta, 1.0f / situ_beta, situ_linear_beta, inv_lb, lb_active,
-            expert_begin, n_local);
-        moe_down_combine_kernel<WARPS, false, Blk>
-            <<<(unsigned)latent, WARPS * 32, dshm, stream>>>(
-                out, scratch, ids, w, (const Blk*)down_exps, latent, ffn, top_k,
-                expert_begin, n_local);
-    }
+    static const int down_warps = [] {
+        const char* e = std::getenv("SPARKINFER_K3_MOE_DOWN_WARPS");
+        return e && std::atoi(e) == 8 ? 8 : 4;
+    }();
+#define K3_MOE_WCALL(DW) moe_expert_ffn_launch_w<DW, Blk>(                         \
+        out, scratch, x, ids, w, gate_exps, up_exps, down_exps, latent, ffn,       \
+        top_k, situ_beta, situ_linear_beta, stream, expert_begin, n_local_experts)
+    if (down_warps == 8) K3_MOE_WCALL(8);
+    else K3_MOE_WCALL(4);
+#undef K3_MOE_WCALL
 }
 
 void moe_expert_ffn_iq2xs_f32(float* out, float* scratch,
@@ -2618,7 +4872,7 @@ void dequant_iq1_s_f32(float* out, const void* src, int64_t n, cudaStream_t stre
     const int64_t n_groups = n / 8;
     const int T = 256;
     const int64_t blocks = (n_groups + T - 1) / T;
-    dequant_iq1_s_kernel<<<(unsigned)blocks, T, 0, stream>>>(
+    k3_pdl_launch((unsigned)blocks, T, 0, stream, dequant_iq1_s_kernel, 
         out, (const BlockIQ1S*)src, n_groups);
 }
 
@@ -2655,7 +4909,7 @@ bool dequant_f32_by_type(float* out, const void* src, int64_t n, int ggml_type,
             if (n <= 0) return false;
             const int T = 256;
             const int64_t blocks = (n + T - 1) / T;
-            dequant_f32_passthrough_kernel<<<(unsigned)blocks, T, 0, stream>>>(
+            k3_pdl_launch((unsigned)blocks, T, 0, stream, dequant_f32_passthrough_kernel, 
                 out, (const float*)src, n);
             return true;
         }
@@ -2664,7 +4918,7 @@ bool dequant_f32_by_type(float* out, const void* src, int64_t n, int ggml_type,
             const int64_t n_blocks = n / 32;
             const int T = 256;
             const int64_t blocks = (n_blocks + T - 1) / T;
-            dequant_q8_0_kernel<<<(unsigned)blocks, T, 0, stream>>>(
+            k3_pdl_launch((unsigned)blocks, T, 0, stream, dequant_q8_0_kernel, 
                 out, (const BlockQ8_0*)src, n_blocks);
             return true;
         }
@@ -2690,7 +4944,7 @@ bool moe_expert_ffn_f32_by_type(float* out, float* scratch,
         BlockQ8K* qin = (BlockQ8K*)q8k_scratch;
         BlockQ8K* qacts = qin + latent / 256;
         const int T = 128;
-        quantize_q8_k_kernel<<<((latent / 256) + T - 1) / T, T, 0, stream>>>(
+        k3_pdl_launch(((latent / 256) + T - 1) / T, T, 0, stream, quantize_q8_k_kernel, 
             qin, x, latent / 256, 1);
         const int lb_active = situ_linear_beta > 0.0f ? 1 : 0;
         const int n_local = n_local_experts > 0 ? n_local_experts : INT_MAX;
@@ -2698,7 +4952,7 @@ bool moe_expert_ffn_f32_by_type(float* out, float* scratch,
         switch (ggml_type) {
             case 17:
                 ensure_iq2xs_tables();
-                moe_gate_up_situ_q8k_kernel<BlockIQ2XS><<<g1, 32, 0, stream>>>(
+                k3_pdl_launch(g1, 32, 0, stream, moe_gate_up_situ_q8k_kernel<BlockIQ2XS>, 
                     scratch, qin, ids, (const BlockIQ2XS*)gate_exps,
                     (const BlockIQ2XS*)up_exps, latent, ffn,
                     situ_beta, 1.0f / situ_beta, situ_linear_beta,
@@ -2707,7 +4961,7 @@ bool moe_expert_ffn_f32_by_type(float* out, float* scratch,
                 break;
             case 19:
                 ensure_iq1s_tables();
-                moe_gate_up_situ_q8k_kernel<BlockIQ1S><<<g1, 32, 0, stream>>>(
+                k3_pdl_launch(g1, 32, 0, stream, moe_gate_up_situ_q8k_kernel<BlockIQ1S>, 
                     scratch, qin, ids, (const BlockIQ1S*)gate_exps,
                     (const BlockIQ1S*)up_exps, latent, ffn,
                     situ_beta, 1.0f / situ_beta, situ_linear_beta,
@@ -2718,14 +4972,14 @@ bool moe_expert_ffn_f32_by_type(float* out, float* scratch,
                 return false;
         }
         const int act_blocks = top_k * (ffn / 256);
-        quantize_q8_k_kernel<<<(act_blocks + T - 1) / T, T, 0, stream>>>(
+        k3_pdl_launch((act_blocks + T - 1) / T, T, 0, stream, quantize_q8_k_kernel, 
             qacts, scratch, ffn / 256, top_k);
         if (ggml_type == 17) {
-            moe_down_combine_q8k_kernel<BlockIQ2XS><<<(unsigned)latent, 32, 0, stream>>>(
+            k3_pdl_launch((unsigned)latent, 32, 0, stream, moe_down_combine_q8k_kernel<BlockIQ2XS>, 
                 out, qacts, ids, w, (const BlockIQ2XS*)down_exps,
                 latent, ffn, top_k, expert_begin, n_local);
         } else {
-            moe_down_combine_q8k_kernel<BlockIQ1S><<<(unsigned)latent, 32, 0, stream>>>(
+            k3_pdl_launch((unsigned)latent, 32, 0, stream, moe_down_combine_q8k_kernel<BlockIQ1S>, 
                 out, qacts, ids, w, (const BlockIQ1S*)down_exps,
                 latent, ffn, top_k, expert_begin, n_local);
         }
@@ -2749,27 +5003,220 @@ bool moe_expert_ffn_f32_by_type(float* out, float* scratch,
     }
 }
 
+// ---------------------------------------------------------------------------
+// The token-batched front door. See "4b. THE TOKEN-BATCHED DISPATCH" above for the
+// shape and the bit-identity argument; this is the plumbing.
+// ---------------------------------------------------------------------------
+
+// Rows carried per register tile in the grouped gate/up pass.
+//
+// 4, not 8. The DRAM win does not depend on it at all — that comes from every row of
+// an expert being walked by the SAME warp, so the weight row is fetched once and the
+// re-reads across tiles are L1 hits. NR only amortises the IQ1_S DECODE (the divergent
+// lattice gather is the expensive half of block_dot) and the L1 traffic. At NR = 8 the
+// gate/up kernel carries 16 accumulators and 8 row pointers on top of the decode
+// temporaries, which pushes it past the 48-register occupancy cliff the per-token
+// kernel already sits on — paying occupancy for an amortisation that is already 4x.
+constexpr int kMoeBatchRows = 4;
+
+static bool k3_moe_batch_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("SPARKINFER_K3_MOE_BATCH");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+
+// Smallest chunk the regroup is allowed to serve. Default 2, i.e. "every batched
+// call", per the one-binary A/B convention — but see the arithmetic in the section
+// header: the WEIGHT win is proportional to tokens-per-expert (B/56) and only becomes
+// the dominant term around B = 256. Below that the batched path is still a win on
+// launch count alone (2 launches plus a 3-kernel integer sort, against 2B), which is
+// why it is not gated higher by default. Raise it to bisect the two effects.
+static int k3_moe_batch_min_tok() {
+    static const int v = [] {
+        const char* e = std::getenv("SPARKINFER_K3_MOE_BATCH_MIN");
+        const int n = e ? atoi(e) : 2;
+        return n < 2 ? 2 : n;
+    }();
+    return v;
+}
+
+size_t k3_moe_batch_ws_bytes(int n_tok, int top_k, int n_expert_slots) {
+    if (n_tok <= 0 || top_k <= 0 || n_expert_slots <= 0) return 0;
+    // count[n_slots] | off[n_slots+1] | cursor[n_slots] | row_tok[N] | row_slot[N]
+    return ((size_t)3 * (size_t)n_expert_slots + 1 +
+            2 * (size_t)n_tok * (size_t)top_k) * sizeof(int);
+}
+
+template <typename Blk>
+static void moe_batch_launch(float* out, int64_t out_stride,
+                             float* scratch, int64_t scratch_stride,
+                             const float* x, int64_t x_stride,
+                             const int* ids, const float* w,
+                             const void* gate_exps, const void* up_exps,
+                             const void* down_exps,
+                             int latent, int ffn, int top_k, int n_tok,
+                             float situ_beta, float situ_linear_beta,
+                             cudaStream_t stream,
+                             int expert_begin, int n_slots, bool gpack,
+                             int* ws) {
+    constexpr int WARPS = 8;                       // 256-thread CTAs, as per-token
+    constexpr int SCAN = 256;
+    const int lb_active = situ_linear_beta > 0.0f ? 1 : 0;
+    const float inv_lb = lb_active ? 1.0f / situ_linear_beta : 1.0f;
+    const float weps = k3_moe_weps_host();
+    const int n_pair = n_tok * top_k;
+
+    int* d_count  = ws;
+    int* d_off    = d_count + n_slots;
+    int* d_cursor = d_off + n_slots + 1;
+    int* d_tok    = d_cursor + n_slots;
+    int* d_slot   = d_tok + n_pair;
+
+    // The histogram accumulates, so it needs a clear. n_slots ints, not the row list:
+    // every row slot is written by the scatter before anything reads it.
+    cudaMemsetAsync(d_count, 0, (size_t)n_slots * sizeof(int), stream);
+    const int T = 256;
+    k3_pdl_launch((unsigned)((n_pair + T - 1) / T), T, 0, stream,
+        moe_pair_count_kernel,
+        d_count, ids, w, n_pair, expert_begin, n_slots, weps);
+    k3_pdl_launch(1u, SCAN, 0, stream, moe_expert_offsets_kernel<SCAN>,
+        d_off, d_cursor, d_count, n_slots);
+    k3_pdl_launch((unsigned)((n_pair + T - 1) / T), T, 0, stream,
+        moe_pair_scatter_kernel,
+        d_tok, d_slot, d_cursor, ids, w, n_pair, top_k, expert_begin, n_slots, weps);
+
+    // gate/up: (j-blocks, local experts). `e` is the SLOW axis so the CTAs co-resident
+    // on an SM share one expert's activations in L1.
+    const dim3 g1((unsigned)((ffn + WARPS - 1) / WARPS), (unsigned)n_slots);
+    if (gpack) {
+        k3_pdl_launch(g1, WARPS * 32, 0, stream,
+            moe_gate_up_grouped_kernel<WARPS, kMoeBatchRows, Blk, true>,
+            scratch, scratch_stride, x, x_stride, d_tok, d_slot, d_off,
+            (const Blk*)gate_exps, (const Blk*)up_exps, latent, ffn,
+            situ_beta, 1.0f / situ_beta, situ_linear_beta, inv_lb, lb_active);
+    } else {
+        k3_pdl_launch(g1, WARPS * 32, 0, stream,
+            moe_gate_up_grouped_kernel<WARPS, kMoeBatchRows, Blk, false>,
+            scratch, scratch_stride, x, x_stride, d_tok, d_slot, d_off,
+            (const Blk*)gate_exps, (const Blk*)up_exps, latent, ffn,
+            situ_beta, 1.0f / situ_beta, situ_linear_beta, inv_lb, lb_active);
+    }
+
+    // down: (output elements, tokens). `o` fast — see the kernel's header.
+    //
+    // n_slots, NOT the INT_MAX "no band" sentinel, is what the combine's band test
+    // gets. For tp > 1 the two are the same number. For tp = 1 the sentinel would
+    // admit an id >= n_experts and index off the end of down_exps; n_slots refuses
+    // it and folds a zero instead. Only a corrupt router can tell them apart, and
+    // this is the direction that does not read a neighbouring allocation.
+    const size_t dshm = (size_t)top_k * (2 * sizeof(float) + sizeof(int));
+    const dim3 g2((unsigned)latent, (unsigned)n_tok);
+    if (gpack) {
+        k3_pdl_launch(g2, WARPS * 32, dshm, stream,
+            moe_down_combine_batch_kernel<WARPS, true, Blk, true>,
+            out, out_stride, scratch, scratch_stride, ids, w,
+            (const Blk*)down_exps, latent, ffn, top_k, expert_begin,
+            n_slots, weps);
+    } else {
+        k3_pdl_launch(g2, WARPS * 32, dshm, stream,
+            moe_down_combine_batch_kernel<WARPS, true, Blk, false>,
+            out, out_stride, scratch, scratch_stride, ids, w,
+            (const Blk*)down_exps, latent, ffn, top_k, expert_begin,
+            n_slots, weps);
+    }
+}
+
+// DECLINING IS ALWAYS SAFE AND IS NEVER AN ERROR. Every `return false` below means
+// "run the per-token loop", which is the shipped path and produces the same numbers.
+// The caller must treat false as a fallback, not a failure.
+bool moe_expert_ffn_batch_f32_by_type(float* out, int64_t out_row_stride,
+                                      float* scratch, int64_t scratch_row_stride,
+                                      const float* x, int64_t x_row_stride,
+                                      const int* ids, const float* w,
+                                      const void* gate_exps, const void* up_exps,
+                                      const void* down_exps,
+                                      int latent, int ffn, int top_k, int n_tok,
+                                      float situ_beta, float situ_linear_beta,
+                                      int ggml_type, cudaStream_t stream,
+                                      int expert_begin, int n_local_experts,
+                                      int n_expert_total,
+                                      void* ws, size_t ws_bytes) {
+    if (!k3_moe_batch_on()) return false;
+    if (n_tok < k3_moe_batch_min_tok()) return false;
+    if (latent <= 0 || ffn <= 0 || top_k <= 0) return false;
+    if (latent % 256 || ffn % 256) return false;
+    if (ggml_type != 17 && ggml_type != 19) return false;
+    if (!ws) return false;
+
+    // The bucket count is the rank's OWN expert count: its band under tp > 1, the
+    // whole model otherwise. The per-token kernels take INT_MAX as "no band", which
+    // is a fine test but not a fine array size — hence the separate total.
+    const int n_slots = n_local_experts > 0 ? n_local_experts : n_expert_total;
+    if (n_slots <= 0 || n_slots > 65535) return false;   // gridDim.y, gate/up
+    if (n_tok > 65535) return false;                     // gridDim.y, down
+    if (ws_bytes < k3_moe_batch_ws_bytes(n_tok, top_k, n_slots)) return false;
+
+    // The grouped kernels read activations as float4 unconditionally (the scalar
+    // fallback exists only on the decode path, where an unaligned base has never been
+    // observed). Decline rather than fault: every K3 caller passes cudaMalloc bases
+    // with 16-byte-multiple row strides, so this is a tripwire, not a live branch.
+    if (((((uintptr_t)x) | ((uintptr_t)scratch)) & 15u) != 0) return false;
+    if (((x_row_stride | scratch_row_stride) & 3) != 0) return false;
+
+    static const bool gpack = [] {
+        const char* e = std::getenv("SPARKINFER_K3_IQ1S_PACK");
+        return !(e && e[0] == '0');
+    }();
+
+    if (ggml_type == 17) {
+        ensure_iq2xs_tables();
+        moe_batch_launch<BlockIQ2XS>(out, out_row_stride, scratch, scratch_row_stride,
+                                     x, x_row_stride, ids, w, gate_exps, up_exps,
+                                     down_exps, latent, ffn, top_k, n_tok, situ_beta,
+                                     situ_linear_beta, stream, expert_begin, n_slots,
+                                     gpack, (int*)ws);
+    } else {
+        ensure_iq1s_tables();
+        moe_batch_launch<BlockIQ1S>(out, out_row_stride, scratch, scratch_row_stride,
+                                    x, x_row_stride, ids, w, gate_exps, up_exps,
+                                    down_exps, latent, ffn, top_k, n_tok, situ_beta,
+                                    situ_linear_beta, stream, expert_begin, n_slots,
+                                    gpack, (int*)ws);
+    }
+    return true;
+}
+
 void mla_gate_out_f32(float* out, const float* attn_out, const float* gate_proj,
-                      int64_t n, cudaStream_t stream) {
-    if (n <= 0) return;
+                      int64_t n, cudaStream_t stream,
+                      int n_rows, int64_t row_stride) {
+    if (n <= 0 || n_rows <= 0) return;
     const int T = 256;
     const int64_t blocks = (n + T - 1) / T;
-    mla_gate_out_kernel<<<(unsigned)blocks, T, 0, stream>>>(out, attn_out, gate_proj, n);
+    if (row_stride == 0) row_stride = n;
+    k3_pdl_launch(dim3((unsigned)blocks, (unsigned)n_rows), T, 0, stream,
+                  mla_gate_out_kernel, out, attn_out, gate_proj, n, row_stride);
 }
 
 void kda_decay_gate_f32(float* out, const float* g_raw, const float* A,
                         int head_dim, int n_head, float lower_bound,
-                        cudaStream_t stream) {
-    if (head_dim <= 0 || n_head <= 0) return;
-    kda_decay_gate_kernel<<<(unsigned)n_head, head_dim, 0, stream>>>(
-        out, g_raw, A, head_dim, lower_bound);
+                        cudaStream_t stream, int n_rows, int64_t row_stride) {
+    if (head_dim <= 0 || n_head <= 0 || n_rows <= 0) return;
+    if (row_stride == 0) row_stride = (int64_t)head_dim * n_head;
+    k3_pdl_launch(dim3((unsigned)n_head, (unsigned)n_rows), head_dim, 0, stream,
+        kda_decay_gate_kernel,
+        out, g_raw, A, head_dim, lower_bound, row_stride);
 }
 
 void l2_norm_heads_f32(float* out, const float* x, int head_dim, int n_head,
-                       float scale, float eps, cudaStream_t stream) {
-    if (head_dim <= 0 || n_head <= 0) return;
-    l2_norm_heads_kernel<128><<<(unsigned)n_head, 128, 0, stream>>>(
-        out, x, head_dim, scale, eps);
+                       float scale, float eps, cudaStream_t stream,
+                       int n_rows, int64_t row_stride) {
+    if (head_dim <= 0 || n_head <= 0 || n_rows <= 0) return;
+    if (row_stride == 0) row_stride = (int64_t)head_dim * n_head;
+    k3_pdl_launch(dim3((unsigned)n_head, (unsigned)n_rows), 128, 0, stream,
+        l2_norm_heads_kernel<128>,
+        out, x, head_dim, scale, eps, row_stride);
 }
 
 void mla_absorb_q_f32(float* out, const float* q_nope, const float* q_pe,
@@ -2777,15 +5224,187 @@ void mla_absorb_q_f32(float* out, const float* q_nope, const float* q_pe,
                       int n_head, cudaStream_t stream) {
     if (n_head <= 0 || kv_lora <= 0 || qk_nope <= 0) return;
     dim3 grid((unsigned)kv_lora, (unsigned)n_head);
-    mla_absorb_q_kernel<128><<<grid, 128, 0, stream>>>(
+    k3_pdl_launch(grid, 128, 0, stream, mla_absorb_q_kernel<128>, 
         out, q_nope, q_pe, wk_b, qk_nope, kv_lora, rope_dim);
 }
 
-void mla_decode_attn_f32(float* out, const float* q, const float* k_cache,
-                         const float* wv_b, int key_length, int kv_lora,
-                         int v_dim, int n_head, int n_ctx, float scale,
-                         cudaStream_t stream) {
+// SPARKINFER_K3_MLA_FILL, read once. Lifted out of the launcher's function-local static
+// so k3_mla_split_suggest() below cannot read a different answer than the launcher acts
+// on. Same env var, same default, same value — only the storage moved.
+// SPARKINFER_K3_MLA_FILL_PARTIAL, lifted for the SAME reason and it matters MORE here
+// than the flag above does.
+//
+// The partial-fill relaxation is what makes the below-threshold case move at all: at the
+// scored ingestion depths (n_ctx < 33,792, i.e. all of the 0 -> 32,768 walk) the loop's
+// shortened slice never reaches `fill`, so this flag alone decides whether `min_slice`
+// is taken or discarded — 256 splits against 64 at n_ctx 32,768. A k3_mla_split_suggest()
+// that did not model it would advise the pre-relaxation number and a pinned chunk graph
+// would bake a grid four times narrower than the one the unpinned launcher runs.
+//
+// Same env var, same default (ON), same one-time read as the launcher's static: the two
+// callers cannot disagree because there is only one `on` to disagree about.
+// THE ONE DERIVATION OF `splits`. The launcher below calls this, and so does the driver's
+// graph-invalidation check — deliberately the same function, not the same formula written
+// twice. A capture that believes the plan is unchanged while the launcher picks a different
+// grid does not fail loudly; it launches the wrong shape.
+int k3_mla_decode_plan(int n_head, int kv_lora, int n_ctx) {
+    if (n_head <= 0 || kv_lora <= 0 || n_ctx <= 0) return 1;
+    int dev = 0;
+    // A pin short-circuits the derivation in BOTH callers, which is what makes the
+    // "one derivation" property hold harder while pinned than while not: unpinned,
+    // this function is a coarser bucketing than the launcher (it does not model the
+    // launcher's fill relaxation) and is only ever used as an invalidation TRIGGER;
+    // pinned, the two agree exactly, because both reduce to the same clamp.
+    const int pin = k3_mla_split_pin_at(n_ctx);
+    if (pin > 0) {
+        if (pin == 1 || !k3_mla_split_scratch(n_head, kv_lora, &dev)) return 1;
+        return std::min(pin, k3_mla_max_splits(n_head));
+    }
+    const int smin = k3_mla_split_min_ctx_at(n_ctx);
+    if (n_ctx < smin) return 1;
+    if (!k3_mla_split_scratch(n_head, kv_lora, &dev)) return 1;
+    return std::min(k3_mla_max_splits(n_head), (n_ctx + smin - 1) / smin);
+}
+
+// WHAT THE LAUNCHER WOULD PICK AT THIS DEPTH, UNPINNED. Advisory, and that word is
+// load-bearing.
+//
+// k3_mla_decode_plan() above is a COARSER answer than the launcher's: it stops at
+// ceil(n_ctx / smin) and does not model the fill relaxation, because it only has to
+// change when the plan changes, not to equal it. That is fine for invalidation and
+// wrong for choosing a pin — at n_ctx 32,768 with the ingestion floor at 512 it returns
+// 64, where the launcher actually runs 256. Pinning 64 would be correct and would throw
+// away four fifths of the CTAs the relaxation exists to win.
+//
+// So a caller that is about to pin asks THIS for the number, and pins that. Nothing's
+// SAFETY depends on the two agreeing: once pinned, the launcher and
+// k3_mla_decode_plan() both reduce to std::min(pin, k3_mla_max_splits(n_head)) and are
+// exactly equal by construction. A drift here can only cost occupancy, never
+// correctness — which is why duplicating the shape of the derivation is acceptable
+// here and is not acceptable between the launcher and the invalidation check.
+//
+// Reads the CURRENT split-min scope, so call it with the same scope the captured region
+// will run under, and BEFORE engaging the pin (a pin would short-circuit the floor).
+int k3_mla_split_suggest(int n_head, int key_length, int kv_lora, int n_ctx) {
+    if (n_head <= 0 || key_length <= 0 || kv_lora <= 0 || n_ctx <= 0) return 1;
+    constexpr int BLOCK = 256;   // mla_decode_attn_launch's block size
+    int dev = 0;
+    const int smin = k3_mla_split_min_ctx_at(n_ctx);
+    int splits = (n_ctx >= smin && k3_mla_split_scratch(n_head, kv_lora, &dev))
+               ? std::min(k3_mla_max_splits(n_head), (n_ctx + smin - 1) / smin)
+               : 1;
+    if (splits <= 1) return 1;
+
+    const int rslots = (kv_lora + BLOCK - 1) / BLOCK;
+    const int hpb    = k3_mla_heads_per_block(n_head, key_length);
+    if (hpb > 1 && rslots <= kMlaMaxRSlots) {
+        const int groups = n_head / hpb;
+        const int sm     = k3_sm_count(dev);
+        if (sm > 0) {
+            const int fill = (kMlaBlocksPerSm * sm + groups - 1) / groups;
+            int min_slice  = k3_mla_min_slice_len(hpb, key_length, kv_lora);
+            int by_len     = std::max(1, n_ctx / min_slice);
+            // THE MIRROR IS LINE-FOR-LINE ON PURPOSE. Everything from `fill` down to the
+            // two clamps below is the launcher's relaxation copied verbatim, including
+            // the partial-fill guard and the dead `min_slice` store, so the two can be
+            // diffed by eye. The flags are read through the same two helpers the
+            // launcher calls rather than re-parsed from the environment here.
+            if (k3_mla_reach_fill()) {
+                int ms = min_slice;
+                while (ms > kMlaCtxTile && n_ctx / ms < fill) ms -= kMlaCtxTile;
+                if (k3_mla_partial_fill() || n_ctx / ms >= fill) {
+                    min_slice = ms;
+                    by_len    = std::max(1, n_ctx / ms);
+                }
+            }
+            splits = std::max(splits, std::min(fill, by_len));
+            splits = std::min(std::max(splits, 1), k3_mla_max_splits(n_head));
+        }
+    }
+    return splits;
+}
+
+// Allocate the split scratch BEFORE any capture begins.
+//
+// k3_mla_split_scratch() cudaMallocs when capacity is short, and an allocation inside a
+// stream capture does not fail the allocation — it fails the CAPTURE, from a call site
+// nowhere near the graph code. Pre-warming at the largest shape the model will use means
+// the in-capture call hits its `need <= cap` early return and allocates nothing.
+bool k3_mla_prewarm_split_scratch(int n_head, int kv_lora) {
+    int dev = 0;
+    return k3_mla_split_scratch(n_head, kv_lora, &dev);
+}
+
+void k3_mla_kv_store_f32(float* cache, const float* kv_cmpr_normed,
+                         const float* kv_a_out, const int* d_pos,
+                         int kv_lora, int rope_dim, int key_length,
+                         cudaStream_t stream, int n_rows,
+                         int64_t cmpr_stride, int64_t kva_stride) {
+    if (!cache || !d_pos || kv_lora <= 0 || rope_dim <= 0 || key_length <= 0) return;
+    if (n_rows <= 0 || n_rows > 65535) return;
+    // The two source buffers have DIFFERENT natural widths and always did: the normed
+    // compressed latent is kv_lora wide, the raw kv_a projection is key_length wide (the
+    // kernel reads its rope tail past kv_lora). One shared stride for both would be
+    // silently wrong the moment n_rows > 1, so 0 resolves per buffer.
+    if (cmpr_stride == 0) cmpr_stride = kv_lora;
+    if (kva_stride == 0)  kva_stride  = key_length;
+    const int n = kv_lora + rope_dim;
+    const int T = 256;
+    k3_pdl_launch(dim3((unsigned)((n + T - 1) / T), (unsigned)n_rows), T, 0, stream,
+        mla_kv_store_kernel,
+        cache, kv_cmpr_normed, kv_a_out, d_pos, kv_lora, rope_dim, key_length,
+        cmpr_stride, kva_stride);
+}
+
+void k3_fill_pos_vec(int* out, const int* base, int n, cudaStream_t stream) {
+    if (!out || !base || n <= 0) return;
+    const int T = 64;
+    k3_pdl_launch((unsigned)((n + T - 1) / T), T, 0, stream, fill_pos_vec_kernel,
+                  out, base, n);
+}
+
+void k3_bump_pos_by(int* d_pos, int n, cudaStream_t stream) {
+    if (!d_pos || n <= 0) return;
+    k3_pdl_launch(1, 1, 0, stream, bump_pos_by_kernel, d_pos, n);
+}
+
+void k3_bump_pos(int* d_pos, cudaStream_t stream) {
+    if (!d_pos) return;
+    k3_pdl_launch(1, 1, 0, stream, bump_pos_kernel, d_pos);
+}
+
+void k3_add_pos(int* d_pos, int delta, cudaStream_t stream) {
+    if (!d_pos || delta == 0) return;
+    k3_pdl_launch(1, 1, 0, stream, add_pos_kernel, d_pos, delta);
+}
+
+// TWO LENGTHS, AND THE SPLIT BETWEEN THEM IS THE WHOLE POINT.
+//
+//   n_ctx    — the HOST's view. Used only to derive `splits`, which sizes the grid and
+//              picks which kernel runs. A captured graph cannot change either, so this
+//              one is allowed to be a plain int: when it moves the plan, the driver
+//              re-captures (see k3_mla_decode_plan).
+//   d_pos    — the DEVICE's view, holding the ROW INDEX. The kernels derive the length
+//              from it as *d_pos + 1, the same +1 the host applies. One device value
+//              with one meaning: the KV store indexes a row with it, the attention
+//              lengths a loop with it. Read from
+//              memory on every launch, so a replayed graph attends over the live
+//              position instead of the one frozen at capture time.
+//
+// They must agree. k3_mla_decode_plan() is the single derivation both the driver's
+// invalidation check and this launcher call — a probe that can drift from what actually
+// launches fails by launching the wrong grid, which is worse than not having one.
+//
+// One launcher for both cache layouts: KV is deduced by every kernel from the
+// k_cache argument, so this dispatch is written once and the f32/f16 entry
+// points at the bottom are one-line wrappers.
+template <typename KV>
+static void mla_decode_attn_launch(float* out, const float* q, const KV* k_cache,
+                                   const float* wv_b, int key_length, int kv_lora,
+                                   int v_dim, int n_head, int n_ctx, const int* d_pos,
+                                   float scale, cudaStream_t stream) {
     if (n_head <= 0 || n_ctx <= 0 || key_length <= 0 || kv_lora <= 0 || v_dim <= 0) return;
+    if (!d_pos) return;
     constexpr int BLOCK = 256;
     // O(key_length + kv_lora + tile) and NOT O(n_ctx) — 4.8 KB at K3's real dims,
     // the same at 128 tokens of context and at 1M. See the kernel's header note on
@@ -2804,12 +5423,48 @@ void mla_decode_attn_f32(float* out, const float* q, const float* k_cache,
     // pass and the extra global round trip cost more than the parallelism buys, and the
     // un-split kernel is also the one the numeric test pins bit-for-bit.
     int dev = 0;
-    int splits = (n_ctx >= kMlaSplitMinCtx && k3_mla_split_scratch(n_head, kv_lora, &dev))
+    const int split_pin = k3_mla_split_pin_at(n_ctx);
+    int splits = split_pin > 0
+               ? ((split_pin > 1 && k3_mla_split_scratch(n_head, kv_lora, &dev))
+                    ? std::min(split_pin, k3_mla_max_splits(n_head)) : 1)
+               : (n_ctx >= kMlaSplitMinCtx && k3_mla_split_scratch(n_head, kv_lora, &dev))
                ? std::min(k3_mla_max_splits(n_head), (n_ctx + kMlaSplitMinCtx - 1) / kMlaSplitMinCtx)
                : 1;
+
+    // THE PIN REPLACES THE DERIVED COUNT, AND IS CLAMPED BY THE SAME TWO LIMITS THAT
+    // BOUND IT.
+    //
+    //   k3_mla_max_splits(n_head)  — the (head, slice) budget, kMlaSplitBudget/n_head
+    //                                capped at 1024, or SPARKINFER_K3_MLA_SPLIT_CAP.
+    //   the per-device scratch     — sized by k3_mla_split_scratch() at exactly
+    //                                n_head * k3_mla_max_splits(n_head) * kv_lora, so
+    //                                the clamp above IS the allocation bound. Nothing
+    //                                a pin can ask for grows it, which is also what
+    //                                keeps this call capture-safe: it hits the
+    //                                `need <= cap` early return that
+    //                                k3_mla_prewarm_split_scratch() arranged, and a
+    //                                cudaMalloc inside a capture would fail the
+    //                                CAPTURE rather than the allocation.
+    //
+    // The combine's shared memory is the third consumer of `splits` (s_w is splits + 1
+    // floats) and is bounded by the same clamp: 1024 slices is 4 KB against the 48 KB
+    // kMlaShmBudget, so it cannot be the binding limit.
+    //
+    // Pinning to 1 is legal and means the un-split kernel, one block per head, no
+    // scratch and no combine — a perfectly stable geometry for a recording.
+    //
+    // The `n_ctx` the kernels slice with is UNTOUCHED. See the note on
+    // k3_mla_set_split_pin: bounds stay per-token, only the count is fixed.
+    const int pin_l = k3_mla_split_pin_at(n_ctx);
+    if (pin_l > 0) {
+        splits = (pin_l > 1 && k3_mla_split_scratch(n_head, kv_lora, &dev))
+               ? std::min(pin_l, k3_mla_max_splits(n_head))
+               : 1;
+    }
+
     if (splits <= 1) {
-        mla_decode_attn_kernel<BLOCK><<<(unsigned)n_head, BLOCK, shm, stream>>>(
-            out, q, k_cache, wv_b, key_length, kv_lora, v_dim, n_ctx, scale);
+        k3_pdl_launch((unsigned)n_head, BLOCK, shm, stream, mla_decode_attn_kernel<BLOCK, KV>, 
+            out, q, k_cache, wv_b, key_length, kv_lora, v_dim, d_pos, scale);
         return;
     }
 
@@ -2841,59 +5496,309 @@ void mla_decode_attn_f32(float* out, const float* q, const float* k_cache,
         // 264 the constant quietly became the binding term and cost 4%.
         const int groups = n_head / hpb;
         const int sm     = k3_sm_count(dev);
-        if (sm > 0) {
-            const int fill      = (kMlaBlocksPerSm * sm + groups - 1) / groups;
-            const int min_slice = k3_mla_min_slice_len(hpb, key_length, kv_lora);
-            const int by_len    = std::max(1, n_ctx / min_slice);
+        if (sm > 0 && split_pin <= 0) {
+            const int fill = (kMlaBlocksPerSm * sm + groups - 1) / groups;
+            int min_slice  = k3_mla_min_slice_len(hpb, key_length, kv_lora);
+            int by_len     = std::max(1, n_ctx / min_slice);
+
+            // MISSING THE FILL TARGET BY 3% COSTS 4%, BECAUSE THE SHORTFALL IS A WHOLE
+            // PARTIAL WAVE.
+            //
+            // `fill` is kMlaBlocksPerSm blocks on every SM and the grid is a single
+            // wave, so block counts BETWEEN wave boundaries do not degrade gracefully:
+            // the remainder blocks land one-per-SM and those SMs idle for the second
+            // half of the kernel while the doubled-up ones finish. At the scored shape
+            // the floor divides 131,039 into 255 slices against a target of 264, so
+            // NINE of 132 SMs run one block instead of two. Measured on one H200 at
+            // ctx 131,039, kernel alone, best of 3 interleaved passes:
+            //
+            //   splits  blk/SM   ms      vs 255
+            //     132    1.00    0.311   0.718x
+            //     198    1.50    0.268   0.832x
+            //     255    1.93    0.223   1.000x   <- shipped
+            //     264    2.00    0.217   1.030x   <- the target, reached
+            //     330    2.50    0.290   0.769x
+            //     396    3.00    0.266   0.840x
+            //
+            // The sawtooth is the whole story: every half-wave point loses to the whole
+            // wave below it. So when the floor lands SHORT of the target, step the slice
+            // down by whole tiles until the target is reachable. This can only ever
+            // raise `splits` to `fill` and never past it — the std::min below still
+            // caps it — so it does not spend the scratch or the combine width that the
+            // comment above warns overshooting costs. What it does spend is slice
+            // length: 131,039/264 = 496 tokens against 514, a 3.6% shorter slice, which
+            // is a 3.6% larger partial-write tax on the 8.6% of traffic that partials
+            // are. That is the trade, and it is 0.3% against 3.0%.
+            //
+            // SPARKINFER_K3_MLA_FILL=0 restores the shipped split count on the SAME
+            // binary. Default ON: the harness scores a default build.
+            // TAKE THE PARALLELISM YOU CAN REACH, NOT ONLY THE PARALLELISM THAT REACHES
+            // THE TARGET.
+            //
+            // This used to apply the shortened slice ONLY when it got all the way to
+            // `fill`, on the reasoning that a context too short to feed the machine is a
+            // case the floor already handles. That reasoning holds at decode, where the
+            // context is long and the guard passes. It is exactly backwards for PREFILL.
+            //
+            // The guard clears only when n_ctx / kMlaCtxTile >= fill, i.e. at K3's
+            // sharded shape (groups 1, fill 264) when n_ctx >= 33,792. The scored prefill
+            // walks 0 -> 32,768 and is therefore ENTIRELY below it: for every token of
+            // the scored metric the shortening was computed and then thrown away, and
+            // the MLA attention ran on the long slice at a grid of 8..64 blocks against
+            // 132 SMs. Reaching only 128 of 264 is not "cannot fill the machine", it is
+            // four times the parallelism of not trying.
+            //
+            // The loop already stops at the first ms that reaches `fill`, so removing the
+            // guard cannot overshoot: a context that DOES clear the threshold gets the
+            // identical ms it got before, and the 128k decode guard is bit-for-bit
+            // untouched. Only the below-threshold case changes, and only upward.
+            //
+            // What it spends is slice length, and the tax is the partial-write term
+            // tax(slice) = 2*hpb*kv_lora/(key_length*slice) -- 4.17% at 512, 16.7% at one
+            // tile. That is traffic, and the kernel it is buying parallelism for is
+            // LATENCY-bound at these grid sizes, not traffic-bound, which is the trade.
+            // SPARKINFER_K3_MLA_FILL_PARTIAL=0 restores the all-or-nothing form on one
+            // binary so the two can be measured against each other.
+            if (k3_mla_reach_fill()) {
+                int ms = min_slice;
+                while (ms > kMlaCtxTile && n_ctx / ms < fill) ms -= kMlaCtxTile;
+                if (k3_mla_partial_fill() || n_ctx / ms >= fill) {
+                    min_slice = ms;
+                    by_len    = std::max(1, n_ctx / ms);
+                }
+            }
+
             splits = std::max(splits, std::min(fill, by_len));
             splits = std::min(std::max(splits, 1), k3_mla_max_splits(n_head));
         }
         dim3 hgrid((unsigned)groups, (unsigned)splits);
         bool launched = true;
+
+        // THE DEEP-UNROLL INSTANTIATION IS OFFERED FOR ONE SHAPE ONLY.
+        //
+        // (UT 8, UD 6) sits at exactly 128 registers — the last pair that still fits two
+        // blocks per SM — and it was measured at HPB 12 / RSLOTS 2, which is what tp=8
+        // head-sharding actually launches at the scored context. The register cost of an
+        // unroll depth is a function of RSLOTS and TPW, so carrying the same depth into
+        // HPB 8 or RSLOTS 4 would be extrapolating a cliff-edge number onto a shape
+        // nothing has compiled, let alone timed. Every other case therefore keeps the
+        // shipped (4, 2) and this front door simply declines.
+        //
+        // SPARKINFER_K3_MLA_UNROLL=0 restores the shipped depth on the SAME binary, so a
+        // leave-one-out ablation does not need a second build. Default ON: the harness
+        // scores a default build.
+        static const bool deep_unroll = [] {
+            const char* e = std::getenv("SPARKINFER_K3_MLA_UNROLL");
+            return !(e && e[0] == '0');
+        }();
+        if (deep_unroll && hpb == 12 && rslots == 2) {
+            // SPARKINFER_K3_MLA_LSPLIT=1 selects the head-group/__half2 latent pass
+            // (see the kernel's LSP note). DEFAULT OFF until measured. Needs a 16-bit
+            // cache and kv_lora divisible by BLOCK so the pair-slots tile exactly.
+            static const bool lsplit = [] {
+                const char* e = std::getenv("SPARKINFER_K3_MLA_LSPLIT");
+                return e && e[0] == '1';
+            }();
+            // SPARKINFER_K3_MLA_PVT=1: t-major s_p (see the kernel's PVT note).
+            // DEFAULT OFF until measured. Composes with LSPLIT; measured alone
+            // first per the overlap lesson.
+            static const bool pvt = [] {
+                // MEASURED +0.51 tok/s. Default ON; =0 restores head-major.
+                const char* e = std::getenv("SPARKINFER_K3_MLA_PVT");
+                return !(e && e[0] == '0');
+            }();
+            static const bool qt = [] {
+                const char* e = std::getenv("SPARKINFER_K3_MLA_QT");
+                return e && e[0] == '1';
+            }();
+            // KLENT=576 folds the per-head s_q bases to immediates. MEASURED
+            // +0.20 on the head-major kernel; composed with PVT below because
+            // the two touch different axes (constant folding vs s_p layout).
+            // =0 restores the runtime-key_length instantiations.
+            static const bool klen_on = [] {
+                const char* e = std::getenv("SPARKINFER_K3_MLA_KLEN");
+                return !(e && e[0] == '0');
+            }();
+            const bool klen576 = klen_on && key_length == 576;
+            if (qt && pvt && lsplit && sizeof(KV) == 2 && (kv_lora % BLOCK) == 0) {
+                k3_pdl_launch(hgrid, BLOCK, hshm, stream,
+                              mla_decode_attn_hbatch_kernel<BLOCK, 12, 2, KV,
+                                                            kMlaTokensPerWarp, 8, 6,
+                                                            true, true, 0, true>,
+                              g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache,
+                              key_length, kv_lora, d_pos, scale, splits);
+            } else if (qt && pvt) {
+                k3_pdl_launch(hgrid, BLOCK, hshm, stream,
+                              mla_decode_attn_hbatch_kernel<BLOCK, 12, 2, KV,
+                                                            kMlaTokensPerWarp, 8, 6,
+                                                            false, true, 0, true>,
+                              g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache,
+                              key_length, kv_lora, d_pos, scale, splits);
+            } else if (qt) {
+                k3_pdl_launch(hgrid, BLOCK, hshm, stream,
+                              mla_decode_attn_hbatch_kernel<BLOCK, 12, 2, KV,
+                                                            kMlaTokensPerWarp, 8, 6,
+                                                            false, false, 0, true>,
+                              g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache,
+                              key_length, kv_lora, d_pos, scale, splits);
+            } else if (pvt && lsplit && sizeof(KV) == 2 && (kv_lora % BLOCK) == 0) {
+                k3_pdl_launch(hgrid, BLOCK, hshm, stream,
+                              mla_decode_attn_hbatch_kernel<BLOCK, 12, 2, KV,
+                                                            kMlaTokensPerWarp, 8, 6, true, true>,
+                              g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache,
+                              key_length, kv_lora, d_pos, scale, splits);
+            } else if (pvt && klen576) {
+                // The default path: PVT's t-major s_p with KLENT's folded bases.
+                k3_pdl_launch(hgrid, BLOCK, hshm, stream,
+                              mla_decode_attn_hbatch_kernel<BLOCK, 12, 2, KV,
+                                                            kMlaTokensPerWarp, 8, 6,
+                                                            false, true, 576>,
+                              g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache,
+                              key_length, kv_lora, d_pos, scale, splits);
+            } else if (pvt) {
+                k3_pdl_launch(hgrid, BLOCK, hshm, stream,
+                              mla_decode_attn_hbatch_kernel<BLOCK, 12, 2, KV,
+                                                            kMlaTokensPerWarp, 8, 6, false, true>,
+                              g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache,
+                              key_length, kv_lora, d_pos, scale, splits);
+            } else if (lsplit && sizeof(KV) == 2 && (kv_lora % BLOCK) == 0) {
+                k3_pdl_launch(hgrid, BLOCK, hshm, stream,
+                              mla_decode_attn_hbatch_kernel<BLOCK, 12, 2, KV,
+                                                            kMlaTokensPerWarp, 8, 6, true>,
+                              g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache,
+                              key_length, kv_lora, d_pos, scale, splits);
+            } else if ([]{ static const bool on = [] {
+                                const char* e = std::getenv("SPARKINFER_K3_MLA_UD7");
+                                return e && e[0] == '1'; }();
+                            return on; }() && key_length == 576) {
+                // The deeper unroll KLEN exists to enable: UD=7 measured 136 regs
+                // with a runtime key_length (over the 128 cliff); with KLENT the
+                // s_q bases fold to immediates and it may fit. ptxas decides.
+                k3_pdl_launch(hgrid, BLOCK, hshm, stream,
+                              mla_decode_attn_hbatch_kernel<BLOCK, 12, 2, KV,
+                                                            kMlaTokensPerWarp, 8, 7,
+                                                            false, false, 576>,
+                              g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache,
+                              key_length, kv_lora, d_pos, scale, splits);
+            } else if (klen576) {
+                // KLENT=576 instantiation — same UT/UD, constants folded into
+                // immediate offsets. ptxas -v (CI) reports the register delta.
+                k3_pdl_launch(hgrid, BLOCK, hshm, stream,
+                              mla_decode_attn_hbatch_kernel<BLOCK, 12, 2, KV,
+                                                            kMlaTokensPerWarp, 8, 6,
+                                                            false, false, 576>,
+                              g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache,
+                              key_length, kv_lora, d_pos, scale, splits);
+            } else {
+            k3_pdl_launch(hgrid, BLOCK, hshm, stream,
+                          mla_decode_attn_hbatch_kernel<BLOCK, 12, 2, KV, kMlaTokensPerWarp, 8, 6>,
+                          g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length,
+                          kv_lora, d_pos, scale, splits);
+            }
+            k3_mla_launch_combine<BLOCK>(out, dev, wv_b, n_head, kv_lora, v_dim,
+                                         splits, stream);
+            return;
+        }
+
         switch (hpb * 8 + rslots) {
-            case 12 * 8 + 1: mla_decode_attn_hbatch_kernel<BLOCK, 12, 1><<<hgrid, BLOCK, hshm, stream>>>(
-                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits); break;
-            case 12 * 8 + 2: mla_decode_attn_hbatch_kernel<BLOCK, 12, 2><<<hgrid, BLOCK, hshm, stream>>>(
-                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits); break;
-            case 12 * 8 + 3: mla_decode_attn_hbatch_kernel<BLOCK, 12, 3><<<hgrid, BLOCK, hshm, stream>>>(
-                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits); break;
-            case 12 * 8 + 4: mla_decode_attn_hbatch_kernel<BLOCK, 12, 4><<<hgrid, BLOCK, hshm, stream>>>(
-                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits); break;
-            case 8 * 8 + 1: mla_decode_attn_hbatch_kernel<BLOCK, 8, 1><<<hgrid, BLOCK, hshm, stream>>>(
-                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits); break;
-            case 8 * 8 + 2: mla_decode_attn_hbatch_kernel<BLOCK, 8, 2><<<hgrid, BLOCK, hshm, stream>>>(
-                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits); break;
-            case 8 * 8 + 3: mla_decode_attn_hbatch_kernel<BLOCK, 8, 3><<<hgrid, BLOCK, hshm, stream>>>(
-                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits); break;
-            case 8 * 8 + 4: mla_decode_attn_hbatch_kernel<BLOCK, 8, 4><<<hgrid, BLOCK, hshm, stream>>>(
-                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits); break;
-            case 4 * 8 + 1: mla_decode_attn_hbatch_kernel<BLOCK, 4, 1><<<hgrid, BLOCK, hshm, stream>>>(
-                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits); break;
-            case 4 * 8 + 2: mla_decode_attn_hbatch_kernel<BLOCK, 4, 2><<<hgrid, BLOCK, hshm, stream>>>(
-                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits); break;
-            case 4 * 8 + 3: mla_decode_attn_hbatch_kernel<BLOCK, 4, 3><<<hgrid, BLOCK, hshm, stream>>>(
-                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits); break;
-            case 4 * 8 + 4: mla_decode_attn_hbatch_kernel<BLOCK, 4, 4><<<hgrid, BLOCK, hshm, stream>>>(
-                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, n_ctx, scale, splits); break;
+            case 12 * 8 + 1: k3_pdl_launch(hgrid, BLOCK, hshm, stream, mla_decode_attn_hbatch_kernel<BLOCK, 12, 1, KV>,
+                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, d_pos, scale, splits); break;
+            case 12 * 8 + 2: k3_pdl_launch(hgrid, BLOCK, hshm, stream, mla_decode_attn_hbatch_kernel<BLOCK, 12, 2, KV>,
+                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, d_pos, scale, splits); break;
+            case 12 * 8 + 3: k3_pdl_launch(hgrid, BLOCK, hshm, stream, mla_decode_attn_hbatch_kernel<BLOCK, 12, 3, KV>, 
+                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, d_pos, scale, splits); break;
+            case 12 * 8 + 4: k3_pdl_launch(hgrid, BLOCK, hshm, stream, mla_decode_attn_hbatch_kernel<BLOCK, 12, 4, KV>, 
+                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, d_pos, scale, splits); break;
+            case 8 * 8 + 1: k3_pdl_launch(hgrid, BLOCK, hshm, stream, mla_decode_attn_hbatch_kernel<BLOCK, 8, 1, KV>, 
+                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, d_pos, scale, splits); break;
+            case 8 * 8 + 2: k3_pdl_launch(hgrid, BLOCK, hshm, stream, mla_decode_attn_hbatch_kernel<BLOCK, 8, 2, KV>, 
+                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, d_pos, scale, splits); break;
+            case 8 * 8 + 3: k3_pdl_launch(hgrid, BLOCK, hshm, stream, mla_decode_attn_hbatch_kernel<BLOCK, 8, 3, KV>, 
+                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, d_pos, scale, splits); break;
+            case 8 * 8 + 4: k3_pdl_launch(hgrid, BLOCK, hshm, stream, mla_decode_attn_hbatch_kernel<BLOCK, 8, 4, KV>, 
+                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, d_pos, scale, splits); break;
+            case 4 * 8 + 1: k3_pdl_launch(hgrid, BLOCK, hshm, stream, mla_decode_attn_hbatch_kernel<BLOCK, 4, 1, KV>, 
+                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, d_pos, scale, splits); break;
+            case 4 * 8 + 2: k3_pdl_launch(hgrid, BLOCK, hshm, stream, mla_decode_attn_hbatch_kernel<BLOCK, 4, 2, KV>, 
+                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, d_pos, scale, splits); break;
+            case 4 * 8 + 3: k3_pdl_launch(hgrid, BLOCK, hshm, stream, mla_decode_attn_hbatch_kernel<BLOCK, 4, 3, KV>, 
+                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, d_pos, scale, splits); break;
+            case 4 * 8 + 4: k3_pdl_launch(hgrid, BLOCK, hshm, stream, mla_decode_attn_hbatch_kernel<BLOCK, 4, 4, KV>, 
+                g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora, d_pos, scale, splits); break;
             default: launched = false; break;
         }
         if (launched) {
-            const size_t cshm = ((size_t)kv_lora + (size_t)splits + 1) * sizeof(float);
-            mla_decode_combine_kernel<BLOCK><<<(unsigned)n_head, BLOCK, cshm, stream>>>(
-                out, g_mla_part_acc[dev], g_mla_part_ml[dev], wv_b, kv_lora, v_dim, splits);
+            k3_mla_launch_combine<BLOCK>(out, dev, wv_b, n_head, kv_lora, v_dim,
+                                         splits, stream);
             return;
         }
         splits = std::min(splits, k3_mla_max_splits(n_head));
     }
 
     dim3 grid((unsigned)n_head, (unsigned)splits);
-    mla_decode_attn_split_kernel<BLOCK><<<grid, BLOCK, shm, stream>>>(
+    k3_pdl_launch(grid, BLOCK, shm, stream, mla_decode_attn_split_kernel<BLOCK, KV>, 
         g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora,
-        n_ctx, scale, splits);
-    // s_acc + s_w, where s_w needs splits + 1 slots (the last holds 1/l).
-    const size_t cshm = ((size_t)kv_lora + (size_t)splits + 1) * sizeof(float);
-    mla_decode_combine_kernel<BLOCK><<<(unsigned)n_head, BLOCK, cshm, stream>>>(
-        out, g_mla_part_acc[dev], g_mla_part_ml[dev], wv_b, kv_lora, v_dim, splits);
+        d_pos, scale, splits);
+    k3_mla_launch_combine<BLOCK>(out, dev, wv_b, n_head, kv_lora, v_dim, splits, stream);
+}
+
+void mla_decode_attn_f32(float* out, const float* q, const float* k_cache,
+                         const float* wv_b, int key_length, int kv_lora,
+                         int v_dim, int n_head, int n_ctx, const int* d_pos,
+                         float scale, cudaStream_t stream) {
+    mla_decode_attn_launch<float>(out, q, k_cache, wv_b, key_length, kv_lora,
+                                  v_dim, n_head, n_ctx, d_pos, scale, stream);
+}
+
+void mla_decode_attn_kvf16(float* out, const float* q, const void* k_cache,
+                           const float* wv_b, int key_length, int kv_lora,
+                           int v_dim, int n_head, int n_ctx, const int* d_pos,
+                           float scale, cudaStream_t stream) {
+    mla_decode_attn_launch<__half>(out, q, (const __half*)k_cache, wv_b,
+                                   key_length, kv_lora, v_dim, n_head, n_ctx,
+                                   d_pos, scale, stream);
+}
+
+// F16 twin of mla_kv_store_kernel: same device-held row index, same concat
+// layout, narrowing with round-to-nearest as ggml does for its own F16 type_k.
+// The f32 path cannot simply be reused because a copy cannot narrow.
+// Same token axis as the f32 twin, and the same statement about it: the narrowing is
+// per element, so row r of a batched launch rounds exactly what row r of its own launch
+// rounded.
+__global__ void mla_kv_store_f16_kernel(__half* __restrict__ cache,
+                                        const float* __restrict__ cmpr,
+                                        const float* __restrict__ kv_a_out,
+                                        const int* __restrict__ d_pos,
+                                        int kv_lora, int rope_dim, int key_length,
+                                        int64_t cmpr_stride, int64_t kva_stride) {
+    // Per the k3_pdl.cuh contract: fence before reading inputs. The f32 twin has
+    // this; this SHIPPED twin (#86 made the cache __half) was the one decode-path
+    // kernel that missed both the sync and the k3_pdl_launch routing.
+    k3_pdl_sync();
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= kv_lora + rope_dim) return;
+    const int r = blockIdx.y;
+    const float* __restrict__ cmpr_r = cmpr     + (int64_t)r * cmpr_stride;
+    const float* __restrict__ kva_r  = kv_a_out + (int64_t)r * kva_stride;
+    __half* row = cache + (size_t)(d_pos[r]) * key_length;
+    row[i] = __float2half_rn(i < kv_lora ? cmpr_r[i] : kva_r[i]);
+}
+
+void k3_mla_kv_store_f16(void* cache, const float* kv_cmpr_normed,
+                         const float* kv_a_out, const int* d_pos,
+                         int kv_lora, int rope_dim, int key_length,
+                         cudaStream_t stream, int n_rows,
+                         int64_t cmpr_stride, int64_t kva_stride) {
+    if (!cache || !d_pos || kv_lora <= 0 || rope_dim <= 0 || key_length <= 0) return;
+    if (n_rows <= 0 || n_rows > 65535) return;
+    if (cmpr_stride == 0) cmpr_stride = kv_lora;
+    if (kva_stride == 0)  kva_stride  = key_length;
+    const int n = kv_lora + rope_dim;
+    const int T = 256;
+    k3_pdl_launch(dim3((unsigned)((n + T - 1) / T), (unsigned)n_rows), T, 0, stream,
+        mla_kv_store_f16_kernel,
+        (__half*)cache, kv_cmpr_normed, kv_a_out, d_pos, kv_lora, rope_dim, key_length,
+        cmpr_stride, kva_stride);
 }
 
 // Threads that would run ZERO iterations of the block loop are not free.
@@ -2935,10 +5840,47 @@ bool k3_proj_f32(float* y, const float* x, const void* W, int wtype,
     if (N <= 0 || K <= 0) return false;
     constexpr int BLOCK = 128;
     switch (wtype) {
-        case 0:   // F32, dense
-            proj_f32_kernel<BLOCK><<<(unsigned)N, BLOCK, 0, stream>>>(
-                y, x, (const float*)W, K);
-            return true;
+        case 0: {  // F32, dense
+            // THE GRID IS N, AND K3'S F32 PROJECTIONS HAVE A TINY N.
+            //
+            // One block per output row means the banded ssm_beta projection launches
+            // TWELVE blocks of 128 threads — 12 of 132 SMs hold anything at all, 161
+            // times per token per rank, at 7.1 us against a ~1.3 us launch floor. The
+            // grid cannot grow without splitting K and paying a second launch to reduce
+            // it (measured elsewhere: a dependent second launch costs ~2.7 us, more than
+            // the latency it would hide). Threads per block is the one axis that raises
+            // loads in flight without touching either.
+            //
+            // Each thread strides `k += BLOCK` over K, so BLOCK threads keep BLOCK loads
+            // in flight; at K=7168 and 128 threads a block issues 56 rounds of one load.
+            // Widening to 1024 gives 8x the requests outstanding for the same bytes, the
+            // same grid and the same arithmetic order per thread — the reduction tree
+            // grows by three shuffle levels and nothing else.
+            //
+            // Only when the grid is too small to fill the device: above that, blocks
+            // hide each other's latency and the extra threads just shrink the per-thread
+            // loop. SPARKINFER_K3_PROJF32_WIDE=0 restores <<<N, 128>>> on one binary.
+            static const bool wide = [] {
+                const char* e = std::getenv("SPARKINFER_K3_PROJF32_WIDE");
+                return !(e && e[0] == '0');
+            }();
+            const int blk = (!wide || N > 64 || K < 1024) ? 128
+                          : (K >= 4096 ? 1024 : 512);
+            switch (blk) {
+                case 1024:
+                    k3_pdl_launch((unsigned)N, 1024, 0, stream, proj_f32_kernel<1024>,
+                        y, x, (const float*)W, K);
+                    return true;
+                case 512:
+                    k3_pdl_launch((unsigned)N, 512, 0, stream, proj_f32_kernel<512>,
+                        y, x, (const float*)W, K);
+                    return true;
+                default:
+                    k3_pdl_launch((unsigned)N, BLOCK, 0, stream, proj_f32_kernel<BLOCK>,
+                        y, x, (const float*)W, K);
+                    return true;
+            }
+        }
         case 8: {  // Q8_0
             if (K % 32 != 0) return false;
             // Multi-row amortises the activation re-read, but it also divides the grid
@@ -2982,65 +5924,83 @@ bool k3_proj_f32(float* y, const float* x, const void* W, int wtype,
             const int nb = K / 32;
             const int TB = proj_block_for(nb);
             if (N >= ROWS_W16 * MIN_BLOCKS) {
+                // SPARKINFER_K3_HEAD_1BAR=0 restores the block_sum epilogue on the
+                // same binary. At the scored tp=8 config the only caller that still
+                // reaches this branch is the banded LM head; the fold is the tier
+                // family's proven one-barrier epilogue, bit-identical by order.
+                static const bool head_1bar = [] {
+                    const char* e = std::getenv("SPARKINFER_K3_HEAD_1BAR");
+                    return !(e && e[0] == '0');
+                }();
                 const unsigned grid = (unsigned)((N + ROWS_W16 - 1) / ROWS_W16);
+                const bool al16 = ((uintptr_t)x & 15u) == 0;
                 switch (TB) {
                     case 32:
-                        proj_q8_0_multirow_kernel<32, ROWS_W16><<<grid, 32, 0, stream>>>(
-                            y, x, (const BlockQ8_0*)W, nb, N);
+                        if (head_1bar && al16)
+                            k3_pdl_launch(grid, 32, 0, stream, proj_q8_0_multirow_1bf_kernel<32, ROWS_W16>,
+                                y, x, (const BlockQ8_0*)W, nb, N);
+                        else
+                            k3_pdl_launch(grid, 32, 0, stream, proj_q8_0_multirow_kernel<32, ROWS_W16>,
+                                y, x, (const BlockQ8_0*)W, nb, N);
                         break;
                     case 64:
-                        proj_q8_0_multirow_kernel<64, ROWS_W16><<<grid, 64, 0, stream>>>(
-                            y, x, (const BlockQ8_0*)W, nb, N);
+                        if (head_1bar && al16)
+                            k3_pdl_launch(grid, 64, 0, stream, proj_q8_0_multirow_1bf_kernel<64, ROWS_W16>,
+                                y, x, (const BlockQ8_0*)W, nb, N);
+                        else
+                            k3_pdl_launch(grid, 64, 0, stream, proj_q8_0_multirow_kernel<64, ROWS_W16>,
+                                y, x, (const BlockQ8_0*)W, nb, N);
                         break;
                     default:
-                        proj_q8_0_multirow_kernel<BLOCK, ROWS_W16>
-                            <<<grid, BLOCK, 0, stream>>>(y, x, (const BlockQ8_0*)W, nb, N);
+                        if (head_1bar && al16)
+                            k3_pdl_launch(grid, BLOCK, 0, stream, proj_q8_0_multirow_1bf_kernel<BLOCK, ROWS_W16>, y, x, (const BlockQ8_0*)W, nb, N);
+                        else
+                            k3_pdl_launch(grid, BLOCK, 0, stream, proj_q8_0_multirow_kernel<BLOCK, ROWS_W16>, y, x, (const BlockQ8_0*)W, nb, N);
                         break;
                 }
             } else if (N >= ROWS_W8 * MIN_BLOCKS) {
                 const unsigned grid = (unsigned)((N + ROWS_W8 - 1) / ROWS_W8);
                 switch (TB) {
                     case 32:
-                        proj_q8_0_multirow_kernel<32, ROWS_W8><<<grid, 32, 0, stream>>>(
+                        k3_pdl_launch(grid, 32, 0, stream, proj_q8_0_multirow_kernel<32, ROWS_W8>, 
                             y, x, (const BlockQ8_0*)W, nb, N);
                         break;
                     case 64:
-                        proj_q8_0_multirow_kernel<64, ROWS_W8><<<grid, 64, 0, stream>>>(
+                        k3_pdl_launch(grid, 64, 0, stream, proj_q8_0_multirow_kernel<64, ROWS_W8>, 
                             y, x, (const BlockQ8_0*)W, nb, N);
                         break;
                     default:
-                        proj_q8_0_multirow_kernel<BLOCK, ROWS_W8>
-                            <<<grid, BLOCK, 0, stream>>>(y, x, (const BlockQ8_0*)W, nb, N);
+                        k3_pdl_launch(grid, BLOCK, 0, stream, proj_q8_0_multirow_kernel<BLOCK, ROWS_W8>, y, x, (const BlockQ8_0*)W, nb, N);
                         break;
                 }
             } else if (N >= ROWS * MIN_BLOCKS) {
                 const unsigned grid = (unsigned)((N + ROWS - 1) / ROWS);
                 switch (TB) {
                     case 32:
-                        proj_q8_0_multirow_kernel<32, ROWS><<<grid, 32, 0, stream>>>(
+                        k3_pdl_launch(grid, 32, 0, stream, proj_q8_0_multirow_kernel<32, ROWS>, 
                             y, x, (const BlockQ8_0*)W, nb, N);
                         break;
                     case 64:
-                        proj_q8_0_multirow_kernel<64, ROWS><<<grid, 64, 0, stream>>>(
+                        k3_pdl_launch(grid, 64, 0, stream, proj_q8_0_multirow_kernel<64, ROWS>, 
                             y, x, (const BlockQ8_0*)W, nb, N);
                         break;
                     default:
-                        proj_q8_0_multirow_kernel<BLOCK, ROWS><<<grid, BLOCK, 0, stream>>>(
+                        k3_pdl_launch(grid, BLOCK, 0, stream, proj_q8_0_multirow_kernel<BLOCK, ROWS>, 
                             y, x, (const BlockQ8_0*)W, nb, N);
                         break;
                 }
             } else {
                 switch (TB) {
                     case 32:
-                        proj_q8_0_kernel<32><<<(unsigned)N, 32, 0, stream>>>(
+                        k3_pdl_launch((unsigned)N, 32, 0, stream, proj_q8_0_kernel<32>, 
                             y, x, (const BlockQ8_0*)W, nb);
                         break;
                     case 64:
-                        proj_q8_0_kernel<64><<<(unsigned)N, 64, 0, stream>>>(
+                        k3_pdl_launch((unsigned)N, 64, 0, stream, proj_q8_0_kernel<64>, 
                             y, x, (const BlockQ8_0*)W, nb);
                         break;
                     default:
-                        proj_q8_0_kernel<BLOCK><<<(unsigned)N, BLOCK, 0, stream>>>(
+                        k3_pdl_launch((unsigned)N, BLOCK, 0, stream, proj_q8_0_kernel<BLOCK>, 
                             y, x, (const BlockQ8_0*)W, nb);
                         break;
                 }
@@ -3055,7 +6015,7 @@ bool k3_proj_f32(float* y, const float* x, const void* W, int wtype,
 bool k3_proj_ggml_f32_x4(float* y0, float* y1, float* y2, float* y3, const float* x,
                          const void* W0, const void* W1, const void* W2, const void* W3,
                          int wtype, int N, int K, void* q8_scratch,
-                         cudaStream_t stream) {
+                         cudaStream_t stream, bool x_pre_q8) {
     // Same narrow contract as the f32-activation x4 below: Q8_0 weights, four
     // identical shapes, false means "use the slow path" rather than an error.
     if (N <= 0 || K <= 0 || wtype != 8 || K % 32 != 0) return false;
@@ -3071,14 +6031,20 @@ bool k3_proj_ggml_f32_x4(float* y0, float* y1, float* y2, float* y3, const float
     // consumer go out back-to-back on one stream, so no caller has to promise
     // anything about the activation's lifetime -- the reuse cannot outlive the
     // launch that produced it.
+    //
+    // ...unless the CALLER already quantised this exact activation, which it does on
+    // every KDA layer: `normed` is hoisted for ssm_f_a and ssm_beta before this runs.
+    // Quantising again here made the hoist a net LOSS on those 69 layers -- it added a
+    // launch and removed none, because the other two consumers turned out to be
+    // f32-weighted and never quantised at all. x is passed only so this can tell.
     constexpr int QT = 128;
-    quantize_q8_0_kernel<<<(nb + QT - 1) / QT, QT, 0, stream>>>(
-        (BlockQ8_0*)q8_scratch, x, nb);
+    if (!x_pre_q8)
+        k3_quantize_q8_0(q8_scratch, x, nb, stream);
 
     const unsigned grid = (unsigned)((N + ROWS - 1) / ROWS);
     const BlockQ8_0* xq = (const BlockQ8_0*)q8_scratch;
 #define K3_QQ4_LAUNCH(BS)                                                        \
-    proj_q8_0_q8_0_fused4_kernel<BS, ROWS><<<grid, BS, 0, stream>>>(             \
+    k3_pdl_launch(grid, BS, 0, stream, proj_q8_0_q8_0_fused4_kernel<BS, ROWS>,              \
         y0, y1, y2, y3, xq, (const BlockQ8_0*)W0, (const BlockQ8_0*)W1,          \
         (const BlockQ8_0*)W2, (const BlockQ8_0*)W3, nb, N)
     switch (proj_block_for(nb)) {
@@ -3109,17 +6075,17 @@ bool k3_proj_f32_x4(float* y0, float* y1, float* y2, float* y3, const float* x,
     const unsigned grid = (unsigned)((N + ROWS - 1) / ROWS);
     switch (proj_block_for(nb)) {
         case 32:
-            proj_q8_0_fused4_kernel<32, ROWS><<<grid, 32, 0, stream>>>(
+            k3_pdl_launch(grid, 32, 0, stream, proj_q8_0_fused4_kernel<32, ROWS>, 
                 y0, y1, y2, y3, x, (const BlockQ8_0*)W0, (const BlockQ8_0*)W1,
                 (const BlockQ8_0*)W2, (const BlockQ8_0*)W3, nb, N);
             break;
         case 64:
-            proj_q8_0_fused4_kernel<64, ROWS><<<grid, 64, 0, stream>>>(
+            k3_pdl_launch(grid, 64, 0, stream, proj_q8_0_fused4_kernel<64, ROWS>, 
                 y0, y1, y2, y3, x, (const BlockQ8_0*)W0, (const BlockQ8_0*)W1,
                 (const BlockQ8_0*)W2, (const BlockQ8_0*)W3, nb, N);
             break;
         default:
-            proj_q8_0_fused4_kernel<128, ROWS><<<grid, 128, 0, stream>>>(
+            k3_pdl_launch(grid, 128, 0, stream, proj_q8_0_fused4_kernel<128, ROWS>, 
                 y0, y1, y2, y3, x, (const BlockQ8_0*)W0, (const BlockQ8_0*)W1,
                 (const BlockQ8_0*)W2, (const BlockQ8_0*)W3, nb, N);
             break;
@@ -3127,16 +6093,58 @@ bool k3_proj_f32_x4(float* y0, float* y1, float* y2, float* y3, const float* x,
     return true;
 }
 
-bool k3_proj_ggml_f32(float* y, const float* x, const void* W, int wtype,
-                      int N, int K, void* q8_scratch, cudaStream_t stream) {
-    if (N <= 0 || K <= 0) return false;
-    if (wtype == 0)
-        return k3_proj_f32(y, x, W, wtype, N, K, stream);
-    if (wtype != 8 || !q8_scratch || K % 32 != 0) return false;
+// Quantise one activation to Q8_0, on its own, so a caller with several projections
+// over the SAME activation can pay for it once.
+//
+// K3 re-quantises the identical vector three or four times per layer: `normed` feeds the
+// fused qkvg group plus ssm_f_a and ssm_beta on every KDA layer, and `normed2` feeds the
+// router, routed_down and both shared-expert projections on every MoE layer. Profiled at
+// ctx 131072 that is 61,848 launches of quantize_q8_0 -- 7.9% of GPU kernel time at
+// 4.19 us each to move ~28 KB, i.e. ~6.7 GB/s on a 4.8 TB/s part. It is not work, it is
+// launch overhead, and 462 of those launches per token per rank are recomputing bytes
+// that are already sitting in the scratch.
+bool k3_quantize_act_f32(void* q8_out, const float* x, int K, cudaStream_t stream) {
+    if (!q8_out || !x || K <= 0 || K % 32 != 0) return false;
     const int nb = K / 32;
     constexpr int QT = 128;
-    quantize_q8_0_kernel<<<(nb + QT - 1) / QT, QT, 0, stream>>>(
-        (BlockQ8_0*)q8_scratch, x, nb);
+    k3_quantize_q8_0(q8_out, x, nb, stream);
+    return true;
+}
+
+bool k3_quantize_act_rows_f32(void* q8_out, const float* x, int K, int n_rows,
+                              int64_t row_stride, cudaStream_t stream) {
+    if (!q8_out || !x || K <= 0 || (K % 32) != 0 || n_rows <= 0) return false;
+    if (row_stride == 0) row_stride = K;
+    // k3_quantize_q8_0 already assigns one independent CTA to each 32-value block.
+    // Tight rows are therefore exactly the single-row launch with a larger block count:
+    // no reduction or scale crosses a row boundary. Padded rows need a gather-aware
+    // kernel and deliberately decline here.
+    if (row_stride != K) return false;
+    const int64_t blocks = (int64_t)(K / 32) * n_rows;
+    if (blocks > INT_MAX) return false;
+    k3_quantize_q8_0(q8_out, x, (int)blocks, stream);
+    return true;
+}
+
+// Projection from an ALREADY-quantised activation. This is k3_proj_ggml_f32's body with
+// the quantise lifted out; that function now calls it, so there is one implementation and
+// the hoisted and non-hoisted paths cannot drift apart.
+//
+// Deliberately takes the quantised buffer rather than caching one keyed on `x`. An
+// earlier attempt at this optimisation DID cache, guarded by "was the scratch last
+// written from this pointer?", and shipped top1 0.0 / mean_kld 0.937 -- fluent, wrong,
+// and faster. That guard tracked which pointer the scratch came from, never whether the
+// bytes behind it still matched. Passing the buffer makes the reuse window explicit in
+// the caller's straight-line code instead of an invariant someone has to maintain.
+bool k3_proj_q8act_f32(float* y, const void* q8_scratch, const void* W, int wtype,
+                       int N, int K, cudaStream_t stream) {
+    // SoA-first (k3_q8soa.cu): engages only for load-registered tensors under
+    // SPARKINFER_K3_Q8SOA=1; bit-identical to the dispatch below by construction.
+    if (k3_proj_q8soa(y, q8_scratch, W, N, K, stream)) return true;
+
+    if (N <= 0 || K <= 0) return false;
+    if (wtype != 8 || !q8_scratch || K % 32 != 0) return false;
+    const int nb = K / 32;
     // Same idle-thread sizing as the f32-activation path above.
     constexpr int BLOCK = 128;
     const int TB = proj_block_for(nb);
@@ -3164,15 +6172,15 @@ bool k3_proj_ggml_f32(float* y, const float* x, const void* W, int wtype,
         const unsigned grid = (unsigned)((N + (R) - 1) / (R));                        \
         switch (TB) {                                                                \
             case 32:                                                                 \
-                proj_q8_0_q8_0_multirow_kernel<32, R><<<grid, 32, 0, stream>>>(       \
+                k3_pdl_launch(grid, 32, 0, stream, proj_q8_0_q8_0_multirow_kernel<32, R>,        \
                     y, (const BlockQ8_0*)q8_scratch, (const BlockQ8_0*)W, nb, N);      \
                 break;                                                               \
             case 64:                                                                 \
-                proj_q8_0_q8_0_multirow_kernel<64, R><<<grid, 64, 0, stream>>>(       \
+                k3_pdl_launch(grid, 64, 0, stream, proj_q8_0_q8_0_multirow_kernel<64, R>,        \
                     y, (const BlockQ8_0*)q8_scratch, (const BlockQ8_0*)W, nb, N);      \
                 break;                                                               \
             default:                                                                 \
-                proj_q8_0_q8_0_multirow_kernel<BLOCK, R><<<grid, BLOCK, 0, stream>>>( \
+                k3_pdl_launch(grid, BLOCK, 0, stream, proj_q8_0_q8_0_multirow_kernel<BLOCK, R>,  \
                     y, (const BlockQ8_0*)q8_scratch, (const BlockQ8_0*)W, nb, N);      \
                 break;                                                               \
         }                                                                            \
@@ -3184,23 +6192,157 @@ bool k3_proj_ggml_f32(float* y, const float* x, const void* W, int wtype,
     else {
         // Below the threshold the single-row kernel keeps the wide grid, and it is
         // also the one the numeric test pins bit-for-bit.
+        //
+        // SPARKINFER_K3_B2WIDE=1 swaps the Q8_0 block accessor for the 32-bit-load
+        // form (see get_int_b2_wide). DEFAULT OFF until measured. This kernel is the
+        // largest consumer OUTSIDE k3_proj_q8_fast.cu -- shexp gate/up, ssm_f_a and
+        // attn_kv_a_mqa -- and it calls the accessor on BOTH dp4a operands, so it is
+        // where the instruction-count change should show up first if it shows at all.
+        static const bool b2wide = [] {
+            // MEASURED +0.30 tok/s. Default ON; =0 restores the 16-bit pair.
+            const char* e = std::getenv("SPARKINFER_K3_B2WIDE");
+            return !(e && e[0] == '0');
+        }();
+#define K3_QQ_W(BLK)                                                                  \
+        do {                                                                          \
+            if (b2wide)                                                               \
+                k3_pdl_launch((unsigned)N, (BLK), 0, stream,                          \
+                    proj_q8_0_q8_0_kernel<(BLK), true>,                               \
+                    y, (const BlockQ8_0*)q8_scratch, (const BlockQ8_0*)W, nb);        \
+            else                                                                      \
+                k3_pdl_launch((unsigned)N, (BLK), 0, stream,                          \
+                    proj_q8_0_q8_0_kernel<(BLK), false>,                              \
+                    y, (const BlockQ8_0*)q8_scratch, (const BlockQ8_0*)W, nb);        \
+        } while (0)
         switch (TB) {
-            case 32:
-                proj_q8_0_q8_0_kernel<32><<<(unsigned)N, 32, 0, stream>>>(
-                    y, (const BlockQ8_0*)q8_scratch, (const BlockQ8_0*)W, nb);
-                break;
-            case 64:
-                proj_q8_0_q8_0_kernel<64><<<(unsigned)N, 64, 0, stream>>>(
-                    y, (const BlockQ8_0*)q8_scratch, (const BlockQ8_0*)W, nb);
-                break;
-            default:
-                proj_q8_0_q8_0_kernel<BLOCK><<<(unsigned)N, BLOCK, 0, stream>>>(
-                    y, (const BlockQ8_0*)q8_scratch, (const BlockQ8_0*)W, nb);
-                break;
+            case 32:  K3_QQ_W(32);    break;
+            case 64:  K3_QQ_W(64);    break;
+            default:  K3_QQ_W(BLOCK); break;
         }
+#undef K3_QQ_W
     }
 #undef K3_QQ_LAUNCH
     return true;
+}
+
+// Token-batched projection from an already-quantised [n_tok, K] activation.
+//
+// Tile choice. TOKS is what divides the weight traffic, so it is taken as large as
+// the register file allows before ROWS is grown; ROWS then trades grid width for one
+// more use of each staged weight block. The grid is (N/ROWS) x ceil(n_tok/TOKS), and
+// the guard below keeps it at a few hundred blocks minimum — the same reason the
+// decode multirow path refuses to widen small N, except that here the token axis is
+// already supplying blocks, so a narrow N can afford a wider ROWS than it could at
+// batch 1.
+//
+// Both axes are overridable for screening. Defaults are the shapes that measured best;
+// =0 on either falls back to the per-token path in the caller.
+bool k3_proj_q8act_tok_f32(float* y, int ldy, const void* q8_act, int ld_act_blocks,
+                           const void* W, int wtype, int N, int K, int n_tok,
+                           cudaStream_t stream) {
+    if (N <= 0 || K <= 0 || n_tok <= 0) return false;
+    if (wtype != 8 || !q8_act || !y || K % 32 != 0) return false;
+    if (n_tok == 1) return false;          // no token axis to amortise over
+    const int nb = K / 32;
+    if (ld_act_blocks < nb || ldy < N) return false;
+
+    constexpr int BLOCK = 128;
+    const int TB = proj_block_for(nb);
+
+    static const int env_toks = [] {
+        const char* e = std::getenv("SPARKINFER_K3_PROJ_TOKS");
+        const int v = e ? std::atoi(e) : 4;
+        return (v == 0 || v == 2 || v == 4 || v == 8) ? v : 4;
+    }();
+    if (env_toks == 0) return false;
+    static const int env_rows = [] {
+        const char* e = std::getenv("SPARKINFER_K3_PROJ_TROWS");
+        const int v = e ? std::atoi(e) : 4;
+        return (v == 1 || v == 2 || v == 4 || v == 8) ? v : 4;
+    }();
+
+    const int TOKS = n_tok < env_toks ? (n_tok >= 4 ? 4 : (n_tok >= 2 ? 2 : 1)) : env_toks;
+    if (TOKS < 2) return false;
+    // Keep the grid wide enough to cover the device several times over. n_tok/TOKS
+    // blocks come free from the token axis, so ROWS only has to keep N/ROWS from
+    // collapsing on its own.
+    const int tok_blocks = (n_tok + TOKS - 1) / TOKS;
+    int ROWS = env_rows;
+    while (ROWS > 1 && (long)(N / ROWS) * tok_blocks < 256) ROWS >>= 1;
+
+#define K3_TOK_LAUNCH(BLK, R, T)                                                     \
+    do {                                                                             \
+        const dim3 grid((unsigned)((N + (R) - 1) / (R)), (unsigned)tok_blocks);       \
+        k3_pdl_launch(grid, (BLK), 0, stream,                                        \
+            proj_q8_0_q8_0_tok_kernel<(BLK), (R), (T)>,                              \
+            y, ldy, (const BlockQ8_0*)q8_act, ld_act_blocks,                          \
+            (const BlockQ8_0*)W, nb, N, n_tok);                                       \
+    } while (0)
+#define K3_TOK_ROWS(BLK, T)                                                          \
+    do {                                                                             \
+        switch (ROWS) {                                                              \
+            case 8:  K3_TOK_LAUNCH(BLK, 8, T); break;                                \
+            case 4:  K3_TOK_LAUNCH(BLK, 4, T); break;                                \
+            case 2:  K3_TOK_LAUNCH(BLK, 2, T); break;                                \
+            default: K3_TOK_LAUNCH(BLK, 1, T); break;                                \
+        }                                                                            \
+    } while (0)
+#define K3_TOK_BLK(BLK)                                                              \
+    do {                                                                             \
+        switch (TOKS) {                                                              \
+            case 8:  K3_TOK_ROWS(BLK, 8); break;                                     \
+            case 4:  K3_TOK_ROWS(BLK, 4); break;                                     \
+            default: K3_TOK_ROWS(BLK, 2); break;                                     \
+        }                                                                            \
+    } while (0)
+
+    switch (TB) {
+        case 32:  K3_TOK_BLK(32);    break;
+        case 64:  K3_TOK_BLK(64);    break;
+        default:  K3_TOK_BLK(BLOCK); break;
+    }
+#undef K3_TOK_BLK
+#undef K3_TOK_ROWS
+#undef K3_TOK_LAUNCH
+    return true;
+}
+
+// Quantise n_tok CONTIGUOUS [K] activations in one launch.
+//
+// VERIFIED against both shapes in k3_proj_q8_fast.cu. quantize_q8_0_warp_kernel derives
+// its block index from a global thread id (`(blockIdx.x*blockDim.x + threadIdx.x) >> 5`)
+// and reads x[b*32 + lane] into out[b]; quantize_q8_0_same_kernel derives b the same way
+// and walks xb[0..31]. Neither indexes a row, a K or a leading dimension — they are flat
+// over 32-element blocks with no row concept. So a token-major [n_tok, K] activation IS
+// a flat run of n_tok * (K/32) blocks (token t's blocks are t*(K/32) .. +K/32-1), and
+// quantising all of it into a token-major [n_tok, K/32] Q8_0 array is this one call.
+// Bit-identical per block: the same kernel over a longer range, not a different one.
+//
+// THE ONE PRECONDITION THIS CANNOT CHECK: `x` must be FULLY CONTIGUOUS, row stride
+// exactly K, and `q8_out` contiguous at exactly K/32 blocks per token. The flatness that
+// makes this free is also what makes a padded leading dimension silently wrong — there
+// is no stride to pass, because the kernel has no row index to apply it to. A padded
+// activation must be quantised per token.
+bool k3_quantize_act_rows_f32(void* q8_out, const float* x, int K, int n_tok,
+                              cudaStream_t stream) {
+    if (!q8_out || !x || K <= 0 || n_tok <= 0 || K % 32 != 0) return false;
+    // k3_quantize_q8_0 takes an int n_blocks and the warp shape launches n_blocks * 32
+    // threads, so the total must clear int32 with that factor still applied. Decline
+    // rather than wrap — the caller's fallback is the per-token path.
+    const int64_t nb = (int64_t)(K / 32) * n_tok;
+    if (nb * 32 > (int64_t)INT_MAX) return false;
+    k3_quantize_q8_0(q8_out, x, (int)nb, stream);
+    return true;
+}
+
+bool k3_proj_ggml_f32(float* y, const float* x, const void* W, int wtype,
+                      int N, int K, void* q8_scratch, cudaStream_t stream) {
+    if (N <= 0 || K <= 0) return false;
+    if (wtype == 0)
+        return k3_proj_f32(y, x, W, wtype, N, K, stream);
+    if (wtype != 8 || !q8_scratch || K % 32 != 0) return false;
+    if (!k3_quantize_act_f32(q8_scratch, x, K, stream)) return false;
+    return k3_proj_q8act_f32(y, q8_scratch, W, wtype, N, K, stream);
 }
 
 size_t k3_q8_0_bytes(int K) {
@@ -3215,26 +6357,169 @@ size_t k3_moe_q8_k_bytes(int latent, int ffn, int top_k) {
            sizeof(BlockQ8K);
 }
 
+// Threads for the apply phase. The reduction is always 128 threads (see the kernel);
+// this only sizes how many threads walk the elementwise scale. Floored at 128 so the
+// narrow norms keep the shape they already had.
+static inline int rms_norm_block_for(int units) {
+    if (units >= 1024) return 1024;
+    if (units >= 512)  return 512;
+    if (units >= 256)  return 256;
+    return 128;
+}
+
+static inline bool rms_norm_aligned16(const void* p) {
+    return ((uintptr_t)p & 15u) == 0;
+}
+
+// ONE IMPLEMENTATION, TWO ENTRY POINTS. Both ingestion drivers want a token axis on this
+// norm and asked for it with different signatures: the tile driver with `rows` plus a
+// single `row_stride` (its two buffers share a pitch), the chunk driver with `n_rows` plus
+// separate out/x strides (its two buffers do not). Two strides is the superset — a
+// same-pitch caller passes its pitch twice — so both are thin calls on this one function
+// rather than two launchers that have to be kept in step.
+//
+// `allow_narrow_rows` is the ONLY behavioural difference between the two entry points, and
+// it is deliberate rather than an oversight. See the narrow branch below.
+static bool rms_norm_f32_dispatch(float* out, const float* x, const float* w, int n,
+                                  float eps, cudaStream_t stream, int n_rows,
+                                  int64_t out_stride, int64_t x_stride,
+                                  bool allow_narrow_rows) {
+    if (n <= 0 || n_rows <= 0) return false;
+
+    // stride == 0 means contiguous rows of exactly n elements. Two strides because
+    // out and x can live in buffers with different leading dimensions.
+    if (out_stride == 0) out_stride = n;
+    if (x_stride == 0)   x_stride = n;
+
+    // At BLOCK==128 with no vec4 the wide kernel is the original kernel (same 128-thread
+    // sum, same 128-thread apply), so that path stays on rms_norm_kernel for a one-line
+    // reviewer check rather than trusting the specialization. Everything wider shares
+    // that reduction and only grows the apply.
+    //
+    // The row axis adds one alignment condition and nothing else: the float4 apply reads
+    // from (base + r*stride), so a stride that is not a multiple of 4 would misalign
+    // every row but row 0. At n_rows == 1 the test is vacuous and the decision is exactly
+    // the one made today.
+    const bool row_vec4_ok = (n_rows == 1) || (out_stride % 4 == 0 && x_stride % 4 == 0);
+    const bool vec4 = (n % 4 == 0 && rms_norm_aligned16(out) && rms_norm_aligned16(x) &&
+                       rms_norm_aligned16(w) && row_vec4_ok);
+    const int units = vec4 ? n / 4 : n;
+    const int block = rms_norm_block_for(units);
+    const int n4 = vec4 ? n / 4 : 0;
+
+    // On top of the widening, slice the apply across CTAs: the apply is three times
+    // the reduction's bytes, and one CTA is one SM of 132. 327 of these launches per
+    // token per rank at decode (93 attn_norm + 93 ffn_norm + 92 routed_norm +
+    // 24 q_a_norm + 24 kv_a_norm + 1 output_norm). RMSG names the slice count and
+    // RMSU the reduction unroll, so the two can be told apart in an A/B; RMSG=0
+    // RMSU=0 restores the single-CTA launches exactly.
+    //
+    // out == x is NOT safe to spread: with several CTAs, CTA 0 can finish its
+    // reduction and start overwriting x while another CTA is still reading x to
+    // compute the same sum. Two call sites are in-place; the rest spread.
+    //
+    // The row axis does not widen that hazard. Rows are disjoint ranges of two
+    // buffers, so the only aliasing that matters is still out vs x, and the test is
+    // the same base-pointer comparison.
+    static const int rmsg = [] {
+        const char* e = std::getenv("SPARKINFER_K3_RMSG");
+        return e ? atoi(e) : 14;
+    }();
+    static const bool rmsu = [] {
+        const char* e = std::getenv("SPARKINFER_K3_RMSU");
+        return !(e && e[0] == '0');
+    }();
+    int span_units = units;
+    unsigned grid = 1u;
+    int launch_block = block;
+    if (rmsg > 1 && out != x) {
+        // Slices stay warp-aligned, not block-aligned: rounding the span up to a
+        // 1024-thread block would collapse a 14-way spread of n=7168 to grid 2.
+        // Spread CTAs run 128 threads — the reduction is 128 threads regardless,
+        // and 14 slices x 128 threads walk the whole float4 apply in one wave.
+        span_units = ((units + rmsg - 1) / rmsg + 31) / 32 * 32;
+        grid = (unsigned)((units + span_units - 1) / span_units);
+        if (grid > 1u) launch_block = 128;
+    }
+
+    // The token axis is a SECOND grid dimension stacked on the span spread above: grid
+    // (the .x span count) and span_units are still computed from the per-row unit count,
+    // so every row sees the slicing it sees today. dim3(g, 1) is dim3(g).
+    const dim3 grid2((unsigned)grid, (unsigned)n_rows);
+
+    if (grid == 1u && !rmsu && block == 128 && !vec4) {
+        // rms_norm_kernel is a DIFFERENT reduction from the wide one. This commit gives it
+        // the same row axis the wide kernel has, so batching through it IS bit-identical to
+        // looping it — row r reduces row r's own n elements on the same 128 threads with
+        // the same stride and the same block_sum tree, whatever else is in flight.
+        //
+        // rms_norm_f32_rows nevertheless still DECLINES here. Its caller is the tile driver,
+        // which shipped measured against the LOOP; taking the batched branch there would
+        // silently change the launch count of a path this commit does not measure and is
+        // not claiming. The chunk driver, which IS measured with it, comes through the other
+        // entry point and takes the batched branch. Neither driver's numbers move by
+        // accident.
+        if (!allow_narrow_rows && n_rows > 1) return false;
+        k3_pdl_launch(grid2, 128, 0, stream, rms_norm_kernel<128>, out, x, w, n, eps,
+                      out_stride, x_stride);
+        return true;
+    }
+
+#define K3_RMSN(BLK)                                                                   \
+    do {                                                                               \
+        if (rmsu)                                                                      \
+            k3_pdl_launch(grid2, (BLK), 0, stream, rms_norm_wide_kernel<(BLK), true>,  \
+                          out, x, w, n, eps, n4, vec4 ? 1 : 0, span_units,             \
+                          out_stride, x_stride);                                       \
+        else                                                                           \
+            k3_pdl_launch(grid2, (BLK), 0, stream, rms_norm_wide_kernel<(BLK), false>, \
+                          out, x, w, n, eps, n4, vec4 ? 1 : 0, span_units,             \
+                          out_stride, x_stride);                                       \
+    } while (0)
+    switch (launch_block) {
+        case 1024: K3_RMSN(1024); return true;
+        case 512:  K3_RMSN(512);  return true;
+        case 256:  K3_RMSN(256);  return true;
+        default:   K3_RMSN(128);  return true;
+    }
+#undef K3_RMSN
+}
+
+// The chunk driver's entry point. Two strides, and it takes the batched narrow branch.
 void rms_norm_f32(float* out, const float* x, const float* w, int n, float eps,
-                  cudaStream_t stream) {
-    if (n <= 0) return;
-    constexpr int BLOCK = 128;
-    rms_norm_kernel<BLOCK><<<1, BLOCK, 0, stream>>>(out, x, w, n, eps);
+                  cudaStream_t stream, int n_rows, int64_t out_stride,
+                  int64_t x_stride) {
+    rms_norm_f32_dispatch(out, x, w, n, eps, stream, n_rows, out_stride, x_stride,
+                          /*allow_narrow_rows=*/true);
+}
+
+// The tile driver's entry point. One pitch, passed for both buffers, and it declines the
+// narrow branch above rather than changing that driver's launch count. At rows == 1 the
+// row offset is 0 whatever the stride is, so the single-row call is unaffected either way.
+bool rms_norm_f32_rows(float* out, const float* x, const float* w, int n, float eps,
+                       int rows, long long row_stride, cudaStream_t stream) {
+    return rms_norm_f32_dispatch(out, x, w, n, eps, stream, rows, (int64_t)row_stride,
+                                 (int64_t)row_stride, /*allow_narrow_rows=*/false);
 }
 
 void k3_add_f32(float* out, const float* a, const float* b, int64_t n,
-               cudaStream_t stream) {
-    if (n <= 0) return;
+               cudaStream_t stream, int n_rows, int64_t row_stride) {
+    if (n <= 0 || n_rows <= 0) return;
     const int T = 256;
     const int64_t blocks = (n + T - 1) / T;
-    add_f32_kernel<<<(unsigned)blocks, T, 0, stream>>>(out, a, b, n);
+    if (row_stride == 0) row_stride = n;
+    k3_pdl_launch(dim3((unsigned)blocks, (unsigned)n_rows), T, 0, stream,
+                  add_f32_kernel, out, a, b, n, row_stride);
 }
 
-void sigmoid_inplace_f32(float* x, int64_t n, cudaStream_t stream) {
-    if (n <= 0) return;
+void sigmoid_inplace_f32(float* x, int64_t n, cudaStream_t stream,
+                         int n_rows, int64_t row_stride) {
+    if (n <= 0 || n_rows <= 0) return;
     const int T = 256;
     const int64_t blocks = (n + T - 1) / T;
-    sigmoid_inplace_f32_kernel<<<(unsigned)blocks, T, 0, stream>>>(x, n);
+    if (row_stride == 0) row_stride = n;
+    k3_pdl_launch(dim3((unsigned)blocks, (unsigned)n_rows), T, 0, stream,
+                  sigmoid_inplace_f32_kernel, x, n, row_stride);
 }
 
 }  // namespace k3

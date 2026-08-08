@@ -268,6 +268,17 @@ struct KimiK3RuntimeState {
     int max_ctx = 0;
     int position = 0;   // next token's position; incremented by forward_token
 
+    // THE DEVICE'S COPY OF `position`, and why both exist.
+    //
+    // Kernels must read the position from memory or a captured graph replays the one
+    // frozen at capture time. But the LAUNCH PLAN (grid size, which MLA kernel) is a host
+    // decision a graph cannot change, and that decision needs the position too. So the
+    // host mirror above stays authoritative for planning, d_pos is authoritative for
+    // arithmetic, and they advance together — the host increments, and bump_pos runs
+    // inside the captured region. kimi_k3_check_pos_sync() exists so a test can prove
+    // they never drift; drift here is invisible for thousands of tokens and then wrong.
+    int* d_pos = nullptr;   // device int, 4 bytes, owned by kimi_k3_alloc_state()
+
     // Sizes needed to zero each buffer correctly in kimi_k3_reset_state() — stored
     // here rather than re-threading a KimiK3Config through that call. Populated by
     // kimi_k3_alloc_state().
@@ -282,7 +293,15 @@ struct KimiK3RuntimeState {
     std::vector<float*> delta_state;                               // [head_dim, head_dim, n_head]
 
     // Indexed by MLA-layer ordinal (0..n_mla_layers-1).
+    //
+    // Element type is f16 when kv_f16 is set (the default — llama.cpp's own
+    // type_k, and the largest byte item a decode token moves), f32 when
+    // SPARKINFER_K3_KV_F16=0 restores the historical layout. The pointers stay
+    // float* so every existing null-check and container stays as-is; the three
+    // touch points (alloc size, reset memset, store/attend in the forward) all
+    // consult kv_f16, and nothing else dereferences these buffers.
     std::vector<float*> mla_kv_cache;   // [key_length, max_ctx]
+    bool kv_f16 = false;                // set by kimi_k3_alloc_state, fixed for life
 
     // Shared across the whole model — one bank, not one per layer.
     float* res_bank = nullptr;   // [hidden, max_ckpt]
@@ -307,6 +326,12 @@ struct KimiK3RuntimeState {
 bool kimi_k3_alloc_state(const KimiK3Config& cfg, int max_ctx, KimiK3RuntimeState& out,
                         int first_layer = -1, int last_layer = -1,
                         const tp::KdaShardDims* kda = nullptr);
+// Move the decode position. Writes BOTH the host mirror (which picks the MLA launch plan)
+// and the device copy (which the KV store and attention index with). Never set
+// state.position directly — the two must not drift, and a caller that sets only the host
+// side produces a benchmark that runs fast because it is attending over one position.
+bool kimi_k3_set_position(KimiK3RuntimeState& s, int pos);
+
 void kimi_k3_reset_state(KimiK3RuntimeState& s);   // zero everything, position=0, n_ckpt=0
 void kimi_k3_free_state(KimiK3RuntimeState& s);
 
@@ -350,6 +375,21 @@ struct KimiK3Forward {
     // kimi_k3_forward_alloc_scratch(); forward_token() assumes they exist.
     struct Scratch;
     Scratch* s = nullptr;
+
+    // PREFILL TILE, or null for decode. When set and its `layer` matches the layer being
+    // run, the KDA q/k/v/g projections have ALREADY been computed for a tile of tokens and
+    // this call takes row `prefill_tok` instead of projecting again.
+    //
+    // Null for every decode call, which is what keeps the decode guard safe by
+    // construction rather than by care: decode never reads these fields, so a bug here
+    // cannot move the 128k number that #132 makes fatal to the whole round.
+    //
+    // The copy this enables is 4 x qkv floats (24 KB at K3's per-rank qkv=1536) against a
+    // projection that streams 1536 x 7168 Q8_0 = ~11.7 MB. Two thousandths of the cost it
+    // replaces, so pointing the layer at the tile row would save nothing worth the aliasing
+    // risk of handing `s.qkv_*` a buffer it does not own.
+    const void* prefill_tile = nullptr;   // K3PrefillTile*, opaque here to avoid the include
+    int prefill_tok = 0;                  // which row of the tile this call is
 };
 
 bool kimi_k3_forward_alloc_scratch(const KimiK3Config& cfg, KimiK3Forward& fwd);
@@ -402,10 +442,96 @@ bool kimi_k3_forward_layer(KimiK3Forward& fwd, int layer, const float* hidden_in
 // `All` runs all three back to back and is what kimi_k3_forward_layer calls, so the
 // tp_size 1 path is unchanged. Running All must be bit-identical to running the
 // three phases in sequence — asserted by kimi_k3_tp_phase_check.
-enum class K3LayerPhase { All = 0, Attn = 1, FfnPartial = 2, FfnFinish = 3 };
+enum class K3LayerPhase {
+    All = 0,
+    Attn = 1,
+    FfnPrepare = 2, // residual combine + FFN mix/norm, no partial and no collective
+    FfnPartial = 3,
+    FfnFinish = 4
+};
 
+// ---------------------------------------------------------------------------
+// THE TOKEN AXIS ON THE FFN PHASES (`n_tok`)
+// ---------------------------------------------------------------------------
+// Prompt ingestion is launch-bound: ~3401 graph nodes per token, ~5 us each, every
+// GEMM at M=1, and the depth curve says ~90% of the 18.86 ms/token at 32k is a FIXED
+// per-token floor with no context dependence. Only ~348 of those nodes are genuinely
+// sequential (the KDA recurrence and the MLA walk). The FFN has NO cross-token
+// dependency at all, so B tokens can go through FfnPartial/FfnFinish in ONE call and
+// every launch in them amortises over B.
+//
+// n_tok > 1 means: hidden_in, hidden_out and every FFN-side scratch buffer are
+// TOKEN-MAJOR, token b's row of buffer `foo` starting at (foo + b * <one token's
+// element count for foo>). n_tok == 1 is the default and takes exactly the code path
+// this function had before the axis existed — same launches, same grids, same order.
+// That is not a claim about a fast path being "close enough": decode@128k is a hard
+// scoring guard, so every batched call site below is written as `pass n_tok through`
+// on a kernel whose n_rows == 1 launch is dim3(g, 1) == dim3(g), or as a
+// `for (b...)` loop that runs exactly once.
+//
+// THE ATTN PHASE TAKES n_tok ON AN MLA LAYER AND REFUSES IT ON A KDA ONE.
+//
+// What is genuinely cross-token in attention is not the same in the two layer types,
+// and that distinction is the whole change:
+//
+//   * MLA. Token b writes K-cache row b and attends over rows [0..b]. That is a
+//     LENGTH dependence, not an ordering one: every attention kernel lengths its walk
+//     with its own *d_pos + 1, so storing all n_tok rows first and then attending is
+//     exactly what the per-token order computed. Everything else in the phase — the
+//     residual mix, attn_norm, the five projections, the absorb, the gate fold — is
+//     independent per token and is issued once for the chunk. The MLA attention
+//     kernel ITSELF stays per-token: its split geometry is derived from that token's
+//     own n_ctx and moves continuously with it, so one grid for the chunk would
+//     re-partition the online-softmax reduction and stop being bit-identical.
+//   * KDA. The conv window and the delta state are carried from token b-1 to token b.
+//     There is no launch that does that for n_tok tokens without becoming a different
+//     algorithm with a different summation order, so THE SCAN stays a per-token loop in
+//     index order and always will. What is split off from it, under
+//     SPARKINFER_K3_KDA_QKVG_BATCH (DEFAULT OFF), is the PROJECTION half: q/k/v/g and
+//     attn_output are elementwise in the token index, so they are issued once for the
+//     chunk and the scan loop consumes/produces their rows in order. With the gate
+//     unset a KDA layer is refused exactly as before.
+//
+// Ask kimi_k3_attn_batch_ok() rather than inferring either half. Refusing is
+// deliberate and stays deliberate: the previous version of the chunk driver was fast
+// precisely because it was wrong, and a silent wrong answer here is that failure again.
+//
+// PRECONDITIONS the caller owns when n_tok > 1 (none are checkable here):
+//   * n_tok <= kimi_k3_ffn_batch_cap(fwd). Checked, and refused if violated.
+//   * state.res_bank points at TOKEN 0's bank, and token b's bank is
+//     (res_bank + b * res_bank_row_elems * max_ckpt) — the layout
+//     kimi_k3_tp_prefill_chunk allocates.
+//   * FOR THE ATTN PHASE ONLY: state.d_pos points at TOKEN 0's slot of a CONTIGUOUS
+//     n_tok-long position vector (k3_fill_pos_vec's output), so token b's position is
+//     state.d_pos[b]; and state.position is TOKEN 0's host position, so token b's
+//     context length is state.position + 1 + b. Handing it a single shared position is
+//     the "every token writes the same KV row and attends over the same prefix" bug —
+//     wrong AND faster, so a timing run cannot see it.
+//   * the partial buffers exposed by kimi_k3_swap_partial_buffer are chunk-wide:
+//     the Attn partial strides by `hidden`, the FfnPartial partial by
+//     (expert_latent + hidden). Left unswapped they are the scratch allocation,
+//     which IS sized for the cap, so this is safe rather than merely conventional.
+//   * state.n_ckpt is a function of the LAYER, not the token, so one value serves
+//     every row (which is why it is not per-token here).
 bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase phase,
-                                const float* hidden_in, float* hidden_out);
+                                const float* hidden_in, float* hidden_out,
+                                int n_tok = 1);
+
+// The largest n_tok the FFN-side scratch was allocated for. Read from
+// SPARKINFER_K3_PREFILL_CHUNK at kimi_k3_forward_alloc_scratch time (default 16,
+// clamped to [1, 256]). 1 when there is no scratch. A driver should clamp its chunk
+// size to this rather than discover it as a refused phase.
+int kimi_k3_ffn_batch_cap(const KimiK3Forward& fwd);
+
+// Will kimi_k3_forward_layer_phase() take K3LayerPhase::Attn with this n_tok on this
+// layer? THE DRIVER MUST ASK, not infer: it decides between one batched call and a
+// per-token loop, and inferring the answer from the layer type alone would miss the
+// scratch cap, the debug mode and SPARKINFER_K3_ATTN_BATCH=0 — each of which makes the
+// phase refuse, which is a FAILED prefill rather than a slow one. False for n_tok == 1
+// (there is nothing to batch), for every KDA layer unless SPARKINFER_K3_KDA_QKVG_BATCH
+// is set (the conv and delta-rule recurrences keep the scan per-token; only the
+// projections batch), and whenever the batched path is gated off.
+bool kimi_k3_attn_batch_ok(const KimiK3Forward& fwd, int layer, int n_tok);
 
 // The buffer holding THIS RANK'S partial sum after `phase`, and its element count.
 // Returns nullptr with *count = 0 for a phase that produces no partial (FfnFinish).
@@ -427,6 +553,49 @@ float* kimi_k3_partial_buffer(KimiK3Forward& fwd, int layer, K3LayerPhase phase,
 // layer's FFN partial is replicated, never reduced, and stays where it is).
 float* kimi_k3_swap_partial_buffer(KimiK3Forward& fwd, K3LayerPhase phase,
                                   float* buf);
+
+// ---------------------------------------------------------------------------
+// Chunked prompt ingestion.
+//
+// Prompt ingestion is prefill, and prefill runs the DECODE step once per token:
+// every one of a 32k prompt's tokens pays 93 layers of launches, 185 collectives
+// and one output head. The work per token is fixed, but almost none of it is
+// per-token BOUND — the projections are GEMVs that want to be GEMMs, the
+// collectives are 185 rendezvous that could be 185/B, and the head is needed once.
+//
+// A chunked walk carries B tokens through layer L before starting layer L+1. What
+// makes that legal is that the only cross-token dependencies in this model run
+// along the RECURRENT axis, not the layer axis: the KDA conv/delta state and the
+// MLA KV cache are consumed in token order WITHIN a layer, and nothing in layer L
+// reads a later layer's output. So the per-token phases still run in token order
+// inside each layer, and the batching is in what surrounds them.
+//
+//   kimi_k3_forward_alloc_batch     allocate B slots (call after alloc_scratch,
+//                                   and after fwd.state is set — the residual
+//                                   bank is sized from state->max_ckpt).
+//   kimi_k3_forward_batch_begin     start a chunk: clear every slot's checkpoint
+//                                   count.
+//   kimi_k3_forward_select_slot     address slot t. Pointer arithmetic only; the
+//                                   whole of forward_layer_phase then runs on
+//                                   that token unmodified.
+//   kimi_k3_forward_batch_end       give the decode path its own residual bank
+//                                   back. MUST be called before the next
+//                                   forward_token.
+//   kimi_k3_batch_partial_buffer    the base and TOTAL element count of a phase's
+//                                   partial across n_slots, so the driver reduces
+//                                   B tokens in one collective instead of B.
+//
+// B == 1 takes the same path with a one-slot arena and is bit-identical to the
+// token loop — which is what makes it a usable control: any divergence at B=8 is
+// the batching, not the batched code.
+bool kimi_k3_forward_alloc_batch(const KimiK3Config& cfg, KimiK3Forward& fwd,
+                                 int batch);
+int  kimi_k3_forward_batch_capacity(const KimiK3Forward& fwd);
+void kimi_k3_forward_batch_begin(KimiK3Forward& fwd);
+void kimi_k3_forward_select_slot(KimiK3Forward& fwd, int slot);
+void kimi_k3_forward_batch_end(KimiK3Forward& fwd);
+float* kimi_k3_batch_partial_buffer(KimiK3Forward& fwd, int layer,
+                                    K3LayerPhase phase, int n_slots, int* count);
 
 // Print the SPARKINFER_K3_PROFILE=1 phase breakdown to stderr (no-op when unset).
 void kimi_k3_profile_report();

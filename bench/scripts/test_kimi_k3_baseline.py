@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from pathlib import Path
 
@@ -88,15 +89,30 @@ class ForkPinTest(unittest.TestCase):
                 var = f"KIMI_K3_{node}_LLAMA_{suffix}"
                 self.assertEqual(bash(f'echo "${var}"'), "0", var)
 
-    def test_lock_prefix_matches_node(self):
-        for node, want in (("h200x8", "KIMI_K3_H200X8_LLAMA_"),
-                           ("b200x8", "KIMI_K3_B200X8_LLAMA_"),
-                           ("b300x4", "KIMI_K3_B300X4_LLAMA_")):
+    def test_lock_prefix_matches_node_and_quant(self):
+        """The prefix carries BOTH, because a slot names the measurement completely.
+
+        This used to expect the unqualified KIMI_K3_<NODE>_LLAMA_, which is what the script
+        emitted -- and those slots are the all-zero ones the harness does not read. The
+        harness reads KIMI_K3_<NODE>_<QUANT>_LLAMA_128K, so a baseline run landed its number
+        where nothing would ever score from it. See
+        test_the_baseline_writes_the_slot_the_harness_reads, which pins the two derivations
+        to each other."""
+        for node, want in (("h200x8", "KIMI_K3_H200X8_IQ1S_LLAMA_"),
+                           ("b200x8", "KIMI_K3_B200X8_IQ1S_LLAMA_"),
+                           ("b300x4", "KIMI_K3_B300X4_IQ1S_LLAMA_")):
             out = subprocess.run(
                 ["bash", str(SCRIPTS / "kimi_k3_baseline.sh"), "--node", node, "--dry-run"],
                 capture_output=True, text=True, cwd=ROOT)
             self.assertEqual(out.returncode, 0, out.stderr[-2000:])
             self.assertIn(want, out.stdout, node)
+        # ...and the quant half tracks PRIMARY_QUANT rather than being hardcoded.
+        out = subprocess.run(
+            ["bash", str(SCRIPTS / "kimi_k3_baseline.sh"), "--node", "h200x8", "--dry-run"],
+            capture_output=True, text=True, cwd=ROOT,
+            env={**os.environ, "PRIMARY_QUANT": "UD-Q2_K_XL"})
+        self.assertIn("KIMI_K3_H200X8_Q2KXL_LLAMA_", out.stdout,
+                      "the quant tag is hardcoded, so a Q2_K_XL run would overwrite IQ1_S")
 
 
 class ShardPathTest(unittest.TestCase):
@@ -764,6 +780,52 @@ class CiWorkflowTest(unittest.TestCase):
         self.assertIn("needs-node-run", text)
         self.assertNotIn("state: 'closed'", text)
 
+    @unittest.skipUnless(shutil.which("node"), "node not available")
+    def test_node_attestation_scan_is_scoped_to_the_node_run_section(self):
+        """A body-wide ticked-checkbox scan matched the PR-template Checklist boilerplate
+        '- [x] `...kimi_k3_baseline.sh --node h200x8 --dry-run` resolves' -- ticked on
+        nearly every PR and containing 'h200' -- so it read as 'attested on 8x H200' while
+        the real Node run box sat unticked. #74 cleared its needs-node-run label this way
+        with no node run behind it (#78 fixed it).
+
+        Tested by running the REAL functions extracted from the workflow's github-script
+        block, against a body shaped like the PR template -- not a paraphrase that can
+        drift. The fixture keeps the exact colliding Checklist line."""
+        import yaml as _y, tempfile, textwrap
+        wf = _y.safe_load((self.WF / "node-attestation.yml").read_text())
+        script = wf["jobs"]["gate"]["steps"][0]["with"]["script"]
+        self.assertIn("function nodeRunSection", script,
+                      "the section scoper is gone — the body-wide scan is back")
+        fns = script[script.index("const NODES"):script.index("const { owner, repo }")]
+
+        fixture = textwrap.dedent("""\
+            ## Summary
+            x
+            ## Node run
+            - [ ] Tested on **8× H200** (`sm_90`)
+            ## Checklist
+            - [x] `bench/scripts/kimi_k3_baseline.sh --node h200x8 --dry-run` resolves
+        """)
+        driver = fns + textwrap.dedent("""
+            const cases = [
+              tickedNodes(process.argv[2]),                                   // boilerplate only
+              tickedNodes(process.argv[2].replace('- [ ] Tested', '- [x] Tested')),  // real tick
+              tickedNodes(process.argv[2].replace('## Node run', '## Runs')), // heading gone
+            ];
+            console.log(JSON.stringify(cases));
+        """)
+        f = tempfile.NamedTemporaryFile("w", suffix=".js", delete=False)
+        f.write(driver); f.close()
+        out = subprocess.run(["node", f.name, fixture], capture_output=True, text=True)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        boilerplate_only, real_tick, no_heading = json.loads(out.stdout)
+        self.assertEqual(boilerplate_only, [],
+                         "the ticked Checklist boilerplate attested a node again (#74)")
+        self.assertEqual(real_tick, ["8x H200 (sm_90)"],
+                         "a genuinely ticked Node run box must still attest")
+        self.assertEqual(no_heading, [],
+                         "no Node run section must fail closed, not fall back to the body")
+
     def test_sensitive_paths_no_longer_guards_the_whole_harness(self):
         # bench/scripts/ IS the deliverable here; guarding all of it would gate every
         # contribution the repo exists to receive.
@@ -1133,8 +1195,8 @@ class CiWorkflowTest(unittest.TestCase):
             self._bot().mark_merge_first(
                 "r", [(20, {"tps": 8.17}), (25, {"tps": 9.55})], True)
         out = buf.getvalue()
-        self.assertIn("--add-label merge-first on #25", out)
-        self.assertIn("--remove-label merge-first on #20", out)
+        self.assertIn("would add merge-first on #25", out)
+        self.assertIn("would remove merge-first on #20", out)
 
     def test_admin_merge_is_reachable_only_through_the_guards(self):
         """The bot may now bypass branch protection, by explicit operator choice. What must
@@ -1203,19 +1265,31 @@ class CiWorkflowTest(unittest.TestCase):
         was otherwise fine, and the same skew made its reference.lock resolve frontier=0 and
         label a real speedup BASELINE.
 
-        refdata/ is NO LONGER shipped to the box, and that is the point. Restoring the answer
-        key into the same working tree the PR's binary runs in -- fixed relative path, cwd at
-        the repo root -- meant a bench could open bench/refdata/hello.spkl and write it back
-        out as its own --logits dump: top1 1.0, KL 0.0, no work done. Nothing rejected a
+        The ANSWER KEY is never shipped to the box, and that is the point. Restoring it into
+        the same working tree the PR's binary runs in -- fixed relative path, cwd at the repo
+        root -- meant a bench could open bench/refdata/hello.spkl and write it back out as
+        its own --logits dump: top1 1.0, KL 0.0, no work done. Nothing rejected a
         suspiciously exact result either, since label.py only bounds top1 >= 0.90 and
-        KL <= 0.05 while honest main measures 0.004."""
+        KL <= 0.05 while honest main measures 0.004.
+
+        The .ids ARE restored, from origin/main. They are inputs, not answers: which tokens
+        the executor is fed is public in the repo, and the 32k-token parity prompt is ~200 KB
+        -- past MAX_ARG_STRLEN, so it cannot be passed as an ssh argument and has to be read
+        from the box's own checkout. Taking them from origin/main rather than the PR is what
+        stops a PR swapping in a shorter prompt and being graded on it."""
         src = (ROOT / "eval/k3_eval_bot.py").read_text()
         self.assertIn("git checkout -q origin/main -- bench/scripts", src,
                       "the bot grades with the PR's own harness")
+        # The pathspec must be .ids-only: a bare bench/refdata pathspec would write every
+        # .spkl to the box, even if a later step deletes them.
+        self.assertIn("origin/main -- bench/scripts 'bench/refdata/*.ids'", src,
+                      "only the ids may be restored, and they must come from origin/main")
         self.assertNotIn("origin/main -- bench/scripts bench/refdata", src,
                          "the answer key must not be shipped to the box")
-        self.assertIn('"rm -rf bench/refdata"', src,
+        self.assertIn('"rm -f bench/refdata/*.spkl"', src,
                       "a PR could otherwise carry its own copy of the answer key")
+        self.assertNotIn(".spkl", src.split("git checkout -q origin/main")[1].split(",")[0],
+                         "no .spkl may be named in the restore pathspec")
         self.assertLess(src.index("origin/main -- bench/scripts"),
                         src.index("kimi_k3_eval.sh --node"),
                         "the harness must be restored BEFORE the eval runs")
@@ -1347,8 +1421,9 @@ class CiWorkflowTest(unittest.TestCase):
             self.assertIn(p, bot.NEVER_MERGE_PATHS,
                           f"{p} decides payouts and must block an unreviewed merge")
 
-    def test_scored_context_is_128k_everywhere(self):
-        """The scored context is 131,072, and THREE places have to agree on the slot suffix:
+    def test_scored_slot_agrees_everywhere(self):
+        """The scored metric is PREFILL at 32k (2026-08-05), and THREE places have to agree on
+        the slot suffix:
         the harness that measures, the workflow that re-derives the tier, and the bot that
         writes the frontier back. A mismatch means the bot updates one slot while CI scores
         from another, and nothing fails loudly -- the tier is just computed over unrelated
@@ -1359,24 +1434,286 @@ class CiWorkflowTest(unittest.TestCase):
         context were three different things, and 128k -- the configuration CONTRIBUTING says
         this repo runs -- was never scored at all."""
         bot = self._bot()
-        self.assertEqual(bot.CTX_SUFFIX, "128K")
-        self.assertTrue(bot._frontier_slot("h200x8", "UD-IQ1_S").endswith("_128K"))
+        self.assertEqual(bot.CTX_SUFFIX, "32K_PP")
+        self.assertTrue(bot._frontier_slot("h200x8", "UD-IQ1_S").endswith("_32K_PP"))
         ev = (ROOT / "bench/scripts/kimi_k3_eval.sh").read_text()
-        self.assertIn('SCORED_CTX="${KIMI_K3_SCORED_CTX:-131072}"', ev)
-        self.assertIn('CTX_SUFFIX="${KIMI_K3_CTX_SUFFIX:-128K}"', ev)
-        self.assertIn('--ctx "$SCORED_CTX" --seek', ev,
-                      "the speed pass must run at the scored context")
+        self.assertIn('CTX_SUFFIX="${KIMI_K3_CTX_SUFFIX:-32K_PP}"', ev)
         self.assertIn('SPARKINFER_SCORED_CONTEXT="$SCORED_CTX"', ev,
                       "the verdict must record which context earned it")
         wf = (ROOT / ".github/workflows/eval-label.yml").read_text()
-        self.assertIn('{kind}_128K', wf,
+        self.assertIn('SUFFIX = "32K_PP"', wf,
                       "the trusted re-derivation must read the same slot the bot writes")
-        # 128K has to resolve to a context, or a pinned llama reference at it is unverifiable
+        self.assertIn('{kind}_{SUFFIX}', wf,
+                      "the slot name must be built from that one suffix, not a second literal")
+        # the suffix has to resolve to a context, or a pinned llama reference at it is
+        # unverifiable by check_reference_lock.py
         import importlib.util as _u
         spec = _u.spec_from_file_location("crl", ROOT / "bench/scripts/check_reference_lock.py")
         crl = _u.module_from_spec(spec)
         spec.loader.exec_module(crl)
-        self.assertEqual(crl.CTX_OF_SUFFIX.get("128K"), 131072)
+        self.assertEqual(crl.CTX_OF_SUFFIX.get("32K_PP"), 32768)
+
+    def test_the_llama_anchor_is_off_on_the_prefill_metric(self):
+        """A tier's COST scales with the reference, and llama's two metrics are 7.8x apart:
+        18.44 tok/s decode against 143.88 prefill. So the same rule that asks +10% over the
+        frontier for an L on decode asks +27.1% on prefill -- not because prefill work is
+        harder, but because llama.cpp batches the prompt and we do not, which makes 143.88 a
+        different ALGORITHM rather than a mature version of ours.
+
+        The anchor had been inert on K3 since the decode frontier passed 18.44 (ref < frontier
+        -> min() picks g), so every recent K3 tier was already frontier-relative. Moving the
+        scored metric to prefill silently reactivated a dormant rule at 2.7x its old strength
+        and cost #133 the L its +11.4% earned under the rule every prior PR was scored by.
+
+        Turn this back on the round after batched prefill (#137) lands."""
+        run = lambda **e: json.loads(subprocess.run(
+            [sys.executable, str(ROOT / "bench/scripts/label.py"),
+             "59.06", "53.02", "0", "1.0", "0.006694998", "10b0c9a"],
+            capture_output=True, text=True, check=True,
+            env={**os.environ, "SPARKINFER_DIFFICULTY_REF": "143.88", **e},
+        ).stdout.split("RESULT_JSON", 1)[1])
+
+        off = run(SPARKINFER_TIER_ANCHOR="off")
+        self.assertEqual(off["label"], "L", "+11.4% over the frontier is an L")
+        self.assertEqual(off["effective_pct"], 11.4)
+        self.assertEqual(off["tier_basis"], "frontier_relative")
+        # The ref is still pinned and still reported -- it stopped being the BASIS, it did
+        # not stop being true. pct_of_llama must remain delta/143.88, not delta/frontier,
+        # or every receipt written under the new basis silently redefines the field.
+        self.assertEqual(off["pct_of_llama"], 4.2)
+        self.assertEqual(off["tier_anchor_ref"], 143.88)
+        # Turning the anchor off always records WHY in the receipt, whether or not the
+        # caller supplied a specific reason. A tier basis that changed for reasons the log
+        # does not carry is not auditable a year later.
+        self.assertIn("does not measure the same algorithm", off["tier_anchor_off"])
+        why = run(SPARKINFER_TIER_ANCHOR="off",
+                  SPARKINFER_TIER_ANCHOR_REASON="llama.cpp batches the prompt")
+        self.assertEqual(why["tier_anchor_off"], "llama.cpp batches the prompt")
+
+        self.assertEqual(run()["label"], "S", "default stays anchored — this is opt-in")
+
+        # Decode is untouched: there the ref is BELOW the frontier, so the cap already
+        # picked the frontier-relative gain and the anchor never bound.
+        dec = json.loads(subprocess.run(
+            [sys.executable, str(ROOT / "bench/scripts/label.py"),
+             "62.48", "56.8", "0", "1.0", "0.0067", "abc1234"],
+            capture_output=True, text=True, check=True,
+            env={**os.environ, "SPARKINFER_DIFFICULTY_REF": "18.4435"},
+        ).stdout.split("RESULT_JSON", 1)[1])
+        self.assertEqual((dec["label"], dec["effective_pct"]), ("L", 10.0))
+
+    def test_the_harness_and_the_workflow_switch_the_anchor_on_the_same_test(self):
+        """eval-label.yml re-derives the label from the payload's own numbers and REFUSES it
+        when its answer differs from the reported one -- that is the forged-payload check. So
+        a harness that anchors where the workflow does not does not produce a wrong tier, it
+        produces 'payload edited or harness version mismatch' on every prefill PR. Both sides
+        must key off the same thing: a CTX_SUFFIX ending in _PP."""
+        ev = (ROOT / "bench/scripts/kimi_k3_eval.sh").read_text()
+        wf = (ROOT / ".github/workflows/eval-label.yml").read_text()
+        self.assertIn('[[ "$CTX_SUFFIX" == *_PP ]]', ev)
+        self.assertIn('anchor_off = SUFFIX.endswith("_PP")', wf)
+        for src in (ev, wf):
+            self.assertIn("SPARKINFER_TIER_ANCHOR", src)
+            self.assertIn("llama.cpp batches the prompt and sparkinfer does not", src,
+                          "both sides must state the same reason, so a receipt and a "
+                          "workflow log cannot disagree about why the tier moved")
+
+    def test_a_payload_scored_under_the_old_basis_is_superseded_not_refused(self):
+        """The label check is a tamper check, and a tamper check may only compare things that
+        SHOULD be equal. Turning the llama anchor off put every sealed prefill payload in the
+        log at odds with its own re-derivation; refusing them would mean spending ~25
+        GPU-minutes per PR to reprint numbers that are already sealed.
+
+        The claimed label still has to be what the TRUSTED numbers really produce under one of
+        the two rule versions, so a forger cannot name an arbitrary tier -- only one the same
+        inputs actually yield."""
+        wf = (ROOT / ".github/workflows/eval-label.yml").read_text()
+        self.assertIn("alt_label = score(alt)", wf)
+        self.assertIn("the payload was edited", wf,
+                      "a label matching NEITHER basis is still a hard refusal")
+        self.assertIn("superseded=", wf, "the supersession must reach the PR comment")
+
+        def label(tps, anchor=None):
+            env = {**os.environ, "SPARKINFER_DIFFICULTY_REF": "143.88"}
+            if anchor:
+                env["SPARKINFER_TIER_ANCHOR"] = anchor
+            return json.loads(subprocess.run(
+                [sys.executable, str(ROOT / "bench/scripts/label.py"),
+                 str(tps), "53.02", "0", "1.0", "0.006694998", "10b0c9a"],
+                capture_output=True, text=True, check=True, env=env,
+            ).stdout.split("RESULT_JSON", 1)[1])["label"]
+
+        # #133's sealed run: S under the anchor it was scored with, L under the current rule.
+        # Both are real derivations of 59.06 against 53.02, which is what makes the
+        # supersession safe to accept.
+        self.assertEqual(label(59.06), "S")
+        self.assertEqual(label(59.06, "off"), "L")
+        # ...and nothing makes those numbers an XL under either basis, so a payload claiming
+        # one is still caught.
+        self.assertNotIn("XL", {label(59.06), label(59.06, "off")})
+
+    def test_a_self_declared_block_skips_instead_of_demanding_a_node_run(self):
+        """#144 measured prefill 63.28 vs 59.07 on one binary, held the decode guard, verified
+        parity bit-exact at 1k and 4k -- then found parity FAILS at 32k, pasted the failing
+        compare_logits output into the body, and said do not merge on the perf number. The
+        most careful submission in the queue.
+
+        The template had nowhere to put that, so the author restructured the body, which cost
+        the '## Node run' heading the attestation scan keys on, and the PR was labelled
+        needs-node-run. The loop told someone who had run more experiments than anyone that
+        they had not touched a GPU.
+
+        Both readers now take a ticked Blocked box from the WHOLE body, not from the node-run
+        section -- an author with something to disclose is the one most likely to have
+        reorganised around it."""
+        bot = self._bot()
+        # WITH the needs-node-run label already on it. That is the state the mechanism has to
+        # win from: #144 was labelled before it could adopt the box, and a blocked declaration
+        # that loses to a stale label reports the same wrong reason it was meant to replace.
+        blocked = {"number": 1, "isDraft": False, "labels": [{"name": "needs-node-run"}],
+                   "body": "## Summary\n- [x] **Blocked — do not evaluate yet.** parity @32k\n"}
+        ok, why = bot.eligibility(blocked)
+        self.assertFalse(ok)
+        self.assertIn("marked this blocked", why)
+        # ...and it is not reported as a missing node run, which is the whole point.
+        self.assertNotIn("needs-node-run", why)
+        self.assertNotIn("has not attested", why)
+
+        # Unticked is the normal state and must not skip anything: the box is a declaration,
+        # not a keyword. #144's own body carried an UNTICKED "parity @32k — FAILS ... Blocking."
+        # line, and reading that as a block would let any mention of the word stop a round.
+        unblocked = dict(blocked, body="## Summary\n- [ ] **Blocked** — no\nblocked blocked\n")
+        self.assertNotIn("marked this blocked", bot.eligibility(unblocked)[1])
+
+        wf = (ROOT / ".github/workflows/node-attestation.yml").read_text()
+        self.assertIn("author marked this blocked", wf,
+                      "the label must not be applied to a PR that already said 'not yet'")
+        tpl = (ROOT / ".github/PULL_REQUEST_TEMPLATE.md").read_text()
+        self.assertIn("Blocked — do not evaluate yet", tpl)
+        self.assertIn("Known problems", tpl,
+                      "there has to be somewhere to write the defect that is not a "
+                      "machine-read section")
+
+    def test_the_template_never_hardcodes_a_frontier_number(self):
+        """A frontier quoted in a doc is stale the next time anything merges, and a stale one
+        is not a cosmetic error: #135, #136 and #138 were all optimised against a pin that
+        understated main by 31%, all measured honestly, and all landed under the bar.
+
+        The template used to print 'main does 40.35' directly. It now sends people to
+        reference.lock on main, and tells them to measure main themselves in the same session
+        as their own arm -- which is what kept #133's self-measured before within 0.2% of what
+        the node independently found."""
+        tpl = (ROOT / ".github/PULL_REQUEST_TEMPLATE.md").read_text()
+        for stale in ("40.35", "53.02", "56.8", "59.06"):
+            self.assertNotIn(stale, tpl,
+                             f"{stale} is a measurement with a shelf life — link the lock "
+                             f"instead of copying the number into a template")
+        self.assertIn("reference.lock", tpl)
+        self.assertIn("measure `main` yourself", tpl)
+
+    def test_merging_a_winner_advances_the_pin_in_the_same_breath(self):
+        """reconcile_lock only runs when a round STARTS, so between a merge and the next round
+        the pin describes the main that existed before the winner landed. After #133 that gap
+        was 53.02 pinned against ~59.06 on main.
+
+        A stale-low pin does not merely mislead. The pin is what the claim gate compares
+        against, so it makes the gate too LENIENT: a PR claiming 55 clears a 53.02 bar while
+        being slower than the main it would merge into, and buys ~25 GPU-minutes to find that
+        out."""
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        merge_at = src.index("if merge_winner(args.repo, winner")
+        after = src[merge_at:merge_at + 1600]
+        self.assertIn("reconcile_lock(args.repo, NODE, quant, winner_tps", after,
+                      "the pin has to move with the merge, not with the next round")
+        self.assertIn("winner_tps > 0", after,
+                      "a missing measurement must not write a zero frontier")
+
+    def test_the_top1_bar_is_095_everywhere_that_can_disagree(self):
+        """Three readers apply this bar -- label.py's default, the harness, and the workflow's
+        re-derivation -- and eval-label.yml REFUSES a payload whose label it cannot reproduce.
+        A bar that differs between them does not produce a wrong verdict, it produces
+        'payload edited' on every PR, so they are pinned together."""
+        # label.py's DEFAULT stays 0.90 -- that is the Qwen track's bar, and accuracy.sh
+        # grades top-1 there over many rows at 0.875/0.80, so raising the shared default to
+        # tighten K3 would silently tighten a gate whose numbers we have never measured.
+        # K3 pins its own, exactly as it pins KL 0.05 against label.py's Qwen default 0.20.
+        lp = (ROOT / "bench/scripts/label.py").read_text()
+        self.assertIn('SPARKINFER_TOP1_BAR",  "0.90"', lp)
+        ev = (ROOT / "bench/scripts/kimi_k3_eval.sh").read_text()
+        self.assertIn('TOP1_BAR="${KIMI_K3_TOP1_BAR:-0.95}"', ev)
+        self.assertIn('SPARKINFER_TOP1_BAR="$TOP1_BAR"', ev)
+        self.assertIn('"top1_bar": float(top1_bar)', ev,
+                      "the bar the box ran must be in the payload, or a disagreement is "
+                      "guesswork")
+        wf = (ROOT / ".github/workflows/eval-label.yml").read_text()
+        self.assertIn('TOP1_BAR = "0.05", "0.02", "0.95"', wf)
+        self.assertIn('env["SPARKINFER_TOP1_BAR"] = TOP1_BAR', wf)
+
+    def test_top1_is_a_boolean_because_every_probe_dumps_one_row(self):
+        """THE BAR IS NOT A 5% TOLERANCE AND THE DOCS MUST NOT IMPLY ONE.
+
+        compare_logits computes (argmax_ref == argmax_test).mean() over the rows in the .spkl,
+        and every reference file carries n_tok=1. The mean of one boolean is 0.0 or 1.0;
+        k3_eval_bot then takes min() across depths. So every bar in (0, 1] behaves identically
+        -- 'the argmax must match exactly at every depth' -- and all 48 top-1 values in the
+        sealed log are exactly 1.0.
+
+        This test fails the day a probe dumps more than one row, which is the point: at that
+        moment 0.95 starts to mean something and the prose below it has to be revisited."""
+        import struct
+        refs = sorted((ROOT / "bench/refdata").glob("*.spkl"))
+        self.assertTrue(refs, "no reference logits to check")
+        for f in refs:
+            with open(f, "rb") as fh:
+                self.assertEqual(fh.read(4), b"SPKL", f.name)
+                _, n_tok, _ = struct.unpack("<III", fh.read(12))
+            self.assertEqual(n_tok, 1,
+                             f"{f.name} now carries {n_tok} rows -- top-1 is no longer a "
+                             f"boolean, so revisit the 0.95 bar and the docs that call it "
+                             f"pass/fail")
+        # The correctness-gate prose lives in CONTRIBUTING and docs/technical.md; the
+        # README links to them rather than restating the bars. Assert wherever the claim
+        # is actually made, so moving it between docs cannot quietly drop it.
+        for doc, needle in ((("CONTRIBUTING.md"), "top-1 is pass/fail"),
+                            (("docs/technical.md"), "effectively pass/fail")):
+            self.assertIn(needle, (ROOT / doc).read_text(),
+                          f"{doc} must not present the bar as a graded tolerance")
+
+    def test_the_docs_quote_k3s_own_kl_bar_not_the_qwen_default(self):
+        """README said 'KL <= 0.20' in two places. That is label.py's shared default, which is
+        the Qwen track's; K3 pins 0.05 in the harness and in eval-label.yml. Quoting 0.20
+        tells a K3 contributor their PR has 4x the parity headroom it really has."""
+        # Checked across every doc that quotes a bar, not just the README: the numbers
+        # moved to docs/technical.md when the README was cut down, and a guard bound to
+        # one file would have gone green while the wrong bar sat in another.
+        docs = {d: (ROOT / d).read_text()
+                for d in ("README.md", "docs/technical.md", "CONTRIBUTING.md")}
+        for name, body in docs.items():
+            self.assertNotIn("KL <= 0.20", body, name)
+            self.assertNotIn("KL ≤ 0.20", body, name)
+        joined = "\n".join(docs.values())
+        self.assertIn("KL ≤ 0.05", joined)
+
+    def test_decode_is_guarded_at_128k_even_though_prefill_is_scored(self):
+        """Prefill and decode share kernels, so batching the prompt WILL move decode. The
+        guard bounds how far, and it is a refusal rather than a tier: a prefill gain bought
+        by giving decode back has not moved the engine forward, it has moved work around.
+
+        1% sits above the worst same-code spread observed between rounds (0.80%: main
+        measured 46.48 then 46.11), so it separates a real regression from box scatter."""
+        ev = (ROOT / "bench/scripts/kimi_k3_eval.sh").read_text()
+        self.assertIn('DECODE_GUARD_PCT="${KIMI_K3_DECODE_GUARD_PCT:-1.0}"', ev)
+        self.assertIn('DECODE_CTX="${KIMI_K3_DECODE_CTX:-131072}"', ev,
+                      "the guard must be applied at 128k, whatever is scored")
+        self.assertIn('--ctx "$DECODE_CTX" --seek', ev,
+                      "the decode pass must run at 128k even when prefill is scored")
+        self.assertIn("decode regressed to", ev, "the guard never refuses")
+        # and the receipt must record that the guard ran, else an inactive guard and a
+        # passing one look identical afterwards
+        self.assertIn('"decode_tps"', ev)
+        self.assertIn('"scored_metric"', ev)
+        bot = self._bot()
+        self.assertEqual(bot.DECODE_SUFFIX, "128K")
 
     def test_accuracy_is_not_measured_at_the_scored_context(self):
         """--seek attends over a ZEROED cache. That is faithful for TIMING (the MLA reduction
@@ -1461,7 +1798,7 @@ class CiWorkflowTest(unittest.TestCase):
         return f.name
 
     def _run_guard(self, ns_lo, ns_hi, n_lo, n_hi, self_tps, self_ms,
-                   tol="1.5", work_tol="2.0", llama_ref="16.70",
+                   tol="1.5", work_tol="2.0", llama_ref="18.44",
                    max_over_llama="3.0", jitter_s="2.0"):
         return subprocess.run(
             [sys.executable, self._speed_guard(), str(int(ns_lo)), str(int(ns_hi)),
@@ -1520,8 +1857,9 @@ class CiWorkflowTest(unittest.TestCase):
         The defaults must overlap. If the ceiling sat above the crossover there would be a
         band where a fabricated claim is both timing-free and scorable, which is the original
         hole in a narrower window."""
-        MARGIN, JITTER, WORK_TOL, LLAMA, MULT = 128, 2.0, 2.0, 16.70, 3.0
-        crossover = MARGIN / (JITTER * WORK_TOL)      # 32 tok/s: timing stops being evidence
+        MARGIN = self._margin_default()               # read from the harness, not restated
+        JITTER, WORK_TOL, LLAMA, MULT = 2.0, 2.0, 18.44, 3.0
+        crossover = MARGIN / (JITTER * WORK_TOL)      # tok/s: timing stops being evidence
         ceiling = LLAMA * MULT                        # 50.1 tok/s: plausibility takes over
         self.assertLessEqual(
             ceiling, crossover * 2,
@@ -1539,16 +1877,85 @@ class CiWorkflowTest(unittest.TestCase):
         self.assertEqual(rc.returncode, 0, f"a real 20 tok/s run was refused:\n{rc.stderr}")
 
     def test_jitter_never_trips_the_work_check(self):
-        """Load jitter INFLATES d_ns (the differential reads slower than truth), so it can
-        only make the work check pass more easily. The check must therefore never fire on an
-        honest run, however unlucky the load -- a false refusal here costs a real PR its
-        tier, which is exactly how the 8-and-24-token version broke on trusted main."""
+        """A false refusal here costs an honest PR its tier, so the work check must survive
+        the worst load the box actually produces.
+
+        The docstring here used to claim jitter is one-directional -- 'it only ever makes the
+        differential read SLOWER than truth, so it can only make the work check pass more
+        easily'. That is false, and #77 is the counterexample. d_ns is a DIFFERENCE of two
+        loads: when the SECOND run loads faster than the first, the difference is negative and
+        it is subtracted from the decode signal. The old cases only passed because they were
+        written at ~1 tok/s, where 128 tokens is 128 s of signal and a few seconds of jitter
+        cannot reach it. Measured on the h200x8 box the load spread is 7.0 s (33.25-40.27 s
+        over five runs), so the jitter range below is the real one."""
+        MARGIN = self._margin_default()
         LOAD, MS = 150e9, 1000.0
-        for jitter_s in (-2, -1, 0, 1, 2, 5):
+        for jitter_s in (-7, -5, -2, 0, 2, 5, 7):
             rc = self._run_guard(LOAD + 8e9, LOAD + 8e9 + 128e9 + jitter_s * 1e9,
                                  8, 136, 1.0, MS)
             self.assertEqual(rc.returncode, 0,
                              f"{jitter_s:+} s of load jitter refused an honest run:\n{rc.stderr}")
+
+        # And at the speed main ACTUALLY runs at now, where the signal is small enough for
+        # 7 s to matter. This is the case that refused #77.
+        ms = 1000.0 / 18.88                       # main: 18.88 tok/s at 128k
+        for jitter_s in (-7, -3.4, 0, 7):
+            signal = MARGIN * ms / 1000.0
+            rc = self._run_guard(LOAD + 8e9, LOAD + 8e9 + (signal + jitter_s) * 1e9,
+                                 8, 8 + MARGIN, 18.88, ms)
+            self.assertEqual(rc.returncode, 0,
+                             f"at {MARGIN} marginal tokens, {jitter_s:+} s of jitter refused "
+                             f"an honest 18.88 tok/s run:\n{rc.stderr}")
+
+    def _margin_default(self):
+        """MARGIN_TOKENS as the harness actually defaults it — read, not restated, so this
+        file cannot drift from the value that gates PRs."""
+        import re as _re
+        ev = (ROOT / "bench/scripts/kimi_k3_eval.sh").read_text()
+        m = _re.search(r'MARGIN_TOKENS="\$\{KIMI_K3_MARGIN_TOKENS:-(\d+)\}"', ev)
+        self.assertIsNotNone(m, "MARGIN_TOKENS default no longer parses")
+        return int(m.group(1))
+
+    def test_the_margin_outruns_the_measured_load_jitter(self):
+        """THE MARGIN HAS TO TRACK THE ENGINE.
+
+        The decode signal is MARGIN_TOKENS x ms/token, so every speedup this loop pays for
+        shrinks it, while the load jitter it must clear does not move. 128 tokens was a 28 s
+        signal when main ran at 4.53 tok/s and a 6.8 s one by 18.88 tok/s -- below the 7.0 s
+        spread measured on the box, at which point the guard refuses honest work. #77 was
+        refused exactly there: 128 tokens that should have cost 6.36 s measured 2.96 s.
+
+        work_tol tolerates a shortfall of signal/work_tol, so that is what must clear the
+        jitter -- with real headroom, because this only gets tighter as the frontier rises."""
+        MARGIN = self._margin_default()
+        JITTER_S, WORK_TOL, FRONTIER = 7.0, 2.0, 18.88
+        signal = MARGIN * (1000.0 / FRONTIER) / 1000.0
+        self.assertGreater(
+            signal / WORK_TOL, JITTER_S * 1.5,
+            f"MARGIN_TOKENS={MARGIN} gives {signal:.1f} s of decode at {FRONTIER} tok/s; "
+            f"work_tol absorbs {signal / WORK_TOL:.1f} s against {JITTER_S} s of measured "
+            "load jitter — too little headroom, honest PRs will be refused")
+
+    def test_77s_exact_numbers_are_the_regression_case(self):
+        """The real refusal, replayed. #77 self-reported 49.70 ms/token (20.12 tok/s, a
+        +6.6% win over main's 18.88) and its 128 marginal tokens measured 2.96 s against the
+        6.36 s the claim implies. Corroborated by the sweep: five runs of main on the same
+        box self-reported 52.98/53.11/53.07/53.02/53.50 ms/token, spread 1.0%, so the
+        self-report was not the unreliable half."""
+        LOAD, SELF_MS, D_MEASURED = 150e9, 49.70, 2.96
+        rc = self._run_guard(LOAD + 8e9, LOAD + 8e9 + D_MEASURED * 1e9,
+                             8, 136, 1000.0 / SELF_MS, SELF_MS)
+        self.assertEqual(rc.returncode, 1, "the historical refusal no longer reproduces")
+        self.assertIn("did not do the extra work", rc.stderr)
+
+        # Same jitter in seconds, same claim, at the margin the harness now defaults to.
+        MARGIN = self._margin_default()
+        shortfall = SELF_MS * 128 / 1000.0 - D_MEASURED         # 3.40 s of adverse jitter
+        d = MARGIN * SELF_MS / 1000.0 - shortfall
+        rc = self._run_guard(LOAD + 8e9, LOAD + 8e9 + d * 1e9, 8, 8 + MARGIN,
+                             1000.0 / SELF_MS, SELF_MS)
+        self.assertEqual(rc.returncode, 0,
+                         f"MARGIN_TOKENS={MARGIN} still refuses #77's honest run:\n{rc.stderr}")
 
     def test_a_faster_claim_than_elapsed_time_is_still_refused(self):
         """The original one-sided check must survive the second side being added."""
@@ -1585,7 +1992,7 @@ class CiWorkflowTest(unittest.TestCase):
                 "set -euo pipefail\n"
                 f"NS_LO={int(ns_lo)}\nNS_HI={int(ns_hi)}\n"
                 "TOKENS_LO=8\nTOKENS_HI=136\n"
-                f"SELF_TPS={self_tps}\nSELF_MS={self_ms}\nLLAMA_REF=16.70\n"
+                f"SELF_TPS={self_tps}\nSELF_MS={self_ms}\nLLAMA_REF=18.44\n"
                 + fragment
                 + "\necho SCORED_TPS=$TPS\n")
             f = tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False)
@@ -1687,8 +2094,10 @@ class CiWorkflowTest(unittest.TestCase):
                            "without a tolerance the lock is rewritten on pure noise, and "
                            "every commit to main costs every open PR a rebase")
         # only the one node+quant frontier slot is ever addressed
+        # the scored slot moved to prefill @32k on 2026-08-05; decode's _128K slot is still
+        # written, but as the regression guard's baseline rather than the tier basis
         self.assertEqual(bot._frontier_slot("h200x8", "UD-IQ1_S"),
-                         "KIMI_K3_H200X8_IQ1S_SPARKINFER_128K")
+                         "KIMI_K3_H200X8_IQ1S_SPARKINFER_32K_PP")
         self.assertNotIn("LLAMA", bot._frontier_slot("h200x8", "UD-IQ1_S"),
                          "the llama reference is a real external constant — never rewritten")
         rec = src[src.index("def reconcile_lock("):src.index("def evaluate(")]
@@ -1835,8 +2244,8 @@ class CiWorkflowTest(unittest.TestCase):
                       "the bar label.py is given must be the one recorded in provenance")
         self.assertIn('SPARKINFER_KL_PREFER="$KL_PREFER"', ev)
         wf = (ROOT / ".github/workflows/eval-label.yml").read_text()
-        self.assertIn('KL_BAR, KL_PREFER = "0.05", "0.02"', wf,
-                      "the trusted re-derivation would use the Qwen default and disagree")
+        self.assertIn('KL_BAR, KL_PREFER, TOP1_BAR = "0.05", "0.02", "0.95"', wf,
+                      "the trusted re-derivation would use the Qwen defaults and disagree")
 
     def test_a_moved_kl_knob_names_itself(self):
         """The harness bar is env-overridable and the workflow's is pinned, so a box running
@@ -1915,6 +2324,1232 @@ class CiWorkflowTest(unittest.TestCase):
         at = (ROOT / "bench/scripts/kimi_k3_attest.py").read_text()
         self.assertIn("clocks_pinned=False", at,
                       "the sealer must keep recording the truth, not start pinning on paper")
+
+    def test_bot_eligibility_scan_is_scoped_to_the_node_run_section(self):
+        """eligibility() had the exact bug #78 fixed in node-attestation.yml, unfixed: a
+        body-wide TICKED+H200 scan that the ticked Checklist boilerplate ('--node h200x8
+        --dry-run resolves') satisfies with the real Node run box unticked. Live impact:
+        #71 was evaluated in two rounds and #74 queued, neither ever attesting a node run.
+        The bot must mirror the workflow's rule, and now mirrors its fix."""
+        import textwrap
+        bot = self._bot()
+        base = textwrap.dedent("""\
+            ## Summary
+            x
+            ## Node run
+            - [ ] Tested on **8× H200** (`sm_90`)
+            - [x] **Prefill measured at 32k** on 8× H200
+            - [x] **No 128k decode regression** on 8× H200
+            
+            | | before (main) | after (this PR) |
+            |---|--:|--:|
+            | prefill @ 32k | 98.80 | 120.00 |
+            | decode @ 128k | 56.82 | 56.79 |
+            ## Checklist
+            - [x] `bench/scripts/kimi_k3_baseline.sh --node h200x8 --dry-run` resolves
+        """)
+        pr = lambda body: {"isDraft": False, "labels": [], "body": body}
+
+        ok, reason = bot.eligibility(pr(base))
+        self.assertFalse(ok, "the ticked Checklist boilerplate attested a node run again")
+        self.assertIn("not ticked", reason)
+
+        ok, _ = bot.eligibility(pr(base.replace("- [ ] Tested", "- [x] Tested")))
+        self.assertTrue(ok, "a genuinely ticked Node run box must still be eligible")
+
+        ok, _ = bot.eligibility(pr(base.replace("## Node run", "## Runs")))
+        self.assertFalse(ok, "no Node run section must fail closed, not fall back to the body")
+
+        ok, _ = bot.eligibility(pr(""))
+        self.assertFalse(ok, "an empty body was eligible")
+
+        # CRLF bodies (GitHub web edits) must not defeat the section boundaries
+        crlf = base.replace("- [ ] Tested", "- [x] Tested").replace("\n", "\r\n")
+        ok, _ = bot.eligibility(pr(crlf))
+        self.assertTrue(ok, "CRLF line endings broke the section scan")
+
+    def test_the_copycat_judge_resolves_to_the_provider_whose_key_exists(self):
+        """The 70-80% band is the only tier containment cannot decide, so it must actually
+        reach a model.
+
+        Two ways the wiring silently disabled it, both from passing repo variables straight
+        through as env:
+
+          COPYCAT_LLM_PROVIDER defaulted to 'openai' when the variable was unset. _llm_provider
+          returns any explicit value without checking a key exists, so it selected a provider
+          with no key and never reached the autodetect that would have found YUNWEI_API_KEY.
+
+          COPYCAT_LLM_MODEL was hardcoded to gpt-4o-mini, overriding the yunwei provider default
+          (deepseek-v4-pro) that the gateway actually serves. And passing an unset variable
+          through sets the variable to "" -- os.environ.get(k, default) returns "" for a key
+          that EXISTS, so the model became the empty string rather than the default."""
+        import importlib
+        sys.path.insert(0, str(ROOT / "eval"))
+        try:
+            saved = {k: os.environ.get(k) for k in
+                     ("OPENAI_API_KEY", "CURSOR_API_KEY", "DEEPSEEK_API_KEY", "YUNWEI_API_KEY",
+                      "COPYCAT_LLM_PROVIDER", "COPYCAT_LLM_MODEL")}
+            for k in saved:
+                os.environ.pop(k, None)
+            os.environ["YUNWEI_API_KEY"] = "sk-test"
+            os.environ["COPYCAT_LLM_PROVIDER"] = ""    # unset repo variable
+            os.environ["COPYCAT_LLM_MODEL"] = ""       # unset repo variable
+            import copycat_guard as g
+            importlib.reload(g)
+            provider = g._llm_provider()
+            self.assertEqual(provider, "yunwei",
+                             "autodetect skipped the provider whose key is present")
+            self.assertTrue(g._llm_api_key(provider), "resolved a provider with no key")
+            self.assertEqual(g._llm_model(provider), "deepseek-v4-pro",
+                             "an empty COPYCAT_LLM_MODEL became the model name")
+        finally:
+            for k, v in saved.items():
+                os.environ.pop(k, None)
+                if v is not None:
+                    os.environ[k] = v
+            sys.path.remove(str(ROOT / "eval"))
+
+        wf = (ROOT / ".github/workflows/copycat-guard.yml").read_text()
+        self.assertNotIn("|| 'openai'", wf,
+                         "the workflow forces a provider again, defeating key autodetect")
+        self.assertNotIn("COPYCAT_LLM_MODEL: gpt-4o-mini", wf,
+                         "the model is hardcoded again, overriding the provider default")
+
+    def test_no_workflow_has_a_duplicate_key(self):
+        """A duplicate YAML key is a STARTUP FAILURE: GitHub refuses the file, creates zero
+        jobs, and the check goes red with nothing to click into.
+
+        copycat-guard.yml had `COPYCAT_LLM_PROVIDER` twice in one env block and had therefore
+        NEVER run -- 100 of 100 recorded runs failed, every one before any job existed. It hid
+        because the file also has a documented reason to be red (no OPENAI_API_KEY), so a
+        permanently failing check looked like the known condition.
+
+        Python's yaml.safe_load accepts duplicates silently (last wins), so a plain parse test
+        would not have caught it. This one looks for the duplicate specifically."""
+        import yaml as _y
+        found = []
+
+        def collect(path):
+            def check(loader, node, deep=False):
+                seen = set()
+                for k, _v in node.value:
+                    key = loader.construct_object(k, deep=deep)
+                    if key in seen:
+                        found.append(f"{path}:{k.start_mark.line + 1} duplicate key {key!r}")
+                    seen.add(key)
+                return _y.SafeLoader.construct_mapping(loader, node, deep)
+            return check
+
+        wfs = sorted((ROOT / ".github/workflows").glob("*.yml"))
+        self.assertTrue(wfs, "no workflows found — wrong path?")
+        for wf in wfs:
+            loader = type("L", (_y.SafeLoader,), {})
+            loader.add_constructor(_y.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+                                   collect(wf.name))
+            with wf.open() as fh:
+                _y.load(fh, loader)
+        self.assertEqual(found, [], "duplicate keys make GitHub reject the whole workflow:\n"
+                                    + "\n".join(found))
+
+    def test_copycat_containment_does_not_depend_on_an_llm_key(self):
+        """Layers 1, 2 and 4 are containment — deterministic, no model involved. Only the
+        50-70% judge band uses one, and copycat_policy.py gates that itself via LLM_ENABLED /
+        COPYCAT_LLM_ENABLED.
+
+        Both the checkout and the guard step used to carry
+        `if: steps.key.outputs.have_key == 'true'`, so with no key the blocking tiers never
+        ran at all -- while the workflow's own notice said "containment tiers still run".
+        The step that would have printed that notice was in the job that never started."""
+        wf = (ROOT / ".github/workflows/copycat-guard.yml").read_text()
+        body = wf[wf.index("    steps:"):]
+        self.assertNotIn("if: steps.key.outputs.have_key == 'true'", body,
+                         "containment is gated on an optional LLM key again")
+        # ...and a PR that opens clean then pushes copied code must still be scanned.
+        self.assertIn("synchronize", wf,
+                      "only the moment of opening is scanned — push-after-open evades it")
+
+    def test_every_eval_builds_from_scratch_with_a_pinned_compiler(self):
+        """build/ is gitignored, so `git clean -qfd` leaves it (that needs -x) and every PR
+        was compiled on top of the previous PR's objects, round after round.
+
+        On 2026-08-03 that path produced numbers no fresh build can reproduce: #81 measured
+        14.54 in a round against 22.17 on six clean builds, and main measured 14.14 through
+        the same build directory against 21.25 clean. #84 reverted #81 on that reading, and
+        the PR was a genuine +4.1%.
+
+        A single incremental step is not obviously at fault (main->#81 in isolation gives
+        22.18); the bot does a dozen. The cure is ~20 s per build, so the argument is not
+        worth having."""
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        bb = src[src.index("def _box_build"):src.index("def _box_eval")]
+
+        self.assertIn('"rm -rf build"', bb, "builds are incremental again")
+        self.assertLess(bb.index("rm -rf build"), bb.index("cmake -B build"),
+                        "the clean must happen before configure, or it does nothing")
+
+        # The compiler must not be chosen by a symlink the box owner can move -- and it DID
+        # move today, 12.8 -> 13.0 under /usr/local/cuda.
+        self.assertIn("-DCMAKE_CUDA_COMPILER=", bb, "the CUDA compiler is unpinned again")
+        self.assertIn("--version", bb, "the toolchain version is not recorded in the log")
+
+        # A failed configure must not fall through to a build against a stale cache.
+        cfg = bb[bb.index("cmake -B build"):]
+        cfg = cfg[:cfg.index("cmake --build")]
+        self.assertNotIn(">/dev/null", cfg,
+                         "configure output is discarded again — a failed configure would be "
+                         "invisible and cmake --build would proceed on whatever cache exists")
+        self.assertIn("configure FAILED", cfg, "a failed configure no longer aborts")
+
+    def test_the_baseline_writes_the_slot_the_harness_reads(self):
+        """A reference measured into a slot nothing scores from is wasted GPU time.
+
+        _kimi_k3.sh states the convention: "The reference.lock slots keep the quant in their
+        NAME for exactly this reason (KIMI_K3_H200X8_IQ1S_LLAMA_128), so a number measured
+        under this default can never be read as a Q2_K_XL result."
+
+        kimi_k3_baseline.sh did not implement it. It emitted KIMI_K3_H200X8_LLAMA_* whatever
+        PRIMARY_QUANT said, while kimi_k3_eval.sh reads KIMI_K3_H200X8_IQ1S_LLAMA_128K -- and
+        the unqualified slots it wrote instead are the all-zero ones whose emptiness once made
+        label.py return BASELINE for every run.
+
+        Runs BOTH derivations as shell, the real ones lifted from each file, so agreement is
+        demonstrated rather than asserted."""
+        base = (ROOT / "bench/scripts/kimi_k3_baseline.sh").read_text()
+        ev = (ROOT / "bench/scripts/kimi_k3_eval.sh").read_text()
+
+        writer = next(l for l in base.splitlines() if l.startswith("LOCK_PREFIX="))
+        reader_pfx = next(l for l in ev.splitlines() if l.startswith("PFX="))
+        reader_q = next(l for l in ev.splitlines() if l.startswith("QUANT="))
+
+        for node, quant in (("h200x8", "UD-IQ1_S"), ("h200x8", "UD-Q2_K_XL"),
+                            ("b200x8", "UD-IQ1_S")):
+            w = subprocess.run(
+                ["bash", "-c", f'NODE={node}; PRIMARY_QUANT={quant}; {writer}; printf "%s" "$LOCK_PREFIX"'],
+                capture_output=True, text=True).stdout
+            r = subprocess.run(
+                ["bash", "-c", f'NODE={node}; PRIMARY_QUANT={quant}; {reader_pfx}; {reader_q}; '
+                               f'printf "%s_%s" "$PFX" "$QUANT"'],
+                capture_output=True, text=True).stdout
+            self.assertEqual(w, r,
+                             f"{node}/{quant}: baseline writes {w!r} but the harness reads {r!r}")
+
+        # And the IQ1_S case must be the slot that actually exists in the shipped lock.
+        lock = (ROOT / "bench/scripts/reference.lock").read_text()
+        w = subprocess.run(
+            ["bash", "-c", f'NODE=h200x8; PRIMARY_QUANT=UD-IQ1_S; {writer}; printf "%s" "$LOCK_PREFIX"'],
+            capture_output=True, text=True).stdout
+        self.assertIn(f"{w}_LLAMA_128K", lock,
+                      f"{w}_LLAMA_128K is not a slot in reference.lock")
+
+    def test_conflicted_prs_are_labelled_and_the_label_clears_itself(self):
+        """The conflict skip was correct but invisible: it printed a line in a log only the
+        operator reads, so #55, #87 and #90 each sat out a full round with nothing on the PR
+        saying why. The label is the contributor-facing half of a decision the round was
+        already making.
+
+        Self-clearing, like needs-rebase — mergeability is re-resolved every round before
+        this runs, so a rebased PR loses the label without anyone asking."""
+        bot = self._bot()
+        calls = []
+        orig_gh = bot.gh
+
+        class R:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        def fake_gh(args, timeout=120):
+            calls.append(args)
+            return R()
+
+        try:
+            bot.gh = fake_gh
+            prs = [
+                {"number": 90, "mergeable": "CONFLICTING", "labels": []},              # add
+                {"number": 55, "mergeable": "CONFLICTING",
+                 "labels": [{"name": bot.CONFLICT_LABEL}]},                            # already
+                {"number": 86, "mergeable": "MERGEABLE",
+                 "labels": [{"name": bot.CONFLICT_LABEL}]},                            # clear
+                {"number": 71, "mergeable": "MERGEABLE", "labels": []},                # nothing
+                {"number": 96, "mergeable": "UNKNOWN", "labels": []},                  # nothing
+            ]
+            bot.sync_conflict_labels("r", prs, dry_run=False)
+        finally:
+            bot.gh = orig_gh
+
+        posts = [c for c in calls if "-X" in c and "POST" in c and "labels" in " ".join(c)]
+        dels = [c for c in calls if "-X" in c and "DELETE" in c]
+        self.assertEqual(len(posts), 1, f"expected exactly one add, got {posts}")
+        self.assertIn("issues/90/labels", " ".join(posts[0]), "labelled the wrong PR")
+        self.assertEqual(len(dels), 1, f"expected exactly one clear, got {dels}")
+        self.assertIn("issues/86/labels", " ".join(dels[0]),
+                      "the label does not clear once a PR is mergeable again")
+        # UNKNOWN must not be labelled — it is the normal answer while GitHub recomputes.
+        self.assertNotIn("issues/96", " ".join(" ".join(c) for c in calls),
+                         "labelled a PR whose mergeability GitHub had not computed")
+        # NOT `gh pr edit --add-label`: it hits deprecated projectCards and exits 1.
+        self.assertFalse([c for c in calls if c[:2] == ["pr", "edit"]],
+                         "used the projectCards path that silently fails")
+
+    def test_the_conflict_label_never_blocks_a_merge(self):
+        """GitHub already refuses to merge a conflicted branch, so putting this in
+        NEVER_MERGE_LABELS adds nothing — and a stale one would block a PR that is now
+        perfectly mergeable. The state is the authority; the label only reports it."""
+        bot = self._bot()
+        self.assertNotIn(bot.CONFLICT_LABEL, bot.NEVER_MERGE_LABELS)
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        head = src[src.index("resolve_mergeability(args.repo, prs)"):src.index("if args.rebase_sweep")]
+        self.assertIn("sync_conflict_labels(", head,
+                      "conflicted PRs are skipped silently again")
+        self.assertLess(head.index("resolve_mergeability("), head.index("sync_conflict_labels("),
+                        "labelled before mergeability was settled — would label on UNKNOWN")
+
+    def test_the_round_serves_the_oldest_pr_first(self):
+        """`gh pr list` returns newest-first, so a round served the most recent submission
+        first and the longest-waiting one last -- backwards for a queue that pays people.
+
+        It matters most exactly when it is least visible: #86, #87, #89 and #90 all capture
+        the decode token as a CUDA graph, only one can win, and the rest re-measure against a
+        main that already has it and score eval:none. Serving newest-first would hand that
+        outcome to whoever submitted last.
+
+        Order does NOT decide the winner -- mark_merge_first ranks by measured tok/s against
+        the shared frontier. It decides who gets measured at all if the round dies partway."""
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        head = src[src.index("prs = list_prs(args.repo)"):src.index("if args.list:")]
+        self.assertIn('prs.sort(key=lambda p: p["number"])', head,
+                      "the round is back to newest-first")
+        # ...and before anything consumes the list.
+        self.assertLess(head.index("prs.sort("), head.index("resolve_mergeability("),
+                        "sorted after the list was already walked")
+
+        prs = [{"number": n} for n in (90, 89, 88, 87, 86, 76, 71, 55)]   # gh's real order
+        prs.sort(key=lambda p: p["number"])
+        self.assertEqual([p["number"] for p in prs], [55, 71, 76, 86, 87, 88, 89, 90])
+
+        # The winner is still the fastest, not the oldest.
+        bot = self._bot()
+        results = [(55, {"tps": 21.0}), (90, {"tps": 26.0})]
+        self.assertEqual(max(results, key=lambda r: r[1]["tps"])[0], 90,
+                         "ordering leaked into the merge decision")
+        self.assertIn("ranked = sorted(results", src)
+
+    # ---- #81: a regression was merged as "the round's largest verified gain" -------------
+    def test_eval_none_is_not_a_passing_tier(self):
+        """merge_blockers accepted any label starting with 'eval:' as proof of passing.
+
+        `eval:none` starts with 'eval:'. So the one label whose whole meaning is "no
+        significant gain" satisfied the check that exists to require a gain. #81 merged
+        through that hole at 14.54 tok/s against a 21.24 frontier and cost main 31.5%."""
+        bot = self._bot()
+        self.assertNotIn(bot.NO_GAIN_TIER, bot.SCORING_TIERS)
+        self.assertTrue(bot.NO_GAIN_TIER.startswith("eval:"),
+                        "the whole bug was that this prefix matched — keep the test honest")
+        for t in ("eval:xs", "eval:s", "eval:m", "eval:l", "eval:xl"):
+            self.assertIn(t, bot.SCORING_TIERS)
+
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        start = src.index("def merge_blockers")
+        mb = src[start:start + src[start:].index("\ndef ", 1)]     # this function only
+        self.assertIn("bad = []", mb, "sliced the wrong function")
+        # sync_rebase_labels uses the same prefix test legitimately -- ANY tier, including
+        # eval:none, goes stale when the frontier moves -- so this must be scoped, not global.
+        self.assertNotIn('any(l.startswith("eval:") for l in labels)', mb,
+                         "the prefix check is back — eval:none passes the gate again")
+        self.assertIn("NO_GAIN_TIER in labels", mb,
+                      "eval:none is not explicitly refused")
+        self.assertIn("SCORING_TIERS", mb)
+
+    def test_the_merge_winner_must_actually_beat_the_frontier(self):
+        """Ranking by absolute tok/s makes the least-bad result of a bad round the winner.
+
+        With a single result a REGRESSION is trivially the maximum, which is exactly what
+        happened: one PR in the round, 14.54 tok/s, frontier 21.24, and the bot reported it
+        as 'the round's largest verified gain' and admin-merged it.
+
+        Replays that round and the mixed case."""
+        FRONTIER = 21.24
+        pick = lambda results: [(n, r) for n, r in results
+                                if float(r.get("tps") or 0) > FRONTIER]
+
+        # The actual #81 round: one result, and it is a regression.
+        self.assertEqual(pick([(81, {"tps": 14.54})]), [],
+                         "a regression is still a merge candidate — #81 all over again")
+
+        # Mixed round: only the genuine win survives, and it is the winner.
+        cands = pick([(81, {"tps": 14.54}), (74, {"tps": 21.26}), (99, {"tps": FRONTIER})])
+        self.assertEqual([n for n, _ in cands], [74])
+        self.assertEqual(max(cands, key=lambda r: r[1]["tps"])[0], 74)
+
+        # Exactly equal to the frontier is not a gain.
+        self.assertEqual(pick([(99, {"tps": FRONTIER})]), [],
+                         "matching the frontier was treated as beating it")
+
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        decision = src[src.index("mergeable = [r for r in results"):]
+        self.assertIn("> frontier", decision,
+                      "the winner is still chosen without comparing against the frontier")
+        self.assertLess(decision.index("> frontier"), decision.index("mark_merge_first("),
+                        "merge-first is labelled before the losers are filtered out")
+
+    # ---- the accuracy gate was a floor, not a ratchet -----------------------------------
+    MAIN_KL = 0.0038673887147093475      # main measured this, three rounds running
+    PR74_KL = 0.0059102102093803194      # what #74 measured and merged on
+
+    def test_the_ratchet_sees_drift_the_absolute_bar_cannot(self):
+        """label.py asks "is KL under the bar?", never "is it worse than main?".
+
+        At K3's bars that is a lot of room: main measures 0.0038674 against KL_PREFER 0.02 and
+        KL_BAR 0.05, so a PR can degrade parity ~5x and pass CLEAN -- not even annotated. #74
+        did exactly that at 1.53x and merged with nothing said, moving main's baseline
+        permanently; the next 1.53x then lands at 0.0089 and also passes clean. About five
+        such merges fit under the warn line, each individually 'fine'.
+
+        The ratchet compares against what main measured THIS ROUND on THIS BOX."""
+        bot = self._bot()
+        m = self.MAIN_KL
+
+        self.assertEqual(bot.kl_ratchet(m, m)[0], "ok",
+                         "a bit-identical PR (#77, #81) must be silent")
+        verdict, ratio, note = bot.kl_ratchet(self.PR74_KL, m)
+        self.assertEqual(verdict, "warn", "#74's 1.53x regression was reported as clean again")
+        # and crossing the bar is still a hard block
+        self.assertEqual(bot.kl_ratchet(0.06, m)[0], "reject")
+        self.assertAlmostEqual(ratio, 1.528, places=2)
+        self.assertIn("1.53x", note)
+        self.assertIn("main", note)
+
+        # The bars themselves would have said nothing about any of these.
+        # POLICY 2026-08-04: parity under label.py's 0.05 bar is not a regression, so the
+        # >=2x cases WARN rather than block -- main is 0.0039, so even 5x is 0.019, well
+        # inside what the bar accepts. The ratchet still SEES the drift, which is the
+        # property this test is really about; it no longer blocks on it alone.
+        for mult, want in ((1.2499, "ok"), (1.25, "warn"), (1.9999, "warn"),
+                           (2.0, "warn"), (5.0, "warn")):
+            self.assertEqual(bot.kl_ratchet(m * mult, m)[0], want,
+                             f"{mult}x main classified wrong")
+            self.assertLess(m * mult, 0.05 if mult < 12 else 1e9,
+                            "test case is above the absolute bar, so it proves nothing new")
+
+    def test_the_ratchet_only_ever_adds_a_constraint(self):
+        """A missing baseline must not become a silent reject -- that would halt the loop on
+        the --frontier path, which deliberately skips measuring main. It degrades to "ok" with
+        an explicit note, and the absolute bars still apply underneath, unchanged."""
+        bot = self._bot()
+        for pr_kl, base, label in ((0.005, 0, "--frontier: no baseline"),
+                                   (0.005, None, "baseline missing"),
+                                   (None, self.MAIN_KL, "PR KL missing"),
+                                   ("abc", self.MAIN_KL, "unparseable"),
+                                   (0.005, -1, "nonsense baseline")):
+            verdict, _, note = bot.kl_ratchet(pr_kl, base)
+            self.assertEqual(verdict, "ok", f"{label} became a blocking verdict")
+            self.assertIn("unavailable", note, f"{label} did not say why")
+
+    # ---- the gate was ONE 4-token probe, n=1 --------------------------------------------
+    DEEP_DEPTHS = (128, 256, 512, 1024, 2048, 4096)
+    OPT_IN_DEPTHS = (8192, 16384, 32768)   # captured and committed, off by default on cost
+
+    def test_parity_is_probed_at_many_depths_not_one_point(self):
+        """The gate graded a single next-token distribution after a 4-token prompt.
+
+        One row of one .spkl -- n=1, KV cache essentially empty -- deciding whether a change
+        that is SCORED at 131,072 tokens preserved accuracy. Everything that only appears
+        with a populated cache (F16 latent cache, per-rank CUDA graphs, banded LM head, 2-D
+        MoE sharding) was gated by a measurement that barely touches it: a kernel can be
+        bit-exact at 4 tokens and wrong at 100k and pass clean."""
+        bot = self._bot()
+        self.assertEqual(tuple(bot.PARITY_DEPTHS), self.DEEP_DEPTHS)
+        probes = bot._parity_probes()
+        self.assertEqual(len(probes), 1 + len(self.DEEP_DEPTHS),
+                         "the default suite is not ctx4 + six depths")
+        self.assertEqual(probes[0][0], "ctx4",
+                         "the historical 4-token probe must be kept, so the number this "
+                         "gate has always reported stays comparable")
+
+    def test_the_deeper_depths_are_captured_even_though_they_are_off_by_default(self):
+        """4096 is the default because the deep pass costs max(depth)/decode_tok_s per
+        measured build -- 136 s to 4096 against 812 s to 32768, at a flat ~42 tok/s. The
+        deeper references are still committed so K3_PARITY_DEPTHS can turn them on without
+        a fresh 554 GB capture; dropping the files would make that a lie."""
+        refdata = ROOT / "bench" / "refdata"
+        for depth in self.OPT_IN_DEPTHS:
+            self.assertTrue((refdata / f"longctx.ctx{depth}.spkl").is_file(),
+                            f"opt-in depth {depth} has no committed reference")
+            self.assertTrue((refdata / f"longctx.ctx{depth}.ids").is_file())
+        # and the knob that turns them on must be the documented one
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        self.assertIn("K3_PARITY_DEPTHS", src)
+
+    def test_every_probed_depth_has_a_committed_reference(self):
+        """A depth whose answer key is missing is a depth that silently stops being checked,
+        and the suite would quietly shrink back toward the single probe it replaced."""
+        bot = self._bot()
+        refdata = ROOT / "bench" / "refdata"
+        for depth in bot.PARITY_DEPTHS:
+            spkl = refdata / f"longctx.ctx{depth}.spkl"
+            ids = refdata / f"longctx.ctx{depth}.ids"
+            self.assertTrue(spkl.is_file(), f"missing answer key {spkl.name}")
+            self.assertTrue(ids.is_file(), f"missing prompt ids {ids.name}")
+            # SPKL = 4-byte magic + 3 u32 + n_vocab f32, one row.
+            self.assertEqual(spkl.stat().st_size, 16 + 163840 * 4,
+                             f"{spkl.name} is not one 163840-wide logit row")
+            self.assertEqual(sum(1 for ln in ids.read_text().split() if ln.strip()), depth,
+                             f"{ids.name} does not hold exactly {depth} ids")
+
+    def test_the_worst_depth_decides_not_the_average(self):
+        """A suite is only as strong as the depth it fails at.
+
+        Averaging would let a real 32k regression hide behind nine good shallow probes --
+        which is the exact failure mode the single-probe gate had, reintroduced."""
+        bot = self._bot()
+        main = {f"ctx{d}": {"kl": 0.004} for d in (4, 128, 32768)}
+        pr = {"ctx4": {"kl": 0.004}, "ctx128": {"kl": 0.004}, "ctx32768": {"kl": 0.010}}
+        verdict, ratio, note = bot.kl_ratchet(pr, main)
+        # 0.010 is under the 0.05 bar, so this warns rather than blocks; the point of the
+        # test is that the WORST depth decides and is named, not that it blocks.
+        self.assertEqual(verdict, "warn", "a 2.5x regression at 32k went unreported")
+        self.assertAlmostEqual(ratio, 2.5, places=6)
+        self.assertIn("ctx32768", note, "the note does not say WHICH depth failed")
+        # The mean ratio here is 1.5x -- a warn, not a reject. With the full nine deep
+        # probes it would have been ~1.17x: silent.
+        mean_ratio = sum(pr[k]["kl"] / main[k]["kl"] for k in pr) / len(pr)
+        self.assertLess(mean_ratio, bot.KL_RATCHET_REJECT,
+                        "this case no longer distinguishes worst-case from mean")
+
+    # measured on h200x8 / UD-IQ1_S, main @ cee15a2 — the round that raised this question
+    MAIN_DEPTHS = {"ctx4": 0.006694998, "ctx128": 0.000038610, "ctx256": 0.000002824,
+                   "ctx512": 0.000025096, "ctx1024": 0.000064222, "ctx2048": 0.000419637,
+                   "ctx4096": 0.000001542}
+
+    @staticmethod
+    def _d(m):
+        return {k: {"kl": v} for k, v in m.items()}
+
+    def test_a_ratio_on_a_number_far_under_the_bar_is_not_a_regression(self):
+        """#104 was blocked for 3.85x at ctx512 — an absolute KLD of 0.000097, which is
+        0.19% of label.py's KL_BAR of 0.05 — while being BETTER than main at ctx4, the depth
+        that carries real weight.
+
+        The sweep grades down to ctx4096 where main sits at 1.5e-06, five orders of magnitude
+        under the bar. There a reduction-order change moves the RATIO by multiples and the
+        absolute divergence by nothing actionable. The ratchet exists to stop parity drifting
+        toward the bar, not to police arithmetic already 500x beneath it."""
+        bot = self._bot()
+        pr104 = {"ctx4": 0.004538860, "ctx128": 0.000046209, "ctx256": 0.000002271,
+                 "ctx512": 0.000096551, "ctx1024": 0.000018631, "ctx2048": 0.000119183,
+                 "ctx4096": 0.000002993}
+        v, _, note = bot.kl_ratchet(self._d(pr104), self._d(self.MAIN_DEPTHS))
+        self.assertEqual(v, "ok", "blocked on a ratio 500x under the acceptance bar")
+        # the immaterial depths are still REPORTED, marked, so nothing is hidden
+        self.assertIn("ctx512=3.85x*", note)
+
+    def test_a_material_regression_is_still_rejected(self):
+        """#115 is the contrast and must stay blocked: ctx2048 at 0.0019 is 3.9% of the bar,
+        and its ctx4 parity degraded 60% (0.0067 -> 0.0107, 21% of the bar). That is exactly
+        the cumulative drift toward the bar the ratchet was built to catch."""
+        bot = self._bot()
+        pr115 = {"ctx4": 0.010727574, "ctx128": 0.000022304, "ctx256": 0.000009617,
+                 "ctx512": 0.000065321, "ctx1024": 0.000067953, "ctx2048": 0.001943870,
+                 "ctx4096": 0.000000325}
+        v, r, note = bot.kl_ratchet(self._d(pr115), self._d(self.MAIN_DEPTHS))
+        # POLICY: parity still under label.py's 0.05 bar is not a regression, however the
+        # ratio reads. 0.0019 at ctx2048 is 3.9% of the bar, so this WARNS and is reported
+        # -- visible in the round log and the PR comment -- but does not block a merge.
+        self.assertEqual(v, "warn")
+        self.assertAlmostEqual(r, 4.632, places=2)
+        self.assertIn("ctx2048", note)
+        self.assertIn("under the", note)
+
+    def test_the_floor_is_not_tuned_to_two_cases(self):
+        """Every floor from 1e-4 to 1e-3 clears #104 and keeps #115, so the default sits
+        mid-plateau rather than on a knife edge."""
+        bot = self._bot()
+        pr104 = {"ctx4": 0.004538860, "ctx128": 0.000046209, "ctx256": 0.000002271,
+                 "ctx512": 0.000096551, "ctx1024": 0.000018631, "ctx2048": 0.000119183,
+                 "ctx4096": 0.000002993}
+        pr115 = {"ctx4": 0.010727574, "ctx128": 0.000022304, "ctx256": 0.000009617,
+                 "ctx512": 0.000065321, "ctx1024": 0.000067953, "ctx2048": 0.001943870,
+                 "ctx4096": 0.000000325}
+        orig = bot.KL_RATCHET_FLOOR
+        try:
+            for f in (1e-4, 2.5e-4, 5e-4, 1e-3):
+                bot.KL_RATCHET_FLOOR = f
+                self.assertEqual(bot.kl_ratchet(self._d(pr104), self._d(self.MAIN_DEPTHS))[0],
+                                 "ok", f"floor {f:g} blocks #104")
+                self.assertEqual(bot.kl_ratchet(self._d(pr115), self._d(self.MAIN_DEPTHS))[0],
+                                 "warn", f"floor {f:g} silences #115 entirely")
+        finally:
+            bot.KL_RATCHET_FLOOR = orig
+        self.assertGreaterEqual(orig, 1e-4)
+        self.assertLessEqual(orig, 1e-3)
+
+    def test_the_floor_never_exempts_the_depth_that_carries_weight(self):
+        """main's ctx4 is 0.0067 — 13% of the bar — so it is always material and the ratchet
+        stays fully live exactly where cumulative drift would show."""
+        bot = self._bot()
+        self.assertGreater(self.MAIN_DEPTHS["ctx4"], bot.KL_RATCHET_FLOOR)
+        worse = dict(self.MAIN_DEPTHS)
+        worse["ctx4"] = self.MAIN_DEPTHS["ctx4"] * 2.5      # 0.0167 — still under the bar
+        self.assertEqual(bot.kl_ratchet(self._d(worse), self._d(self.MAIN_DEPTHS))[0], "warn")
+        over = dict(self.MAIN_DEPTHS)
+        over["ctx4"] = 0.06                                  # at/over the 0.05 bar
+        self.assertEqual(bot.kl_ratchet(self._d(over), self._d(self.MAIN_DEPTHS))[0], "reject")
+
+    def test_a_depth_the_pr_did_not_measure_is_called_out(self):
+        """Comparing only the depths both sides happen to share would let a narrowed
+        K3_PARITY_DEPTHS on one side silently shrink the gate to whatever overlaps."""
+        bot = self._bot()
+        main = {f"ctx{d}": {"kl": 0.004} for d in (4, 128, 32768)}
+        pr = {"ctx4": {"kl": 0.004}}
+        verdict, _, note = bot.kl_ratchet(pr, main)
+        self.assertEqual(verdict, "ok", "the shared depth genuinely passed")
+        self.assertIn("ctx128", note)
+        self.assertIn("ctx32768", note)
+        self.assertIn("not measured on the PR", note)
+
+    def test_the_ratchet_reads_the_controllers_number_not_the_rounded_receipt(self):
+        """res["kl"] is not the measured value: it goes to the box as --kl and comes back
+        through label.py's round(kl, 4). The ratchet used to compare that against main's
+        un-rounded value -- 4 decimals against 9. At KL ~0.0067 that quantises the ratio by
+        ~1.5%, one-sided, right where the 1.25x line sits, and it printed as "0.0067000" so
+        the lost precision was invisible in the log."""
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        loop = src[src.index("for pr in eligible:"):]
+        self.assertIn('kl_ratchet(res.get("kl_depths")', loop,
+                      "the ratchet is fed the round-tripped receipt value")
+        self.assertNotIn('kl_ratchet(res.get("kl"), ', loop)
+        self.assertIn('res["kl_depths"] = depths', src,
+                      "the controller's full-precision measurement is never attached")
+        # The RESULT_JSON field specifically -- the prose warning at KL_PREFER may format
+        # however it likes, since nothing parses it.
+        lab = (ROOT / "bench/scripts/label.py").read_text()
+        self.assertIn('"kl": round(kl, 9)', lab,
+                      "the receipt still records only 4 decimals of KL")
+        self.assertNotIn('"kl": round(kl, 4)', lab)
+
+    def test_the_deep_pass_is_one_pass_over_nested_prefixes(self):
+        """The depths are nested prefixes of one document and the executor decodes a prompt
+        one token at a time, so after L tokens the logits ARE the L-token prefix's answer.
+        One pass therefore yields every depth -- no cache reset the runtime does not expose,
+        and no re-feeding of every shorter prefix."""
+        src = (ROOT / "runtime/examples/kimi_k3_tp_bench.cpp").read_text()
+        self.assertIn("--checkpoints", src)
+        self.assertIn("--logits-prefix", src)
+        # A checkpoint that cannot be honoured must stop the run, not vanish: a missing dump
+        # becomes "no comparison at that depth", which is what this exists to remove.
+        self.assertIn("out of range", src)
+        self.assertIn("exceeds --ctx", src)
+        self.assertIn("FAILED to write", src)
+        self.assertIn("--checkpoints needs --logits-prefix", src)
+
+    def test_a_partial_parity_suite_is_never_scored(self):
+        """Nine of ten probes returning is not a pass at 90%. It is an unmeasured depth."""
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        acc = src[src.index("def measure_accuracy("):src.index("def _hello_ids_csv(")]
+        self.assertIn("incomplete parity suite", acc)
+        self.assertIn("raise RuntimeError", acc)
+        # worst-case aggregation, not mean
+        self.assertIn("min(d[\"top1\"]", acc)
+        self.assertIn("max(d[\"kl\"]", acc)
+
+    def test_the_probe_archive_cannot_write_outside_its_extract_dir(self):
+        """The suite now comes back as a tar, and that tar is BUILT ON THE BOX -- the
+        machine running unmodified PR code. A bench that dropped a symlink or a '..' entry
+        into its output directory could otherwise turn the extract into an arbitrary write
+        on the controller, which is the one machine holding the answer key and the merge
+        credentials."""
+        import io as _io, tarfile as _tar, tempfile as _tmp
+        bot = self._bot()
+        work = _tmp.mkdtemp()
+
+        # a well-formed archive still extracts
+        good = os.path.join(work, "good.tar")
+        payload = os.path.join(work, "hello.spkl")
+        with open(payload, "wb") as f:
+            f.write(b"x" * 32)
+        with _tar.open(good, "w") as tf:
+            tf.add(payload, arcname="hello.spkl")
+        dest = _tmp.mkdtemp()
+        with _tar.open(good) as tf:
+            bot._extract_probes(tf, dest)
+        self.assertEqual(sorted(os.listdir(dest)), ["hello.spkl"])
+
+        # a symlink is refused
+        eviltar = os.path.join(work, "evil.tar")
+        with _tar.open(eviltar, "w") as tf:
+            info = _tar.TarInfo("sneaky.spkl")
+            info.type, info.linkname = _tar.SYMTYPE, "/etc/passwd"
+            tf.addfile(info)
+        with _tar.open(eviltar) as tf:
+            with self.assertRaises(RuntimeError):
+                bot._extract_probes(tf, _tmp.mkdtemp())
+
+        # a traversal entry is refused
+        travtar = os.path.join(work, "trav.tar")
+        with _tar.open(travtar, "w") as tf:
+            info = _tar.TarInfo("../escape.spkl")
+            info.size = 0
+            tf.addfile(info, _io.BytesIO(b""))
+        with _tar.open(travtar) as tf:
+            with self.assertRaises(RuntimeError):
+                bot._extract_probes(tf, _tmp.mkdtemp())
+
+    def test_a_busy_node_is_waited_for_and_a_dead_probe_explains_itself(self):
+        """2026-08-04: a round walked into another tenant's benchmark on the rented box.
+        Both jobs tried to allocate ~70 GiB/GPU and both died on cudaMalloc.
+
+        Two separate failures, two separate fixes:
+
+        The bot did not WAIT. The harness has settle_gpus(), but that runs in _box_eval --
+        by which point measure_accuracy has already tried to load 553 GiB. The wait has to
+        be where the first allocation happens.
+
+        The bot could not SAY WHY. Both probes were run with `>/dev/null 2>&1`, so an
+        out-of-memory death surfaced as "probe ctx4 produced no logits — refusing to score
+        a partial parity suite", which reads as a bug in the parity suite and sends the
+        investigation to entirely the wrong place. One line of `cudaMalloc failed` was
+        thrown away."""
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        acc = src[src.index("def measure_accuracy("):src.index("def _extract_probes(")]
+        # the probes must not discard their own diagnostics
+        self.assertNotIn(">/dev/null 2>&1", acc,
+                         "a probe's stderr is thrown away, so a dead probe cannot say why")
+        self.assertIn("hello.log", acc)
+        self.assertIn("deep.log", acc)
+        # …and the failure path must actually read them back
+        self.assertIn('os.path.join(workdir, log)', acc,
+                      "the failure path never opens the probe logs it captured")
+        # the wait happens before the first big allocation
+        self.assertIn("nvidia-smi", acc, "measure_accuracy never checks whether the node is free")
+        self.assertLess(acc.index("nvidia-smi"), acc.index("--logits"),
+                        "the settle must come BEFORE the first probe, not after")
+        bot = self._bot()
+        self.assertGreater(bot.PARITY_SETTLE_TRIES * bot.PARITY_SETTLE_SLEEP, 300,
+                           "the wait is too short to outlast a neighbour's run")
+
+    def test_a_busy_node_is_retried_not_treated_as_a_verdict(self):
+        """The round that died on 2026-08-04 should have retried and probably succeeded.
+
+        is_transient() treats a VERDICT_MARKER anywhere in the message as decisive, and the
+        incomplete-suite error said "refusing to score a partial parity suite" -- so
+        `cudaMalloc failed`, which TRANSIENT_RE explicitly lists as retryable, was
+        classified as a permanent verdict about the PR and with_box_retry gave up on the
+        first attempt.
+
+        The refusal is not the bug and does not change: 7 of 8 probes is not parity and is
+        never scored. What changes is that a BUSY BOX is the box failing, not the harness
+        reaching a conclusion, so it gets the retry it always should have had."""
+        bot = self._bot()
+
+        # The phrasing that poisoned the classifier must be gone from the RAISED MESSAGE.
+        # Scoped to the raise expression, not the whole function: is_transient() only ever
+        # sees str(exc), so a comment explaining the trap is not itself the trap.
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        start = src.index('f"{what}: incomplete parity suite')
+        raised = src[start:start + 600]
+        for marker in bot.VERDICT_MARKERS:
+            self.assertNotIn(marker, raised,
+                             f"the incomplete-suite message says {marker!r}, which "
+                             f"is_transient() reads as a permanent verdict")
+
+        # a real incomplete-suite message, carrying the probe log the box actually emits
+        busy = ("main: incomplete parity suite — probe ctx4 produced no logits. "
+                "Came back: ['longctx.ctx128.spkl']\n"
+                "hello.log: …[k3] cudaMalloc failed for blk.92.ffn_gate_exps.weight "
+                "rank slice (240844800 bytes)\n[k3-tp] rank 0: weight load failed\n"
+                "init failed at tp=8, 93 layers")
+        self.assertTrue(bot.is_transient(RuntimeError(busy)),
+                        "a node that was merely busy is still not retried")
+
+        # …while a genuine scoring refusal must still never be retried
+        verdict = "main measured 0 tok/s — refusing to score a round against it"
+        self.assertFalse(bot.is_transient(RuntimeError(verdict)),
+                         "a real verdict became retryable — the guard is now advisory")
+
+    def test_the_regression_label_uses_the_endpoint_that_works(self):
+        """`gh pr edit --add-label` queries projectCards, which GitHub deprecated, so it
+        exits 1 even where the repo has no projects. merge-first and merge-conflict were
+        both moved to the issues REST endpoint for exactly that reason; the
+        accuracy-regression call was missed.
+
+        Observed live on #104 and #115: both measured a parity regression, both printed the
+        warning, and both finished the round carrying only their eval:* tier. unsafe_tier
+        still excluded them from THAT round's merge decision, but the label is the durable
+        enforcement -- it is what NEVER_MERGE_LABELS reads, so without it a later round or a
+        human sees a clean PR."""
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        self.assertNotIn('"--add-label"', src,
+                         "a label is still applied via the deprecated projectCards path")
+        bot = self._bot()
+        # every label the merge path depends on must go through the REST endpoint
+        for lbl in ("merge-first", bot.KL_REGRESSION_LABEL, bot.CONFLICT_LABEL):
+            self.assertIn(f'labels[]={lbl}', src.replace('{KL_REGRESSION_LABEL}',
+                                                         bot.KL_REGRESSION_LABEL)
+                                               .replace('{CONFLICT_LABEL}',
+                                                        bot.CONFLICT_LABEL),
+                          f"{lbl} is not applied via issues/N/labels")
+        self.assertIn(bot.KL_REGRESSION_LABEL, bot.NEVER_MERGE_LABELS)
+
+    def test_the_wall_clock_margin_dominates_load_jitter(self):
+        """The differential is a BOUND carrying load variance, not a reading. At 512 marginal
+        tokens and a ~40 tok/s frontier the signal was ~12.8 s against jitter measured at up
+        to 17 s -- larger than the thing being measured -- and one round produced all three
+        mutually exclusive failures of this check on code that never changed: #104 too fast
+        (WORK_TOL), #109 too slow (SPEED_TOL), #113 negative delta.
+
+        The tolerances are deliberately NOT the fix: raising SPEED_TOL buys the same pass
+        rate by letting a binary claim 2x its measured speed, which is the fabrication this
+        guard refuses."""
+        ev = (ROOT / "bench/scripts/kimi_k3_eval.sh").read_text()
+        import re
+        m = re.search(r'MARGIN_TOKENS="\$\{KIMI_K3_MARGIN_TOKENS:-(\d+)\}"', ev)
+        self.assertIsNotNone(m, "MARGIN_TOKENS is no longer env-tunable with a default")
+        margin = int(m.group(1))
+        WORST_JITTER_S, FRONTIER = 17.0, 45.0
+        self.assertGreaterEqual(margin / FRONTIER, 2 * WORST_JITTER_S,
+                                f"{margin} tokens is {margin/FRONTIER:.1f}s of signal against "
+                                f"{WORST_JITTER_S}s of measured jitter — the bound carries no "
+                                f"information")
+        # and the tolerances must not have been loosened to compensate
+        self.assertIn("KIMI_K3_SPEED_TOL:-1.5", ev, "the fabrication tolerance was widened")
+        self.assertIn("KIMI_K3_WORK_TOL:-2.0", ev)
+
+    def test_the_answer_key_capture_is_reproducible(self):
+        """The corpus is committed with its hash and the capture is one documented command,
+        so a reference nobody can regenerate never becomes the thing everything is scored
+        against."""
+        corpus = ROOT / "bench" / "refdata" / "longctx.txt"
+        self.assertTrue(corpus.is_file())
+        import hashlib
+        digest = hashlib.sha256(corpus.read_bytes()).hexdigest()
+        readme = (ROOT / "bench" / "refdata" / "README.md").read_text()
+        self.assertIn(digest, readme,
+                      "the corpus hash in README.md does not match the committed corpus")
+        self.assertTrue((ROOT / "bench" / "scripts" / "capture_parity_refs.sh").is_file())
+        # and the README must not overclaim: the deepest probe is not the scored context
+        self.assertIn("is not 131072", readme)
+
+    def test_a_rejected_pr_cannot_be_merged_by_the_round(self):
+        """The label is the enforcement, so it has to be one the merge path already refuses."""
+        bot = self._bot()
+        self.assertIn(bot.KL_REGRESSION_LABEL, bot.NEVER_MERGE_LABELS)
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        loop = src[src.index("for pr in eligible:"):]
+        self.assertIn("kl_ratchet(", loop, "the ratchet is never evaluated in the round")
+        self.assertIn("--add-label", loop, "a rejected PR is never actually labelled")
+        # If the label cannot be applied, the PR must not merge anyway.
+        self.assertIn("unsafe_tier.add(num)",
+                      loop[loop.index("could not apply"):loop.index("could not apply") + 400],
+                      "a failed label left the PR mergeable — the guard would be advisory")
+
+    def test_parity_is_reported_even_when_it_passes(self):
+        """#74 passed every automated check silently. A number a human can see beats a
+        threshold nobody is told about, so the comment carries parity whatever the verdict."""
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        post = src[src.index("def post("):src.index("def publish_receipt")]
+        self.assertIn("parity", post)
+        self.assertIn("parity vs main", post, "the comment never shows the comparison")
+        loop = src[src.index("for pr in eligible:"):]
+        self.assertIn("parity=parity", loop, "post() is called without the parity it needs")
+        # --frontier must still define the baseline or the round dies on NameError.
+        head = src[src.index("if args.frontier is not None:"):src.index("for pr in eligible:")]
+        self.assertIn("main_parity = {}", head,
+                      "main_parity is unbound on the --frontier path — NameError mid-round")
+        # An empty suite must read as "unavailable", never as a comparison against zero.
+        bot = self._bot()
+        self.assertEqual(bot.kl_ratchet({"ctx4": {"kl": 0.005}}, {})[0], "ok")
+        self.assertIn("unavailable", bot.kl_ratchet({"ctx4": {"kl": 0.005}}, {})[2])
+
+    def test_a_transient_box_failure_does_not_discard_the_whole_round(self):
+        """One frontier failure used to throw away every PR in the round.
+
+        measure_frontier raises -> main() bails -> nothing is evaluated, however healthy the
+        PRs were. Two rounds in the ledger died exactly there: rounds/66955446f62f, and
+        rounds/11eb5e4d02b7 on `ncclCommInitAll(n=8): unhandled cuda error` / `init failed at
+        tp=8`. A collective that failed to initialise says nothing about anyone's code."""
+        bot = self._bot()
+        orig_sleep = time.sleep
+        try:
+            bot.time.sleep = lambda s: None
+            calls = []
+
+            def flaky(fails, exc_text):
+                def _f():
+                    calls.append(1)
+                    if len(calls) <= fails:
+                        raise RuntimeError(exc_text)
+                    return "measured"
+                return _f
+
+            # The real NCCL failure from rounds/11eb5e4d02b7, recovering on attempt 2.
+            ncc = ("no RESULT_JSON from the harness for main — kimi_k3_eval: bench failed\n"
+                   "[tp] FATAL: ncclCommInitAll(n=8): unhandled cuda error\n"
+                   "init failed at tp=8, 93 layers")
+            calls.clear()
+            self.assertEqual(bot.with_box_retry("frontier", flaky(1, ncc), tries=3, delay=0),
+                             "measured")
+            self.assertEqual(len(calls), 2, "the retry did not happen")
+
+            # Persistent failure still stops the round -- it must not fall back to the pin.
+            calls.clear()
+            with self.assertRaises(RuntimeError):
+                bot.with_box_retry("frontier", flaky(99, ncc), tries=3, delay=0)
+            self.assertEqual(len(calls), 3, "gave up before using its attempts")
+        finally:
+            bot.time.sleep = orig_sleep
+
+    def test_a_guard_refusal_is_never_retried(self):
+        """A GUARD THAT CAN BE RETRIED IS NOT A GUARD.
+
+        The harness refusing to score is an ANSWER, not a glitch. Re-running it until it
+        passes is sampling until the result is convenient, and every one of these guards
+        exists because the number could otherwise be fabricated. Each refusal below must
+        surface on the FIRST attempt."""
+        bot = self._bot()
+        orig_sleep = time.sleep
+        try:
+            bot.time.sleep = lambda s: None
+            refusals = [
+                # the one that refused #77, and the one that refused round 66955446
+                "kimi_k3_eval: 128 extra tokens took 2.96 s ...\n"
+                "  refusing to score: the longer run did not do the extra work",
+                "kimi_k3_eval: the bench claims 4.55 tok/s but wall clock allows 3.45.\n"
+                "  refusing to score: ... signature of a fabricated number.",
+                "harness measured commit 'abc1234' but main is 'def5678'",
+                "the bench reported no ms/token line — nothing to score",
+                "non-positive time delta (-3 ns over 128 tokens)",
+            ]
+            for text in refusals:
+                calls = []
+
+                def _f():
+                    calls.append(1)
+                    raise RuntimeError(text)
+
+                self.assertFalse(bot.is_transient(RuntimeError(text)),
+                                 f"classified as transient, so it would be retried: {text[:60]}")
+                with self.assertRaises(RuntimeError):
+                    bot.with_box_retry("x", _f, tries=4, delay=0)
+                self.assertEqual(len(calls), 1,
+                                 f"a verdict was retried {len(calls)}x: {text[:60]}")
+
+            # A verdict marker wins even when transient-looking words share the message --
+            # the error carries a 1200-char tail of box output, so this overlap is normal.
+            mixed = ("no RESULT_JSON — kimi_k3_eval: bench failed\n"
+                     "  refusing to score: the longer run did not do the extra work")
+            self.assertFalse(bot.is_transient(RuntimeError(mixed)),
+                             "a refusal buried under box noise became retryable")
+        finally:
+            bot.time.sleep = orig_sleep
+
+    def test_transient_signatures_cover_what_actually_broke(self):
+        bot = self._bot()
+        for text in ("ncclCommInitAll(n=8): unhandled cuda error",
+                     "init failed at tp=8, 93 layers",
+                     "[k3] cudaMalloc failed for blk.92.attn_kv_a_norm.weight",
+                     "[k3-tp] rank 3: weight load failed",
+                     "kimi_k3_eval: bench failed",
+                     "ssh timeout after 7200s",
+                     "kex_exchange_identification: Connection closed by remote host"):
+            self.assertTrue(bot.is_transient(RuntimeError(text)),
+                            f"a real box failure would not be retried: {text}")
+
+    def test_both_the_frontier_and_each_pr_are_retried(self):
+        """Wiring, not behaviour: the helper above is worthless if nothing calls it."""
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        frontier_call = src[src.index("if args.frontier is not None:"):src.index("for pr in eligible:")]
+        self.assertIn("with_box_retry(", frontier_call,
+                      "one transient box failure still discards every PR in the round")
+        self.assertIn("measure_frontier(", frontier_call)
+        pr_loop = src[src.index("for pr in eligible:"):]
+        self.assertIn("with_box_retry(", pr_loop,
+                      "a PR still loses its round to one transient box failure")
+        self.assertIn("evaluate(pr,", pr_loop)
+
+    def test_unknown_mergeability_is_settled_before_the_node_is_booked(self):
+        """The CONFLICTING skip was decorative in the one case it had to work.
+
+        GitHub answers UNKNOWN while recomputing mergeability, and the base branch moving is
+        what sets it recomputing -- which this bot does to ITSELF, committing the frontier to
+        reference.lock at the start of every round. Observed live: seconds after a merge, #64
+        read ELIGIBLE while being CONFLICTING; a minute later the same call read CONFLICTING.
+
+        So the round must wait for a real answer. Asked only about PRs that are otherwise
+        eligible -- mergeability cannot rescue an unticked box -- and fails OPEN on timeout,
+        because a wrong skip during a GitHub incident stops every round while a wrong include
+        costs one eval the merge guards still refuse."""
+        bot = self._bot()
+        # the scored metric and its guard each need their own claim (2026-08-05)
+        body = ("## Node run\n- [x] Tested on **8× H200** (`sm_90`)\n"
+                "- [x] **Prefill measured at 32k** on 8× H200\n"
+                "- [x] **No 128k decode regression** on 8× H200\n"
+                "\n| | before (main) | after (this PR) |\n|---|--:|--:|\n"
+                "| prefill @ 32k | 98.80 | 120.00 |\n"
+                "| decode @ 128k | 56.82 | 56.79 |\n")
+        calls = []
+
+        def fake_state(seq):
+            it = iter(seq)
+            def _state(repo, num):
+                v = next(it, seq[-1])
+                calls.append((num, v))
+                return {"mergeable": v} if v else {}
+            return _state
+
+        orig_state, orig_sleep = bot._pr_state, time.sleep
+        try:
+            bot.time.sleep = lambda s: None       # do not actually wait in a unit test
+
+            # The live race: UNKNOWN, UNKNOWN, then the truth. Must end CONFLICTING.
+            bot._pr_state = fake_state(["UNKNOWN", "UNKNOWN", "CONFLICTING"])
+            prs = [{"number": 64, "isDraft": False, "labels": [], "body": body}]
+            bot.resolve_mergeability("r", prs, tries=5, delay=0)
+            self.assertEqual(prs[0]["mergeable"], "CONFLICTING")
+            self.assertFalse(bot.eligibility(prs[0])[0],
+                             "a conflicted PR still reached the node after settling")
+
+            # Never settles -> fail OPEN, so a GitHub incident cannot halt the loop.
+            calls.clear()
+            bot._pr_state = fake_state(["UNKNOWN"])
+            prs = [{"number": 64, "isDraft": False, "labels": [], "body": body}]
+            bot.resolve_mergeability("r", prs, tries=3, delay=0)
+            self.assertTrue(bot.eligibility(prs[0])[0],
+                            "a stuck UNKNOWN skipped the PR — that halts the loop")
+            self.assertEqual(len(calls), 3, "the poll did not use its full budget")
+
+            # An unreadable PR gives up after one retry rather than polling for a minute.
+            calls.clear()
+            bot._pr_state = fake_state([None])
+            prs = [{"number": 64, "isDraft": False, "labels": [], "body": body}]
+            bot.resolve_mergeability("r", prs, tries=20, delay=0)
+            self.assertLessEqual(len(calls), 2, "an unreadable PR was polled 20 times")
+
+            # PRs skipped for a NON-mergeability reason are never asked about.
+            calls.clear()
+            bot._pr_state = fake_state(["CONFLICTING"])
+            prs = [{"number": 55, "isDraft": False, "body": body,
+                    "labels": [{"name": "needs-node-run"}]},
+                   {"number": 9, "isDraft": True, "labels": [], "body": body}]
+            bot.resolve_mergeability("r", prs, tries=3, delay=0)
+            self.assertEqual(calls, [], "spent API calls on PRs that were already skipped")
+
+            # An already-definite answer is not re-queried.
+            calls.clear()
+            prs = [{"number": 77, "isDraft": False, "labels": [], "body": body,
+                    "mergeable": "MERGEABLE"}]
+            bot.resolve_mergeability("r", prs, tries=3, delay=0)
+            self.assertEqual(calls, [], "re-queried a mergeability GitHub had already given")
+        finally:
+            bot._pr_state, bot.time.sleep = orig_state, orig_sleep
+
+    def test_pr_state_actually_asks_for_mergeable(self):
+        """resolve_mergeability reads info['mergeable'] — dead code if _pr_state never asks."""
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        fn = src[src.index("def _pr_state"):src.index("def wait_mergeable_state")]
+        self.assertIn("mergeable", fn)
+        main = src[src.index("prs = list_prs("):]
+        self.assertLess(main.index("resolve_mergeability("), main.index("if args.list:"),
+                        "mergeability must be settled before anything reads it")
+
+    def test_the_first_bench_on_a_fresh_box_does_not_set_the_frontier(self):
+        """The bot measures main FIRST, so the run that pays to pull 554 GiB off disk into
+        page cache is the one that sets the frontier -- and an understated frontier makes
+        every PR in that round look better than it is. On this box: first bench loads in
+        40.27 s, the next four in 33.25-33.49 s.
+
+        Warms by READING THE WEIGHTS, not by running the bench: the cause is page cache, and
+        a throwaway bench run would spend 8 GPUs and risk the cudaMalloc race settle_gpus
+        exists for, to fix a disk problem.
+
+        Exercises the real function extracted from the harness."""
+        import tempfile, stat as _stat
+        ev = (ROOT / "bench/scripts/kimi_k3_eval.sh").read_text()
+        fn = ev[ev.index("warm_page_cache() {"):]
+        fn = fn[:fn.index("\n}\n") + 3]
+        self.assertIn("dd if=", fn, "warming no longer reads the weights")
+        self.assertNotIn("$BENCH", fn, "warming must not run the bench — that is 8 GPUs")
+
+        d = Path(tempfile.mkdtemp())
+        models = d / "models"
+        models.mkdir()
+        for i in (1, 2):
+            (models / f"m-0000{i}-of-00002.gguf").write_bytes(b"x" * 4096)
+        marker = d / "marker"
+
+        def run(extra_env=None, path_prefix=None, model=None):
+            script = d / "w.sh"
+            script.write_text(
+                "set -euo pipefail\n"
+                f'MODEL="{model or models / "m-00001-of-00002.gguf"}"\n'
+                + fn + "\nwarm_page_cache\necho SURVIVED\n")
+            env = dict(os.environ, KIMI_K3_WARM_MARKER=str(marker))
+            if path_prefix:
+                env["PATH"] = f"{path_prefix}:{env['PATH']}"
+            env.update(extra_env or {})
+            return subprocess.run(["bash", str(script)], capture_output=True, text=True,
+                                  env=env)
+
+        r = run()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("warming the page cache", r.stderr)
+        self.assertTrue(marker.exists(), "no marker — it would re-warm on every eval")
+
+        # Once per box, not per eval: the second call must be silent.
+        r = run()
+        self.assertNotIn("warming the page cache", r.stderr,
+                         "re-warmed with the marker present — that is 35 s per eval")
+
+        # Weights bigger than RAM: warming would evict what IS cached. Skip and say so.
+        marker.unlink()
+        stub = d / "stub"
+        stub.mkdir()
+        du = stub / "du"
+        du.write_text('#!/bin/bash\necho "999999999999\t/fake"\n')
+        du.chmod(du.stat().st_mode | _stat.S_IEXEC)
+        r = run(path_prefix=str(stub))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("exceed RAM", r.stderr)
+        self.assertNotIn("warming the page cache", r.stderr)
+        self.assertTrue(marker.exists(), "would re-probe every eval")
+
+        # A failed warm-up must never fail an eval — it optimises the measurement, it is
+        # not part of it.
+        marker.unlink()
+        r = run(model="/nonexistent/dir/m-00001-of-00002.gguf")
+        self.assertEqual(r.returncode, 0, f"an unreadable weights dir failed the eval\n{r.stderr}")
+        self.assertIn("SURVIVED", r.stdout)
+
+        # And an operator can turn it off outright.
+        marker.unlink()
+        r = run(extra_env={"KIMI_K3_NO_WARM": "1"})
+        self.assertEqual(r.returncode, 0)
+        self.assertNotIn("warming the page cache", r.stderr)
+        self.assertFalse(marker.exists(), "the kill switch still wrote a marker")
+
+    def test_settle_gpus_cannot_kill_the_eval_it_exists_to_protect(self):
+        """settle_gpus waits for the driver to reclaim ~1.1 TiB between the two timed runs,
+        because a run that starts too early dies in cudaMalloc and costs the PR its whole
+        eval. The script runs under `set -euo pipefail`, so the nvidia-smi pipeline needs
+        `|| true`: without it a single non-zero nvidia-smi -- a driver hiccup, an ECC scrub --
+        fails the pipeline, fails the assignment, and `set -e` kills the eval. Verified: the
+        version without `|| true` exits 15 here and never reaches the runs it was guarding.
+
+        Exercises the real function extracted from the harness, not a paraphrase."""
+        import tempfile, textwrap, stat as _stat
+        ev = (ROOT / "bench/scripts/kimi_k3_eval.sh").read_text()
+        fn = ev[ev.index("settle_gpus() {"):]
+        fn = fn[:fn.index("\n}\n") + 3]
+        self.assertIn("|| true", fn, "the pipefail escape hatch is gone")
+
+        d = tempfile.mkdtemp()
+        script = Path(d) / "sg.sh"
+        script.write_text("set -euo pipefail\n" + fn + "\nsettle_gpus\necho SURVIVED\n")
+        binn = Path(d) / "bin"
+        binn.mkdir()
+        smi = binn / "nvidia-smi"
+
+        def run(stub):
+            smi.write_text(stub)
+            smi.chmod(smi.stat().st_mode | _stat.S_IEXEC)
+            env = dict(os.environ, PATH=f"{binn}:{os.environ['PATH']}",
+                       KIMI_K3_SETTLE_TRIES="2")
+            return subprocess.run(["bash", str(script)], capture_output=True, text=True,
+                                  env=env)
+
+        for label, stub in (
+                ("nvidia-smi exits non-zero", "#!/bin/bash\nexit 15\n"),
+                ("nvidia-smi prints garbage", '#!/bin/bash\necho "ERR: driver mismatch"\n'),
+                ("all devices free", '#!/bin/bash\nprintf "%s\\n" 0 0 0 0 0 0 0 0\n'),
+                ("one device pinned", '#!/bin/bash\nprintf "%s\\n" 92160 0 0 0 0 0 0 0\n')):
+            r = run(stub)
+            self.assertEqual(r.returncode, 0, f"{label}: settle_gpus aborted the eval\n{r.stderr}")
+            self.assertIn("SURVIVED", r.stdout, f"{label}: the timed runs were never reached")
+
+    def test_harness_overrides_are_forwarded_and_recorded(self):
+        """bench/scripts is restored from origin/main before every build, so the harness the
+        box runs is whatever is on the protected branch. That is right for anything a PR could
+        influence and wrong for an operator fixing a harness bug the round is hitting: without
+        a forward, a constant cannot be exercised without merging it first.
+
+        The recording half is the part that matters for the ledger. #77's merged tier was
+        produced under KIMI_K3_MARGIN_TOKENS=512 while main still said 128 -- a number nobody
+        could reproduce from main alone unless the log says so. So the override must reach the
+        box AND be printed into the round log that ships to sparkinfer-k3-log."""
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        box_eval = src[src.index("def _box_eval"):src.index("def measure_frontier")]
+        self.assertIn("KIMI_K3_", box_eval)
+        self.assertIn("env_prefix", box_eval,
+                      "controller-side harness knobs never reach the box")
+        self.assertIn("harness overrides from the controller", box_eval,
+                      "an override that is not logged makes the round unreproducible")
+        self.assertIn("shlex.quote", box_eval,
+                      "override values are interpolated into an ssh command line")
+        # KIMI_K3_MODELS_DIR is set explicitly by the command itself; forwarding it too would
+        # emit the variable twice and let the controller silently repoint the weights.
+        self.assertIn('"KIMI_K3_MODELS_DIR"', box_eval)
+        self.assertIn("import shlex", src)
+
+    def test_eligibility_skips_prs_that_cannot_be_evaluated_or_merged(self):
+        """The node is a scarce serial resource, so the round must not book ~40 GPU-minutes
+        for a PR whose result nobody can act on. Two such classes, both live in one round:
+        #64 was CONFLICTING (update_pr_branch could not advance it), and #74/#71 carried
+        needs-node-run, which is in NEVER_MERGE_LABELS and so forecloses the merge."""
+        import textwrap
+        bot = self._bot()
+        body = textwrap.dedent("""\
+            ## Node run
+            - [x] Tested on **8× H200** (`sm_90`)
+            - [x] **Prefill measured at 32k** on 8× H200
+            - [x] **No 128k decode regression** on 8× H200
+            
+            | | before (main) | after (this PR) |
+            |---|--:|--:|
+            | prefill @ 32k | 98.80 | 120.00 |
+            | decode @ 128k | 56.82 | 56.79 |
+        """)
+        pr = lambda **kw: {"isDraft": False, "labels": [], "body": body, **kw}
+
+        ok, _ = bot.eligibility(pr())
+        self.assertTrue(ok, "the control case must be eligible or this test proves nothing")
+
+        ok, reason = bot.eligibility(pr(mergeable="CONFLICTING"))
+        self.assertFalse(ok, "a conflicted PR was booked onto the node (#64)")
+        self.assertIn("conflicts with main", reason)
+
+        # UNKNOWN is the normal answer while GitHub recomputes after main moves. Skipping on
+        # it would empty the field every round; the merge path waits for a real answer.
+        self.assertTrue(bot.eligibility(pr(mergeable="UNKNOWN"))[0],
+                        "UNKNOWN mergeability must not skip — it is the post-push default")
+        self.assertTrue(bot.eligibility(pr(mergeable="MERGEABLE"))[0])
+
+        ok, reason = bot.eligibility(pr(labels=[{"name": "needs-node-run"}]))
+        self.assertFalse(ok, "a label that already blocks the merge must not book the node")
+        self.assertIn("needs-node-run", reason)
+
+    def test_every_never_merge_label_that_forecloses_a_merge_is_checked_early(self):
+        """needs-node-run is skipped up front because it can never clear during the round.
+        needs-rebase deliberately is NOT: the bot rebases PRs itself and then clears it, so
+        skipping on it would make the label self-fulfilling."""
+        bot = self._bot()
+        self.assertIn("needs-node-run", bot.NEVER_MERGE_LABELS)
+        self.assertIn("needs-rebase", bot.NEVER_MERGE_LABELS)
+        # the scored metric and its guard each need their own claim (2026-08-05)
+        body = ("## Node run\n- [x] Tested on **8× H200** (`sm_90`)\n"
+                "- [x] **Prefill measured at 32k** on 8× H200\n"
+                "- [x] **No 128k decode regression** on 8× H200\n"
+                "\n| | before (main) | after (this PR) |\n|---|--:|--:|\n"
+                "| prefill @ 32k | 98.80 | 120.00 |\n"
+                "| decode @ 128k | 56.82 | 56.79 |\n")
+        ok, _ = bot.eligibility({"isDraft": False, "body": body,
+                                 "labels": [{"name": "needs-rebase"}]})
+        self.assertTrue(ok, "needs-rebase must stay evaluable — the bot clears it by rebasing")
+
+    def test_bot_asks_github_for_mergeability(self):
+        """The CONFLICTING check is dead code unless the field is actually requested."""
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        listing = src[src.index("def list_prs"):src.index("def eligibility")]
+        self.assertIn("mergeable", listing,
+                      "eligibility() reads pr['mergeable'] but list_prs never asks for it")
 
     # ---- clearing the previous round's tier -------------------------------------------
     def _bot(self):
@@ -2381,3 +4016,302 @@ class CiWorkflowTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class RatchetBlocksOnlyAtTheBarTest(unittest.TestCase):
+    """Parity under label.py's KL_BAR is not a regression, whatever the ratio says.
+
+    The ratchet still measures and reports every depth and still warns, because a ratio is
+    the only signal that sees drift at all. It no longer applies the blocking label below the
+    bar. What that gives up is deliberate and recorded: the absolute bar cannot see
+    cumulative drift -- #74 merged at 1.53x main, which moved the baseline permanently, and
+    about five such merges fit under 0.05 before the bar notices."""
+
+    MAIN = {"ctx4": 0.006694998, "ctx2048": 0.000419637}
+
+    def _bot(self):
+        import importlib.util
+        s = importlib.util.spec_from_file_location("b", str(ROOT / "eval/k3_eval_bot.py"))
+        m = importlib.util.module_from_spec(s); s.loader.exec_module(m); return m
+
+    @staticmethod
+    def _d(m):
+        return {k: {"kl": v} for k, v in m.items()}
+
+    def test_a_big_ratio_under_the_bar_warns_but_never_blocks(self):
+        bot = self._bot()
+        for mult in (2.0, 5.0, 7.0):                     # 0.0134, 0.0335, 0.0469 — all < 0.05
+            pr = dict(self.MAIN); pr["ctx4"] = self.MAIN["ctx4"] * mult
+            v, _, _ = bot.kl_ratchet(self._d(pr), self._d(self.MAIN))
+            self.assertEqual(v, "warn", f"{mult}x main is under the bar and must not block")
+
+    def test_crossing_the_bar_still_blocks(self):
+        bot = self._bot()
+        pr = dict(self.MAIN); pr["ctx4"] = 0.051
+        self.assertEqual(bot.kl_ratchet(self._d(pr), self._d(self.MAIN))[0], "reject")
+
+    def test_the_block_threshold_is_the_acceptance_bar(self):
+        bot = self._bot()
+        self.assertEqual(bot.KL_RATCHET_BLOCK_AT, 0.05,
+                         "the ratchet must block at label.py's KL_BAR, not a separate number")
+
+
+class PrefillAttestationTest(unittest.TestCase):
+    """The scored metric and its guard each need their own claim.
+
+    The tier is earned on PREFILL at 32k and decode at 128k is a regression guard, so a node
+    tick no longer says what was run. "I touched a GPU" was enough when there was one number;
+    it is not enough now that a PR can move one metric and quietly cost the other.
+
+    Three places must agree, for the same reason the slot suffix must: the template that asks,
+    the workflow that labels, and the bot that skips. A PR the workflow labels but the bot
+    evaluates -- or the reverse -- is the failure this prevents."""
+
+    def _bot(self):
+        import importlib.util as u
+        s = u.spec_from_file_location("b", str(ROOT / "eval/k3_eval_bot.py"))
+        m = u.module_from_spec(s); s.loader.exec_module(m); return m
+
+    def _pr(self, section):
+        return {"body": "## Node run\n" + section + "\n## Checklist\n", "labels": [],
+                "isDraft": False, "mergeable": "MERGEABLE", "isCrossRepository": False,
+                "author": {"login": "x"}, "number": 1, "title": "perf(k3): x",
+                "headRefOid": "a" * 40}
+
+    def _template_section(self):
+        bot = self._bot()
+        return bot.node_run_section((ROOT / ".github/PULL_REQUEST_TEMPLATE.md").read_text())
+
+    def test_the_template_asks_for_both_claims(self):
+        sec = self._template_section()
+        self.assertTrue(sec, "the template has no '## Node run' section to scan")
+        self.assertRegex(sec, r"(?i)-\s*\[\s*\]\s*.*prefill")
+        self.assertRegex(sec, r"(?i)-\s*\[\s*\]\s*.*decode regression")
+
+    def test_all_three_ticked_is_eligible(self):
+        """The shipped template ships EMPTY measurement cells on purpose, so ticking every box
+        without filling them is not enough -- see AttestationNeedsEvidenceTest. Fill them the
+        way an author who actually ran it would."""
+        # Every box EXCEPT Blocked: that one is a declaration that something is wrong, so an
+        # author with three clean measurements leaves it alone. Ticking it is what #144 needed
+        # and is covered by its own test.
+        sec = "\n".join(
+            ln if "Blocked" in ln else ln.replace("- [ ]", "- [x]")
+            for ln in self._template_section().splitlines()
+        ) + ("\n| | before (main) | after (this PR) |\n|---|--:|--:|\n"
+             "| prefill @ 32k | 98.80 | 120.00 |\n"
+             "| decode @ 128k | 56.82 | 56.79 |\n")
+        ok, why = self._bot().eligibility(self._pr(sec))
+        self.assertTrue(ok, why)
+
+    def test_a_node_tick_alone_is_no_longer_enough(self):
+        sec = self._template_section().replace("- [ ] Tested on", "- [x] Tested on")
+        ok, why = self._bot().eligibility(self._pr(sec))
+        self.assertFalse(ok, "a bare node tick still admits a PR to the scoring loop")
+        self.assertIn("prefill", why)
+        self.assertIn("decode", why)
+
+    def test_a_partial_claim_names_what_is_missing(self):
+        sec = (self._template_section()
+               .replace("- [ ] Tested on", "- [x] Tested on")
+               .replace("- [ ] **Prefill", "- [x] **Prefill"))
+        ok, why = self._bot().eligibility(self._pr(sec))
+        self.assertFalse(ok)
+        self.assertIn("decode regression", why)
+        self.assertNotIn("prefill measured", why, "it should not report a claim that WAS made")
+
+    def test_the_workflow_and_the_bot_agree_on_what_counts(self):
+        """Two independent readings that must agree beat one trusted absolutely -- the same
+        argument that made the bot re-check the node tick after #74 and #71 slipped through."""
+        wf = (ROOT / ".github/workflows/node-attestation.yml").read_text()
+        self.assertIn("CLAIMS", wf, "the workflow does not check the metric claims at all")
+        self.assertIn("tickedClaims", wf)
+        self.assertIn("missingClaims.length === 0", wf,
+                      "the workflow clears the label without requiring the claims")
+        bot = self._bot()
+        self.assertTrue(bot.PREFILL_CLAIM.search("- [x] Prefill measured at 32k"))
+        self.assertTrue(bot.DECODE_CLAIM.search("- [x] No 128k decode regression"))
+
+    def test_a_ticked_claim_is_not_itself_a_node_attestation(self):
+        """The claim boxes name the node too ("Prefill measured at 32k on 8x H200"), so a
+        ticked claim satisfied the ticked+H200 scan on its own and the node box could stay
+        empty -- the exact #74/#71 shape this scan was narrowed to stop, reintroduced by the
+        very checkboxes added to make attestation MORE specific.
+
+        Caught by test_bot_eligibility_scan_is_scoped_to_the_node_run_section while this was
+        being written, which is the second time that test has earned its keep."""
+        sec = ("- [ ] Tested on **8x H200** (`sm_90`)\n"
+               "- [x] **Prefill measured at 32k** on 8x H200\n"
+               "- [x] **No 128k decode regression** on 8x H200\n")
+        ok, why = self._bot().eligibility(self._pr(sec))
+        self.assertFalse(ok, "ticked claims stood in for the unticked node box")
+        self.assertIn("not ticked", why)
+        wf = (ROOT / ".github/workflows/node-attestation.yml").read_text()
+        self.assertIn("if (/prefill|decode\\s+regression/i.test(ln)) continue;", wf,
+                      "the workflow still lets a claim line pass as a node attestation")
+
+
+class AttestationNeedsEvidenceTest(unittest.TestCase):
+    """A ticked box is not a measurement.
+
+    #128 ticked all three boxes and wrote "Tables left for the round to write -- I am not
+    inventing numbers", with "*awaits eval round*" where the measured value goes. That is the
+    checkbox being used to REQUEST evaluation rather than attest one, and the gate could not
+    tell the difference: it checked that a box was ticked, never that anything stood behind
+    it. A round then books ~25 GPU-minutes per PR to measure what the author could have
+    measured, for someone who has not shown the change does anything."""
+
+    def _bot(self):
+        import importlib.util as u
+        s = u.spec_from_file_location("b", str(ROOT / "eval/k3_eval_bot.py"))
+        m = u.module_from_spec(s); s.loader.exec_module(m); return m
+
+    TICKS = ("- [x] Tested on **8x H200** (`sm_90`)\n"
+             "- [x] **Prefill measured at 32k** on 8x H200\n"
+             "- [x] **No 128k decode regression** on 8x H200\n")
+
+    def _pr(self, tables):
+        return {"body": "## Node run\n" + self.TICKS + tables + "\n## Checklist\n",
+                "labels": [], "isDraft": False, "mergeable": "MERGEABLE",
+                "isCrossRepository": False, "author": {"login": "x"}, "number": 1,
+                "title": "perf(k3): x", "headRefOid": "a" * 40}
+
+    def test_measured_numbers_are_eligible(self):
+        t = ("\n| | before (main) | after (this PR) |\n|---|--:|--:|\n"
+             "| prefill @ 32k | 53.02 | **120.00** |\n"
+             "| decode @ 128k | 56.82 | 56.79 |\n")
+        ok, why = self._bot().eligibility(self._pr(t))
+        self.assertTrue(ok, why)
+
+    def test_a_placeholder_is_not_a_measurement(self):
+        """#128's exact shape."""
+        t = ("\n| | before (main) | after (this PR) |\n|---|--:|--:|\n"
+             "| prefill @ 32k | 40.35 | *awaits eval round* |\n"
+             "| decode @ 128k | 56.8 | *awaits eval round* |\n")
+        ok, why = self._bot().eligibility(self._pr(t))
+        self.assertFalse(ok, "a PR that measured nothing was admitted to the scoring loop")
+        self.assertIn("prefill", why)
+        self.assertIn("decode", why)
+
+    def test_an_assertion_is_not_a_measurement(self):
+        """#136's shape: 'no change -- no decode path is touched'. It may well be right, but
+        the box says the regression was checked on 8x H200, and the guard exists precisely
+        because prefill and decode share kernels."""
+        t = ("\n| | before (main) | after (this PR) |\n|---|--:|--:|\n"
+             "| prefill @ 32k | 98.80 | 120.00 |\n"
+             "| decode @ 128k | 56.82 | **no change — no decode path is touched** |\n")
+        ok, why = self._bot().eligibility(self._pr(t))
+        self.assertFalse(ok)
+        self.assertIn("decode", why)
+        self.assertNotIn("prefill,", why, "prefill WAS measured and should not be reported")
+
+    def test_the_after_column_is_found_by_header_not_position(self):
+        """#133 adds a delta column, so the measured value is not the last cell."""
+        t = ("\n| | before (main) | after (this PR) | delta |\n|---|--:|--:|--:|\n"
+             "| prefill @ 32k | **53.02** | **120.00** | +16.9% |\n"
+             "| decode @ 128k | **56.81** | **56.80** | -0.02% |\n")
+        ok, why = self._bot().eligibility(self._pr(t))
+        self.assertTrue(ok, why)
+
+
+class StaleFrontierNoticeTest(unittest.TestCase):
+    """A frontier that overshoots its pin by a lot means the PIN was stale.
+
+    Main does not gain 30% between rounds. The prefill slot was hand-seeded at 40.35 from a
+    measurement taken before #114/#115/#127 landed; prefill shares the single-token path with
+    decode, so those decode wins lifted it to 53.02. Rounds were unaffected -- the bot
+    measures the frontier and passes it explicitly -- but eval-label.yml derives tiers from
+    the pin and contributors read it to decide what to beat, so three PRs optimised against a
+    number that was 31% low."""
+
+    def _bot(self):
+        import importlib.util as u
+        s = u.spec_from_file_location("b", str(ROOT / "eval/k3_eval_bot.py"))
+        m = u.module_from_spec(s); s.loader.exec_module(m); return m
+
+    def test_the_notice_threshold_sits_above_round_to_round_noise(self):
+        bot = self._bot()
+        # observed same-code spread between rounds is ~0.8%; the notice must not fire on that
+        self.assertGreater(bot.FRONTIER_STALE_NOTICE, 0.02)
+        # …and must fire well below the 31% miss that prompted it
+        self.assertLess(bot.FRONTIER_STALE_NOTICE, 0.31)
+
+    def test_reconcile_says_so_when_the_pin_was_stale(self):
+        src = (ROOT / "eval/k3_eval_bot.py").read_text()
+        rec = src[src.index("def reconcile_lock("):src.index("FRONTIER_STALE_NOTICE = ")
+                  if "FRONTIER_STALE_NOTICE = " in src[src.index("def reconcile_lock("):]
+                  else len(src)]
+        self.assertIn("FRONTIER_STALE_NOTICE", src)
+        self.assertIn("the pin was stale by", src,
+                      "a stale pin is corrected silently and nobody learns it was wrong")
+
+    def test_the_lock_records_which_commit_a_seeded_frontier_came_from(self):
+        """The seed was recorded as 'main @ 3b6a3f4' when it was measured on a169ff4 -- both
+        the commit and the staleness were wrong, and the wrong commit is what made it hard to
+        notice."""
+        lock = (ROOT / "bench/scripts/reference.lock").read_text()
+        self.assertIn("a169ff4", lock, "the real measurement commit is not recorded")
+        self.assertIn("53.02", lock)
+
+
+class ClaimMustBeatTheFrontierTest(unittest.TestCase):
+    """A round costs ~25 GPU-minutes per PR. If the number an author reports would not score
+    even if it were exact, the node has nothing to learn by re-deriving it -- and the author
+    already knows, because they measured it.
+
+    #135 is the case: 50.60 honestly measured, correctly reported, and 4.6% BELOW the 53.02
+    frontier it has to beat. Measuring it can only confirm what its own table says."""
+
+    def _bot(self):
+        import importlib.util as u
+        s = u.spec_from_file_location("b", str(ROOT / "eval/k3_eval_bot.py"))
+        m = u.module_from_spec(s); s.loader.exec_module(m); return m
+
+    TICKS = ("- [x] Tested on **8x H200** (`sm_90`)\n"
+             "- [x] **Prefill measured at 32k** on 8x H200\n"
+             "- [x] **No 128k decode regression** on 8x H200\n")
+
+    def _pr(self, prefill, decode=56.79):
+        tbl = ("\n| | before (main) | after (this PR) |\n|---|--:|--:|\n"
+               f"| prefill @ 32k | 53.02 | {prefill} |\n"
+               f"| decode @ 128k | 56.82 | {decode} |\n")
+        return {"body": "## Node run\n" + self.TICKS + tbl + "\n## Checklist\n",
+                "labels": [], "isDraft": False, "mergeable": "MERGEABLE",
+                "isCrossRepository": False, "author": {"login": "x"}, "number": 1,
+                "title": "perf(k3): x", "headRefOid": "a" * 40}
+
+    def test_the_pin_is_read_from_the_lock(self):
+        bot = self._bot()
+        slot = bot._frontier_slot("h200x8", "UD-IQ1_S")
+        self.assertTrue(slot.endswith("_32K_PP"))
+        self.assertGreater(bot.pinned_frontier(slot), 0)
+
+    def test_a_claim_that_clears_the_gate_is_evaluated(self):
+        bot = self._bot()
+        pin = bot.pinned_frontier(bot._frontier_slot("h200x8", "UD-IQ1_S"))
+        ok, why = bot.eligibility(self._pr(round(pin * 1.10, 2)))
+        self.assertTrue(ok, why)
+
+    def test_a_claim_below_the_frontier_is_not_worth_the_node(self):
+        """#135's shape."""
+        bot = self._bot()
+        pin = bot.pinned_frontier(bot._frontier_slot("h200x8", "UD-IQ1_S"))
+        ok, why = bot.eligibility(self._pr(round(pin * 0.95, 2)))
+        self.assertFalse(ok)
+        self.assertIn("does not beat", why)
+        self.assertIn("-5.0%", why)
+
+    def test_a_claim_inside_the_significance_gate_is_not_worth_the_node(self):
+        """#133's shape: honestly flat, and flat cannot score."""
+        bot = self._bot()
+        pin = bot.pinned_frontier(bot._frontier_slot("h200x8", "UD-IQ1_S"))
+        ok, why = bot.eligibility(self._pr(round(pin * 1.002, 2)))
+        self.assertFalse(ok, "a flat claim still booked the node")
+        self.assertIn("significance gate", why)
+
+    def test_the_gate_matches_label_pys_significance_threshold(self):
+        """Skipping on anything label.py would still score would silently narrow the loop."""
+        bot = self._bot()
+        lab = (ROOT / "bench/scripts/label.py").read_text()
+        self.assertIn("SIG = 0.02", lab)
+        self.assertEqual(bot.CLAIM_SIG, 0.02)

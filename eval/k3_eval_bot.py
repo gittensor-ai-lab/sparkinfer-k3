@@ -45,8 +45,11 @@ import io
 import json
 import os
 import re
+import shlex
+import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import urllib.parse
@@ -66,13 +69,33 @@ BOX_RECEIPTS = os.environ.get("K3_BOX_RECEIPTS", f"{BOX_REPO_DIR}/bench/results/
 # that carries a payout tier. Every one of them is a reason a human would have wanted to
 # look, and none can be satisfied by the PR simply being fast.
 NEVER_MERGE_LABELS = {"hold", "copycat", "copycat-warn", "flagged:gaming", "penalty",
-                      "needs-benchmark", "needs-node-run", "llm-judge", "needs-rebase"}
+                      "needs-benchmark", "needs-node-run", "llm-judge", "needs-rebase",
+                      # Applied by the round itself when a PR's KL is >= KL_RATCHET_REJECT x
+                      # main's, measured on the same box minutes apart. A speed win bought
+                      # with parity is a trade a human should make on purpose.
+                      "accuracy-regression"}
 # Paths that decide payouts. sensitive-paths-guard already fails a non-maintainer PR that
 # touches these, but a bot that merges without anyone reading should not depend on another
 # check having run correctly.
 NEVER_MERGE_PATHS = ("eval/", ".github/", ".gittensor/", "bench/scripts/", "bench/results/",
                      "bench/refdata/", "dashboard/", "CODEOWNERS")
 REBASE_LABEL = "needs-rebase"
+CONFLICT_LABEL = "merge-conflict"
+
+# THE TIERS THAT MEAN A PR ACTUALLY WON SOMETHING.
+#
+# merge_blockers used to accept any label starting with "eval:" as proof the PR had passed the
+# gate. `eval:none` starts with "eval:". So the one label whose entire meaning is "no
+# significant gain" satisfied the check that exists to require a gain.
+#
+# #81 merged through that hole and cost main 31.5%. It had been measured honestly at +4.17%
+# against a 20.14 main in an earlier round; #74 then landed underneath it, the two changes
+# conflicted, and the re-measurement on current main came back 14.54 against a 21.24 frontier.
+# Every part of the loop that was supposed to catch this DID: needs-rebase forced the
+# re-measurement, and eval-label.yml correctly applied eval:none. The merge decision then
+# ignored both.
+SCORING_TIERS = {"eval:xs", "eval:s", "eval:m", "eval:l", "eval:xl"}
+NO_GAIN_TIER = "eval:none"
 
 # The PR template's hardware attestation. Matched loosely on purpose -- the template uses a
 # multiplication sign (8x H200) that is easy to retype as an ASCII x, and failing a real
@@ -80,6 +103,118 @@ REBASE_LABEL = "needs-rebase"
 # the ticked box, because that is the author's attestation that they ran it.
 TICKED = re.compile(r"-\s*\[\s*[xX]\s*\]")
 H200 = re.compile(r"h200", re.I)
+NODE_RUN_HEADING = re.compile(r"^##\s+node run\s*$", re.I)
+ANY_HEADING = re.compile(r"^##\s+")
+
+
+# The two claims a perf-bearing PR must make, beyond ticking the node. Kept in step with
+# CLAIMS in .github/workflows/node-attestation.yml -- both read the same '## Node run'
+# section of the same body, and disagreeing about what counts as attested is the same class
+# of bug as disagreeing about the frontier.
+# A TICKED BOX IS NOT A MEASUREMENT.
+#
+# #128 ticked all three boxes and wrote "Tables left for the round to write -- I am not
+# inventing numbers", with "*awaits eval round*" where the measured value goes. That is the
+# checkbox being used to REQUEST evaluation rather than to attest one, and the gate could not
+# tell the difference: it checked that a box was ticked, never that anything stood behind it.
+#
+# So a claim must be backed by a number in the "after (this PR)" column of its table. The
+# column is located from the header rather than assumed to be last, because a PR may add a
+# delta column (#133 does) and then the last cell is prose.
+#
+# This refuses assertions as well as placeholders. #136 wrote "no change -- no decode path is
+# touched", which is a reasoned claim and may well be right, but the box says "No 128k decode
+# regression on 8x H200" and that cannot be attested without measuring -- the guard exists
+# precisely because prefill and decode share kernels, as that PR itself notes.
+MEASURED_CELL = re.compile(r"^\s*\**\s*[-+]?\d+(?:\.\d+)?\s*\**\s*$")
+
+
+def _row_cells(line):
+    return [c.strip() for c in line.strip().strip("|").split("|")]
+
+
+def measured_claims(section):
+    """{'prefill','decode'} for rows whose 'after' cell holds a bare number."""
+    return set(measured_values(section))
+
+
+def measured_values(section):
+    """{'prefill': float, 'decode': float} from the 'after (this PR)' column."""
+    found, after_idx = {}, None
+    for ln in section.splitlines():
+        if ln.count("|") < 2:
+            continue
+        cells = _row_cells(ln)
+        low = [c.lower() for c in cells]
+        if any("after" in c for c in low):          # header row -> locate the column
+            after_idx = next(i for i, c in enumerate(low) if "after" in c)
+            continue
+        if after_idx is None or after_idx >= len(cells):
+            continue
+        if not MEASURED_CELL.match(cells[after_idx]):
+            continue
+        val = float(cells[after_idx].strip("* "))
+        if "prefill" in low[0]:
+            found.setdefault("prefill", val)
+        if "decode" in low[0]:
+            found.setdefault("decode", val)
+    return found
+
+
+# THE CLAIM HAS TO BE WORTH MEASURING.
+#
+# A round costs ~25 GPU-minutes per PR. If the number an author reports would not score even
+# if it were exact, the node has nothing to learn by re-deriving it -- and the author already
+# knows, because they measured it. #135 claimed 50.60 against a 53.02 frontier: honestly
+# measured, correctly reported, and 4.6% BELOW the thing it has to beat.
+#
+# Compared against the PIN rather than a fresh measurement, because the pin is the number
+# published to contributors -- it is what they were told to beat. The 2% is label.py's
+# significance gate: below it a gain scores `none` however real, so measuring cannot change
+# the outcome.
+CLAIM_SIG = float(os.environ.get("K3_CLAIM_SIG", "0.02"))
+
+# A ticked "Blocked" box. Deliberately loose about surrounding markup -- the authors who
+# need this are the ones whose bodies do not look like the template.
+BLOCKED_CLAIM = re.compile(r'\bblocked\b', re.I)
+
+
+def pinned_frontier(slot):
+    """The pinned frontier for `slot`, from this checkout's reference.lock. None if absent."""
+    try:
+        text = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                 "bench", "scripts", "reference.lock")).read()
+    except OSError:
+        return None
+    m = re.search(rf"^{re.escape(slot)}=\"\$\{{[^:]+:-([0-9.]+)\}}\"", text, re.M)
+    if not m:
+        return None
+    v = float(m.group(1))
+    return v if v > 0 else None
+
+
+PREFILL_CLAIM = re.compile(r"prefill", re.I)
+DECODE_CLAIM = re.compile(r"decode\s+regression|no\s+.*decode|decode.*no\s+regress", re.I)
+
+
+def node_run_section(body):
+    """Only the text between '## Node run' and the next '##' heading.
+
+    Same bug, same fix as node-attestation.yml (#78): a body-wide TICKED+H200 scan matched
+    the PR-template Checklist boilerplate '- [x] `...--node h200x8 --dry-run` resolves' --
+    ticked on nearly every PR and containing 'h200' -- so a PR read as attested while the
+    real Node run box sat unticked. Here the consequence was bounded (the bot still
+    measures for real) but live: #71 was evaluated in two rounds and #74 queued, neither
+    ever having attested a node run. The attestation is a claim made in ONE place; read
+    only that place. No section => not attested, which fails closed.
+    """
+    lines = (body or "").split("\n")
+    start = next((i for i, ln in enumerate(lines) if NODE_RUN_HEADING.match(ln)), -1)
+    if start == -1:
+        return ""
+    end = next((i for i in range(start + 1, len(lines)) if ANY_HEADING.match(lines[i])),
+               len(lines))
+    return "\n".join(lines[start + 1:end])
 
 
 def gh(args, timeout=120):
@@ -104,7 +239,7 @@ def sh(cmd, timeout=7200):
 
 def list_prs(repo):
     r = gh(["pr", "list", "-R", repo, "--state", "open", "--limit", "50", "--json",
-            "number,title,isDraft,headRefOid,body,author,labels,isCrossRepository"])
+            "number,title,isDraft,headRefOid,body,author,labels,isCrossRepository,mergeable"])
     if r.returncode != 0:
         raise SystemExit(f"k3_eval_bot: gh pr list failed: {r.stderr.strip()}")
     return json.loads(r.stdout or "[]")
@@ -117,11 +252,271 @@ def eligibility(pr):
     labels = {l.get("name", "") for l in pr.get("labels") or []}
     if "hold" in labels:
         return False, "hold label set"
-    body = pr.get("body") or ""
-    ticked = any(TICKED.search(ln) and H200.search(ln) for ln in body.splitlines())
+
+    # THE AUTHOR SAYING "NOT YET" IS THE CHEAPEST SIGNAL THIS LOOP GETS, AND IT HAD NOWHERE
+    # TO GO.
+    #
+    # #144 measured prefill 63.28 vs 59.07 on one binary, held the decode guard, verified
+    # parity bit-exact at 1k and 4k -- and then found parity FAILS at 32k, wrote the failing
+    # compare_logits output into the body, and said "do not merge on the perf number until
+    # that resolves". The most careful submission in the queue. The template had no way to
+    # say that, so the author restructured the body, which cost the '## Node run' heading the
+    # attestation scan keys on, and the PR was labelled needs-node-run: the loop told someone
+    # who had run more experiments than anyone that they had not touched a GPU.
+    #
+    # Read from the WHOLE body, not the node-run section, precisely because an author with
+    # something to disclose is the one most likely to have reorganised around it.
+    if any(TICKED.search(ln) and BLOCKED_CLAIM.search(ln)
+           for ln in (pr.get("body") or "").splitlines()):
+        return False, ("the author marked this blocked — evaluating it would spend ~25 "
+                       "GPU-minutes to re-derive a number they already have and already "
+                       "said not to act on. Untick the box when it resolves")
+
+    # A conflicted branch cannot be brought current, so it cannot be measured against a
+    # frontier that is about to move under it, and it cannot be merged at the end. #64 sat in
+    # a round as CONFLICTING: update_pr_branch could not advance it -- the round log shows
+    # #77, #74 and #71 updated and #64 simply absent -- so anything it measured would have
+    # described a tree that does not exist on main. That is ~40 GPU-minutes spent on a result
+    # nobody can act on.
+    #
+    # Only an explicit CONFLICTING skips. GitHub computes mergeability lazily and answers
+    # UNKNOWN while recomputing, which is the normal state for every open PR in the seconds
+    # after main moves -- treating that as a conflict would skip the entire field. UNKNOWN
+    # falls through to the merge path, where wait_mergeable_state() already blocks for a real
+    # answer.
+    if pr.get("mergeable") == "CONFLICTING":
+        return False, "conflicts with main — rebase before it can be evaluated or merged"
+
+    # CI's own verdict on the attestation, re-derived by node-attestation.yml on every edit
+    # and synchronize, so it does not go stale. It is already in NEVER_MERGE_LABELS: a PR
+    # carrying it cannot merge at the end of the round however fast it measures, so booking
+    # the node for it is spending GPU on a foregone conclusion.
+    #
+    # It is also a cross-check on the scan below. Both read the same checkbox out of the same
+    # body, so a disagreement means one of them is broken -- which is exactly the state this
+    # file was in before the fix below: the label said #74 and #71 had no node run, the bot
+    # said they did, and the bot was wrong. Two independent readings that must agree beat one
+    # reading trusted absolutely.
+    if "needs-node-run" in labels:
+        return False, ("needs-node-run — node-attestation.yml found no ticked node box "
+                       "in '## Node run'")
+
+    section = node_run_section(pr.get("body") or "")
+    lines = section.splitlines()
+    # A CLAIM LINE IS NOT A NODE ATTESTATION.
+    #
+    # The claim boxes name the node too ("Prefill measured at 32k on 8x H200"), so a ticked
+    # claim satisfied the ticked+H200 scan on its own and the node box could stay empty --
+    # the exact shape of the #74/#71 bug this scan was narrowed to stop, reintroduced by the
+    # very checkboxes added to make attestation MORE specific. Excluded explicitly.
+    def _is_claim(ln):
+        return bool(PREFILL_CLAIM.search(ln) or DECODE_CLAIM.search(ln))
+    ticked = any(TICKED.search(ln) and H200.search(ln) and not _is_claim(ln) for ln in lines)
     if not ticked:
         return False, "the 8x H200 box is not ticked — the author has not attested a node run"
+
+    # THE SCORED METRIC AND ITS GUARD EACH NEED THEIR OWN CLAIM (2026-08-05).
+    #
+    # The tier is earned on PREFILL at 32k and decode at 128k is a regression guard, so a
+    # node tick no longer says what was run. "I touched a GPU" was enough when there was one
+    # number; it is not enough now that a PR can move one metric and quietly cost the other.
+    #
+    # Checked HERE as well as in node-attestation.yml for the reason the label check above
+    # exists: two independent readings that must agree beat one trusted absolutely. The
+    # label can also lag a body edit by a workflow run, and a round that starts in that
+    # window would otherwise book the node for a PR that has attested nothing.
+    missing = [name for name, rx in (("prefill measured at 32k", PREFILL_CLAIM),
+                                     ("no 128k decode regression", DECODE_CLAIM))
+               if not any(TICKED.search(ln) and rx.search(ln) for ln in lines)]
+    if missing:
+        return False, ("missing attestation in '## Node run': " + "; ".join(missing) +
+                       " — the tier is earned on prefill and decode is guarded, so both "
+                       "are required")
+
+    # …and the ticked boxes must be backed by measured numbers, not placeholders.
+    have = measured_values(section)
+    unbacked = [n for n in ("prefill", "decode") if n not in have]
+    if unbacked:
+        return False, ("ticked but not measured: " + ", ".join(unbacked) +
+                       " — put the measured tok/s in the 'after (this PR)' column. A ticked "
+                       "box with '*awaits eval round*' or 'no change' in it is a request to "
+                       "be measured, not an attestation that it was")
+
+    # …and the claim has to be worth ~25 GPU-minutes. A number that cannot score even if it
+    # is exact does not need re-deriving on the node: the author measured it, and the pin is
+    # the number they were told to beat.
+    slot = _frontier_slot(NODE, "UD-IQ1_S")
+    pinned = pinned_frontier(slot)
+    claim = have.get("prefill")
+    if pinned and claim is not None and claim <= pinned * (1 + CLAIM_SIG):
+        delta = 100 * (claim / pinned - 1)
+        return False, (f"claimed prefill {claim} does not beat the pinned {pinned} frontier "
+                       f"({delta:+.1f}%) by the {CLAIM_SIG:.0%} significance gate — it would "
+                       f"score `none` even if exact, so the node has nothing to learn. "
+                       f"Re-measure against the current frontier, or close it")
     return True, "eligible"
+
+
+# A GUARD THAT CAN BE RETRIED IS NOT A GUARD.
+#
+# These are the harness saying "I will not score this", which is an ANSWER, not a glitch.
+# Running the same measurement again until it passes is not a retry, it is sampling until the
+# result is convenient -- and every one of these guards exists because a number could
+# otherwise be fabricated. If one of them fires, the round takes the refusal.
+VERDICT_MARKERS = (
+    "refusing to score",
+    "wall clock allows",
+    "did not do the extra work",
+    "harness measured commit",
+    "non-positive time delta",
+    "reported no ms/token line",
+)
+# These are the BOX misbehaving: the model never loaded, the collective never initialised, the
+# connection died. They say nothing about the code under test, so the round should try again
+# rather than throw away every PR in it.
+TRANSIENT_RE = re.compile(
+    r"ncclCommInitAll|unhandled cuda error|\bNCCL\b|cudaMalloc failed|init failed at tp=|"
+    r"weight load failed|out of memory|\bCUDA error\b|bench failed|"
+    r"ssh timeout|Connection (?:timed out|closed|refused|reset)|Broken pipe|"
+    r"kex_exchange_identification|banner exchange",
+    re.I)
+
+
+def is_transient(exc):
+    """True if `exc` is the box failing, not the harness reaching a verdict.
+
+    Order matters: a verdict marker anywhere in the message wins, even if a transient-looking
+    word also appears in the 1200-char tail the error carries. Refusing to retry is the safe
+    direction -- it costs a round, where retrying a verdict costs the guard.
+    """
+    msg = str(exc)
+    if any(m in msg for m in VERDICT_MARKERS):
+        return False
+    return bool(TRANSIENT_RE.search(msg))
+
+
+def with_box_retry(what, fn, tries=3, delay=20):
+    """Run fn(), retrying only when the BOX failed rather than the code under test.
+
+    A frontier failure used to discard the entire round: measure_frontier raises, main() bails,
+    and not one PR is evaluated however healthy it was. Two rounds in the ledger died exactly
+    there -- rounds/66955446f62f and rounds/11eb5e4d02b7, the latter on
+
+        [tp] FATAL: ncclCommInitAll(n=8): unhandled cuda error
+        init failed at tp=8, 93 layers
+
+    -- and every eligible PR in both got nothing. A transient collective-init error is not a
+    statement about anyone's code, and it should cost a couple of minutes, not a round.
+
+    Each attempt re-enters _box_build, which kills orphaned compute processes before it builds,
+    so a retry is a genuinely clean attempt rather than the same poisoned box twice.
+
+    Verdicts are never retried -- see is_transient.
+    """
+    for i in range(1, tries + 1):
+        try:
+            return fn()
+        except RuntimeError as exc:
+            if i >= tries or not is_transient(exc):
+                raise
+            print(f"!! {what}: attempt {i}/{tries} failed on the box — {str(exc).splitlines()[0][:160]}",
+                  file=sys.stderr)
+            print(f"   retrying in {delay}s; the next attempt rebuilds and clears stray "
+                  "compute processes first", file=sys.stderr)
+            time.sleep(delay)
+
+
+def sync_conflict_labels(repo, prs, dry_run):
+    """Label the PRs the round skipped for conflicting with main, and clear the rest.
+
+    The skip was already correct but invisible: it printed a line in a log only the operator
+    reads, so a contributor saw their PR sit out round after round with nothing on the PR
+    saying why. #55, #87 and #90 all sat conflicted through a full round like that.
+
+    SELF-CLEARING, like needs-rebase. Mergeability is re-resolved every round before this
+    runs, so a PR that has been rebased loses the label on the next round without anyone
+    asking. A label only a maintainer can remove turns a mechanical state into a queue
+    somebody has to babysit.
+
+    Deliberately NOT in NEVER_MERGE_LABELS. GitHub already refuses to merge a conflicted
+    branch, so the label would add nothing there -- and if it ever went stale it would block
+    a PR that is now perfectly mergeable. The state is the authority; the label only reports it.
+    """
+    for pr in prs:
+        num = pr["number"]
+        has = CONFLICT_LABEL in {l.get("name", "") for l in pr.get("labels") or []}
+        conflicted = pr.get("mergeable") == "CONFLICTING"
+        if conflicted == has:
+            continue
+        if dry_run:
+            print(f"--- dry-run: would {'add' if conflicted else 'remove'} "
+                  f"{CONFLICT_LABEL} on #{num}")
+            continue
+        if conflicted:
+            gh(["label", "create", CONFLICT_LABEL, "-R", repo, "--color", "B60205",
+                "--description", "conflicts with main — rebase and the round picks it up"])
+            # NOT `gh pr edit --add-label`: it queries projectCards, which GitHub has
+            # deprecated, so it exits 1 even where the repo has no projects.
+            q = gh(["api", "-X", "POST", f"repos/{repo}/issues/{num}/labels",
+                    "-f", f"labels[]={CONFLICT_LABEL}"])
+            if q.returncode != 0:
+                print(f"!! #{num}: could not label {CONFLICT_LABEL}: {q.stderr.strip()[:120]}",
+                      file=sys.stderr)
+                continue
+            print(f">> #{num}: {CONFLICT_LABEL} (conflicts with main — not evaluated)")
+        else:
+            gh(["api", "-X", "DELETE", f"repos/{repo}/issues/{num}/labels/{CONFLICT_LABEL}"])
+            print(f">> #{num}: {CONFLICT_LABEL} cleared — no longer conflicting")
+
+
+def resolve_mergeability(repo, prs, tries=8, delay=5):
+    """Settle pr['mergeable'] for the PRs where it decides whether to book the node.
+
+    THE BOT ASKS THIS QUESTION AT THE ONE MOMENT THE ANSWER IS GUARANTEED TO BE MISSING.
+
+    GitHub computes mergeability lazily and answers UNKNOWN while recomputing, which is the
+    normal state for every open PR in the seconds after the base branch moves -- and this bot
+    moves the base branch itself, committing the frontier to reference.lock at the start of
+    every round. So the CONFLICTING skip was least reliable exactly when it was needed.
+    Verified live: seconds after a merge, #64 read ELIGIBLE while being CONFLICTING; a minute
+    later the same call read CONFLICTING and skipped it correctly.
+
+    Polled only for PRs that are otherwise eligible, so it costs a handful of API calls rather
+    than the ~40 GPU-minutes the answer is protecting. A PR already skipped for an unticked
+    box or a needs-node-run label is not asked about -- mergeability cannot change that.
+
+    FAILS OPEN on timeout, loudly. A wrong skip during a wide UNKNOWN (a GitHub incident)
+    would stop every round and the payouts with it; a wrong include costs one wasted eval that
+    merge_blockers and wait_mergeable_state still refuse at the end. The asymmetry decides it.
+    """
+    for pr in prs:
+        if pr.get("mergeable") in ("MERGEABLE", "CONFLICTING"):
+            continue
+        if not eligibility(pr)[0]:
+            continue
+        num = pr["number"]
+        for i in range(tries):
+            info = _pr_state(repo, num)
+            # No data at all is "cannot read this PR", not "still recomputing" -- polling it
+            # for a minute helps nobody. One retry covers a transient blip, as in
+            # wait_mergeable_state.
+            if not info:
+                if i >= 1:
+                    print(f"!! #{num}: cannot read merge state from {repo}", file=sys.stderr)
+                    break
+                time.sleep(min(delay, 2))
+                continue
+            state = info.get("mergeable") or "UNKNOWN"
+            if state != "UNKNOWN":
+                pr["mergeable"] = state
+                if i:
+                    print(f"   #{num}: mergeability settled to {state} after ~{i * delay}s")
+                break
+            time.sleep(delay)
+        else:
+            print(f"!! #{num}: mergeability still UNKNOWN after {tries * delay}s — evaluating "
+                  "it anyway; a conflicted branch is still refused at the merge",
+                  file=sys.stderr)
 
 
 def _box_build(sha, what):
@@ -177,15 +572,62 @@ def _box_build(sha, what):
         # bench/refdata/hello.spkl and write it back out as its own --logits dump: top1 1.0,
         # KL 0.0, for a binary that computed nothing. Accuracy is measured by the controller
         # now (measure_accuracy), against a reference this box never receives.
-        "git checkout -q origin/main -- bench/scripts",
-        "rm -rf bench/refdata",
+        # bench/refdata comes back, but WITHOUT its answer key.
+        #
+        # The .ids are INPUTS: which tokens the executor is fed. They are public in the
+        # repo, so withholding them protects nothing, and the 32k-token parity prompt is
+        # ~200 KB -- far past MAX_ARG_STRLEN, so shipping it per round over ssh is not
+        # possible anyway. They come from origin/main precisely so a PR cannot swap in a
+        # shorter or easier prompt and be graded on it.
+        #
+        # The .spkl are the ANSWERS, and they still never reach this box. That is the
+        # attack this defends: a bench could open bench/refdata/*.spkl and write it back
+        # out as its own --logits dump -- top1 1.0, KL 0.0, for a binary that computed
+        # nothing. Accuracy is graded by the controller (measure_accuracy) against the
+        # controller's own copy.
+        # NOTE THE PATHSPEC: '*.ids' ONLY. The answer key is never written to this disk at
+        # all, not even for the instant before a delete.
+        "git checkout -q origin/main -- bench/scripts 'bench/refdata/*.ids'",
+        # …and any .spkl the PR's OWN checkout carried is removed, since bench/refdata is
+        # committed and a branch can contain whatever it likes.
+        "rm -f bench/refdata/*.spkl",
         "export PATH=/usr/local/cuda/bin:$PATH",
+        # EVERY BUILD IS FROM SCRATCH.
+        #
+        # build/ is gitignored, so `git clean -qfd` leaves it (that needs -x) and every PR
+        # was compiled on top of the previous PR's objects, round after round, across a dozen
+        # checkouts. On 2026-08-03 that path produced numbers no fresh build can reproduce:
+        # #81 measured 14.54 in a round and 22.17 on six clean builds, and main measured
+        # 14.14 through the same build directory against 21.25 clean. The regression that
+        # reading caused was real -- #81 was reverted in #84 on the strength of it.
+        #
+        # A single incremental step is not obviously at fault: main->#81 in isolation
+        # reproduces 22.18. What the bot does is not a single step, it is a dozen, and the
+        # difference is not worth reasoning about when the cure is this cheap. A clean build
+        # is ~20 s here, about 2 minutes across a full round, against a ~40 minute round --
+        # far less than one wrong measurement costs.
+        "rm -rf build",
+        # PIN THE COMPILER. /usr/local/cuda is a symlink the box owner can move, and it DID
+        # move today: the note in memory recorded 12.8, the link now resolves to 13.0. Both
+        # measure the same here (21.24 vs 21.25), so this did not cause the above -- but a
+        # loop that pays on measurements should not let a symlink choose its compiler, and
+        # the version belongs in the log so the next discrepancy is diagnosable rather than
+        # archaeological.
+        'NVCC="$(command -v nvcc)"',
+        '[ -x "$NVCC" ] || { echo "no nvcc on PATH" >&2; exit 1; }',
+        'echo ">> toolchain: $($NVCC --version | tail -1)"',
         # -DSPARKINFER_TP=ON is not optional here. Without it the runtime has no NCCL
         # collective, and kimi_k3_tp_bench refuses to run sharded rather than silently
         # producing a wrong number -- correct behaviour, but it means a build configured
         # without this flag fails at eval time with no hint that configure was the cause.
-        "cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=90 "
-        "-DSPARKINFER_TP=ON >/dev/null",
+        #
+        # Configure output is NO LONGER discarded. It used to go to /dev/null, so a failed
+        # configure was invisible and `cmake --build` walked on against whatever cache
+        # happened to exist -- which is how a stale build directory can decide a payout
+        # without anything in the log admitting it.
+        'cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=90 '
+        '-DSPARKINFER_TP=ON -DCMAKE_CUDA_COMPILER="$NVCC" '
+        '|| { echo "cmake configure FAILED" >&2; exit 1; }',
         f"cmake --build build -j{BUILD_JOBS} --target kimi_k3_tp_bench >/dev/null",
     ])
     r = sh(f"{steps} && echo K3_BUILD_OK", timeout=5400)
@@ -204,6 +646,69 @@ def _box_build(sha, what):
 REFDATA = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                        "bench", "refdata")
 
+# THE DEPTHS THE PARITY SUITE PROBES, BEYOND THE HISTORICAL 4-TOKEN ONE.
+#
+# WHY MORE THAN ONE PROBE. The gate used to be a single next-token distribution after a
+# 4-token prompt -- one row of one .spkl, n=1. Everything the engine is actually scored on
+# happens at 131,072 tokens, and everything that only appears once the KV cache is
+# populated (the F16 latent cache, per-rank CUDA graphs, the banded LM head, 2-D MoE
+# sharding) was gated by a measurement that barely touches it. A change can be bit-exact
+# at 4 tokens and wrong at 100k and the old gate would pass it clean.
+#
+# These are nested prefixes of ONE document (bench/refdata/longctx.txt), so they test
+# genuine long-range dependency rather than ten unrelated short prompts, and one pass over
+# the longest prefix produces all of them.
+#
+# WHY IT STOPS AT 8192, AND WHAT IT COSTS.
+#
+# The deep pass feeds the prefix through the DECODE path one token at a time -- the
+# runtime has no batched prefill -- so the cost is max(depth)/decode_tok_s per measured
+# build, paid once for main plus once per PR in a round. Measured on the 8x H200 node,
+# main @ be3c818, decode time for one continuous pass:
+#
+#     to  4096   136 s   (2.3 min)   <-- the default
+#     to  8192   236 s   (3.9 min)
+#     to 16384   429 s   (7.2 min)
+#     to 32768   812 s  (13.5 min)
+#
+# END TO END this function costs MORE than the decode figure, because it pays TWO model
+# loads: the 4-token probe and the deep pass are separate invocations (tp_bench takes one
+# --ids set, and they are different prompts). Measured at the 8192 default: 452 s per
+# measured build, of which ~219 s is model loading. A round pays that once for main plus
+# once per PR.
+#
+# Decode rate is flat at ~42 tok/s across those segments: per-token cost is dominated by
+# streaming the active weights, and MLA keeps the context-dependent term small. So the
+# cost is very close to linear in max(depth), and 32768 triples a round's parity budget
+# to buy two more depths.
+#
+# References for 8192, 16384 and 32768 ARE captured and committed. Opt in with
+# K3_PARITY_DEPTHS=...,8192,16384,32768 when a change plausibly breaks only very deep.
+#
+# 4096 is the default because ingestion is the round's dominant cost and buys no extra
+# coverage per second: a 6-build round pays 35 min at 4096 against 45 min at 8192. That
+# ceiling is a deliberate trade against the 131,072 the engine is SCORED at -- see #119.
+# It moves back up for free the moment batched prefill exists.
+#
+# WHY NOT 131072. Two reasons, and only one of them is the reference. The capture side
+# grows with depth, but OUR side is the binding one: ingestion runs at decode speed
+# (measured 42.80 tok/s, 1.03x our scored decode rate), so a 131,072-token probe costs
+# ~52 minutes PER BUILD. This narrows the untested gap from "everything past 4 tokens" to
+# "everything past 4k" (32k when opted in) -- it does not close it, and README/CONTRIBUTING
+# say so rather than implying full-context parity is proven.
+PARITY_DEPTHS = [int(x) for x in os.environ.get(
+    "K3_PARITY_DEPTHS",
+    "128,256,512,1024,2048,4096").split(",") if x.strip()]
+PARITY_CORPUS = os.environ.get("K3_PARITY_CORPUS", "longctx")
+# The deep pass is minutes of decode, not seconds, and it runs behind the same ssh call
+# as the 4-token probe. 3600 was sized for the latter alone.
+PARITY_TIMEOUT = int(os.environ.get("K3_PARITY_TIMEOUT", "10800"))
+# Wait for a busy node before loading 553 GiB onto it. A GPU under this many MiB counts as
+# free -- a few hundred MiB of driver/context is normal and never clears.
+PARITY_SETTLE_MIB = int(os.environ.get("K3_PARITY_SETTLE_MIB", "2048"))
+PARITY_SETTLE_TRIES = int(os.environ.get("K3_PARITY_SETTLE_TRIES", "60"))
+PARITY_SETTLE_SLEEP = int(os.environ.get("K3_PARITY_SETTLE_SLEEP", "20"))
+
 
 def measure_accuracy(what):
     """Grade the box's logits HERE, against a reference the box never sees.
@@ -218,73 +723,229 @@ def measure_accuracy(what):
     against this machine's copy of the reference. The box cannot match a file it does not
     have.
 
-    Returns (top1, kl) or raises RuntimeError.
-    """
-    ids_file = os.path.join(REFDATA, "hello.ids")
-    ref_spkl = os.path.join(REFDATA, "hello.spkl")
-    for p in (ids_file, ref_spkl):
-        if not os.path.isfile(p):
-            raise RuntimeError(f"missing controller-side reference {p} — refusing to score "
-                               f"without a correctness gate")
-    with open(ids_file) as f:
-        # hello.ids holds prompt ids THEN the reference continuations; the prompt is the
-        # first 4. Taking the whole file would score a different step.
-        ids_csv = ",".join(l.strip() for l in list(f)[:4] if l.strip())
+    Returns (top1, kl, depths):
 
-    remote = "/tmp/k3acc_$$.spkl"
-    # base64 back over the same ssh channel: no scp, no second auth, and the transfer is
-    # part of the command whose exit status we already check.
-    cmd = (f"cd {BOX_REPO_DIR} && "
-           f"env -u POLARIS_API_KEY {BOX_REPO_DIR}/build/runtime/kimi_k3_tp_bench "
-           f"$(ls {BOX_MODELS_DIR}/*/*-00001-of-*.gguf | head -1) "
-           f"{len(DEVICES.split(','))} 93 1 --ids {ids_csv} --logits {remote} "
-           f">/dev/null 2>&1; "
-           f"[ -s {remote} ] && base64 -w0 {remote}; rm -f {remote}")
-    r = sh(cmd, timeout=3600)
+        top1    the WORST top-1 agreement across the suite
+        kl      the WORST (highest) mean KLD across the suite
+        depths  {probe_name: {"top1": float, "kl": float}} for every probe
+
+    The two scalars are worst-case on purpose. A suite is only as strong as the depth it
+    fails at, and averaging would let a 32k regression hide behind nine good shallow
+    probes -- which is the exact failure mode this replaced.
+
+    Raises RuntimeError if any probe fails to come back: a missing depth would silently
+    become "no comparison at that depth", which is what this exists to remove.
+    """
+    probes = _parity_probes()
+
+    outdir = "/tmp/k3par_$$"
+    ndev = len(DEVICES.split(","))
+    gguf = f"$(ls {BOX_MODELS_DIR}/*/*-00001-of-*.gguf | head -1)"
+    binary = f"{BOX_REPO_DIR}/build/runtime/kimi_k3_tp_bench"
+    steps = [f"cd {BOX_REPO_DIR}", f"mkdir -p {outdir}"]
+
+    # WAIT FOR THE NODE. This is a RENTED box and it is not always ours: on 2026-08-04 a
+    # round walked into another tenant's benchmark sweep, both jobs tried to allocate ~70
+    # GiB/GPU, and both died on cudaMalloc. The harness gained settle_gpus() for its own
+    # run, but that is in _box_eval -- by which point THIS function has already tried to
+    # load 553 GiB. Wait here, where the first allocation actually happens.
+    #
+    # Advisory, not fatal: if the box never clears we still try, because refusing to score
+    # because a neighbour is busy is its own failure mode. The point is to not collide with
+    # something that is about to finish.
+    steps.append(
+        f'for i in $(seq 1 {PARITY_SETTLE_TRIES}); do '
+        f'busy=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null '
+        f"| awk -v lim={PARITY_SETTLE_MIB} '$1 > lim' | wc -l || true); "
+        f'[ "${{busy:-0}}" = "0" ] && break; '
+        f'echo "waiting for $busy busy GPU(s) …" >&2; sleep {PARITY_SETTLE_SLEEP}; done')
+
+    # The 4-token probe: fed inline exactly as it always was, so its number stays
+    # comparable with every round this gate has ever reported.
+    #
+    # STDERR GOES TO A FILE, NOT /dev/null. It used to be discarded, and when the probe
+    # died of cudaMalloc the only thing the round could say was "probe ctx4 produced no
+    # logits" -- which reads as a bug in the parity suite and sent the investigation to
+    # entirely the wrong place. The log is small and rides back in the same tar.
+    steps.append(f"env -u POLARIS_API_KEY {binary} {gguf} {ndev} 93 1 "
+                 f"--ids {_hello_ids_csv()} --logits {outdir}/hello.spkl "
+                 f"> {outdir}/hello.log 2>&1")
+
+    # The deep suite: ONE pass over the longest prefix, dumping at each checkpoint. The
+    # ids are read from the box's own origin/main checkout -- 32768 ids is ~200 KB, far
+    # past MAX_ARG_STRLEN, so they cannot be passed as an argument.
+    if PARITY_DEPTHS:
+        deep_ids = f"{BOX_REPO_DIR}/bench/refdata/{PARITY_CORPUS}.ctx{max(PARITY_DEPTHS)}.ids"
+        # Say so on stderr rather than letting the bench fail obscurely on a missing file:
+        # the ids come from origin/main's checkout, so an absent one means the restore
+        # pathspec in _box_build and the depths configured here have drifted apart.
+        steps.append(f'test -s {deep_ids} || echo "MISSING PARITY IDS: {deep_ids}" >&2')
+        steps.append(f"env -u POLARIS_API_KEY {binary} {gguf} {ndev} 93 1 "
+                     f"--ids @{deep_ids} "
+                     f"--checkpoints {','.join(str(d) for d in PARITY_DEPTHS)} "
+                     f"--logits-prefix {outdir}/{PARITY_CORPUS} "
+                     f"--ctx {max(PARITY_DEPTHS) + 16} > {outdir}/deep.log 2>&1")
+
+    # tar+base64 back over the same ssh channel: no scp, no second auth, and the transfer
+    # is part of the command whose exit status we already check.
+    cmd = ("; ".join(steps) +
+           f"; tar cf - -C {outdir} . | base64 -w0; rm -rf {outdir}")
+    r = sh(cmd, timeout=PARITY_TIMEOUT)
     blob = (r.stdout or "").strip()
     if not blob:
         raise RuntimeError(f"no logits dump came back for {what} — cannot grade correctness"
                            + (f": {(r.stderr or '').strip()[:200]}" if r.stderr else ""))
-    fd, ours = tempfile.mkstemp(prefix="k3acc_", suffix=".spkl")
-    with os.fdopen(fd, "wb") as f:
-        f.write(base64.b64decode(blob))
+
+    workdir = tempfile.mkdtemp(prefix="k3par_")
     try:
-        cmp_py = os.path.join(os.path.dirname(REFDATA), "scripts", "compare_logits.py")
-        p = subprocess.run([sys.executable, cmp_py, ref_spkl, ours, "--json"],
-                           capture_output=True, text=True, timeout=600)
-        # ITS EXIT CODE IS A VERDICT, NOT AN ERROR, AND IT IS ALWAYS 1 FOR K3.
-        #
-        # compare_logits returns 0 only for mean_kld < 1e-5 -- a SAME-IMPLEMENTATION bar,
-        # "two implementations of one arithmetic". K3's accepted parity is 4.05e-03, about
-        # 400x that, from a known cause: K3 keeps f32 activations where ggml quantizes them
-        # before a quantized mat-vec. CONTRIBUTING documents it. So the tool says FAIL on a
-        # perfectly good run, every time.
-        #
-        # The shell this replaced ran it with `|| true` and read the JSON; porting it to
-        # Python without that turned every round into "compare_logits failed" with an empty
-        # stderr, which is how the first hardened round died. The gate that matters is
-        # label.py's (top1 >= 0.90, kl <= 0.20), applied downstream.
-        #
-        # So parse the output and let the numbers speak. Only a MISSING or unparseable
-        # payload is a real failure -- that means the tool did not run, which is different
-        # from it disagreeing.
-        out = (p.stdout or "").strip()
-        if not out:
-            raise RuntimeError(f"compare_logits produced no output for {what} (rc="
-                               f"{p.returncode}): {(p.stderr or '').strip()[:300]}")
-        try:
-            d = json.loads(out)
-            top1, kl = float(d["top1_agreement"]), float(d["mean_kld"])
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
-            raise RuntimeError(f"compare_logits output for {what} is not the expected JSON "
-                               f"({exc}): {out[:200]}") from exc
+        tar_path = os.path.join(workdir, "probes.tar")
+        with open(tar_path, "wb") as f:
+            f.write(base64.b64decode(blob))
+        with tarfile.open(tar_path) as tf:
+            _extract_probes(tf, workdir)
+
+        depths = {}
+        for name, ref_spkl, remote_name in probes:
+            ours = os.path.join(workdir, remote_name)
+            if not os.path.isfile(ours) or os.path.getsize(ours) == 0:
+                # Quote the PROBE'S OWN log, not just ssh's stderr. The probe writes to
+                # <outdir>/{hello,deep}.log and it rides back in the same tar, so the
+                # actual reason -- most often `cudaMalloc failed`, i.e. the node was busy
+                # -- is right here instead of being inferred from an absent file.
+                why = []
+                for log in ("hello.log", "deep.log"):
+                    p = os.path.join(workdir, log)
+                    if os.path.isfile(p):
+                        tail = open(p, errors="replace").read().strip()
+                        tail = "\n".join(l for l in tail.splitlines()
+                                         if "setlocale" not in l)[-400:]
+                        if tail:
+                            why.append(f"{log}: …{tail}")
+                # DO NOT SAY "refusing to score" HERE.
+                #
+                # That exact phrase is VERDICT_MARKERS[0], and is_transient() treats a
+                # verdict marker ANYWHERE in the message as decisive -- so wording it that
+                # way told with_box_retry that a busy node was a permanent scoring verdict
+                # and killed the round on the first attempt. An incomplete suite is the
+                # box failing, not the harness reaching a conclusion about this PR: the
+                # right response is to retry, and TRANSIENT_RE already matches the
+                # `cudaMalloc failed` / `init failed at tp=` the probe log carries.
+                #
+                # The REFUSAL is unchanged -- 7 of 8 probes is still not parity and is
+                # still never scored. Only the classification of WHY it happened changes.
+                raise RuntimeError(
+                    f"{what}: incomplete parity suite — probe {name} produced no logits. "
+                    f"Came back: "
+                    f"{sorted(f for f in os.listdir(workdir) if f.endswith('.spkl'))}"
+                    + ("\n" + "\n".join(why) if why else "")
+                    + (f"\nssh stderr: {(r.stderr or '').strip()[:200]}" if r.stderr else ""))
+            depths[name] = _compare_logits_here(ref_spkl, ours, what, name)
     finally:
-        try:
-            os.unlink(ours)
-        except OSError:
-            pass
-    print(f"{what}: accuracy measured HERE — top1={top1} kl={kl}")
-    return top1, kl
+        shutil.rmtree(workdir, ignore_errors=True)
+
+    top1 = min(d["top1"] for d in depths.values())
+    kl = max(d["kl"] for d in depths.values())
+    width = max(len(n) for n in depths)
+    for name, d in depths.items():
+        print(f"  {name:>{width}}: top1={d['top1']:.6f} kl={d['kl']:.9f}")
+    print(f"{what}: accuracy measured HERE over {len(depths)} depths — "
+          f"worst top1={top1} worst kl={kl}")
+    return top1, kl, depths
+
+
+def _extract_probes(tf, dest):
+    """Unpack the probe tar, refusing anything that is not a plain file under dest.
+
+    THIS TAR IS BUILT ON THE BOX, and the box is the machine running unmodified PR code.
+    A bench that dropped a symlink or a "../.." entry into its output directory could
+    otherwise turn this extract into an arbitrary write on the CONTROLLER -- the one
+    machine in this system that holds the answer key and the merge credentials. Nothing
+    legitimate here is anything but a regular .spkl file.
+    """
+    root = os.path.realpath(dest)
+    for m in tf.getmembers():
+        if m.name in (".", "./"):
+            continue
+        if not m.isfile():
+            raise RuntimeError(f"probe archive contains a non-regular entry {m.name!r} "
+                               f"({'symlink' if m.issym() or m.islnk() else 'special'}) — "
+                               f"refusing to extract anything the box may have planted")
+        target = os.path.realpath(os.path.join(root, m.name))
+        if target != root and not target.startswith(root + os.sep):
+            raise RuntimeError(f"probe archive entry {m.name!r} escapes the extract "
+                               f"directory — refusing to extract")
+    # filter="data" is the belt to the above braces on 3.12+; older runtimes get the
+    # validation loop alone, which already covers the same cases.
+    try:
+        tf.extractall(dest, filter="data")
+    except TypeError:
+        tf.extractall(dest)
+
+
+def _hello_ids_csv():
+    """The historical 4-token probe's ids, from the controller's own copy."""
+    ids_file = os.path.join(REFDATA, "hello.ids")
+    if not os.path.isfile(ids_file):
+        raise RuntimeError(f"missing controller-side reference {ids_file} — refusing to "
+                           f"score without a correctness gate")
+    with open(ids_file) as f:
+        # hello.ids holds prompt ids THEN the reference continuations; the prompt is the
+        # first 4. Taking the whole file would score a different step.
+        return ",".join(l.strip() for l in list(f)[:4] if l.strip())
+
+
+def _parity_probes():
+    """[(name, controller-side ref .spkl, filename the box will produce)] for the suite.
+
+    Every reference must exist HERE before a single GPU-second is spent: discovering a
+    missing answer key after the run would either waste the round or, worse, tempt a
+    partial score.
+    """
+    probes = [("ctx4", os.path.join(REFDATA, "hello.spkl"), "hello.spkl")]
+    for depth in PARITY_DEPTHS:
+        probes.append((f"ctx{depth}",
+                       os.path.join(REFDATA, f"{PARITY_CORPUS}.ctx{depth}.spkl"),
+                       f"{PARITY_CORPUS}.ctx{depth}.spkl"))
+    missing = [p for _, p, _ in probes if not os.path.isfile(p)]
+    if missing:
+        raise RuntimeError(
+            "missing controller-side parity reference(s) — refusing to score without the "
+            "full correctness gate: " + ", ".join(os.path.basename(m) for m in missing) +
+            ". Capture them with bench/scripts/capture_parity_refs.sh")
+    return probes
+
+
+def _compare_logits_here(ref_spkl, ours, what, tag):
+    """Run compare_logits.py on THIS machine and return {"top1":…, "kl":…}."""
+    cmp_py = os.path.join(os.path.dirname(REFDATA), "scripts", "compare_logits.py")
+    p = subprocess.run([sys.executable, cmp_py, ref_spkl, ours, "--json"],
+                       capture_output=True, text=True, timeout=600)
+    # ITS EXIT CODE IS A VERDICT, NOT AN ERROR, AND IT IS ALWAYS 1 FOR K3.
+    #
+    # compare_logits returns 0 only for mean_kld < 1e-5 -- a SAME-IMPLEMENTATION bar,
+    # "two implementations of one arithmetic". K3's accepted parity is 4.05e-03, about
+    # 400x that, from a known cause: K3 keeps f32 activations where ggml quantizes them
+    # before a quantized mat-vec. CONTRIBUTING documents it. So the tool says FAIL on a
+    # perfectly good run, every time.
+    #
+    # The shell this replaced ran it with `|| true` and read the JSON; porting it to
+    # Python without that turned every round into "compare_logits failed" with an empty
+    # stderr, which is how the first hardened round died. The gate that matters is
+    # label.py's (top1 >= 0.90, kl <= 0.20), applied downstream.
+    #
+    # So parse the output and let the numbers speak. Only a MISSING or unparseable
+    # payload is a real failure -- that means the tool did not run, which is different
+    # from it disagreeing.
+    out = (p.stdout or "").strip()
+    if not out:
+        raise RuntimeError(f"compare_logits produced no output for {what} {tag} (rc="
+                           f"{p.returncode}): {(p.stderr or '').strip()[:300]}")
+    try:
+        d = json.loads(out)
+        return {"top1": float(d["top1_agreement"]), "kl": float(d["mean_kld"])}
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(f"compare_logits output for {what} {tag} is not the expected "
+                           f"JSON ({exc}): {out[:200]}") from exc
 
 
 def _box_eval(what, frontier=None, seal=False, top1=None, kl=None):
@@ -300,6 +961,21 @@ def _box_eval(what, frontier=None, seal=False, top1=None, kl=None):
     """
     seal_flag = " --seal" if seal else ""
     front_flag = "" if frontier is None else f" --frontier {frontier}"
+    # Harness knobs set on the CONTROLLER, forwarded to the box. bench/scripts is restored
+    # from origin/main before every build, so the harness the box runs is whatever is on the
+    # protected branch -- there is otherwise no way to run a round against a tuned constant
+    # without merging it first. That is the right default for anything a PR could influence,
+    # and the wrong one for an operator fixing a harness bug the round is currently hitting.
+    #
+    # PRINTED, not silent. These change how a number was produced, so a round log that does
+    # not name them describes a measurement nobody can reproduce. The value goes in the log
+    # that ships to sparkinfer-k3-log, next to the result it produced.
+    passthru = {k: v for k, v in sorted(os.environ.items())
+                if k.startswith("KIMI_K3_") and k not in ("KIMI_K3_MODELS_DIR",)}
+    if passthru:
+        print("   harness overrides from the controller: "
+              + " ".join(f"{k}={v}" for k, v in passthru.items()))
+    env_prefix = "".join(f"{k}={shlex.quote(v)} " for k, v in passthru.items())
     # Accuracy graded on THIS machine, handed to the harness. Without these the harness
     # falls back to comparing on the box against a reference the binary can read.
     acc_flag = "" if top1 is None or kl is None else f" --top1 {top1} --kl {kl}"
@@ -312,6 +988,7 @@ def _box_eval(what, frontier=None, seal=False, top1=None, kl=None):
         # $SPARKINFER_BUILD/kimi_k3_tp_bench, so pointing this at build/ makes it exit 2 with
         # "not built" immediately after a build that in fact succeeded.
         f"KIMI_K3_MODELS_DIR={BOX_MODELS_DIR} SPARKINFER_BUILD={BOX_REPO_DIR}/build/runtime "
+        f"{env_prefix}"
         f"bash bench/scripts/kimi_k3_eval.sh --node {NODE} --devices {DEVICES}"
         f"{front_flag}{acc_flag}{seal_flag}"
     )
@@ -350,7 +1027,7 @@ def measure_frontier(repo):
     _box_build(sha, "main")
     # frontier=0 makes label.py return BASELINE, which is what we want: this run is not a
     # submission and must not be sealed or scored. Only its tps is used.
-    top1, kl = measure_accuracy("main")
+    top1, kl, depths = measure_accuracy("main")
     res, _, _ = _box_eval("main", frontier=0, seal=False, top1=top1, kl=kl)
     tps = float(res.get("tps") or 0)
     if tps <= 0:
@@ -359,7 +1036,142 @@ def measure_frontier(repo):
     if not sha.lower().startswith(got) or len(got) < 7:
         raise RuntimeError(f"harness measured commit {got!r} but main is {sha[:12]!r}")
     print(f"main: frontier = {tps} tok/s @ {sha[:8]}")
-    return sha, tps, str(res.get("quant") or "UD-IQ1_S")
+    # main's PER-DEPTH KL is the round's PARITY BASELINE, measured on the same box minutes
+    # before every PR in the round. The absolute bars cannot see drift; only this can.
+    # Returned per depth, not collapsed: a PR that is fine at 4 tokens and 2x worse at 32k
+    # is exactly the case a single number cannot express. See kl_ratchet().
+    return sha, tps, str(res.get("quant") or "UD-IQ1_S"), depths
+
+
+# THE ACCURACY GATE WAS A FLOOR, NOT A RATCHET.
+#
+# label.py asks "is KL under the bar?" and never "is it worse than main?". At K3's bars that
+# left a lot of room: main measures 0.0038674, KL_PREFER is 0.02 and KL_BAR is 0.05, so a PR
+# can degrade parity 5x and still pass CLEAN -- not even annotated. #74 did exactly that,
+# measuring 0.0059102 (1.53x main) and merging with nothing said, which moved main's baseline
+# permanently. The next 1.53x then lands at 0.0089 and also passes clean. Roughly five such
+# merges fit under the warn line, each individually "fine", and parity drifts with no round
+# ever reporting a problem.
+#
+# A ratchet compares against what main measured THIS ROUND, on THIS BOX, minutes earlier --
+# the only comparison that can see drift at all.
+#
+# NOT set to 1.0. Changing float reduction order changes the numbers legitimately: #74 swaps
+# the TP collective to peer-oneshot, and #77/#81 were bit-identical only because they did not
+# touch reduction order. A ratchet at parity would reject honest work. These factors are wide
+# enough for that and far tighter than the 13x the absolute bar allows.
+KL_RATCHET_WARN = float(os.environ.get("K3_KL_RATCHET_WARN", "1.25"))
+KL_RATCHET_REJECT = float(os.environ.get("K3_KL_RATCHET_REJECT", "2.0"))
+KL_REGRESSION_LABEL = "accuracy-regression"
+# MATERIALITY FLOOR: a ratio is only a regression if the number it moved is big enough to
+# matter. The depth sweep grades parity from ctx4 down to ctx4096, where main sits at
+# 1.5e-06 -- five orders of magnitude below label.py's KL_BAR of 0.05. At those magnitudes a
+# reduction-order change moves the ratio by multiples while moving the ABSOLUTE divergence by
+# nothing anyone can act on, and the ratchet exists to stop parity drifting toward the bar,
+# not to police arithmetic that is already 500x under it.
+#
+# #104 is the case: its only >=2x depth was ctx512 at 0.000097 -- 0.19% of the bar -- while it
+# was BETTER than main at ctx4, the depth that carries real weight. It was blocked anyway.
+# #115 is the contrast and must stay blocked: ctx2048 at 0.0019 is 3.9% of the bar and its
+# ctx4 parity degraded 60% (0.0067 -> 0.0107, 21% of the bar).
+#
+# 5e-4 is 1% of KL_BAR and sits mid-plateau: every floor from 1e-4 to 1e-3 clears #104 and
+# keeps #115, so this is not tuned to two cases. Depths below it are still REPORTED, marked
+# with *, and a depth that grows material stops being exempt on its own.
+KL_RATCHET_FLOOR = float(os.environ.get("K3_KL_RATCHET_FLOOR", "5e-4"))
+# BELOW THE ACCEPTANCE BAR, A RATIO IS NOT A REGRESSION.
+#
+# label.py REJECTs at mean KLD > 0.05, and that bar is the accuracy gate. A PR whose parity
+# is still under it has not degraded accuracy in any sense the project acts on, however its
+# ratio against main reads -- so the ratchet no longer applies the blocking label there. It
+# still MEASURES and REPORTS every depth, and still warns, because a ratio is the only signal
+# that sees drift at all; it just no longer blocks a merge on its own.
+#
+# WHAT THIS GIVES UP, ON PURPOSE. The ratchet existed because the absolute bar cannot see
+# cumulative drift: #74 merged at 1.53x main, which moved the baseline permanently, and the
+# next 1.53x then starts from the new number. About five such merges fit under 0.05, each
+# individually fine, and the bar only catches it once the damage is done. That risk is now
+# accepted policy -- the warn line is what surfaces it, and a human decides.
+KL_RATCHET_BLOCK_AT = float(os.environ.get("K3_KL_RATCHET_BLOCK_AT", "0.05"))
+
+
+def _depth_sort_key(name):
+    """ctx4 < ctx128 < … < ctx32768, so notes read in depth order rather than lexically."""
+    m = re.search(r"(\d+)", str(name))
+    return int(m.group(1)) if m else 0
+
+
+def _as_depth_kls(v):
+    """Normalise a parity result to {depth_name: kl_float}.
+
+    Accepts the suite's {name: {"top1":…, "kl":…}}, a plain {name: float}, or a bare float
+    (treated as the single historical 4-token probe) so a caller holding only the old
+    scalar still gets a meaningful comparison rather than a crash.
+    """
+    if isinstance(v, dict):
+        out = {}
+        for k, d in v.items():
+            try:
+                out[str(k)] = float(d["kl"] if isinstance(d, dict) else d)
+            except (TypeError, ValueError, KeyError):
+                continue
+        return out
+    try:
+        return {"ctx4": float(v)}
+    except (TypeError, ValueError):
+        return {}
+
+
+def kl_ratchet(pr_kl, main_kl):
+    """Return (verdict, worst_ratio, note) comparing a PR's parity against main's.
+
+    Compares DEPTH BY DEPTH and reports the worst. A PR that is bit-identical at 4 tokens
+    and 2x worse at 32k is precisely the regression a single scalar cannot express, and
+    precisely the one that matters: the engine is scored at 131,072, not at 4.
+
+    verdict is "ok", "warn" or "reject". A missing or zero baseline yields "ok" with a note
+    -- an unmeasurable baseline must not become a silent reject, and the absolute bars
+    still apply underneath. This only ever ADDS a constraint; it never lets through
+    anything the floor would have caught.
+    """
+    pr = _as_depth_kls(pr_kl)
+    mn = _as_depth_kls(main_kl)
+    shared = [k for k in pr if k in mn and mn[k] > 0 and pr[k] >= 0]
+    if not shared:
+        return "ok", 0.0, "parity vs main: unavailable (no baseline measured this round)"
+
+    ratios = {k: pr[k] / mn[k] for k in shared}
+    order = sorted(shared, key=_depth_sort_key)
+    # Only depths whose absolute divergence is material can produce a verdict. The rest are
+    # reported with a trailing * so the full picture is still visible in the round log.
+    graded = [k for k in shared if pr[k] >= KL_RATCHET_FLOOR]
+    detail = " ".join(f"{k}={ratios[k]:.2f}x" + ("" if k in graded else "*") for k in order)
+    if not graded:
+        top = max(shared, key=lambda k: ratios[k])
+        return "ok", ratios[top], (
+            f"parity vs main: every depth below the {KL_RATCHET_FLOOR:g} materiality floor "
+            f"(worst {ratios[top]:.2f}x at {top}, {pr[top]:.9f}) [{detail}]")
+    worst = max(graded, key=lambda k: ratios[k])
+    ratio = ratios[worst]
+    note = (f"KLD {pr[worst]:.9f} vs main {mn[worst]:.9f} — {ratio:.2f}x at {worst} "
+            f"(worst of {len(graded)} material depths of {len(shared)}) [{detail}]")
+    # A depth main measured but the PR did not is lost coverage, not a pass. measure_accuracy
+    # already hard-fails on a partial suite; this catches the case where the two sides were
+    # measured with different K3_PARITY_DEPTHS, which would otherwise silently narrow the gate.
+    dropped = sorted(set(mn) - set(pr), key=_depth_sort_key)
+    if dropped:
+        note += f"  [WARNING: not measured on the PR: {', '.join(dropped)}]"
+
+    # A blocking verdict needs BOTH a large ratio and an absolute divergence that has
+    # actually reached the acceptance bar. Under the bar the ratio is reported and warned on,
+    # never labelled: parity that is still inside what label.py accepts is not a regression.
+    if ratio >= KL_RATCHET_REJECT and pr[worst] >= KL_RATCHET_BLOCK_AT:
+        return "reject", ratio, f"{note} (>= {KL_RATCHET_REJECT}x AND at/over the {KL_RATCHET_BLOCK_AT} bar — accuracy regression)"
+    if ratio >= KL_RATCHET_WARN:
+        under = (f" — reported only: {pr[worst]:.9f} is under the {KL_RATCHET_BLOCK_AT} bar"
+                 if ratio >= KL_RATCHET_REJECT else "")
+        return "warn", ratio, f"{note} (>= {KL_RATCHET_WARN}x — worse than main{under})"
+    return "ok", ratio, note
 
 
 LOCK_PATH = "bench/scripts/reference.lock"
@@ -372,12 +1184,35 @@ FRONTIER_TOL = 0.02
 # that needs a human: either something regressed on main or the box is degraded. Both are
 # reasons to stop, not to quietly re-baseline the thing that decides payouts.
 FRONTIER_ALARM = 0.90
+# A frontier that overshoots its pin by this much means the PIN WAS STALE, not that main got
+# faster this instant -- main does not gain 30% between rounds. It is worth saying out loud
+# because a stale-low pin is invisible while it does damage: the bot measures and passes the
+# frontier explicitly, so ROUNDS score correctly, but eval-label.yml derives from the lock and
+# contributors read it to decide what to beat.
+#
+# 2026-08-05: the prefill slot was hand-seeded at 40.35 from a measurement taken before #114,
+# #115 and #127 landed. Prefill shares the single-token path with decode, so those decode wins
+# lifted it to 53.02 -- a 31% understatement that three PRs optimised against, reporting gains
+# of +25.4%, +24.5% and +5.3% that were really -4.6%, -5.3% and -19.8%.
+FRONTIER_STALE_NOTICE = float(os.environ.get("K3_FRONTIER_STALE_NOTICE", "0.10"))
 
 
-# The scored context is 131,072, so the frontier lives in the _128K slot. Keep this in step
-# with kimi_k3_eval.sh's CTX_SUFFIX and eval-label.yml's slot(): all three read the same
-# pin, and a mismatch means the bot writes one slot while CI scores from another.
-CTX_SUFFIX = "128K"
+# THE SCORED METRIC IS PREFILL AT 32k (2026-08-05), so the frontier lives in _32K_PP.
+#
+# Decode at 128k is now a REGRESSION GUARD rather than the tier basis. It was the right
+# thing to score while sparkinfer was 18x behind llama.cpp there; at 3.08x ahead the
+# remaining headroom is small, and the untouched gap is prompt ingestion -- 40.35 tok/s
+# against llama.cpp's 143.88, because there is no batched prefill and every prompt token
+# goes through the single-token decode step.
+#
+# KEEP ALL THREE IN STEP: this constant, kimi_k3_eval.sh's CTX_SUFFIX, and eval-label.yml's
+# slot(). A mismatch means the bot writes one slot while CI scores from another, and nothing
+# fails loudly -- the tier is just computed over unrelated numbers. A test asserts they
+# agree, which is how this change was caught mid-flight.
+CTX_SUFFIX = os.environ.get("K3_CTX_SUFFIX", "32K_PP")
+# The guard's slot. Never scored, always measured; the harness refuses a round whose decode
+# fell more than KIMI_K3_DECODE_GUARD_PCT under this.
+DECODE_SUFFIX = os.environ.get("K3_DECODE_SUFFIX", "128K")
 
 
 def _frontier_slot(node, quant):
@@ -436,6 +1271,14 @@ def reconcile_lock(repo, node, quant, measured, main_sha, dry_run):
         print(f">> frontier: main measures {measured}, below the pinned {pinned} but within "
               f"the alarm band — scoring against the pin (the conservative direction)")
         return pinned
+
+    if pinned > 0 and measured > pinned * (1 + FRONTIER_STALE_NOTICE):
+        print(f"!! {slot} pinned {pinned} but main measures {measured} — the pin was stale by "
+              f"{100 * (measured / pinned - 1):.1f}%.\n"
+              f"   Rounds were unaffected (the frontier is measured and passed explicitly), but "
+              f"eval-label.yml derives tiers from this pin and contributors read it to decide "
+              f"what to beat, so anything scored or written against {pinned} was priced wrong.",
+              file=sys.stderr)
 
     # Rewrite BY LINE, not by splicing the regex match out of the whole text. Splicing looked
     # fine and quietly ate the blank line after the slot, because the trailing-whitespace part
@@ -538,8 +1381,16 @@ def evaluate(pr, repo, frontier, seal=False):
     sha = pr["headRefOid"]
     num = pr["number"]
     _box_build(sha, f"#{num}")
-    top1, kl = measure_accuracy(f"#{num}")
+    top1, kl, depths = measure_accuracy(f"#{num}")
     res, out, rc = _box_eval(f"#{num}", frontier=frontier, seal=seal, top1=top1, kl=kl)
+    # Carry the FULL-PRECISION per-depth parity beside the harness payload.
+    #
+    # res["kl"] is not this number: it went to the box as --kl, and label.py writes it into
+    # RESULT_JSON as round(kl, 4). The ratchet used to read it back from there and compare
+    # it against main's un-rounded value -- 4 significant decimals against 9. At KL ~0.0067
+    # that quantises the ratio by about 1.5%, one-sided, right where the 1.25x line sits,
+    # and it printed as "0.0067000" so the lost precision was invisible in the log.
+    res["kl_depths"] = depths
     # --seal publishes to sparkinfer-k3-log and prints the receipt id. Carry it in the
     # payload: eval-label.yml looks it up there when REQUIRE_EVAL_RECEIPT is on, and
     # without it a sealed run is indistinguishable from an unsealed one.
@@ -597,7 +1448,7 @@ DERIVED_BY_CI = ("label", "speed_label", "frontier_tps", "note", "pct_over_front
                  "pct_of_ceiling", "effective_pct")
 
 
-def post(repo, num, res, dry_run):
+def post(repo, num, res, dry_run, parity=None):
     res = {k: v for k, v in res.items() if k not in DERIVED_BY_CI}
     # RESULT_JSON must stay on the FIRST line: eval-label.yml gates on
     # startsWith(comment.body, '/eval') and then sed-scrapes the object off one line. The
@@ -614,11 +1465,27 @@ def post(repo, num, res, dry_run):
         ("quant", res.get("quant")),
         ("receipt", f"`{rid}`" if rid else "_unsealed_"),
     ]
+    # Parity against main measured THIS ROUND, printed whatever the verdict. The absolute
+    # bars cannot show drift, so an unannotated "passes clean" is exactly how #74 moved main's
+    # baseline 1.53x with no round reporting anything. A number a human can see beats a
+    # threshold nobody is told about.
+    if parity:
+        verdict, ratio, note = parity
+        rows.append(("parity vs main", note))
     table = "\n".join(f"| {k} | {v} |" for k, v in rows if v not in (None, ""))
+    banner = ""
+    if parity and parity[0] == "reject":
+        banner = (f"\n> **Accuracy regression.** {parity[2]}\n>\n"
+                  f"> Labelled `{KL_REGRESSION_LABEL}`, which blocks the automatic merge. A "
+                  "speed win bought with parity is a trade a maintainer should make on "
+                  "purpose; remove the label to allow it.\n")
+    elif parity and parity[0] == "warn":
+        banner = (f"\n> **Note:** {parity[2]}. Under the absolute bar, so not blocking — "
+                  "recorded so the drift is visible.\n")
     body = (
         "/eval RESULT_JSON " + json.dumps(res, separators=(",", ":")) + "\n\n"
         "### Node measurement\n\n"
-        "| metric | value |\n|---|--:|\n" + table + "\n\n"
+        "| metric | value |\n|---|--:|\n" + table + "\n" + banner + "\n"
         "Measured on the pinned 8x H200 node by `eval/k3_eval_bot.py`. **These are inputs, "
         "not the verdict** — the tier is re-derived from `bench/scripts/reference.lock` on "
         "`main` by `eval-label.yml`, so nothing this comment claims can set a payout.\n\n"
@@ -676,8 +1543,64 @@ def publish_receipt(repo_log, num, res, box_out, dry_run):
             print(f"#{num}: could not publish {name}: {q.stderr.strip()[:160]}",
                   file=sys.stderr)
             return False
+    index_run(repo_log, rid, res, json.loads(body), num, dry_run)
     print(f">> #{num}: published runs/{rid} to {repo_log}")
     return True
+
+
+def index_run(repo_log, rid, res, receipt, num, dry_run):
+    """Append the run to ledger.jsonl and index.json.
+
+    THE INDEX IS THE PAGE. The log's README calls index.json "newest-first summary, for the
+    page" and ledger.jsonl "append-only, one line per run" -- but only kimi_k3_attest.py ever
+    wrote them, and that is the BOX-side publisher, which cannot run: the box has no git
+    write credentials, deliberately, because a machine being judged should not be able to
+    rewrite the ledger judging it. When publishing moved here the index maintenance was left
+    behind, so 24 of 25 runs never reached either file and both had been frozen since
+    2026-07-31 on a single 3.55 BASELINE row.
+
+    Same schema as the sealer, so the two paths cannot disagree about what a row looks like.
+    Non-fatal on failure: the run directory is the record of truth and is already published;
+    a missing index row is a display bug, and losing the receipt over one would be worse.
+    """
+    att = receipt.get("attestation", {}) if isinstance(receipt, dict) else {}
+    entry = {
+        "run_id": rid,
+        "timestamp_utc": att.get("timestamp_utc", ""),
+        "label": res.get("label"),
+        "tps": res.get("tps"),
+        "top1": res.get("top1"),
+        "kl": res.get("kl"),
+        "commit": att.get("code", {}).get("commit", "") or res.get("commit", ""),
+        "attestation_type": receipt.get("attestation_type", "") if isinstance(receipt, dict) else "",
+        "pr": num,
+    }
+    if dry_run:
+        print(f"--- dry-run: would index {rid} ({entry['label']} tps={entry['tps']})")
+        return True
+    ok = True
+    for path, mutate in (("ledger.jsonl", lambda cur: cur + json.dumps(entry, sort_keys=True) + "\n"),
+                         ("index.json", lambda cur: json.dumps(
+                             [entry] + (json.loads(cur) if cur.strip() else []), indent=2))):
+        r = gh(["api", f"repos/{repo_log}/contents/{path}"])
+        sha, cur = "", ""
+        if r.returncode == 0:
+            try:
+                meta = json.loads(r.stdout or "{}")
+                sha = meta.get("sha", "")
+                cur = base64.b64decode(meta.get("content", "")).decode()
+            except (ValueError, KeyError):
+                pass
+        args = ["api", "-X", "PUT", f"repos/{repo_log}/contents/{path}",
+                "-f", f"message=index {rid}: {entry['label']} tps={entry['tps']} (PR #{num})",
+                "-f", "content=" + base64.b64encode(mutate(cur).encode()).decode()]
+        if sha:
+            args += ["-f", f"sha={sha}"]
+        if gh(args).returncode != 0:
+            print(f"!! #{num}: could not update {path} — the run is published but the page "
+                  "will not show it", file=sys.stderr)
+            ok = False
+    return ok
 
 
 # Which merge states each path may proceed through.
@@ -795,7 +1718,7 @@ def publish_round_log(repo_log, main_sha, results, text, dry_run):
 
 def _pr_state(repo, num):
     r = gh(["pr", "view", str(num), "-R", repo, "--json",
-            "mergeStateStatus,labels,headRefOid,state"])
+            "mergeStateStatus,mergeable,labels,headRefOid,state"])
     try:
         return json.loads(r.stdout or "{}")
     except json.JSONDecodeError:
@@ -1012,7 +1935,12 @@ def merge_blockers(repo, num, pr, waiting_is_blocking=True, mode="strict"):
     hit = labels & NEVER_MERGE_LABELS
     if hit:
         bad.append(f"labels {sorted(hit)}")
-    if not any(l.startswith("eval:") for l in labels):
+    # Membership, not startswith. `eval:none` starts with "eval:" and means the OPPOSITE of
+    # having passed -- it is eval-label.yml saying the gain did not clear the significance
+    # gate. Accepting it merged #81 at -31.5%.
+    if NO_GAIN_TIER in labels:
+        bad.append(f"{NO_GAIN_TIER} — measured no significant gain over the current frontier")
+    elif not (labels & SCORING_TIERS):
         bad.append("no eval:* tier — it has not passed the gate")
     r = gh(["pr", "diff", str(num), "-R", repo, "--name-only"])
     files = [f for f in (r.stdout or "").split() if f]
@@ -1185,7 +2113,10 @@ def mark_merge_first(repo, results, dry_run, queue_auto_merge=False, prs=()):
     winner = ranked[0][0]
     for num, res in ranked:
         has = num == winner
-        act = "--add-label" if has else "--remove-label"
+        # Display only. Deliberately NOT the flag name: labels go through the issues REST
+        # endpoint below, and echoing a `gh pr edit` flag here made the dry-run describe a
+        # code path that no longer exists.
+        act = "add" if has else "remove"
         if dry_run:
             print(f"--- dry-run: would {act} merge-first on #{num} "
                   f"(tps={res.get('tps')})")
@@ -1310,11 +2241,33 @@ def main():
                                 args.dry_run, rid) else 1
 
     prs = list_prs(args.repo)
+    # OLDEST FIRST. `gh pr list` returns newest-first, so a round served the most recent
+    # submission first and the longest-waiting one last. That ordering is backwards for a
+    # queue that pays people: when several PRs implement the SAME idea -- #86, #87, #89 and
+    # #90 are all "capture the decode token as a CUDA graph" -- only one can win, and the
+    # rest re-measure against a main that already has it and score eval:none. Whoever is
+    # served first should be whoever submitted first.
+    #
+    # Order does not decide the winner: mark_merge_first ranks by measured tok/s against the
+    # shared frontier, not by position. What it decides is who gets measured at all if the
+    # round dies partway, and who eats whatever box state the frontier measurement left
+    # behind. Both of those should go to the earliest submission.
+    prs.sort(key=lambda p: p["number"])
     if args.only_pr:
         prs = [p for p in prs if p["number"] == args.only_pr]
         if not prs:
             sys.stderr.write(f"k3_eval_bot: #{args.only_pr} is not an open PR on {args.repo}\n")
             return 1
+
+    # Settle mergeability BEFORE anything reads it. gh pr list answers UNKNOWN while GitHub
+    # recomputes, and the previous round's own frontier commit is what set it recomputing --
+    # so the conflict skip has to wait for a real answer or it is decorative.
+    resolve_mergeability(args.repo, prs)
+    # After mergeability is settled, before the round books anything: the label reports a
+    # state the round has just established, and it is the only place a contributor can see
+    # why their PR was skipped. --list stays read-only, so it reports and does not label.
+    if not args.list:
+        sync_conflict_labels(args.repo, prs, args.dry_run)
 
     if args.list:
         for pr in prs:
@@ -1370,13 +2323,22 @@ def main():
         if args.frontier is not None:
             main_tps = float(args.frontier)
             quant = "UD-IQ1_S"
-            print(f">> frontier: {main_tps} tok/s (--frontier, main not re-measured)")
+            # --frontier skips the main measurement, so there is NO parity baseline for this
+            # round. An empty suite makes kl_ratchet report "unavailable" rather than
+            # inventing a comparison; the absolute KL bars still apply underneath, unchanged.
+            main_parity = {}
+            print(f">> frontier: {main_tps} tok/s (--frontier, main not re-measured; "
+                  "no parity baseline, so the KL ratchet is inactive this round)")
             r = gh(["api", f"repos/{args.repo}/commits/main", "--jq", ".sha"])
             main_sha = (r.stdout or "").strip()
         else:
-            main_sha, main_tps, quant = measure_frontier(args.repo)
+            # Retried, because this one failure discards every PR in the round. A persistent
+            # failure still stops it -- falling back to the pinned lock value would score the
+            # round against a number main has already beaten, which is the #20 mispricing.
+            main_sha, main_tps, quant, main_parity = with_box_retry(
+                "frontier", lambda: measure_frontier(args.repo))
     except RuntimeError as exc:
-        print(f"frontier measurement failed — {exc}", file=sys.stderr)
+        print(f"frontier measurement failed after retries — {exc}", file=sys.stderr)
         # _bail falls back to the main_sha resolved before the try block, so this round is
         # published under rounds/<sha>/ even though it sealed nothing.
         return _bail(1)
@@ -1426,12 +2388,50 @@ def main():
         print(f"#{num}: evaluating {pr['headRefOid'][:8]} on {NODE} "
               f"against frontier {frontier} …")
         try:
-            res = evaluate(pr, args.repo, frontier, seal=not args.no_seal)
+            # Same reasoning as the frontier, one PR down: a collective that failed to
+            # initialise is not a verdict on this PR's kernels, and losing its round over one
+            # is the same unfairness in miniature. A refusal from the harness is NOT retried.
+            res = with_box_retry(
+                f"#{num}",
+                lambda: evaluate(pr, args.repo, frontier, seal=not args.no_seal))
         except RuntimeError as exc:
             print(f"#{num}: eval failed — {exc}", file=sys.stderr)
             continue
         print(f"#{num}: tps={res.get('tps')} top1={res.get('top1')} kl={res.get('kl')} "
               f"ms/token={res.get('ms_per_token')} — tier is eval-label.yml's to derive")
+        # Parity against main measured minutes ago on this same box, depth by depth.
+        # Reported every time, blocking only past KL_RATCHET_REJECT.
+        #
+        # Fed from res["kl_depths"] -- the controller's own full-precision measurement --
+        # NOT res["kl"], which has been through label.py's round(kl, 4).
+        parity = kl_ratchet(res.get("kl_depths"), main_parity)
+        print(f"#{num}: {parity[2]}")
+        if parity[0] == "reject":
+            print(f"!! #{num}: accuracy regression — labelling {KL_REGRESSION_LABEL}, which "
+                  "blocks the automatic merge", file=sys.stderr)
+            if args.dry_run:
+                print(f"--- dry-run: would label #{num} {KL_REGRESSION_LABEL}")
+            else:
+                gh(["label", "create", KL_REGRESSION_LABEL, "-R", args.repo,
+                    "--color", "B60205",
+                    "--description", "parity is worse than main's, measured the same round"])
+                # NOT `gh pr edit --add-label`: it queries projectCards, which GitHub has
+                # deprecated, so it exits 1 even where the repo has no projects. merge-first
+                # and merge-conflict were both moved to the REST endpoint for exactly this
+                # reason; THIS call was missed, so the label that blocks the merge never
+                # landed. Observed on #104 and #115: both measured a parity regression, both
+                # printed the warning, and both ended the round carrying only their eval:*
+                # tier. Within a round unsafe_tier still excluded them, but the label IS the
+                # durable enforcement -- a later round or a human sees a clean PR.
+                lr = gh(["api", "-X", "POST", f"repos/{args.repo}/issues/{num}/labels",
+                         "-f", f"labels[]={KL_REGRESSION_LABEL}"])
+                if lr.returncode != 0:
+                    # The label is what stops the merge, so failing to apply it must not
+                    # leave the round merging the PR anyway.
+                    print(f"!! #{num}: could not apply {KL_REGRESSION_LABEL} "
+                          f"({lr.stderr.strip()[:120]}) — excluding it from the merge decision",
+                          file=sys.stderr)
+                    unsafe_tier.add(num)
         if res.get("receipt_id"):
             publish_receipt(LOG_REPO, num, res, BOX_RECEIPTS, args.dry_run)
         # This evaluation IS the re-measurement a leftover needs-rebase demanded, so clear
@@ -1444,7 +2444,7 @@ def main():
         tier_cleared = True
         if args.merge_admin or args.auto_merge:
             tier_cleared = clear_stale_tier(args.repo, num, args.dry_run)
-        post(args.repo, num, res, args.dry_run)
+        post(args.repo, num, res, args.dry_run, parity=parity)
         # eval-label.yml applies the tier asynchronously. Wait for it here, once, rather
         # than letting the merge decision below read a label that has not landed yet.
         if not args.dry_run and (args.merge_admin or args.auto_merge):
@@ -1472,6 +2472,20 @@ def main():
     # else -- posting, sealing, the round log -- still sees every result.
     mergeable = [r for r in results if r[0] not in unsafe_tier]
 
+    # A WINNER HAS TO HAVE WON. Ranking by absolute tok/s makes the least-bad result of a bad
+    # round the "largest verified gain": with one result, a REGRESSION is trivially the
+    # maximum. That is how #81 merged at 14.54 against a 21.24 frontier and cost main 31.5%.
+    #
+    # Compared against the frontier this round measured, which is the same baseline the tier
+    # is derived from -- so this agrees with eval-label.yml by construction rather than by
+    # coincidence. Reported per PR, because "nothing merged" and "nothing was faster than
+    # main" are different rounds and the operator needs to know which one happened.
+    losers = [(n, r) for n, r in mergeable if float(r.get("tps") or 0) <= frontier]
+    for num, res in losers:
+        print(f">> #{num}: {res.get('tps')} tok/s does not beat the {frontier} tok/s frontier "
+              "— not a merge candidate")
+    mergeable = [(n, r) for n, r in mergeable if float(r.get("tps") or 0) > frontier]
+
     if args.merge_first or args.auto_merge or args.merge_admin:
         mark_merge_first(args.repo, mergeable, args.dry_run,
                          queue_auto_merge=args.auto_merge, prs=prs)
@@ -1479,7 +2493,24 @@ def main():
     if args.merge_admin and mergeable:
         winner = max(mergeable, key=lambda r: r[1].get("tps") or 0)[0]
         by_num = {p["number"]: p for p in prs}
+        winner_tps = float(dict(mergeable).get(winner, {}).get("tps") or 0)
         if merge_winner(args.repo, winner, by_num.get(winner, {}), args.dry_run):
+            # THE PIN MUST MOVE WITH THE MERGE, NOT WITH THE NEXT ROUND.
+            #
+            # reconcile_lock only runs when a round starts, so between a merge and the next
+            # round the pin describes the main that existed BEFORE the winner landed. After
+            # #133 that gap was 53.02 pinned against ~59.06 on main -- 11.4% -- and the pin
+            # is what the claim gate compares against and what CONTRIBUTING tells authors to
+            # beat. A stale-low pin does not just mislead: it makes the gate too LENIENT, so
+            # a PR claiming 55 clears a 53.02 bar while being slower than the main it would
+            # merge into, and buys ~25 GPU-minutes to discover that.
+            #
+            # The value is the winner's own measurement, taken on the merge candidate against
+            # this round's frontier minutes earlier -- the most recent honest reading of what
+            # main is about to do. reconcile_lock still refuses to LOWER the pin, so a
+            # throttled box cannot walk the frontier down through this path either.
+            if winner_tps > 0:
+                reconcile_lock(args.repo, NODE, quant, winner_tps, main_sha, args.dry_run)
             # Only after something actually merged does the frontier move, so the rebase
             # sweep is conditional on the merge -- labelling everything needs-rebase after a
             # merge that was blocked would tell every contributor to redo work for nothing.
@@ -1491,7 +2522,11 @@ def main():
     elif args.merge_admin:
         # "no results" and "results, none of them safe to merge on" are different rounds and
         # the operator reading this needs to know which one happened.
-        if unsafe_tier:
+        if losers:
+            beaten = ", ".join(f"#{n} at {r.get('tps')}" for n, r in losers)
+            print(f"nothing merged — no PR beat the {frontier} tok/s frontier this round "
+                  f"({beaten})", file=sys.stderr)
+        elif unsafe_tier:
             print(f"no results safe to merge — {len(unsafe_tier)} PR(s) still carry a tier "
                   f"from an earlier round: {', '.join(f'#{n}' for n in sorted(unsafe_tier))}",
                   file=sys.stderr)

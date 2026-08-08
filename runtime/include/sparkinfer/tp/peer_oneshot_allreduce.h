@@ -30,6 +30,10 @@ public:
     // Consulted by the collective adapter at compile time; multimem stays false
     // until its own f32 path exists, so only this backend accepts K3's stream.
     static constexpr bool kSupportsF32 = true;
+    // Rotating input slots for the single-barrier f32 path. THREE, and the count
+    // is load-bearing rather than a tuning choice — see sparkinfer/tp/k3_coll_1bar.h.
+    // static_assert'd against tp_allreduce.cuh's kSlotCount in the .cu.
+    static constexpr int kInputSlots = 3;
     // `count` = max elements (hidden_size); must be a multiple of 8 (128-bit
     // packed). Enables peer access across all device pairs. Check ok().
     PeerOneShotAllreduce(const std::vector<int>& devices, std::size_t count);
@@ -42,6 +46,11 @@ public:
 
     // Rank r's input pointer (on devices[r]) — write input here.
     void* rank_buffer(int rank) const noexcept;
+    // Slot-addressed input, for the single-barrier f32 path. Slot 0 is the buffer
+    // rank_buffer(rank) returns, so a caller that never rotates sees main exactly.
+    // See sparkinfer/tp/k3_coll_1bar.h for why there are three and not two.
+    void* rank_buffer(int rank, int slot) const noexcept;
+    static int slots() noexcept;
     // Rank r's output pointer (on devices[r]) — reduced sum lands here.
     void* rank_result(int rank) const noexcept;
 
@@ -56,6 +65,10 @@ public:
     // residual stream f32 by design, so the bf16-only surface made every K3
     // collective fall back to NCCL.
     void allreduce_f32(std::size_t count, const std::vector<void*>& streams);
+    // slot >= 0 reduces out of that input slot with ONE rendezvous instead of two;
+    // slot < 0 is main's two-barrier kernel over slot 0. The caller owns the
+    // rotation and must have written its partial into rank_buffer(rank, slot).
+    void allreduce_f32(std::size_t count, const std::vector<void*>& streams, int slot);
 
     // A/B baseline: the SAME packed reduce but synchronized with a host-event
     // 8-way cross-stream barrier (cudaEventRecord + cudaStreamWaitEvent), i.e.

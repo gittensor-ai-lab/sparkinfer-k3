@@ -91,43 +91,51 @@ class LabelPolicyTest(unittest.TestCase):
         self.assertEqual(score(28.0, frontier=23.0, env=env)["label"], "XS")   # +5 (+22% over frontier) but 2.6% of llama
         self.assertEqual(score(171.0, frontier=23.0, env=env)["label"], "XL")  # a real 7x IS an XL (78% of llama)
 
-    def test_difficulty_boost_high_cap_still_capped_at_twice_raw_speedup(self):
-        # Even with a generous DIFF_MAX, g_eff cannot exceed 2× pct_over_frontier.
+    def test_difficulty_boost_high_cap_still_capped_at_the_raw_speedup(self):
+        # Even with a generous DIFF_MAX, g_eff cannot exceed pct_over_frontier.
+        #
+        # The cap was 2x the raw speedup until 2026-08-04. That was invisible while a
+        # frontier sat below its llama reference (the anchor bound first), and became the
+        # whole rule once a frontier passed 2x the reference -- awarding every tier at twice
+        # the real gain. Re-scored from K3's sealed receipts it had inflated 8 of 18 runs.
+        # Capping at the measured speedup makes the boost inert past the reference, which is
+        # intended: a difficulty multiplier should not pay 2x the gain that was measured.
         res = score(484.79, frontier=469.13, ceiling=366.0, top1=0.9612, kl=0.0175,
                     commit="c30bf58",
                     env={"SPARKINFER_DIFFICULTY_BOOST": "1",
                          "SPARKINFER_DIFFICULTY_REF": "365.85",
                          "SPARKINFER_DIFFICULTY_K": "8",
                          "SPARKINFER_DIFFICULTY_MAX": "4"})
-        self.assertEqual(res["label"], "M")
         self.assertEqual(res["pct_over_frontier"], 3.3)
-        self.assertGreaterEqual(res["effective_pct"], 6.0)
-        self.assertLess(res["effective_pct"], 10.0)
+        self.assertLessEqual(res["effective_pct"], res["pct_over_frontier"],
+                             "tier credit exceeds the speedup that was actually measured")
+        self.assertEqual(res["label"], "XS")
 
     def test_difficulty_boost_default_cap_is_one_point_five_x(self):
-        # Default SPARKINFER_DIFFICULTY_MAX=1.5 with strict 2× raw cap.
+        # Default SPARKINFER_DIFFICULTY_MAX=1.5. The multiplier is still reported for
+        # transparency, but the cap now holds tier credit to the measured speedup.
         res = score(484.79, frontier=469.13, ceiling=366.0, top1=0.9612, kl=0.0175,
                     commit="c30bf58",
                     env={"SPARKINFER_DIFFICULTY_BOOST": "1",
                          "SPARKINFER_DIFFICULTY_REF": "365.85",
                          "SPARKINFER_DIFFICULTY_K": "8"})
-        self.assertEqual(res["label"], "M")
         self.assertEqual(res["difficulty_mult"], 1.5)
         self.assertEqual(res["pct_over_frontier"], 3.3)
-        self.assertGreaterEqual(res["effective_pct"], 6.0)
-        self.assertLess(res["effective_pct"], 10.0)
+        self.assertLessEqual(res["effective_pct"], res["pct_over_frontier"])
+        self.assertEqual(res["label"], "XS")
 
     def test_strict_cap_limits_per_context_llama_ref_inflation(self):
-        # Qwen3.6 @ 128: a low per-context llama ref must not push a ~3% raw gain to L.
+        # Qwen3.6 @ 128: a low per-context llama ref must not push a ~3% raw gain up a tier
+        # at all. Previously this was capped at 2x and still landed M; the cap is now the
+        # measured speedup, so a 3.1% gain scores as a 3.1% gain.
         res = score(479.96, frontier=465.41, ceiling=366.0, top1=0.967, kl=0.0281,
                     commit="d12766f",
                     env={"SPARKINFER_DIFFICULTY_BOOST": "1",
                          "SPARKINFER_DIFFICULTY_REF": "275.81",
                          "SPARKINFER_DIFFICULTY_K": "8"})
-        self.assertEqual(res["label"], "M")
         self.assertEqual(res["pct_over_frontier"], 3.1)
-        self.assertGreaterEqual(res["effective_pct"], 6.0)
-        self.assertLess(res["effective_pct"], 10.0)
+        self.assertLessEqual(res["effective_pct"], res["pct_over_frontier"])
+        self.assertEqual(res["label"], "XS")
 
     def test_long_context_metadata_is_preserved_in_verdict(self):
         # Anchor pinned explicitly: this case asserts XL, which needs 70/ref >= 0.18, so the
@@ -299,3 +307,51 @@ class NoRegressionGuardTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TierBasisRescoreTest(unittest.TestCase):
+    """The cap is the measured speedup, and the K3 ladder re-scores to match the receipts.
+
+    Until 2026-08-04 tier credit was capped at 2x the measured gain. While a frontier sat
+    BELOW its llama.cpp reference the llama anchor bound first and the cap never showed. Once
+    the frontier passed 2x the reference (h200x8: 40.02 vs 18.4435) the anchor stopped
+    binding and the cap became the rule -- every tier awarded at twice the real gain, so XL
+    cost 9% over main instead of 18%.
+
+    These cases are taken from the SEALED RECEIPTS in sparkinfer-k3-log (tps and
+    frontier_tps as recorded at the time), not from the README ladder."""
+
+    LLAMA = "18.4435"
+
+    def _label(self, tps, frontier):
+        return score(tps, frontier=frontier, ceiling=0, top1=1.0, kl=0.004, commit="dead",
+                     env={"SPARKINFER_DIFFICULTY_REF": self.LLAMA})["label"]
+
+    def test_the_inflated_tiers_drop_to_the_measured_gain(self):
+        # (tps, frontier, awarded, correct) — every one llama-unbound, so the cap decided it.
+        for tps, fr, was, now in ((45.38, 40.02, "XL", "L"),    # #114  13.4%
+                                  (41.39, 35.63, "XL", "L"),    # #107  16.2%
+                                  (33.56, 29.93, "XL", "L"),    # #96   12.1%
+                                  (29.97, 26.09, "XL", "L"),    # #90   14.9%
+                                  (26.08, 22.12, "XL", "L"),    # #89   17.9%
+                                  (35.14, 33.58, "M",  "S"),    # #86    4.6%
+                                  (21.26, 20.14, "M",  "S"),    # #74    5.6%
+                                  (41.15, 40.02, "S",  "XS")):  # #115   2.8%
+            self.assertEqual(self._label(tps, fr), now,
+                             f"{tps} over {fr} was {was}, should re-score {now}")
+
+    def test_the_llama_anchor_still_protects_a_weak_frontier(self):
+        """min() takes the CONSERVATIVE basis, so the anchor keeps working below the
+        reference: a big raw gain over an un-optimized frontier must not mint a tier."""
+        # #64: 10.5% over a 9.04 frontier, but only 5.7% of llama -> stays S, not L.
+        self.assertEqual(self._label(9.99, 9.04), "S")
+        # and the early XLs are untouched, because llama was the smaller basis there
+        for tps, fr in ((14.95, 9.04), (9.19, 4.53)):           # #63 35.4%, #57 27.9%
+            self.assertEqual(self._label(tps, fr), "XL")
+
+    def test_tier_credit_never_exceeds_the_measured_speedup(self):
+        for tps, fr in ((45.38, 40.02), (41.15, 40.02), (26.08, 22.12), (9.99, 9.04)):
+            r = score(tps, frontier=fr, ceiling=0, top1=1.0, kl=0.004, commit="dead",
+                      env={"SPARKINFER_DIFFICULTY_REF": self.LLAMA})
+            self.assertLessEqual(r["effective_pct"], r["pct_over_frontier"] + 1e-9,
+                                 f"{tps}/{fr}: tier credit above the measured gain")

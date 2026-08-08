@@ -15,6 +15,8 @@ const char* rule_name(Rule r) {
         case Rule::RowShard:    return "row";
         case Rule::ColShard:    return "col";
         case Rule::ExpertShard: return "expert";
+        case Rule::ExpertRow2D: return "expert2d-row";
+        case Rule::ExpertCol2D: return "expert2d-col";
         case Rule::Unknown:     return "unknown";
     }
     return "?";
@@ -23,7 +25,12 @@ const char* rule_name(Rule r) {
 bool rule_needs_reduce(Rule r) {
     // Only a column shard produces a partial sum over the full output width.
     // A row shard's boundary IS the activation boundary, so it needs nothing.
-    return r == Rule::ColShard;
+    //
+    // ExpertCol2D is a column shard wearing an expert axis: its band cuts the
+    // contracted dim, so it yields a partial over the full output and must be
+    // summed. ExpertRow2D cuts the FFN width, which is an activation boundary the
+    // elementwise situ preserves — nothing to reduce, exactly like RowShard.
+    return r == Rule::ColShard || r == Rule::ExpertCol2D;
 }
 
 namespace {
@@ -235,6 +242,19 @@ Rule rule_for(const std::string& tensor_name) {
     return (it == t.end()) ? Rule::Unknown : it->second;
 }
 
+Rule routed_expert_2d_rule(const std::string& tensor_name) {
+    // Matched by NAME, not by "carries ExpertShard". attn_k_b / attn_v_b are in the
+    // table as ExpertShard too, and their ne2 is a HEAD axis — banding it a second
+    // way would split a head across ranks, which is the one thing attention cannot
+    // survive. Only these three tensors have an expert ne2 and an FFN axis.
+    const std::string s = suffix_of(tensor_name);
+    if (s == "ffn_gate_exps.weight" || s == "ffn_up_exps.weight")
+        return Rule::ExpertRow2D;    // band ne1: the FFN output rows
+    if (s == "ffn_down_exps.weight")
+        return Rule::ExpertCol2D;    // band ne0: the FFN input it contracts over
+    return Rule::Unknown;
+}
+
 TensorPlan plan_for(const std::string& tensor_name, int rows, int cols,
                     const ShardDims& d) {
     TensorPlan p;
@@ -337,6 +357,19 @@ TensorPlan plan_for(const std::string& tensor_name, int rows, int cols,
             }
             p.experts = d.expert_band;
             p.band = d.expert_band;
+            break;
+        }
+
+        case Rule::ExpertRow2D:
+        case Rule::ExpertCol2D: {
+            // Reachable only if someone puts a 2-D rule in the TABLE. It is not
+            // there: the 2-D rules are an UPGRADE applied per rank in
+            // weight_residency::resolve_rule, because whether they apply depends on
+            // ShardDims::moe_2d and the table is rank-independent. Handled anyway so
+            // the two bands are reported rather than silently left as the defaults.
+            p.experts = d.expert_band;
+            p.band = d.moe_ffn_band;
+            p.note = "2-D MoE rule resolved per rank, not from the table";
             break;
         }
 

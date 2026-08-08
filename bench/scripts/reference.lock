@@ -144,15 +144,22 @@ KIMI_K3_H200X8_IQ1S_SPARKINFER_128="${KIMI_K3_H200X8_IQ1S_SPARKINFER_128:-10.34}
 # this repo runs"; until now nothing measured it — kimi_k3_tp_bench hardcoded max_ctx=64,
 # so the slot said 128, the doc said 128k, and the hardware saw 64.
 #
-# WHY IT MATTERS, in one comparison. 8x H200, UD-IQ1_S, same weights, measured 2026-08-01:
+# WHY IT MATTERS, in one comparison. 8x H200, UD-IQ1_S, same weights:
 #
 #              depth 0/64   depth 131,072   lost
-#   llama.cpp     18.20         16.70        -8%
-#   sparkinfer    10.34          1.01       -90%
+#   llama.cpp     18.32         18.44        ~0%   (3 reps, 2026-08-03)
+#   sparkinfer    10.34          1.01       -90%   (as first measured, 2026-08-01)
 #
-# llama.cpp keeps a compressed MLA cache (kv_lora 512, f16); sparkinfer reduces over 576
-# f32 per token in a kernel with one block per head. Scoring at 64 hid a 16.5x gap behind
+# llama.cpp keeps a compressed MLA cache (kv_lora 512, f16); sparkinfer reduced over 576
+# f32 per token in a kernel with one block per head. Scoring at 64 hid an 18x gap behind
 # a 1.8x one, and pointed the incentive at a context nobody runs.
+#
+# THE -8% DEPTH FALLOFF PREVIOUSLY RECORDED HERE WAS A MEASUREMENT ARTEFACT. It came from a
+# single rep (llama-bench -r 1) taken on a different box on 2026-08-01. Re-measured with 3
+# reps on the box that scores every PR, llama.cpp holds its decode rate essentially flat
+# from depth 0 to 131,072 (18.32 -> 18.44). It is sparkinfer that fell off a cliff with
+# depth, not llama.cpp -- and the corrected reference makes that comparison honest rather
+# than flattering.
 #
 # THE TWO SIDES ARE NOT MEASURED THE SAME WAY, and that belongs here rather than in a commit
 # message. llama.cpp prefills 131,072 REAL tokens (llama-bench -d). sparkinfer has no
@@ -162,16 +169,89 @@ KIMI_K3_H200X8_IQ1S_SPARKINFER_128="${KIMI_K3_H200X8_IQ1S_SPARKINFER_128:-10.34}
 # value-independent. For CORRECTNESS they are not, which is why the accuracy gate still runs
 # at short context against bench/refdata/ and never at 128k.
 #
-# Tier basis. Backed by bench/results/kimi_k3_UD-IQ1_S_h200x8_baseline_20260801T103818Z.json,
-# whose depth-0 sample reproduces the 18.3210 pinned above to within 0.67% — which is what
-# makes the two contexts comparable rather than two unrelated runs.
-KIMI_K3_H200X8_IQ1S_LLAMA_128K="${KIMI_K3_H200X8_IQ1S_LLAMA_128K:-16.7026}"
+# Tier basis. Backed by bench/results/kimi_k3_UD-IQ1_S_h200x8_baseline_20260803T084547Z.json:
+# 3 reps at the scored context, on the SAME BOX that measures every frontier it is compared
+# against. That last part is the point. The previous 16.7026 was a single rep from a
+# different machine on 2026-08-01, so the tier basis divided deltas measured here by a
+# reference measured there -- and box-to-box spread on this hardware is several percent
+# (main itself read 18.14 pinned vs 18.88 measured when the box changed). A llama-anchored
+# tier is only meaningful when both halves come off the same metal.
+#
+# Raising it 16.7026 -> 18.4435 makes every tier ~9.4% SMALLER, because the tier basis is
+# delta/llama_ref. Nothing about anyone's measured speed changed; the yardstick was wrong.
+KIMI_K3_H200X8_IQ1S_LLAMA_128K="${KIMI_K3_H200X8_IQ1S_LLAMA_128K:-18.4435}"
 # frontier at the scored context. eval/k3_eval_bot.py rewrites this each round; it is
 # raise-only, so a slow box cannot deflate it and mint tiers for everyone behind it.
 # 1.00 tok/s (995.65 ms/token) measured on main @ 37d4219 via the committed --ctx/--seek
 # path, which reproduces the throwaway seek_patch.py measurement (1.01 / 991.75) to 0.4%.
-# frontier: measured by eval/k3_eval_bot.py on main @ fb63759c6461 (h200x8, UD-IQ1_S). Do not hand-edit — the bot rewrites this each round.
-KIMI_K3_H200X8_IQ1S_SPARKINFER_128K="${KIMI_K3_H200X8_IQ1S_SPARKINFER_128K:-18.14}"
+#
+# SET TO 56.8 BY HAND ON 2026-08-05, deliberately, because this slot stopped being the tier
+# basis and became the DECODE REGRESSION GUARD's baseline (#131).
+#
+# It read 46.48 while main did ~56.8: #127 (+23.2%) merged outside a round, so no round had
+# re-measured. As the tier basis a stale-low pin only over-scores the next PR, which the
+# next round corrects. As a GUARD baseline it is worse than that -- the floor is 1% under
+# this number, so 46.48 would have admitted a decode collapse to 46.02, a 19% regression,
+# while reporting that the guard passed.
+#
+# 56.8 is from #127's sealed receipt 8641ae28 (56.82 measured against a 46.11 frontier),
+# rounded down. Main itself has NOT been measured with #127 in it. Precedent says that is
+# close: #114 measured 45.38 and main then measured 44.85; #115 measured 46.49 and main
+# measured 46.48.
+#
+# THE RISK OF SETTING IT HIGH. The slot is raise-only, so if main actually measures under
+# the 56.232 floor the bot will not lower it and every PR fails the decode guard until a
+# human intervenes. FRONTIER_ALARM (0.90 -> 51.1) would not catch that. This wants a main
+# measurement to confirm it.
+KIMI_K3_H200X8_IQ1S_SPARKINFER_128K="${KIMI_K3_H200X8_IQ1S_SPARKINFER_128K:-56.8}"
+
+# ---- PREFILL @ 32k — the SCORED metric from 2026-08-05 -----------------------------------
+#
+# Decode at 128k is now a REGRESSION GUARD, not the tier basis. It was the right thing to
+# score while sparkinfer was 18x behind llama.cpp there; at 3.08x ahead the remaining
+# headroom is small, and the untouched gap is prompt ingestion.
+#
+# THERE IS NO BATCHED PREFILL. Every prompt token goes through the single-token decode step,
+# so a prompt costs what generating it costs: 32,768 tokens took 812.2 s wall clock on
+# main @ a169ff4 (40.35 tok/s), re-measured at 53.02 on main @ c1a1642e once #114/#115/#127
+# had landed. Ingesting is not faster than generating, which is the whole opportunity.
+#
+# llama.cpp reference: llama-bench -p 32768 -n 0 -r 3 -ngl 999 on this node and this GGUF,
+# 143.88 +/- 0.23 tok/s (+/-0.16%). It batches the prompt and we do not, so it is 3.57x
+# faster here while being 3.08x slower at decode.
+KIMI_K3_H200X8_IQ1S_LLAMA_32K_PP="${KIMI_K3_H200X8_IQ1S_LLAMA_32K_PP:-143.88}"
+# frontier: rewritten by eval/k3_eval_bot.py each round, raise-only. Do not hand-edit.
+#
+# SEEDED STALE, 2026-08-05. This slot was hand-seeded at 40.35 from an 812.2 s /
+# 32,768-token measurement, recorded here as "main @ 3b6a3f4". BOTH parts were wrong: the
+# measurement was taken on main @ a169ff4, and by the time it was written #114, #115 and
+# #127 had merged. Prefill runs the SAME single-token path as decode, so those decode wins
+# lifted prefill too -- the first round to measure it found 53.02, a 31% understatement.
+#
+# The cost was not mis-scoring: the bot measures the frontier every round and passes it
+# explicitly, so the round that found 53.02 also scored against 53.02. The cost was that
+# three PRs (#135, #136, #138) optimised against the published 40.35 and reported gains of
+# +25.4%, +24.5% and +5.3% which are -4.6%, -5.3% and -19.8% against the real number. Only
+# #133 measured main itself, and landed within 0.23% of the bot (53.14 vs 53.02).
+#
+# 69.02 -> 98.80 on 2026-08-06 with #148, the first BATCHED prompt ingestion: the layer
+# loop moves outside the token loop and a chunk of tokens goes through the kernels
+# together, so each weight tile is read once and spent on the whole chunk instead of once
+# per token. Same-binary against its own per-token walk, 32,768 real tokens: 69.41 ->
+# 99.68 tok/s, output bit-identical at every chunk width.
+#
+# #148's ORIGINAL 169.72 tok/s was not real and is recorded here because the number is in
+# the log. It was measured with two defects live -- a gate documented default-off but read
+# opt-out, and the activation/bank strides transposed at all three attn_res_mix_f32 call
+# sites -- and the corrupted walk was FASTER because it was reading the wrong rows. The
+# transposition hid below 13 layers, where max_ckpt is 1 and the two strides are equal.
+# 98.80 is what the same change does once it computes the right answer.
+#
+# A seeded frontier is a claim about main that nobody measured. If one is unavoidable,
+# measure the CURRENT head, and say which commit -- see the notice reconcile_lock now emits
+# when a measured frontier overshoots its pin.
+# frontier: measured by eval/k3_eval_bot.py on main @ 2a6c66f9cb1d (h200x8, UD-IQ1_S). Do not hand-edit — the bot rewrites this each round.
+KIMI_K3_H200X8_IQ1S_SPARKINFER_32K_PP="${KIMI_K3_H200X8_IQ1S_SPARKINFER_32K_PP:-98.80}"
 
 KIMI_K3_H200X8_LLAMA_128="${KIMI_K3_H200X8_LLAMA_128:-0}"
 KIMI_K3_H200X8_LLAMA_512="${KIMI_K3_H200X8_LLAMA_512:-0}"

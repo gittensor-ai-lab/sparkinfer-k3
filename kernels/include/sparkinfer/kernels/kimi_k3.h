@@ -31,6 +31,32 @@ namespace sparkinfer {
 namespace kernels {
 namespace k3 {
 
+// ===========================================================================
+// THE TOKEN (ROW) AXIS — read this before using n_rows on anything below
+// ===========================================================================
+// Prompt ingestion is launch-bound, not arithmetic-bound: ~2790 launches per token, most
+// of them per-row or elementwise kernels whose entire content is one operation per
+// element. Every function below that carries a trailing `int n_rows = 1` takes B
+// token-major rows in ONE launch instead of B launches.
+//
+// THE CONTRACT, which is the same for all of them:
+//
+//   * row r's buffers start at (base + r * row_stride). `row_stride == 0` means
+//     CONTIGUOUS — the natural element count of that buffer for one row.
+//   * the row is a NEW grid dimension (.y). Nothing about a row's own launch changes:
+//     same block size, same grid .x, same thread-to-element striding, same reduction
+//     partition, same accumulation order. Block (bx, r) does exactly what block bx did
+//     when it was launched alone on row r's pointers. That is what makes every one of
+//     these BIT-IDENTICAL to n_rows separate calls — the only thing that moved is which
+//     CUDA block an element belongs to.
+//   * WEIGHTS AND PARAMETERS ARE NOT STRIDED. rms_norm_f32's `w`, kda_gate_out_f32's
+//     `norm_w` and kda_decay_gate_f32's `A` are shared by every token and are read at
+//     the same address for every row. Only activations move.
+//   * n_rows == 1 is the default and reproduces today's launch exactly — dim3(g, 1) is
+//     dim3(g) — so no existing caller changes shape or output.
+//   * n_rows must not exceed 65535 (the gridDim.y cap). The two bool-returning fast-path
+//     entries decline above it; the void ones are declarations of intent, not checks.
+//
 // ---------------------------------------------------------------------------
 // 1. situ activation
 // ---------------------------------------------------------------------------
@@ -45,8 +71,13 @@ namespace k3 {
 // branch gets only the scaled-tanh. Treating this as a symmetric "tanh both sides"
 // or as SwiGLU-with-tanh is the obvious wrong guess and it stays numerically close
 // enough to look like it works.
+//
+// TOKEN AXIS: out, gate and up all stride by row_stride (they are all activations);
+// row_stride == 0 means contiguous (== n). Elementwise, so there is no reduction to
+// re-partition and the fold is bit-identical by construction.
 void situ_f32(float* out, const float* gate, const float* up, int64_t n,
-              float beta, float linear_beta, cudaStream_t stream);
+              float beta, float linear_beta, cudaStream_t stream,
+              int n_rows = 1, int64_t row_stride = 0);
 
 // ---------------------------------------------------------------------------
 // 2. KDA decode step (gated delta rule, one token)
@@ -100,9 +131,15 @@ void kda_decode_step_f32(float* out, float* state,
 // The RMS norm is per (head, token) over head_dim, with a learned weight, and the
 // gate is FULL-RANK in K3 (a single ssm_g projection) where kimi-linear factors it
 // as g_b(g_a(x)). g2 is the raw projection output; the sigmoid is applied here.
+//
+// TOKEN AXIS: out, o and g2 stride by row_stride (== head_dim * n_head when 0); norm_w
+// is the LEARNED WEIGHT and is shared by every row. The grid was n_head blocks and
+// becomes (n_head, n_rows) — the per-(head, token) rms reduction is still one 128-thread
+// block over head_dim with the same stride and the same block_sum tree.
 void kda_gate_out_f32(float* out, const float* o, const float* norm_w,
                       const float* g2, int head_dim, int n_head,
-                      float eps, cudaStream_t stream);
+                      float eps, cudaStream_t stream,
+                      int n_rows = 1, int64_t row_stride = 0);
 
 // ---------------------------------------------------------------------------
 // 4. cross-layer attention residual mix
@@ -128,9 +165,40 @@ void kda_gate_out_f32(float* out, const float* o, const float* norm_w,
 // and live until the launches complete. Pass it on a hot path: the mix runs ~185
 // times per token, and without it each call makes a cudaMallocAsync/cudaFreeAsync
 // pair. Passing nullptr keeps that older behaviour and is correct, just not free.
+//
+// `cur_b`/`sum_out` fold the residual add that used to precede this call into the
+// mix itself: when cur_b is non-null the kernels read the current stream as
+// (cur + cur_b), performing that add with the same single f32 addition per element
+// the deleted standalone kernel used; when sum_out is non-null the apply kernel
+// stores that sum there, exactly once per element. Callers that pass neither get
+// the original behaviour, bit for bit.
+//
+// TOKEN AXIS: this one carries TWO strides, because it reads two different kinds of
+// per-token buffer.
+//   * `out`, `cur`, `cur_b` and `sum_out` are activations and stride by row_stride
+//     (== n_embd when 0).
+//   * `ckpts` is row r's cross-layer residual BANK and strides by bank_stride. That is
+//     the bank's ALLOCATION PITCH (res_bank_row_elems * max_ckpt), NOT n_ckpt*n_embd:
+//     n_ckpt is the live count and sits below the capacity, so the natural-width default
+//     (bank_stride == 0 -> n_ckpt*n_embd) is only ever right at n_rows == 1, where it is
+//     multiplied by row 0. A batching caller passes it.
+//   * `score_w` is a LEARNED WEIGHT and is NOT strided.
+//   * `scores` MUST hold n_rows * (n_ckpt + 1) floats, and row r owns
+//     scores + r*(n_ckpt+1). A single row shared across the grid .y makes every token
+//     blend with whichever token's softmax landed last: no crash, no NaN, no top-1 move
+//     (the weights are a softmax over a handful of near-equal scores), and INVISIBLE to
+//     a short-context parity probe because n_ckpt is 0 or 1 there. It only bites at
+//     depth. Pass nullptr and the fallback allocation sizes itself correctly.
+//   * `n_ckpt` stays a SCALAR, not a per-row value: it is a function of the layer
+//     (banked = res_bs > 0 && layer % res_bs == 0), and the chunk driver reads it once
+//     per layer and restores it before each token, so every row of a chunk has the same
+//     one. See the precondition list on kimi_k3_forward_layer_phase.
 void attn_res_mix_f32(float* out, const float* ckpts, const float* cur,
                       const float* score_w, int n_embd, int n_ckpt,
-                      float eps, cudaStream_t stream, float* scores = nullptr);
+                      float eps, cudaStream_t stream, float* scores = nullptr,
+                      const float* cur_b = nullptr, float* sum_out = nullptr,
+                      int n_rows = 1, int64_t act_row_stride = 0,
+                      int64_t bank_row_stride = 0, int64_t score_row_stride = 0);
 
 // ---------------------------------------------------------------------------
 // 6. KDA causal short conv, decode step
@@ -157,8 +225,111 @@ void attn_res_mix_f32(float* out, const float* ckpts, const float* cur,
 //
 // x, out are [d_inner]; state is [d_conv-1, d_inner] with the time index fastest;
 // w is [d_conv, d_inner] with the time index fastest.
+// The three KDA short convs and the q/k L2 norms as ONE launch, grid (n_head, 3).
+// Replaces five dependent launches per KDA layer — two of which ran at n_head = 12
+// blocks on a 132-SM part. Bit-identical: the conv is per-channel and untouched, and
+// at kda_head_dim = 128 the norm already reduced exactly one element per thread over
+// one head, which is the mapping this keeps. Returns false (and changes nothing) when
+// head_dim exceeds the block width, so the caller keeps the unfused path.
+bool k3_kda_conv_l2_fused(float* out_q, float* out_k, float* out_v,
+                          float* st_q, float* st_k, float* st_v,
+                          const float* x_q, const float* x_k, const float* x_v,
+                          const float* w_q, const float* w_k, const float* w_v,
+                          int d_conv, int head_dim, int n_head,
+                          float q_scale, float eps, cudaStream_t stream);
+
 void kda_conv_step_f32(float* out, float* state, const float* x, const float* w,
                        int d_conv, int d_inner, cudaStream_t stream);
+
+// ---------------------------------------------------------------------------
+// 6b. KDA chunk-parallel prefill scan
+// ---------------------------------------------------------------------------
+// kda_decode_step_f32 above is one token; prompt ingestion currently calls it T
+// times in a sequential loop, so a KDA layer's cost at prefill is T dependent
+// launches of a kernel whose own body is one rank-1 update. This is the
+// chunk-parallel (WY / UT-transform) reformulation of the SAME recurrence —
+// mathematically the delta-rule family sparkinfer already carries for Qwen's
+// GDN (kernels/csrc/cuda/fused/prefill_gdn_chunk.cu), specialised to K3's own
+// gate (per-channel, A_log/dt_bias/lower_bound-sigmoid form — see op 7 below)
+// and scalar-per-head beta.
+//
+// THE ALGORITHM IS RE-DERIVED FROM kda_decode_step_f32's OWN PINNED FORMULA,
+// not assumed. Per chunk of CHUNK=16 local tokens t=0..15, contraction index i
+// (what q/k contract over — the SAME i that op 6's decay is indexed by) and
+// output index j, with S_in the state entering the chunk:
+//
+//   G_t[i]      = sum_{r=0}^{t} g_r[i]                (inclusive cumsum, per channel)
+//   k_decayed_t = k_t * exp(G_t)     q_decayed_t = q_t * exp(G_t)   (q already 1/sqrt(D)-scaled
+//   k_inv_t     = k_t * exp(-G_t)    k_restored_t = k_inv_t * exp(G_total)     by this point)
+//   L[t][s]     = beta_t * (k_decayed_t . k_inv_s)   s < t,  else 0   (strictly lower)
+//   Mqk[t][s]   =          (q_decayed_t . k_inv_s)   s <= t, else 0   (lower, incl. diag)
+//   INV         = (I + L)^{-1}                         [16,16], state-independent
+//   RHS_t       = beta_t * (v_t - k_decayed_t @ S_in)              state-dependent
+//   U           = INV @ RHS                             [16, head_dim]
+//   O           = Q_decayed @ S_in + Mqk @ U             [16, head_dim] <- chunk output
+//   S_out[i][j] = S_in[i][j] * exp(G_total[i]) + (K_restored^T @ U)[i][j]
+//
+// Everything through INV is a pure function of this chunk's own q/k/v/g/beta —
+// no dependence on S_in — so it is computed for EVERY chunk of EVERY head in
+// parallel (kernel 1, "prep"). Only the state-dependent tail (RHS onward) is
+// sequential, and only over CHUNKS, not tokens: T/16 dependent steps instead
+// of T, each a small dense matmul against a precomputed [16,16] inverse
+// instead of a fresh triangular solve (kernel 2, "scan"). The full derivation
+// is proven against the token-by-token recurrence in
+// kernels/tests/k3_kda_chunk_prefill_cpu_test.cpp: multi-chunk, a ragged
+// final chunk (zero-padded — beta=0 on a padded row zeros that row of L
+// entirely, so it cannot contaminate the state or any real row's output),
+// and the axis-of-decay swap that op 6's own history already shipped once as
+// a silent bug.
+//
+// F32, NOT TENSOR CORES. A tensor-core implementation of this shape would be
+// bf16/fp16 throughout for rate, and would invert (I+L) by a doubling Neumann
+// series to stay in range under CHUNK=16. This is f32 end to end — matching every other
+// kernel in this file's stated convention, correctness first — and inverts
+// by plain forward substitution: at CHUNK=16 the triangular solve is O(16^3)
+// against O(16*head_dim^2) for the two decayed projections, a rounding error
+// either way, so there is no precision pressure motivating the doubling trick
+// once nothing is fighting for tensor-core throughput.
+//
+// q, k arrive RAW (not yet L2-normalised) here, unlike kda_decode_step_f32's own
+// contract — the norm is elementwise-per-token exactly like the gate and beta
+// activations, so it is folded into kernel 1 for the same reason they are: one
+// launch per chunk-batch, not one per token. l2_eps is threaded through rather
+// than a baked-in constant because l2_norm_heads_f32's own signature takes it
+// as a parameter, not a fixed value — op 8 above. q ends up scaled by
+// 1/sqrt(head_dim) as part of the SAME norm call op 8 already fuses that into
+// (scale=1/sqrt(D) for Q, scale=1 for K).
+//
+// g_raw is ALREADY f_b(f_a(x)) + dt_bias — op 7's OWN contract, and op 7's kernel takes no
+// separate dt_bias for exactly that reason: the bias is folded in upstream,
+// by the GEMM that produces g_raw, not by the gate kernel. (An implementation
+// that took A_log and dt_bias as two separate tensors and added them inside
+// would be a second gate convention living beside the first; this function
+// takes what op 7 takes, so it stays a drop-in for T calls to the elementwise
+// gate too.) The
+// lb*sigmoid(A*g_raw) transform, and beta's sigmoid, run INSIDE kernel 1
+// (folded, not called out to op 7 and a separate sigmoid T times), because
+// folding is what keeps this to one launch per chunk-batch rather than one
+// per token for the elementwise stages too — the whole point of batching.
+//
+// q,k,v,g_raw: [T, n_head, head_dim].  beta_logit: [T, n_head].
+// A: [n_head], already -exp(A_log) as op 7 documents (ssm_a in the GGUF).
+// state: [n_head, head_dim, head_dim], the SAME j*head_dim+i layout op 6
+// reads and writes — updated in place.  out: [T, n_head, head_dim].
+//
+// NOT bit-identical to T sequential decode steps: the sum a state element
+// accumulates is reassociated by the chunk telescoping (a rounding-order
+// change, the same class op 6's own reassociated warp-per-column schedule
+// already makes), and G_t[i] underflowing exp() to exactly 0 for a deep
+// per-channel decay is the CORRECT physical answer (full forget), not an
+// error — f32's ~1e-38 floor is reached only when the real single-token
+// products would themselves have vanished into it.
+bool k3_kda_chunk_prefill(float* out, float* state,
+                          const float* q, const float* k, const float* v,
+                          const float* g_raw, const float* beta_logit,
+                          const float* A,
+                          int T, int head_dim, int n_head,
+                          float lower_bound, float l2_eps, cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
 // 11. IQ2_XS dequantisation
@@ -301,6 +472,167 @@ void moe_expert_ffn_iq1s_f32(float* out, float* scratch,
                              cudaStream_t stream,
                              int expert_begin = 0, int n_local_experts = 0);
 
+// ---------------------------------------------------------------------------
+// 4c. IQ1_S on the int8 tensor cores — the BATCHED expert GEMM
+// ---------------------------------------------------------------------------
+// The routed experts are ~531 of UD-IQ1_S's 553 GiB, so this is the only tensor-core
+// opportunity in K3 whose prize is the model rather than a corner of it.
+//
+// IQ1_S is an int8 format EXACTLY: w = dl*(g + delta) with g in {-1,0,+1} and
+// delta = +/-0.125 rearranges to w = (dl/8)*(8g + s) with 8g + s in {-9,-7,-1,1,7,9},
+// and dl/8 is constant across the 32-value sub-block. mma.sync.m16n8k32.s8 reduces
+// exactly 32 values of k, so the scale domain and the instruction's k-extent coincide
+// and the int32 accumulator is drained once per mma. The conversion is bit-for-bit
+// lossless — not "higher precision than what is stored", which is what the Q4_K/Q6_K
+// int8 path can claim; this is an equality. k3_moe_iq1s_mma_cpu_test proves it over a
+// million values with no GPU, and measures the resulting reduction as 5x MORE accurate
+// than the shipped f32 scalar path (112 rounded adds at K=3584 against 3584).
+//
+// THESE ARE NOT ON ANY LIVE PATH. At M=1 — every path K3 runs today, decode and
+// prefill alike, since prompt ingestion is a forward_token loop — an m16 tile is 1/16
+// occupied and the shipped GEMV wins. They become correct only once a batched prefill
+// supplies M>1, and they are landed first because whether IQ1_S can reach the tensor
+// cores losslessly is what decides the value of building that batching at all.
+//
+// Tiled on M at launch: a T-token chunk sends T*16/896 = T/56 rows to each expert on
+// average, so M is the caller's knob (T=8192 -> M=146). BM=32 and BM=128 are both
+// instantiated and picked on M; the measured crossover is near M=70.
+
+// PER-32 symmetric int8 quantization of f32 activations, one warp per row. The f32 twin
+// of launch_prefill_quantize_rows_i8 (which takes bf16).
+//
+// `scale` is [rows][cols/32], NOT [rows]. The granularity is not a free parameter: the
+// GEMM already drains its int32 accumulator every 32 k because that is the IQ1_S
+// sub-block, so a per-32 activation scale rides that existing boundary for one extra
+// multiply per drained element. A per-row scale (what this used to emit) is set by the
+// row's largest element and costs resolution everywhere else — measured as relL2 1.7e-2
+// against the shipped scalar op, with the T=1 case ruling out any gather defect.
+//
+// `cols` must be a multiple of 32. Returns false if the shape is unsupported.
+bool k3_moe_iq1s_mma_quantize_rows(signed char* q, float* scale, const float* x,
+                                   int rows, int cols, cudaStream_t stream = nullptr);
+
+// Upload this translation unit's packed IQ1_S lattice before graph capture begins.
+bool k3_moe_iq1s_mma_prepare();
+
+// C[M,N] = A[M,K] @ W[N,K]^T, W the native GGUF IQ1_S [N,K] blocks, A int8 with the
+// per-32 scales `sa` above ([M][K/32]). C is f32 (K3 is f32 end to end) and COMPACT — row m of C
+// is the m'th row of this expert's group.
+//
+// `rows` optionally gathers A's M rows out of a larger token buffer (a MoE dispatch's
+// per-expert row list); null means identity. When it is given, `sa` is indexed by the
+// SOURCE token while C stays compact, so the caller scatters C itself.
+//
+// K must be a whole number of 256-value IQ1_S blocks — the tile derives the sub-block
+// index by shift and mask and has no partial-block form. K3's expert dims (3584, 3072,
+// 7168) all qualify. Returns false if the shape is unsupported or the lattice upload
+// failed; the caller must fall back rather than emit a wrong result.
+bool k3_moe_iq1s_mma_gemm(float* C, const signed char* A, const float* sa,
+                          const void* W, const int* rows,
+                          int M, int N, int K, cudaStream_t stream = nullptr);
+
+// BATCHED Q8_0 PROJECTION: C[M,N] = A[M,K] @ W[N,K]^T, W in Q8_0.
+//
+// The dense counterpart to the expert GEMM above, and the larger half of the
+// problem. k3_proj_f32 takes ONE activation vector, so every dense projection in
+// K3 (attn_q/k/v, ssm_g, attn_output, ffn_routed_down/up, the router, the shared
+// expert, all of MLA's) is a GEMV: it reads a multi-megabyte weight matrix to
+// produce one 7168-float row, at ~2 FLOP per weight byte. Per-token weight traffic
+// splits ~70/30 dense-to-expert — the 896 routed experts are 531 of UD-IQ1_S's
+// 553 GiB but top_k 16 makes them sparse (9.5 GiB/token), while the remaining
+// 22 GiB is read by EVERY token. Unlike the expert side, the dense side amortises
+// at any batch size: M rows share one weight read because every token multiplies
+// the identical matrix.
+//
+// A is int8 with a per-32 scale in `sa` ([M][K/32]) — the SAME format
+// k3_moe_iq1s_mma_quantize_rows emits, and that quantiser is reused rather than
+// duplicated, so the two GEMMs cannot drift on activation handling.
+//
+// No dequantisation happens anywhere: a Q8_0 block is one f16 scale and 32 int8
+// codes (w = d*q), which is exactly mma.m16n8k32.s8's operand with the scale
+// applied at the k=32 drain the instruction already forces. The int8 the tensor
+// core multiplies IS the stored weight.
+//
+// K must be a multiple of 64 (the BK tile); returns false otherwise, and the
+// caller must fall back rather than emit a wrong-shaped result.
+bool k3_proj_q8_mma_gemm(float* C, const signed char* A, const float* sa,
+                         const void* W, int M, int N, int K,
+                         cudaStream_t stream = nullptr);
+
+bool k3_moe_iq1s_mma_grouped(float* C, const signed char* A, const float* sa,
+                             const void* W, const int* rows,
+                             const int* expert_bounds, int n_experts,
+                             int max_rows_per_expert, int N, int K,
+                             cudaStream_t stream = nullptr);
+
+bool k3_moe_iq1s_mma_pairs(float* C, const signed char* A, const float* sa,
+                           const void* W, const int* ids, int pairs,
+                           int activation_top_k, int expert_begin,
+                           int n_local_experts, int N, int K,
+                           cudaStream_t stream = nullptr);
+
+bool k3_moe_build_expert_csr(int* rows, int* slots, int* inverse,
+                             int* expert_bounds, const int* ids,
+                             int T, int top_k, int expert_begin,
+                             int n_local_experts, cudaStream_t stream = nullptr);
+
+bool k3_moe_situ_compact(float* h, const float* gate, const float* up,
+                         const int* inverse, int T, int top_k, int ffn,
+                         float situ_beta, float situ_linear_beta,
+                         cudaStream_t stream = nullptr);
+
+bool k3_moe_combine_compact(float* out, const float* down,
+                            const int* inverse, const float* weights,
+                            int T, int latent, int top_k,
+                            cudaStream_t stream = nullptr);
+
+bool k3_moe_situ_pairs(float* h, const float* gate, const float* up,
+                       const int* ids, int pairs, int ffn,
+                       int expert_begin, int n_local_experts,
+                       float situ_beta, float situ_linear_beta,
+                       cudaStream_t stream = nullptr);
+bool k3_moe_combine_pairs(float* out, const float* down, const int* ids,
+                          const float* weights, int T, int latent, int top_k,
+                          int expert_begin, int n_local_experts,
+                          cudaStream_t stream = nullptr);
+
+// BATCHED expert FFN — the consumer that gives the GEMM above an M.
+//
+// The shipped moe_expert_ffn_iq1s_f32 is ONE token against top_k experts, so every
+// expert sees M=1. This takes T tokens, buckets the (token, slot) pairs BY EXPERT with
+// a counting sort, and runs each expert once over all the rows routed to it — so the
+// expert's 6.45 MB of weights are read once for M rows instead of once per row.
+//
+// Masking instead of gathering does not work here: at 896 experts and top_k 16, running
+// every expert over every token computes 56x the work it keeps. The rows are physically
+// gathered, and the resulting index array is exactly the `rows` list the GEMM takes.
+//
+// x:    [T, latent]        out: [T, latent], WRITTEN (zeroed here, not accumulated)
+// ids:  [T, top_k]         GLOBAL expert indices; out-of-band ones contribute zero
+// w:    [T, top_k]         routing weights
+//
+// NOT bit-identical to the scalar path, for two structural reasons: the activation is
+// int8 with a per-ROW scale where the scalar path uses block_q8_K's per-256 scale, and
+// the top_k combine accumulates with atomicAdd because a token's contributions arrive
+// from different per-expert launches. The WEIGHTS are not re-rounded — that is what the
+// IQ1_S identity buys — so what moves is activation quantization and summation order.
+//
+// Allocates its own scratch with cudaMallocAsync and synchronizes once to read the
+// bucket counts, so it is NOT usable inside a graph capture. That is a prefill-shaped
+// constraint, not a decode one.
+//
+// Returns false on an unsupported shape or an allocation failure; the caller must fall
+// back rather than emit a wrong result. NOTHING CALLS THIS YET — the batched prefill
+// that would produce a [T, latent] activation block does not exist.
+bool k3_moe_expert_ffn_batched_iq1s(float* out, const float* x,
+                                    const int* ids, const float* w,
+                                    const void* gate_exps, const void* up_exps,
+                                    const void* down_exps,
+                                    int T, int latent, int ffn, int top_k,
+                                    float situ_beta, float situ_linear_beta,
+                                    int expert_begin, int n_local_experts,
+                                    cudaStream_t stream = nullptr);
+
 // Type-dispatched front doors. PREFER THESE over the per-type entry points.
 //
 // An unsloth dynamic quant mixes types per tensor, so the expert type is a property
@@ -322,6 +654,59 @@ bool moe_expert_ffn_f32_by_type(float* out, float* scratch,
                                 void* q8k_scratch = nullptr);
 
 // ---------------------------------------------------------------------------
+// The SAME dispatch over n_tok tokens in one pair of launches, with the (token,
+// slot) selections regrouped EXPERT-MAJOR so each expert's gate/up rows are read
+// once and applied to every token that chose them.
+//
+// WHY A SEPARATE FRONT DOOR AND NOT A PARAMETER. `ids` differs per token, so the
+// per-token entry point's whole structure — "for each of MY top_k selections, walk
+// that expert's weights" — has no token axis to add. What pays is the inversion:
+// sort the B*top_k selections by expert id, then run each expert once over its run
+// of rows. At n_experts = 896 and top_k = 16 an expert sees B/56 rows, so the
+// inversion is worth its integer sort from B ~ 256 upward and is pure launch-count
+// saving below that. See "4b. THE TOKEN-BATCHED DISPATCH" in k3_kernels.cu for the
+// locality argument that keeps the DOWN phase token-major.
+//
+// EVERY ROW STRIDE IS EXPLICIT because the caller's buffers are not packed: `out`
+// rows are (expert_latent + hidden) apart (the fused expert/shared partial), while
+// `scratch` rows are top_k * ffn and `x` rows are latent. ids/w are packed [n_tok,
+// top_k]. All strides are in ELEMENTS.
+//
+// RETURNS FALSE TO MEAN "USE THE PER-TOKEN LOOP", never to mean failure — an
+// unsupported quant type, a chunk below the batching floor, a workspace that is
+// absent or too small, SPARKINFER_K3_MOE_BATCH=0. The caller MUST keep the
+// per-token loop as its fallback.
+//
+// PARITY: bit-identical per output element to the per-token loop. Each dot product
+// keeps the same two-level association, the b loop stays ascending, and the combine
+// still folds RAW partials over ascending k with the same skip set. The one thing
+// that varies run to run is the order of rows WITHIN an expert (the scatter is
+// atomic-ordered) — no output element depends on it.
+//
+// `ws` is scratch for the counting sort; size it with k3_moe_batch_ws_bytes and pass
+// n_expert_total = the model's expert count (used only when n_local_experts <= 0,
+// i.e. the "this rank holds every expert" case).
+bool moe_expert_ffn_batch_f32_by_type(float* out, int64_t out_row_stride,
+                                      float* scratch, int64_t scratch_row_stride,
+                                      const float* x, int64_t x_row_stride,
+                                      const int* ids, const float* w,
+                                      const void* gate_exps, const void* up_exps,
+                                      const void* down_exps,
+                                      int latent, int ffn, int top_k, int n_tok,
+                                      float situ_beta, float situ_linear_beta,
+                                      int ggml_type, cudaStream_t stream,
+                                      int expert_begin, int n_local_experts,
+                                      int n_expert_total,
+                                      void* ws, size_t ws_bytes);
+
+// Bytes the counting sort needs for a chunk of n_tok tokens over n_expert_slots
+// local experts. Integer only — the activations are never copied, the sorted index
+// array IS the gather list. At B = 512, top_k = 16 and 896 buckets that is 76,292 B
+// (74.5 KiB); at tp = 8 whole-expert sharding the bucket count is 112 and it is
+// 65.3 KiB. The row list is 2 ints per selection and dominates.
+size_t k3_moe_batch_ws_bytes(int n_tok, int top_k, int n_expert_slots);
+
+// ---------------------------------------------------------------------------
 // 5. MLA output gate
 // ---------------------------------------------------------------------------
 // Reference: src/models/kimi-k3.cpp — "K3: sigmoid output gate applied to the
@@ -329,8 +714,11 @@ bool moe_expert_ffn_f32_by_type(float* out, float* scratch,
 //
 // out = attn_out * sigmoid(gate_proj). Elementwise; kept separate from the KDA
 // gating above because it has no rms_norm and applies to the MLA branch.
+//
+// TOKEN AXIS: all three pointers stride by row_stride (== n when 0). Elementwise.
 void mla_gate_out_f32(float* out, const float* attn_out, const float* gate_proj,
-                      int64_t n, cudaStream_t stream);
+                      int64_t n, cudaStream_t stream,
+                      int n_rows = 1, int64_t row_stride = 0);
 
 // ---------------------------------------------------------------------------
 // 7. KDA decay gate (K3 lower_bound form)
@@ -351,9 +739,13 @@ void mla_gate_out_f32(float* out, const float* attn_out, const float* gate_proj,
 // plausible negative decay and the model stays fluent.
 //
 // g_raw, out: [head_dim, n_head]; A: [n_head].
+//
+// TOKEN AXIS: out and g_raw stride by row_stride (== head_dim * n_head when 0); A is the
+// per-head PARAMETER and is shared by every row. Grid n_head -> (n_head, n_rows), one
+// thread still owning exactly one (head, channel) of one row.
 void kda_decay_gate_f32(float* out, const float* g_raw, const float* A,
                         int head_dim, int n_head, float lower_bound,
-                        cudaStream_t stream);
+                        cudaStream_t stream, int n_rows = 1, int64_t row_stride = 0);
 
 // ---------------------------------------------------------------------------
 // 8. L2-norm over heads (+ optional scale)
@@ -365,8 +757,13 @@ void kda_decay_gate_f32(float* out, const float* g_raw, const float* A,
 //   out[h,d] = x[h,d] * scale / sqrt(sum_d x[h,d]^2 + eps)
 //
 // In-place is fine (out may alias x). Layout [head_dim, n_head].
+//
+// TOKEN AXIS: out and x stride by row_stride (== head_dim * n_head when 0); there is no
+// weight. Grid n_head -> (n_head, n_rows); the per-head reduction keeps its 128 threads,
+// its `d += BLOCK` stride and its block_sum tree.
 void l2_norm_heads_f32(float* out, const float* x, int head_dim, int n_head,
-                       float scale, float eps, cudaStream_t stream);
+                       float scale, float eps, cudaStream_t stream,
+                       int n_rows = 1, int64_t row_stride = 0);
 
 // ---------------------------------------------------------------------------
 // 9. MLA absorb Q (wk_b @ q_nope, concat q_pe)
@@ -417,10 +814,150 @@ void mla_absorb_q_f32(float* out, const float* q_nope, const float* q_pe,
 // k_cache: [key_length, n_ctx]      token-major rows; MQA (one K shared by heads)
 // wv_b:    [kv_lora, v_dim, n_head]  kv_lora fastest
 // out:     [v_dim, n_head]
+// n_ctx is the HOST's context length (position + 1) and is used ONLY to derive the launch
+// plan — grid size and which kernel — which a captured graph cannot change. d_pos is the
+// DEVICE's ROW INDEX; the kernels derive their length from it as *d_pos + 1, so a replayed
+// graph attends over the live position rather than the one frozen at capture. Both must
+// describe the same token: n_ctx == (host position) + 1 and *d_pos == (host position).
 void mla_decode_attn_f32(float* out, const float* q, const float* k_cache,
                          const float* wv_b, int key_length, int kv_lora,
-                         int v_dim, int n_head, int n_ctx, float scale,
-                         cudaStream_t stream);
+                         int v_dim, int n_head, int n_ctx, const int* d_pos,
+                         float scale, cudaStream_t stream);
+
+// The single derivation of `splits`, shared by the launcher above and the driver's
+// graph-invalidation check so the two can never disagree about the live plan.
+int k3_mla_decode_plan(int n_head, int kv_lora, int n_ctx);
+void k3_mla_set_split_pin(int splits);
+int  k3_mla_get_split_pin();
+int  k3_mla_split_suggest(int n_head, int key_length, int kv_lora, int n_ctx);
+
+// Context-split floor, scoped to the caller that opts in. The shipped default (4096)
+// is DECODE tuning: decode always runs long, so the only question there is how many
+// slices. Prompt ingestion spends most of its life below 4096, where the floor pins
+// splits to 1 and the attention grid collapses to a handful of CTAs while most of the
+// machine idles. An ingestion path may lower the floor around its own work and MUST
+// restore 0 afterwards, so decode, the parity probes and the graph plan are untouched.
+// 0 = use the shipped default. Values below one context tile are ignored.
+void k3_mla_set_split_min(int v);
+int  k3_mla_get_split_min();
+
+// PIN the context-split COUNT, for a caller about to CUDA-graph-capture a region whose
+// tokens sit at different depths. `splits` sizes the grid and a graph cannot resize a
+// grid, so every replay must want the same number — and the floor above cannot give
+// that, because the launcher refines its answer with a term (n_ctx / min_slice) that
+// moves continuously with n_ctx. Pinning fixes the COUNT only: the kernels still read
+// the live length from *d_pos and still derive their slice bounds from it, so a token
+// with a shorter prefix gets shorter or empty slices, and empty slices are already
+// merged as an exact zero. The pinned value is clamped to the split budget and the
+// per-device scratch (k3_mla_prewarm_split_scratch), so it can never write past the
+// allocation; 1 is legal and selects the un-split kernel.
+//
+// TOLERANCE-CLASS, not bit-identical: any token whose natural count differs sees the
+// online softmax reassociated. It is therefore honoured only ABOVE ctx 4096, the same
+// graded-parity window the split floor is gated on, and the caller must engage it only
+// for a region whose SHORTEST prefix already clears that window — otherwise the region
+// straddles the gate and one recording covers two grids. 0 = unpinned, the default,
+// and at 0 the launcher is byte-identical to the unpinned build. Scope it around the
+// captured region and restore 0 afterwards, exactly as with the split floor.
+void k3_mla_set_split_pin(int splits);
+int  k3_mla_get_split_pin();
+
+// The value a caller should pin: what the launcher would derive at this depth if
+// nothing were pinned. ADVISORY. k3_mla_decode_plan() is deliberately coarser (it does
+// not model the launcher's occupancy relaxation) and pinning ITS answer is correct but
+// leaves most of the grid on the table. Nothing's safety depends on this matching —
+// once pinned, the launcher and k3_mla_decode_plan() are equal by construction, and a
+// drift here costs occupancy only. Reads the live split-min scope, so call it under the
+// scope the captured region will run in and BEFORE engaging the pin.
+int k3_mla_split_suggest(int n_head, int key_length, int kv_lora, int n_ctx);
+
+// Allocate the MLA split scratch up front. An allocation inside a stream capture fails
+// the CAPTURE, not the allocation, so this must be called before the first capture.
+bool k3_mla_prewarm_split_scratch(int n_head, int kv_lora);
+
+// Upload the IQ2_XS / IQ1_S lattice tables for the CURRENT device up front. They are
+// otherwise uploaded lazily on first use with a synchronous cudaMemcpyToSymbol, which is
+// illegal inside a stream capture — and under IQ1_S that first use falls on the first MoE
+// layer, so it invalidates a capture that had recorded the dense layer cleanly.
+void k3_prewarm_quant_tables();
+
+// WEPS engagement readout for the current device (reset-on-read). Returns how many
+// expert-slot skips the weight-epsilon gate performed since the last read. Counting
+// is opt-in via SPARKINFER_K3_WEPS_COUNT=1, uploaded pre-capture by
+// k3_prewarm_quant_tables; with counting off this returns 0.
+unsigned long long k3_weps_skips_read_current_device();
+
+// Bind the weight-threshold's depth gate on the current device (pre-capture).
+// d_pos is the device position mirror; the threshold engages only at positions
+// >= SPARKINFER_K3_WEPS_MINPOS (default 16384). Unbound, the threshold is
+// depth-unconditional, which is the pre-gate behaviour.
+void k3_weps_bind_pos(const int* d_pos);
+
+// Store this token's MLA K-cache row at a device-held position. Replaces a host-computed
+// row address that a captured graph would freeze at the capture-time position.
+//
+// TOKEN AXIS, AND IT IS THE ONE ENTRY POINT HERE THAT INDEXES `d_pos` RATHER THAN
+// DEREFERENCING IT. At n_rows > 1, `d_pos` must be the CONTIGUOUS n_rows-long position
+// vector k3_fill_pos_vec produced, passed BASE-first, and row r stores at d_pos[r]. Any
+// other pointer makes every row write the same cache row — the exact silently-wrong-and-
+// faster failure the chunk driver exists to avoid.
+//
+// The two sources have DIFFERENT natural widths: kv_cmpr_normed is kv_lora wide and
+// kv_a_out is key_length wide (its rope tail is read past kv_lora). They therefore get
+// SEPARATE strides; 0 on either means that buffer's own natural width. A single shared
+// stride would be wrong for one of them at every n_rows > 1.
+//
+// Storing every token's row before any token attends is safe because the attention
+// kernels length their walk with their OWN *d_pos + 1 — see the note on the kernel.
+void k3_mla_kv_store_f32(float* cache, const float* kv_cmpr_normed,
+                         const float* kv_a_out, const int* d_pos,
+                         int kv_lora, int rope_dim, int key_length,
+                         cudaStream_t stream, int n_rows = 1,
+                         int64_t cmpr_stride = 0, int64_t kva_stride = 0);
+
+// Advance the device's position, inside the captured region.
+void k3_bump_pos(int* d_pos, cudaStream_t stream);
+
+// The same advance by a signed step, for a driver whose layer loop is outside its
+// token loop: the position walks base..base+T-1 within a layer and has to return to
+// base for the next one. Relative rather than absolute so a captured tile replays at
+// the tile it is running, not the tile it was recorded at.
+void k3_add_pos(int* d_pos, int delta, cudaStream_t stream);
+// CHUNKED INGESTION'S POSITION VECTOR.
+//
+// Fill out[0..n-1] with *base + 0 .. *base + n-1. A chunk runs layers-outer /
+// tokens-inner, so the position cannot advance between the tokens of a chunk without
+// being wrong for the next layer's token 0. Every kernel that needs a position reads
+// it as `*d_pos`, so the fix is to give each token its OWN pointer into this vector
+// rather than thread an offset through every launch site. With a single shared d_pos
+// all B tokens write the same KV row and attend over the same prefix — silently wrong,
+// and FASTER, which is how it hides.
+//
+// Reads the base on the device, so a captured graph replays correctly: chunk N
+// recomputes base+0..base+n-1 against whatever the base then holds.
+void k3_fill_pos_vec(int* out, const int* base, int n, cudaStream_t stream);
+
+// Advance by a whole chunk in one launch instead of n separate bumps.
+void k3_bump_pos_by(int* d_pos, int n, cudaStream_t stream);
+
+// Same computation over an F16 latent cache — k_cache holds IEEE half rows in
+// the identical [key_length, n_ctx] layout (void* because half is a CUDA type
+// this header keeps out of the runtime's face). Arithmetic is f32; only the
+// cache element narrows, which is llama.cpp's own default (type_k = F16), so
+// the f32 layout above is the MORE precise of the two, not this one.
+void mla_decode_attn_kvf16(float* out, const float* q, const void* k_cache,
+                           const float* wv_b, int key_length, int kv_lora,
+                           int v_dim, int n_head, int n_ctx, const int* d_pos,
+                           float scale, cudaStream_t stream);
+
+// F16 twin of k3_mla_kv_store_f32 — same device-held position, same row layout,
+// narrowing with round-to-nearest as ggml does for its own F16 type_k. Same token axis
+// and the same d_pos-is-a-vector precondition.
+void k3_mla_kv_store_f16(void* cache, const float* kv_cmpr_normed,
+                         const float* kv_a_out, const int* d_pos,
+                         int kv_lora, int rope_dim, int key_length,
+                         cudaStream_t stream, int n_rows = 1,
+                         int64_t cmpr_stride = 0, int64_t kva_stride = 0);
 
 // ---------------------------------------------------------------------------
 // 14. Generic projection (GEMV), f32 activation in, f32 out
@@ -469,10 +1006,13 @@ bool k3_proj_f32(float* y, const float* x, const void* W, int wtype,
 // the same vector -- 59,696 quantize launches, 8.7% of GPU time, at ~7 GB/s.
 // Returns false for anything outside its contract (non-Q8_0, mismatched shape,
 // N < 4), which means "use the slow path", not an error.
+// x_pre_q8: q8_scratch ALREADY holds this activation, so skip the quantise. Set it only
+// when the caller quantised THIS x into THAT buffer immediately above -- it is a statement
+// about the two lines around the call, not a cache lookup.
 bool k3_proj_ggml_f32_x4(float* y0, float* y1, float* y2, float* y3, const float* x,
                          const void* W0, const void* W1, const void* W2, const void* W3,
                          int wtype, int N, int K, void* q8_scratch,
-                         cudaStream_t stream);
+                         cudaStream_t stream, bool x_pre_q8 = false);
 
 bool k3_proj_f32_x4(float* y0, float* y1, float* y2, float* y3, const float* x,
                     const void* W0, const void* W1, const void* W2, const void* W3,
@@ -487,6 +1027,43 @@ bool k3_proj_f32_x4(float* y0, float* y1, float* y2, float* y3, const float* x,
 //
 // This entry point preserves F32 weights exactly and applies llama's Q8_0 activation
 // conversion only for Q8_0 weights. q8_scratch must hold (K/32)*34 bytes.
+//
+// The two calls below are the same thing with the quantisation lifted out, for callers
+// that project the SAME activation several times: quantise once, then hand the buffer to
+// each consumer. K3 does exactly that 3-4 times per layer, and quantize_q8_0 is 7.9% of
+// GPU kernel time in 61,848 launches that mostly re-encode bytes already in the scratch.
+//
+// The buffer is a PARAMETER, not a cache keyed on `x`. The cached version of this
+// optimisation was tried, guarded on "was the scratch last written from this pointer?",
+// and produced top1 0.0 at a faster ms/token: the guard tracked the pointer the scratch
+// came from, never whether the bytes behind it still matched.
+bool k3_quantize_act_f32(void* q8_out, const float* x, int K, cudaStream_t stream);
+bool k3_quantize_act_rows_f32(void* q8_out, const float* x, int K, int n_rows,
+                              int64_t row_stride, cudaStream_t stream);
+bool k3_proj_q8act_f32(float* y, const void* q8_act, const void* W, int wtype,
+                       int N, int K, cudaStream_t stream);
+
+// TOKEN-BATCHED forms of the two calls above, for prompt ingestion.
+//
+// Decode has one activation and re-reads it from every output row's block, so the
+// decode kernels amortise the ACTIVATION. Ingestion has the opposite and far larger
+// problem: it re-streams every WEIGHT once per prompt token — 15.2 GB per rank per
+// token against a 7.6 KB activation — so a 32k prompt reads the model 32,768 times.
+// These take n_tok token-major rows and read each weight tile ONCE for all of them.
+//
+// Layout: y is [n_tok, ldy] f32 and q8_act is [n_tok, ld_act_blocks] Q8_0 blocks, both
+// token-major. ldy >= N and ld_act_blocks >= K/32.
+//
+// BIT-IDENTICAL per output element to n_tok separate k3_proj_q8act_f32 calls: same
+// k-order, same int32 accumulation, same block reduction. Only the CUDA-block grouping
+// changes. Returns false for anything outside the contract (n_tok == 1, non-Q8_0,
+// under-sized strides), which means "use the per-token path", not an error.
+bool k3_quantize_act_rows_f32(void* q8_out, const float* x, int K, int n_tok,
+                              cudaStream_t stream);
+bool k3_proj_q8act_tok_f32(float* y, int ldy, const void* q8_act, int ld_act_blocks,
+                           const void* W, int wtype, int N, int K, int n_tok,
+                           cudaStream_t stream);
+
 bool k3_proj_ggml_f32(float* y, const float* x, const void* W, int wtype,
                       int N, int K, void* q8_scratch, cudaStream_t stream);
 
@@ -503,8 +1080,38 @@ size_t k3_moe_q8_k_bytes(int latent, int ffn, int top_k);
 // (kda_gate_out_f32 norms per-head then gates; attn_res_mix_f32 norms internally
 // while scoring) — this is the one for a learned weight applied over the WHOLE
 // vector at once, out[d] = x[d]/sqrt(mean(x^2)+eps) * w[d]. In-place is fine.
+//
+// TOKEN AXIS. TWO strides, because out and x can sit in buffers with different leading
+// dimensions; 0 on either means contiguous (== n) for that one. `w` is the LEARNED
+// WEIGHT, shared by every row, never strided.
+//
+// This kernel already spreads its APPLY across span_units CTAs while FREEZING the sum of
+// squares on 128 threads (#115 measured 4.63x KL when the reduction was widened). The
+// token axis is a SEPARATE grid dimension stacked on top of that: span_units and grid .x
+// are still derived from the PER-ROW unit count, so each row sees exactly the slicing it
+// sees at n_rows == 1, and CTA (g, r) recomputes row r's own frozen-128 reduction. The
+// float4 apply additionally requires out_stride and x_stride to be multiples of 4 — the
+// launcher checks that and falls back to the scalar apply, which is bit-identical.
 void rms_norm_f32(float* out, const float* x, const float* w, int n, float eps,
-                  cudaStream_t stream);
+                  cudaStream_t stream, int n_rows = 1, int64_t out_stride = 0,
+                  int64_t x_stride = 0);
+
+// `rows` rows of `n`, `row_stride` elements apart, in ONE launch — the same kernel with a
+// token axis on gridDim.y, not a second implementation. rms_norm_f32 above is this with
+// rows == 1, so the two cannot drift.
+//
+// WHY IT EXISTS. rms_norm is 302 graph nodes per prefill token, 9% of a captured tile's
+// graph, and a captured tile's cost IS its node count (capture is worth 1.93x on a
+// 3308-node graph and 1.56x on a 61258-node one). T launches become one.
+//
+// Bit-identical to looping rms_norm_f32: every block already recomputes the whole row's
+// sum of squares, so a row's arithmetic does not depend on how many rows are in flight.
+//
+// Returns FALSE rather than a wrong answer for a geometry that would not take the wide
+// kernel — the narrow fallback is a different reduction with no token axis. The caller
+// loops in that case, which is what it did before.
+bool rms_norm_f32_rows(float* out, const float* x, const float* w, int n, float eps,
+                       int rows, long long row_stride, cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
 // 16. Elementwise add (residual combine)
@@ -512,13 +1119,23 @@ void rms_norm_f32(float* out, const float* x, const float* w, int n, float eps,
 // out[i] = a[i] + b[i]. Safe in-place with out==a (the residual-add case: prefix_sum
 // += layer_output). The "replace" case (a checkpointed layer's residual combine)
 // needs no kernel at all — it is a plain device-to-device copy of the layer output.
+//
+// TOKEN AXIS: out, a AND b all stride by row_stride (== n when 0). THIS IS THE RESIDUAL
+// COMBINE, NOT A BROADCAST BIAS ADD — if your `b` is a per-row-constant parameter (the
+// ssm_dt bias, which the decode path adds through this entry point) then n_rows > 1 is
+// the WRONG call and would read past the bias. Use k3_kda_decay_gate_dt, which folds
+// that add in and treats dt_bias as shared.
 void k3_add_f32(float* out, const float* a, const float* b, int64_t n,
-                cudaStream_t stream);
+                cudaStream_t stream, int n_rows = 1, int64_t row_stride = 0);
 
 // out[i] = sigmoid(out[i]), in place. Used to apply the sigmoid the K3 KDA layer
 // puts on the beta (update-rate) projection before the delta-rule scan consumes it
 // — llama.cpp's build_kda_layer does `beta = ggml_sigmoid(ssm_beta @ x)`.
-void sigmoid_inplace_f32(float* x, int64_t n, cudaStream_t stream);
+//
+// TOKEN AXIS: x strides by row_stride (== n when 0). Elementwise and in place, so a
+// block only ever touches its own row.
+void sigmoid_inplace_f32(float* x, int64_t n, cudaStream_t stream,
+                         int n_rows = 1, int64_t row_stride = 0);
 
 }  // namespace k3
 }  // namespace kernels

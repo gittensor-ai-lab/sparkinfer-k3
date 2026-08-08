@@ -72,6 +72,39 @@ prov     = json.loads(sys.argv[7]) if len(sys.argv) > 7 and sys.argv[7] else {}
 # way the frontier is. That is a governance decision rather than a constant, and it has not
 # been taken. Do not tighten the floor toward main's number instead: at 2x measured parity
 # it would REJECT on ordinary run-to-run variation, which is how a gate stops being read.
+# 0.95, raised from 0.90 on 2026-08-06.
+#
+# READ THIS BEFORE TRUSTING THE NUMBER. The K3 probes dump ONE logit row per depth
+# (bench/refdata/*.spkl all carry n_tok=1), so top1_agreement is the mean of a single
+# boolean: it is 0.0 or 1.0 and nothing else, and k3_eval_bot aggregates with min() across
+# depths. Any bar in (0, 1] therefore behaves identically -- "the argmax must match exactly
+# at every depth". All 48 top1 values in the sealed log are exactly 1.0, and not one verdict
+# would change at 0.90, 0.95 or 0.99.
+#
+# So this raise tightens the STATED policy, not the executed one. It becomes a real 5%
+# tolerance only when a depth carries >= 20 rows; until then treat top-1 as a boolean and KL
+# as the graded gate -- KL sums over all 163,840 vocab entries and moves long before an
+# argmax flips, which is why sealed runs sit at 0.004-0.008 against a 0.05 bar.
+#
+# The gate is also weaker than it looks: 7 single-token trials means a change that really
+# corrupts 10% of argmaxes passes with probability 0.9^7 = 48%.
+# 0.90 is the QWEN TRACK'S bar and must stay loose for it, exactly as KL_BAR below is
+# Qwen's 0.20 while K3 pins 0.05 in kimi_k3_eval.sh and eval-label.yml. K3 pins 0.95 the same
+# way (2026-08-06). Do not raise this default to tighten K3 -- the Qwen path grades top-1
+# over many rows (accuracy.sh runs bars of 0.875 and 0.80), so a number that is inert for K3
+# is load-bearing there.
+#
+# READ THIS BEFORE TRUSTING K3'S NUMBER. The K3 probes dump ONE logit row per depth
+# (bench/refdata/*.spkl all carry n_tok=1), so top1_agreement is the mean of a single
+# boolean: 0.0 or 1.0 and nothing else, and k3_eval_bot aggregates with min() across depths.
+# Any bar in (0, 1] therefore behaves identically there -- "the argmax must match exactly at
+# every depth". All 48 top-1 values in K3's sealed log are exactly 1.0, and not one verdict
+# would change at 0.90, 0.95 or 0.99. It becomes a real 5% tolerance only when a depth
+# carries >= 20 rows; until then KL is K3's graded gate -- it sums over all 163,840 vocab
+# entries and moves long before an argmax flips.
+#
+# K3's gate is also weaker than it looks: 7 single-token trials means a change that really
+# corrupts 10% of argmaxes passes with probability 0.9^7 = 48%.
 TOP1_BAR  = float(os.environ.get("SPARKINFER_TOP1_BAR",  "0.90"))
 KL_BAR    = float(os.environ.get("SPARKINFER_KL_BAR",    "0.20"))
 KL_PREFER = float(os.environ.get("SPARKINFER_KL_PREFER", "0.15"))
@@ -111,6 +144,40 @@ if _ref_raw is None:
     sys.exit(2)
 DIFF_REF   = float(_ref_raw)
 DIFF_MAX   = float(os.environ.get("SPARKINFER_DIFFICULTY_MAX", "1.5"))
+
+# Does the reference measure the SAME ALGORITHM as the frontier, one maturity level on?
+#
+# The anchor's whole premise is that llama.cpp is a mature version of what we do, so
+# delta/llama_ref reads as "fraction of a mature engine's throughput earned". That premise
+# holds for decode. It does NOT hold for prefill: llama.cpp batches the prompt and sparkinfer
+# ingests it token by token, so 143.88 vs 53.02 is two different algorithms, not two maturity
+# levels of one. Sizing an unbatched gain against a batched engine measures the missing
+# feature, not the work -- and the missing feature is #137, which no amount of tuning inside
+# the current path can close.
+#
+# The damage is not theoretical. The bucket thresholds are fractions of the ref, so what a
+# tier COSTS scales with the ref, and llama's two metrics are 7.8x apart:
+#
+#            llama_ref   frontier    L costs
+#   decode      18.44      56.80     +10.0% over frontier   (ref < frontier: cap picks g)
+#   prefill    143.88      53.02     +27.1% over frontier   (ref > frontier: anchor binds)
+#
+# Nobody chose that. The anchor had been inert on K3 since the decode frontier passed 18.44,
+# so every recent K3 tier was already frontier-relative; moving the scored metric to prefill
+# on 2026-08-05 silently reactivated a dormant rule at 2.7x its old strength. #133 measured a
+# real +11.4% over the frontier -- an L under the rule every prior K3 PR was scored by -- and
+# landed S.
+#
+# So: OFF for prefill until batched prefill exists, ON everywhere else. DIFF_REF stays pinned
+# and keeps being reported as pct_of_llama; it just is not the tier basis. Flip this back the
+# round after #137 lands and the two engines are doing the same thing again.
+TIER_ANCHOR = os.environ.get("SPARKINFER_TIER_ANCHOR", "auto").strip().lower()
+if TIER_ANCHOR not in ("auto", "off"):
+    sys.stderr.write(f"label.py: SPARKINFER_TIER_ANCHOR={TIER_ANCHOR!r} is not 'auto' or 'off'\n")
+    sys.exit(2)
+ANCHOR_OFF_REASON = os.environ.get(
+    "SPARKINFER_TIER_ANCHOR_REASON",
+    "the reference does not measure the same algorithm as the frontier")
 
 # ---- No-regression guards (opt-in; empty => inert) ----------------------------------------
 # The tier is earned at ONE context (SPARKINFER_SCORED_CONTEXT). Every other measured context is a
@@ -165,8 +232,12 @@ def difficulty_mult(frontier):
         return min(1.0 + DIFF_K * max(0.0, DIFF_REF / frontier - 1.0), DIFF_MAX)
     return min(1.0 + DIFF_K * max(0.0, frontier / DIFF_REF - 1.0), DIFF_MAX)
 
+# kl to 9 decimals, not 4. K3's parity sits around 5e-03, where 4 decimals quantise the
+# value by ~1.5% -- coarse enough to matter against a ratchet whose warn line is 1.25x, and
+# invisible in a log that prints it as "0.0067000". top1 is a fraction of a few hundred
+# comparisons, so 4 decimals is already finer than its resolution.
 res = {"commit": commit, "tps": round(tps, 6 if LOWER_IS_BETTER else 2),
-       "top1": round(top1, 4), "kl": round(kl, 4),
+       "top1": round(top1, 4), "kl": round(kl, 9),
        "frontier_tps": round(frontier, 6 if LOWER_IS_BETTER else 2)}
 if LOWER_IS_BETTER:
     res["lower_is_better"] = True
@@ -198,7 +269,7 @@ def _speed_tier_fields(tps, frontier, ceiling):
     # longer mint XLs from low-hanging fruit while a mature one (past llama) can't clear XS. Significance
     # still gates on raw %-over-frontier above (a gain must beat the current best); only the TIER is
     # llama-anchored. Past-llama difficulty boost (Option B) is unchanged. DIFF_REF<=0 -> legacy basis.
-    llama_anchored = DIFF_REF > 0
+    llama_anchored = DIFF_REF > 0 and TIER_ANCHOR != "off"
     ref = DIFF_REF if llama_anchored else frontier
     if LOWER_IS_BETTER:
         # Latency: fair gain = how much of llama's TTFT we cut vs llama (ref - value) / ref.
@@ -206,14 +277,39 @@ def _speed_tier_fields(tps, frontier, ceiling):
     else:
         g_fair = delta / ref
     D = difficulty_mult(frontier)                       # hard-gain boost once past the reference
-    g_eff = min(g_fair * D, 2 * g)                      # strict cap: tier credit ≤ 2× measured speedup
+    # CAP AT THE MEASURED SPEEDUP, NOT TWICE IT.
+    #
+    # The cap used to be 2*g, which was invisible while the frontier sat below llama.cpp --
+    # there g_fair < g and the llama anchor bound. Once the frontier passed 2x the reference
+    # (40.02 vs 18.4435 on h200x8) the anchor stopped binding and the CAP became the rule, so
+    # every tier was awarded at twice the real gain: XL for 9% over main instead of 18%.
+    # Re-scored from the sealed receipts, that inflated 8 of the last 18 scored runs --
+    # #89/#90/#96/#107/#114 all took XL for 12-18% gains.
+    #
+    # min(g_fair, g) is the CONSERVATIVE of the two bases, and it keeps both protections:
+    #   frontier below llama -> g_fair is smaller, the anchor still stops an un-optimized
+    #                           baseline minting XLs from low-hanging fruit (#64: 10.5% raw
+    #                           over a weak frontier, held to S at 5.7% of llama)
+    #   frontier above llama -> g is smaller, so a gain must beat the CURRENT BEST by the
+    #                           full tier percentage, which is what "marginal speedup over
+    #                           the frontier" means
+    # The early XLs are unaffected (#63 35.4%, #57 27.9%, #49 21.0% -- all llama-bound).
+    #
+    # NOTE ON DIFF_BOOST: with the boost on, g_fair*D can exceed g and this cap makes it
+    # inert past the reference. That is deliberate -- the boost multiplies a tier for
+    # difficulty, and paying 2x the measured gain is not a difficulty adjustment. The boost
+    # is off by default (SPARKINFER_DIFFICULTY_BOOST=0) and is not set on the K3 path.
+    g_eff = min(g_fair * D, g)                          # tier credit ≤ the measured speedup
     # A verified improvement over the frontier floors at XS (real but small); the higher tiers
     # (S/M/L/XL) are earned by the llama-anchored size. So "none" always means "not a verified
     # improvement", never "real but tiny".
     label = next((l for thr, l in BUCKETS if g_eff >= thr), "XS")
     out.update(label=label, delta_tps=round(delta, 6 if LOWER_IS_BETTER else 2),
                pct_over_frontier=round(100 * g, 1),      # RAW measured speedup / TTFT reduction
-               pct_of_llama=round(100 * g_fair, 1),      # gain vs llama — the label basis
+               # Gain vs llama. The label basis only while the anchor is on; when it is off
+               # this stays the TRUE fraction of llama (delta/DIFF_REF), not delta/frontier,
+               # so the number keeps meaning the same thing in every receipt.
+               pct_of_llama=round(100 * (delta / DIFF_REF if DIFF_REF > 0 else g_fair), 1),
                pct_of_ceiling=round(100 * tps / ceiling, 1) if ceiling > 0 and not LOWER_IS_BETTER else None)
     out["effective_pct"] = round(100 * g_eff, 1)
     if D != 1.0:                                        # transparency: expose the boost in the verdict
@@ -267,7 +363,12 @@ if res.get("label") != "REJECT" and kl > KL_PREFER:
 res["pass"] = res.pop("pass_", True)
 # Make the basis explicit. A tier computed without a llama anchor is not comparable to one
 # that has it, and the difference was previously invisible in the output.
-res["tier_basis"] = "llama_anchored" if DIFF_REF > 0 else "frontier_relative"
+if DIFF_REF > 0 and TIER_ANCHOR == "off":
+    res["tier_basis"] = "frontier_relative"
+    res["tier_anchor_off"] = ANCHOR_OFF_REASON
+    res["tier_anchor_ref"] = round(DIFF_REF, 4)
+else:
+    res["tier_basis"] = "llama_anchored" if DIFF_REF > 0 else "frontier_relative"
 if SCORED_CTX:
     res["scored_context"] = int(SCORED_CTX)
 if _rows:

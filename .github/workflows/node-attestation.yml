@@ -50,12 +50,64 @@ jobs:
               { key: 'b300', re: /b300/i,  label: '4x+ B300 (sm_103)' },
             ];
 
+            // Scoped to the "## Node run" section only. A body-wide scan matched any ticked
+            // checkbox that merely mentioned a node name -- e.g. the unrelated Checklist item
+            // "- [x] `bench/scripts/kimi_k3_baseline.sh --node h200x8 --dry-run` resolves"
+            // reads as "attested on 8x H200" even though the real attestation checkbox above
+            // it is unticked, since both the ticked-checkbox regex and the node regex hit that
+            // one line. PR #74 cleared its needs-node-run label this way with no real node run.
+            function nodeRunSection(body) {
+              if (!body) return '';
+              const lines = body.split('\n');
+              const start = lines.findIndex(ln => /^##\s+node run\s*$/i.test(ln));
+              if (start === -1) return '';
+              let end = lines.length;
+              for (let i = start + 1; i < lines.length; i++) {
+                if (/^##\s+/.test(lines[i])) { end = i; break; }
+              }
+              return lines.slice(start + 1, end).join('\n');
+            }
+
             function tickedNodes(body) {
-              if (!body) return [];
+              const section = nodeRunSection(body);
+              if (!section) return [];
               const out = [];
-              for (const ln of body.split('\n')) {
+              for (const ln of section.split('\n')) {
                 if (!/-\s*\[\s*[xX]\s*\]/.test(ln)) continue;
+                // A CLAIM LINE IS NOT A NODE ATTESTATION. The claim boxes name the node too,
+                // so a ticked claim would satisfy this scan on its own and the node box could
+                // stay empty -- the exact #74 shape this scan was narrowed to stop.
+                if (/prefill|decode\s+regression/i.test(ln)) continue;
                 for (const n of NODES) if (n.re.test(ln)) out.push(n.label);
+              }
+              return [...new Set(out)];
+            }
+
+            // THE SCORED METRIC AND ITS GUARD EACH NEED THEIR OWN ATTESTATION (2026-08-05).
+            //
+            // The tier is earned on PREFILL at 32k; decode at 128k is a regression guard. A
+            // node tick alone no longer says what was run, and the two claims are different:
+            // "I measured the thing you score" and "I checked I did not break the thing you
+            // guard". A PR that only ticks the node has told us it touched a GPU, which was
+            // enough when there was one number.
+            //
+            // Same scoping as the node tick -- "## Node run" only, ticked lines only -- for
+            // the same reason: a body-wide scan matched any ticked line that merely mentioned
+            // the word, and #74 cleared its label that way with no real node run.
+            const CLAIMS = [
+              { key: 'prefill', re: /prefill/i,
+                label: 'prefill measured at 32k (the scored metric)' },
+              { key: 'decode',  re: /decode\s+regression|no\s+.*decode|decode.*no\s+regress/i,
+                label: 'no 128k decode regression' },
+            ];
+
+            function tickedClaims(body) {
+              const section = nodeRunSection(body);
+              if (!section) return [];
+              const out = [];
+              for (const ln of section.split('\n')) {
+                if (!/-\s*\[\s*[xX]\s*\]/.test(ln)) continue;
+                for (const c of CLAIMS) if (c.re.test(ln)) out.push(c.key);
               }
               return [...new Set(out)];
             }
@@ -80,6 +132,30 @@ jobs:
               .filter(n => PERF_PREFIXES.some(p => n.startsWith(p)));
 
             const ticked = tickedNodes(pr.body);
+            const claims = tickedClaims(pr.body);
+            const missingClaims = CLAIMS.filter(c => !claims.includes(c.key));
+
+            // A TICKED "BLOCKED" BOX IS AN ANSWER, NOT A MISSING NODE RUN.
+            //
+            // #144 measured both metrics on one binary, held the decode guard, verified
+            // parity bit-exact at 1k and 4k, then found parity FAILS at 32k, pasted the
+            // failing compare_logits output, and said do not merge on the perf number. To
+            // fit that in, the author restructured the body -- which cost the '## Node run'
+            // heading this scan keys on, so the loop told the most thorough submission in
+            // the queue that it had not touched a GPU.
+            //
+            // Read from the WHOLE body rather than the node-run section, for exactly that
+            // reason: an author with something to disclose is the one most likely to have
+            // reorganised around it. The narrow body-wide scan that #74 abused was for
+            // CLEARING the label on an unproven claim; this only ever suppresses a nag on
+            // someone volunteering a defect, and it costs them the round either way.
+            const blocked = (pr.body || '').split('\n')
+              .some(ln => /-\s*\[\s*[xX]\s*\]/.test(ln) && /\bblocked\b/i.test(ln));
+            if (blocked) {
+              core.info(`#${num}: author marked this blocked — not asking for a node run`);
+              await setLabel(false);
+              return;
+            }
 
             async function setLabel(on) {
               const has = labels.includes(LABEL);
@@ -97,13 +173,20 @@ jobs:
               await setLabel(false);
               return;
             }
-            if (ticked.length > 0) {
-              core.info(`#${num}: attested on ${ticked.join(', ')}`);
+            if (ticked.length > 0 && missingClaims.length === 0) {
+              core.info(`#${num}: attested on ${ticked.join(', ')} — prefill + decode-guard claimed`);
               await setLabel(false);
               return;
             }
-
-            core.notice(`#${num}: ${perfFiles.length} perf-bearing file(s), no node attested`);
+            if (ticked.length > 0) {
+              // The node was ticked but the metric claims were not. That is a DIFFERENT
+              // failure from "never touched a GPU", and saying so is the difference between
+              // an author fixing it in a minute and an author guessing.
+              core.notice(`#${num}: node attested (${ticked.join(', ')}) but missing: ` +
+                          missingClaims.map(c => c.label).join('; '));
+            } else {
+              core.notice(`#${num}: ${perfFiles.length} perf-bearing file(s), no node attested`);
+            }
             await setLabel(true);
 
             // One comment per PR, updated rather than repeated on every synchronize.
@@ -122,7 +205,12 @@ jobs:
               'CI covers syntax, the no-GPU test suite, configs and the `--dry-run` plans — but it',
               'cannot run an 802 GiB model, so it cannot tell whether this changed the numbers.',
               '',
-              '**To clear this label**, edit the PR description and tick the node you measured on:',
+              ticked.length > 0
+                ? `You ticked **${ticked.join(', ')}**, but the scored metric and its guard each need their own claim. Missing: ${missingClaims.map(c => '**' + c.label + '**').join(', ')}.`
+                : '',
+              ticked.length > 0 ? '' : '',
+              '**To clear this label**, edit the PR description and tick the node you measured on,',
+              '**plus both metric claims** — the evaluation loop skips a PR missing any of them:',
               '',
               ...NODES.map(n => `- [ ] Tested on **${n.label}**`),
               '',
